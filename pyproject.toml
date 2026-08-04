@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "base-agent"
+version = "0.1.0"
+description = "A streamlined local agent with PyQt6 GUI, OpenAI-compatible LLM, and pluggable tools."
+requires-python = ">=3.9"
+dependencies = [
+    "PyQt6>=6.5",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

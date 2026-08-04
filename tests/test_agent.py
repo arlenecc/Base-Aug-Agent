@@ -1,0 +1,596 @@
+"""Tests for the agent main loop (LLM mocked)."""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Iterator, List
+
+import pytest
+
+from agent.agent import Agent
+from agent.config import AgentConfig
+from agent.llm_client import StreamEvent
+
+
+def _evt(t, content="", tool_calls=None, usage=None):
+    return StreamEvent(type=t, content=content, tool_calls=tool_calls or [], usage=usage or {})
+
+
+class MockLLM:
+    """Replays a queue of canned event-lists, one per chat_stream call."""
+
+    def __init__(self, scripts: List[List[StreamEvent]]):
+        self._scripts = list(scripts)
+        self.calls = []
+
+    def chat_stream(self, messages, tools=None, temperature=0.7):
+        self.calls.append({"messages": messages, "tools": tools, "temperature": temperature})
+        if not self._scripts:
+            raise AssertionError("MockLLM ran out of scripted responses")
+        return iter(self._scripts.pop(0))
+
+
+# ---------------------------------------------------------------------------
+# simple reply (no tools)
+# ---------------------------------------------------------------------------
+
+def test_agent_streams_content_and_stops(config, recording_callbacks):
+    mock = MockLLM([[_evt("content", "He"), _evt("content", "llo"),
+                     _evt("done", usage={"total_tokens": 5, "prompt_tokens": 2, "completion_tokens": 3})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("hi")
+
+    assert "".join(recording_callbacks.content) == "Hello"
+    assert recording_callbacks.tool_starts == []
+    assert recording_callbacks.usages == [{"total_tokens": 5, "prompt_tokens": 2, "completion_tokens": 3}]
+
+
+def test_agent_streams_reasoning(config, recording_callbacks):
+    mock = MockLLM([[_evt("reasoning", "thinking..."),
+                     _evt("content", "answer"),
+                     _evt("done", usage={"total_tokens": 4})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("hi")
+
+    assert "".join(recording_callbacks.reasoning) == "thinking..."
+    assert "".join(recording_callbacks.content) == "answer"
+
+
+# ---------------------------------------------------------------------------
+# one tool call then final answer
+# ---------------------------------------------------------------------------
+
+def test_agent_executes_tool_then_answers(config, recording_callbacks):
+    # Create a file the tool will read.
+    with open(__import__("os").path.join(config.workspace, "data.txt"), "w") as f:
+        f.write("42")
+
+    tc = [{"id": "c1", "function": {"name": "file_read", "arguments": json.dumps({"path": "data.txt"})}}]
+    mock = MockLLM([
+        [_evt("reasoning", "I will read the file"),
+         _evt("done", tool_calls=tc, usage={"total_tokens": 10})],
+        [_evt("content", "The answer is 42"),
+         _evt("done", usage={"total_tokens": 12})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("read data.txt")
+
+    assert recording_callbacks.tool_starts == [("file_read", {"path": "data.txt"})]
+    assert len(recording_callbacks.tool_ends) == 1
+    name, res = recording_callbacks.tool_ends[0]
+    assert name == "file_read"
+    assert res.success and res.output == "42"
+    assert "".join(recording_callbacks.content) == "The answer is 42"
+    # 2 LLM calls
+    assert len(mock.calls) == 2
+    # second call must include the tool result message
+    second_msgs = mock.calls[1]["messages"]
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "c1" for m in second_msgs)
+
+
+# ---------------------------------------------------------------------------
+# multi-step tool calls
+# ---------------------------------------------------------------------------
+
+def test_agent_multi_step_tool_chain(config, recording_callbacks):
+    tc1 = [{"id": "c1", "function": {"name": "code_run", "arguments": json.dumps({"code": "x=6*7"})}}]
+    tc2 = [{"id": "c2", "function": {"name": "ask_user", "arguments": json.dumps({"prompt": "ok?"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc1, usage={"total_tokens": 5})],
+        [_evt("done", tool_calls=tc2, usage={"total_tokens": 5})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("compute then ask")
+
+    assert [n for n, _ in recording_callbacks.tool_starts] == ["code_run", "ask_user"]
+    assert recording_callbacks.asks == ["ok?"]
+
+
+# ---------------------------------------------------------------------------
+# confirmation policy: only system-affecting tools (code_run) ask; workspace
+# file ops do not.
+# ---------------------------------------------------------------------------
+
+def test_code_run_requires_confirmation(config, recording_callbacks):
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "print('hi')"})}}]
+    mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+                    [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+
+    recording_callbacks._confirm_return = True
+    agent.run("run code")
+
+    assert len(recording_callbacks.confirms) == 1
+    assert recording_callbacks.tool_starts == [("code_run", {"code": "print('hi')"})]
+
+
+def test_code_run_aborted_when_user_declines(config, recording_callbacks):
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "print('hi')"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        # after refusal, model should still get a tool message saying denied, then answer
+        [_evt("content", "ok skipped"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    recording_callbacks._confirm_return = False
+    agent.run("run code")
+
+    assert recording_callbacks.tool_starts == []  # never started
+    # tool result message should report denial
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "denied" in tool_msg["content"].lower() or "declined" in tool_msg["content"].lower()
+
+
+def test_workspace_file_write_does_not_confirm(config, recording_callbacks):
+    """Writing a file inside the workspace runs without a confirmation prompt."""
+    tc = [{"id": "c1", "function": {"name": "file_write",
+            "arguments": json.dumps({"path": "x.txt", "content": "y"})}}]
+    mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+                    [_evt("content", "written"), _evt("done", usage={"total_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("write file")
+
+    assert recording_callbacks.confirms == []  # no prompt
+    assert recording_callbacks.tool_starts == [("file_write", {"path": "x.txt", "content": "y"})]
+    import os
+
+    assert os.path.exists(os.path.join(config.workspace, "x.txt"))
+
+
+def test_workspace_file_modify_does_not_confirm(config, recording_callbacks):
+    import os
+
+    with open(os.path.join(config.workspace, "m.txt"), "w") as f:
+        f.write("foo")
+    tc = [{"id": "c1", "function": {"name": "file_modify",
+            "arguments": json.dumps({"path": "m.txt", "old": "foo", "new": "bar"})}}]
+    mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+                    [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("edit file")
+
+    assert recording_callbacks.confirms == []
+    with open(os.path.join(config.workspace, "m.txt")) as f:
+        assert f.read() == "bar"
+
+
+# ---------------------------------------------------------------------------
+# safety: max iterations
+# ---------------------------------------------------------------------------
+
+def test_agent_stops_after_max_iterations(config, recording_callbacks):
+    tc = [{"id": "c1", "function": {"name": "code_run", "arguments": json.dumps({"code": "print(1)"})}}]
+    # always returns another tool call -> infinite loop
+    loop = [_evt("done", tool_calls=tc, usage={"total_tokens": 5})]
+    mock = MockLLM([loop] * 100)
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.max_iterations = 3
+    agent.run("loop")
+
+    assert len(mock.calls) <= 3
+
+
+# ---------------------------------------------------------------------------
+# tool error propagates back to model
+# ---------------------------------------------------------------------------
+
+def test_tool_error_is_returned_to_model(config, recording_callbacks):
+    tc = [{"id": "c1", "function": {"name": "file_read",
+            "arguments": json.dumps({"path": "missing.txt"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "could not read"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("read missing")
+
+    _, res = recording_callbacks.tool_ends[0]
+    assert not res.success
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "error" in tool_msg["content"].lower() or "not exist" in tool_msg["content"].lower()
+
+
+# ---------------------------------------------------------------------------
+# logs & token speed reporting
+# ---------------------------------------------------------------------------
+
+def test_agent_emits_logs_and_speed(config, recording_callbacks):
+    import time
+
+    mock = MockLLM([[_evt("content", "hi"), _evt("done", usage={"total_tokens": 5, "completion_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("hi")
+
+    assert len(recording_callbacks.logs) > 0
+    # at least one speed report
+    assert len(recording_callbacks.speeds) >= 1
+
+
+# ---------------------------------------------------------------------------
+# reasoning streaming: real-time speed + token counting
+# ---------------------------------------------------------------------------
+
+def test_speed_emitted_during_reasoning_streaming(config, recording_callbacks):
+    """While reasoning chunks are streaming in, the agent must emit real-time
+    on_token_speed updates so the UI can show tokens/sec live -- not just a
+    single update at the very end."""
+    # A long reasoning stream followed by a short content + done.
+    reasoning_chunks = [_evt("reasoning", "thinking " * 20) for _ in range(5)]
+    mock = MockLLM([reasoning_chunks + [_evt("content", "answer"),
+                                        _evt("done", usage={"total_tokens": 50, "completion_tokens": 50})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("think hard")
+
+    # At least one speed update must arrive *during* reasoning, before the
+    # final post-done update. We check there are >1 speed reports total.
+    assert len(recording_callbacks.speeds) >= 2, (
+        f"expected real-time speed updates during reasoning, got {recording_callbacks.speeds}"
+    )
+
+
+def test_reasoning_tokens_counted_in_speed(config, recording_callbacks):
+    """When the API reports completion_tokens but the model also emitted a lot
+    of reasoning text, the final speed must account for the reasoning tokens,
+    not just completion_tokens. Otherwise reasoning-heavy models show an
+    implausibly low tok/s."""
+    # 500 chars of reasoning, but usage claims only 5 completion_tokens
+    # (as if the API didn't count reasoning). Speed should not be 5/elapsed.
+    reasoning = _evt("reasoning", "x" * 500)
+    mock = MockLLM([[reasoning, _evt("content", "ok"),
+                     _evt("done", usage={"total_tokens": 10, "completion_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("think")
+
+    # The final speed report should reflect more than just 5 tokens, because
+    # the agent estimates reasoning tokens from the streamed text.
+    last_total, last_speed = recording_callbacks.speeds[-1]
+    assert last_total > 10, (
+        f"total tokens should include estimated reasoning tokens, got {last_total}"
+    )
+
+
+def test_reasoning_tokens_added_to_total_when_api_omits_them(config, recording_callbacks):
+    """Some local model APIs return usage that doesn't include reasoning tokens
+    at all. The agent must add an estimate so the running total reflects
+    actual consumption."""
+    # Long reasoning, usage reports 0 total_tokens (API bug / omission)
+    reasoning = _evt("reasoning", "y" * 400)
+    mock = MockLLM([[reasoning, _evt("content", "done"),
+                     _evt("done", usage={"total_tokens": 0, "completion_tokens": 0})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("think")
+
+    # Despite usage saying 0, the total should be non-zero (estimated).
+    last_total, _ = recording_callbacks.speeds[-1]
+    assert last_total > 0, "total tokens must include estimated reasoning tokens"
+
+
+def test_api_reasoning_tokens_used_when_provided(config, recording_callbacks):
+    """If the API helpfully provides completion_tokens_details.reasoning_tokens,
+    use that exact number instead of a text-length estimate."""
+    reasoning = _evt("reasoning", "z" * 300)
+    usage = {
+        "total_tokens": 100,
+        "completion_tokens": 80,
+        "completion_tokens_details": {"reasoning_tokens": 60},
+    }
+    mock = MockLLM([[reasoning, _evt("content", "ok"), _evt("done", usage=usage)]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("think")
+
+    last_total, _ = recording_callbacks.speeds[-1]
+    # API said 100 total; agent should trust that, not inflate with estimates.
+    assert last_total == 100
+
+
+def test_estimate_tokens_helper():
+    """The token estimation helper returns a positive int for non-empty text
+    and 0 for empty text."""
+    from agent.agent import _estimate_tokens
+
+    assert _estimate_tokens("") == 0
+    assert _estimate_tokens("hello world") > 0
+    # CJK text: each char is roughly 1-2 tokens, so 10 chars >= 5 tokens
+    assert _estimate_tokens("你好世界这是一段中文") >= 5
+    # longer text -> more tokens
+    assert _estimate_tokens("a" * 100) > _estimate_tokens("a" * 10)
+
+
+# ---------------------------------------------------------------------------
+# code_run end-to-end: model writes code -> agent executes -> result fed back
+# ---------------------------------------------------------------------------
+
+def test_code_run_result_fed_back_to_model(config, recording_callbacks):
+    """The stdout from code_run must appear in the tool message sent back to the
+    model so it can reason about the result in the next turn."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "print(2+2)"})}}]
+    mock = MockLLM([
+        [_evt("reasoning", "I'll compute 2+2"), _evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "The answer is 4"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("compute 2+2")
+
+    # tool actually ran and captured stdout
+    name, res = recording_callbacks.tool_ends[0]
+    assert name == "code_run"
+    assert res.success
+    assert "4" in res.output
+    # the tool message in the second LLM call carries the stdout
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "4" in tool_msg["content"]
+
+
+def test_code_run_error_traceback_fed_back_to_model(config, recording_callbacks):
+    """When code_run raises, the traceback must reach the model so it can fix
+    the code on the next turn."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "1/0"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "fixed"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("divide")
+
+    _, res = recording_callbacks.tool_ends[0]
+    assert not res.success
+    assert "ZeroDivisionError" in res.error
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "ZeroDivisionError" in tool_msg["content"]
+
+
+# ---------------------------------------------------------------------------
+# robustness: malformed tool-call arguments must NOT silently run with {}
+# ---------------------------------------------------------------------------
+
+def test_malformed_json_args_reported_to_model(config, recording_callbacks):
+    """If the model emits a tool_call whose arguments are not valid JSON, the
+    agent must tell the model exactly that (not silently run with empty args
+    and produce a confusing 'missing argument' error)."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": "print('hi')"  # not valid JSON, missing braces
+           }}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "recovered"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("run")
+
+    _, res = recording_callbacks.tool_ends[0]
+    assert not res.success
+    # the error must mention JSON so the model knows what to fix
+    assert "json" in res.error.lower() or "parse" in res.error.lower()
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "json" in tool_msg["content"].lower() or "parse" in tool_msg["content"].lower()
+
+
+def test_empty_args_for_required_param_reports_clear_error(config, recording_callbacks):
+    """A tool call with empty arguments for a tool requiring params must produce
+    a clear error naming the missing parameter."""
+    tc = [{"id": "c1", "function": {"name": "file_read", "arguments": ""}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("read")
+
+    _, res = recording_callbacks.tool_ends[0]
+    assert not res.success
+    assert "path" in res.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# API compatibility: assistant messages and tool_call IDs
+# ---------------------------------------------------------------------------
+
+def test_assistant_message_has_content_null_when_only_tool_calls(config, recording_callbacks):
+    """OpenAI-compatible APIs expect assistant messages with tool_calls to carry
+    a `content` field (null). Omitting it causes HTTP 400 on some servers."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "print(1)"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("run")
+
+    # The assistant message in the second call's history must include content.
+    second_msgs = mock.calls[1]["messages"]
+    asst = [m for m in second_msgs if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert asst, "assistant message with tool_calls must be in history"
+    assert "content" in asst[0], "assistant message must have content key (null allowed)"
+
+
+def test_missing_tool_call_id_gets_generated(config, recording_callbacks):
+    """Some local models omit tool_call.id. The agent must synthesize one so the
+    tool result can be correlated back (tool_call_id must not be empty)."""
+    recording_callbacks._confirm_return = True
+    tc = [{"function": {"name": "code_run",
+            "arguments": json.dumps({"code": "print(1)"})}}]  # no "id"
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("run")
+
+    second_msgs = mock.calls[1]["messages"]
+    asst = [m for m in second_msgs if m.get("role") == "assistant" and m.get("tool_calls")][0]
+    tool_msgs = [m for m in second_msgs if m.get("role") == "tool"]
+    assert tool_msgs, "tool result message must exist"
+    # the tool_call id on the assistant side must be non-empty...
+    assert asst["tool_calls"][0].get("id"), "tool_call.id must be non-empty"
+    # ...and match the tool_call_id on the tool side
+    assert tool_msgs[0]["tool_call_id"] == asst["tool_calls"][0]["id"]
+
+
+def test_multiple_tool_calls_results_all_sent_back(config, recording_callbacks):
+    """When the model emits several tool_calls in one turn, every result must
+    be in the next request's history, each with its own tool_call_id."""
+    recording_callbacks._confirm_return = True
+    tcs = [
+        {"id": "c1", "function": {"name": "code_run",
+         "arguments": json.dumps({"code": "print(1)"})}},
+        {"id": "c2", "function": {"name": "file_write",
+         "arguments": json.dumps({"path": "x.txt", "content": "y"})}},
+    ]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tcs, usage={"total_tokens": 5})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("do two things")
+
+    second_msgs = mock.calls[1]["messages"]
+    tool_msgs = [m for m in second_msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    ids = {m["tool_call_id"] for m in tool_msgs}
+    assert ids == {"c1", "c2"}
+
+
+def test_code_run_non_string_code_coerced(config, recording_callbacks):
+    """If the model emits code as a non-string (number/dict), code_run must
+    coerce it to a string rather than crashing with a TypeError."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": 42})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("run number")
+
+    _, res = recording_callbacks.tool_ends[0]
+    # Coercion succeeded: the tool ran without a TypeError crash.
+    assert res.success
+    assert "typeerror" not in res.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# shell_run end-to-end: model calls shell_run -> agent executes -> result back
+# ---------------------------------------------------------------------------
+
+def test_shell_run_result_fed_back_to_model(config, recording_callbacks):
+    """shell_run stdout must appear in the tool message sent back to the model."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "shell_run",
+            "arguments": json.dumps({"command": "echo hello_from_shell"})}}]
+    mock = MockLLM([
+        [_evt("reasoning", "I'll run a shell command"), _evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "The shell said hello"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("run echo")
+
+    name, res = recording_callbacks.tool_ends[0]
+    assert name == "shell_run"
+    assert res.success
+    assert "hello_from_shell" in res.output
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "hello_from_shell" in tool_msg["content"]
+
+
+def test_shell_run_requires_confirmation(config, recording_callbacks):
+    """shell_run is destructive — it must ask the user before executing."""
+    tc = [{"id": "c1", "function": {"name": "shell_run",
+            "arguments": json.dumps({"command": "ls"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    recording_callbacks._confirm_return = True
+    agent.run("list files")
+
+    assert len(recording_callbacks.confirms) == 1
+    assert recording_callbacks.tool_starts[0][0] == "shell_run"
+
+
+def test_shell_run_error_fed_back_to_model(config, recording_callbacks):
+    """A non-zero exit code must be reported back so the model can react."""
+    recording_callbacks._confirm_return = True
+    tc = [{"id": "c1", "function": {"name": "shell_run",
+            "arguments": json.dumps({"command": "exit 7"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "noted the failure"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("fail")
+
+    _, res = recording_callbacks.tool_ends[0]
+    assert not res.success
+    second_msgs = mock.calls[1]["messages"]
+    tool_msg = [m for m in second_msgs if m.get("role") == "tool"][0]
+    assert "7" in tool_msg["content"]
+
+
+def test_code_run_then_shell_run_feedback_loop(config, recording_callbacks):
+    """Multi-turn feedback loop: model writes a file via code_run, then reads
+    it back via shell_run, then produces a final answer. Verifies the full
+    tool-calling cycle: parse -> confirm -> execute -> result -> next call."""
+    recording_callbacks._confirm_return = True
+    tc1 = [{"id": "c1", "function": {"name": "code_run",
+            "arguments": json.dumps({"code": "open('loop.txt','w').write('data123')"})}}]
+    tc2 = [{"id": "c2", "function": {"name": "shell_run",
+            "arguments": json.dumps({"command": "cat loop.txt"})}}]
+    mock = MockLLM([
+        [_evt("reasoning", "write file"), _evt("done", tool_calls=tc1, usage={"total_tokens": 5})],
+        [_evt("reasoning", "read it back"), _evt("done", tool_calls=tc2, usage={"total_tokens": 5})],
+        [_evt("content", "The file contains data123"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    answer = agent.run("write and read back")
+
+    assert "data123" in answer
+    assert [n for n, _ in recording_callbacks.tool_starts] == ["code_run", "shell_run"]
+    # 3 LLM calls: write -> read -> final answer
+    assert len(mock.calls) == 3
+    # The second LLM call sees code_run's result; the third sees both results
+    # (history accumulates). The latest tool result (shell_run) has data123.
+    second_tool_msgs = [m for m in mock.calls[1]["messages"] if m.get("role") == "tool"]
+    third_tool_msgs = [m for m in mock.calls[2]["messages"] if m.get("role") == "tool"]
+    assert len(second_tool_msgs) == 1
+    assert len(third_tool_msgs) == 2  # code_run + shell_run results
+    # the shell_run result (tool_call_id c2) should carry the file content
+    shell_msg = [m for m in third_tool_msgs if m["tool_call_id"] == "c2"][0]
+    assert "data123" in shell_msg["content"]
