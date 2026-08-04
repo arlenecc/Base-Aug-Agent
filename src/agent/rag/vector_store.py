@@ -48,29 +48,25 @@ class VectorStore:
                 "chromadb is required for RAG vector storage. pip install chromadb"
             )
 
-        try:
-            # Verify sentence-transformers is available
-            embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=self._embedding_model
-            )
-        except Exception:
-            raise ImportError(
-                "sentence-transformers is required for embeddings. "
-                "pip install sentence-transformers"
-            )
-
         os.makedirs(self._persist_dir, exist_ok=True)
 
         self._client = chromadb.PersistentClient(path=self._persist_dir)
 
-        # Use local_files_only when running offline (no HF access)
-        local_only = os.environ.get("HF_HUB_OFFLINE", "") == "1" or \
-                     os.environ.get("TRANSFORMERS_OFFLINE", "") == "1"
-        ef_kwargs = {"model_name": self._embedding_model}
-        if local_only:
-            ef_kwargs["local_files_only"] = True
+        # Always use local_files_only to avoid multi-minute hangs when
+        # HuggingFace is unreachable. The model must be pre-cached.
+        try:
+            self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=self._embedding_model,
+                local_files_only=True,
+            )
+        except Exception:
+            raise ImportError(
+                f"Failed to load embedding model '{self._embedding_model}'. "
+                "Ensure sentence-transformers is installed and the model is cached. "
+                "Run: python -c \"from sentence_transformers import SentenceTransformer; "
+                f"SentenceTransformer('{self._embedding_model}')\""
+            )
 
-        self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(**ef_kwargs)
         self._collection = self._client.get_or_create_collection(
             name="knowledge_base",
             embedding_function=self._ef,
@@ -198,19 +194,31 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using BGE reranker for precise scoring.
 
-        Falls back to returning the original candidates if the reranker
-        is unavailable.
+        Falls back to distance-based similarity scoring when the reranker
+        is unavailable. In both cases scores are normalized to [0, 1]
+        (higher is better) and results are returned sorted descending.
         """
         if not candidates:
             return []
 
         reranker = self._get_reranker()
         if reranker is None:
+            # Fallback: ChromaDB cosine distance d in [0, 2] (lower = closer).
+            # Map to a similarity score in [0, 1] (higher = better) and sort
+            # descending so the fallback stays consistent with the reranker.
+            for c in candidates:
+                try:
+                    d = float(c.get("score", 0.0))
+                except (TypeError, ValueError):
+                    d = 0.0
+                c["score"] = max(0.0, min(1.0, 1.0 - d / 2.0))
+            candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             return candidates[:top_k]
 
         # Build pairs for reranker
         pairs = [[query, c["text"]] for c in candidates]
-        scores = reranker.compute_score(pairs)
+        # normalize=True applies sigmoid so scores land in [0, 1].
+        scores = reranker.compute_score(pairs, normalize=True)
 
         # Normalize to list if single result
         if not isinstance(scores, list):

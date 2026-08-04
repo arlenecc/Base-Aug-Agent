@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .parsers import extract_directory, extract_text
+from .parsers import extract_directory, extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, normalize_markdown
 from .chunker import chunk_documents
 from .vector_store import VectorStore
@@ -76,8 +76,19 @@ class RAGEngine:
 
         # Step 1: Extract text from all documents
         logger.info("RAG: extracting documents from %s", self._knowledge_base)
-        extracted = extract_directory(self._knowledge_base, recursive=True)
-        stats["files_found"] = len(extracted)
+
+        # Count supported files on disk first (independent of extraction success)
+        root = Path(self._knowledge_base)
+        stats["files_found"] = sum(
+            1 for fp in root.rglob("*")
+            if fp.is_file()
+            and fp.suffix.lower() in SUPPORTED_EXTENSIONS
+            and not fp.name.startswith(".")
+        )
+
+        extracted = extract_directory(
+            self._knowledge_base, recursive=True, errors=stats["errors"],
+        )
 
         if not extracted:
             logger.info("RAG: no supported documents found")

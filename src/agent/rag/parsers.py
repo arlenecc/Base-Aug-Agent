@@ -285,8 +285,12 @@ def _extract_text(path: Path) -> str:
 def _extract_csv(path: Path) -> str:
     import csv
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        dialect = csv.Sniffer().sniff(f.read(4096))
+        sample = f.read(4096)
         f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel  # default: comma-delimited
         reader = csv.reader(f, dialect)
         rows = list(reader)
     if not rows:
@@ -323,10 +327,12 @@ def extract_directory(
     dirpath: str,
     recursive: bool = True,
     extensions: Optional[set] = None,
+    errors: Optional[List[str]] = None,
 ) -> List[tuple]:
     """Walk a directory and extract text from all supported files.
 
     Returns a list of (filepath, extracted_text) tuples.
+    If *errors* is provided, extraction failure messages are appended to it.
     """
     if extensions is None:
         extensions = SUPPORTED_EXTENSIONS
@@ -348,7 +354,15 @@ def extract_directory(
             if text.strip():
                 results.append((str(filepath), text))
                 logger.info("Extracted: %s (%d chars)", filepath.name, len(text))
+            else:
+                msg = f"{filepath.name}: extracted text is empty"
+                logger.warning(msg)
+                if errors is not None:
+                    errors.append(msg)
         except Exception as e:
+            msg = f"{filepath.name}: {e}"
             logger.warning("Failed to extract '%s': %s", filepath.name, e)
+            if errors is not None:
+                errors.append(msg)
 
     return results

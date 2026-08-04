@@ -201,6 +201,30 @@ class SyncKnowledgeWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class InstallDepsWorker(QThread):
+    """Background worker for checking and installing missing RAG dependencies."""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(object)  # DependencyReport
+
+    def __init__(self, kb_path: str):
+        super().__init__()
+        self._kb_path = kb_path
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from ..rag.deps import ensure_dependencies
+            report = ensure_dependencies(
+                self._kb_path,
+                auto_install=True,
+                include_core=True,
+                progress_callback=self.progress.emit,
+            )
+            self.finished.emit(report)
+        except Exception as e:
+            self.progress.emit(f"依赖检查异常: {e}")
+            self.finished.emit(None)
+
+
 # ===========================================================================
 # Keyed plain text editor: Enter sends, Shift+Enter newline
 # ===========================================================================
@@ -236,6 +260,7 @@ class MainWindow(QMainWindow):
         self._worker: Optional[AgentWorker] = None
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
+        self._deps_worker: Optional[InstallDepsWorker] = None
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
         self._total_tokens = 0
@@ -572,12 +597,51 @@ class MainWindow(QMainWindow):
     def _on_sync_knowledge(self) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
+        if self._deps_worker is not None and self._deps_worker.isRunning():
+            return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
             QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
             return
+        # Step 1: check dependencies before starting sync
         self.sync_knowledge_btn.setEnabled(False)
+        self.sync_knowledge_btn.setText("检查依赖…")
+        self.status_label.setText("正在检查依赖…")
+        self.progress.setRange(0, 0)
+        self._pending_sync_ws = ws
+        self._pending_sync_kb = kb
+        self._deps_worker = InstallDepsWorker(kb)
+        self._deps_worker.progress.connect(self._on_deps_progress)
+        self._deps_worker.finished.connect(self._on_deps_finished)
+        self._deps_worker.finished.connect(self._deps_worker.deleteLater)
+        self._deps_worker.start()
+
+    def _on_deps_progress(self, msg: str) -> None:
+        self.status_label.setText(msg)
+        self._append_log(f"[deps] {msg}")
+
+    def _on_deps_finished(self, report) -> None:
+        self._deps_worker = None
+        if report is not None and report.has_blocking:
+            # Required deps still missing after auto-install attempt
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            self.progress.setRange(0, 1)
+            self.status_label.setText("依赖缺失，无法同步")
+            QMessageBox.critical(
+                self, "依赖缺失",
+                f"以下必要依赖未能自动安装，请手动安装后重试：\n\n{report.summary()}"
+            )
+            return
+
+        # Step 2: start sync
+        ws = getattr(self, "_pending_sync_ws", "")
+        kb = getattr(self, "_pending_sync_kb", "")
+        if not ws or not kb:
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            return
         self.sync_knowledge_btn.setText("同步中…")
         self.status_label.setText("正在同步知识库…")
         self.progress.setRange(0, 0)
@@ -595,13 +659,20 @@ class MainWindow(QMainWindow):
         self._sync_worker = None
         files = stats.get("files_found", 0)
         chunks = stats.get("chunks", 0)
-        QMessageBox.information(
-            self, "同步完成",
+        errors = stats.get("errors", [])
+        msg = (
             f"知识库同步完成！\n\n"
             f"扫描文件：{files} 个\n"
-            f"向量切片：{chunks} 个\n\n"
-            f"后续对话将自动参考知识库内容进行回答。"
+            f"向量切片：{chunks} 个\n"
         )
+        if errors:
+            msg += f"\n⚠ {len(errors)} 个文件提取失败：\n"
+            for e in errors[:5]:
+                msg += f"  - {e}\n"
+            if len(errors) > 5:
+                msg += f"  …（还有 {len(errors) - 5} 个）\n"
+        msg += "\n后续对话将自动参考知识库内容进行回答。"
+        QMessageBox.information(self, "同步完成", msg)
 
     def _on_sync_failed(self, error: str) -> None:
         self.sync_knowledge_btn.setEnabled(True)

@@ -144,8 +144,10 @@ def _split_recursive(
 def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     """Split text by character positions, respecting token budget.
 
-    Uses character sliding window with token-count boundary checks.
-    Falls back to sentence/whitespace boundaries when possible.
+    Uses incremental token counting: O(n) overall instead of O(n²).
+    Maintains running CJK/other character counts and computes tokens
+    as ``cjk // 2 + other // 3`` — matching ``estimate_tokens`` exactly
+    but without rescanning the substring on every step.
     """
     chunks: List[str] = []
     seen: set = set()  # O(1) dedup instead of O(n) `in chunks`
@@ -153,9 +155,19 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     text_len = len(text)
 
     while pos < text_len:
-        # Find a character window that fits within token budget
+        # Find a character window that fits within token budget.
+        # Incremental: add one char at a time, update running counts.
         end = pos
-        while end < text_len and _token_count(text[pos:end + 1]) <= chunk_size:
+        cjk = 0
+        other = 0
+        while end < text_len:
+            ch = text[end]
+            if 0x4e00 <= ord(ch) <= 0x9fff:
+                cjk += 1
+            else:
+                other += 1
+            if cjk // 2 + other // 3 > chunk_size:
+                break
             end += 1
 
         # Try to break at a natural boundary within the window
@@ -175,14 +187,20 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
         if end >= text_len:
             break
 
-        # Advance position with overlap — find overlap boundary by token count
+        # Advance position with overlap — incremental token count
         overlap_start = end
-        overlap_tokens = 0
-        while overlap_start > pos and overlap_tokens < chunk_overlap:
+        ov_cjk = 0
+        ov_other = 0
+        while overlap_start > pos:
+            ch = text[overlap_start - 1]
+            if 0x4e00 <= ord(ch) <= 0x9fff:
+                ov_cjk += 1
+            else:
+                ov_other += 1
             overlap_start -= 1
-            overlap_tokens = _token_count(text[overlap_start:end])
+            if ov_cjk // 2 + ov_other // 3 >= chunk_overlap:
+                break
         pos = max(overlap_start, pos + 1)  # ensure forward progress
-
 
     return chunks
 
@@ -197,12 +215,21 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
         prev = merged[-1]
         curr = chunks[i]
 
-        # Find the overlap boundary: take last N tokens from prev
+        # Find the overlap boundary: take last N tokens from prev.
+        # Incremental: walk backward, maintaining running counts.
         if _token_count(prev) > overlap:
-            # Walk backward to find the overlap text
             boundary = len(prev)
-            while boundary > 0 and _token_count(prev[boundary:]) < overlap:
+            m_cjk = 0
+            m_other = 0
+            while boundary > 0:
+                ch = prev[boundary - 1]
+                if 0x4e00 <= ord(ch) <= 0x9fff:
+                    m_cjk += 1
+                else:
+                    m_other += 1
                 boundary -= 1
+                if m_cjk // 2 + m_other // 3 >= overlap:
+                    break
             prev_end = prev[boundary:]
 
             # Find where this overlap appears in curr

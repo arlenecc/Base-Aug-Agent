@@ -22,6 +22,7 @@ class AgentConfig:
     knowledge_base: str = ""
     request_timeout: float = 120.0
     max_iterations: int = 15
+    max_history: int = 50  # max messages retained in conversation history
 
     # RAG settings
     rag_chunk_size: int = 500       # tokens per chunk

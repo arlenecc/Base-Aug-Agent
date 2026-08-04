@@ -114,6 +114,7 @@ class Agent:
         self.tools = tool_registry or ToolRegistry(config=config, callbacks=callbacks)
         self.skills = skills or SkillManager(path=os.path.join(config.workspace, ".agent", "skills.json"))
         self.max_iterations = int(getattr(config, "max_iterations", 15))
+        self.max_history = int(getattr(config, "max_history", 50))
         self._history: List[Dict[str, Any]] = []
         self._total_tokens = 0
 
@@ -124,6 +125,21 @@ class Agent:
 
     def history(self) -> List[Dict[str, Any]]:
         return list(self._history)
+
+    def _trim_history(self) -> None:
+        """Evict oldest messages when history exceeds max_history.
+
+        Never leaves a dangling ``tool`` result message at the start —
+        it must follow an assistant message with matching ``tool_calls``.
+        """
+        limit = self.max_history
+        if limit <= 0 or len(self._history) <= limit:
+            return
+        # Start with a simple slice, then skip any leading tool messages.
+        cut = len(self._history) - limit
+        while cut < len(self._history) and self._history[cut].get("role") == "tool":
+            cut += 1
+        del self._history[:cut]
 
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
@@ -139,6 +155,8 @@ class Agent:
             self._log(f"[skills] record_request error: {e}")
 
         self._history.append({"role": "user", "content": user_input})
+
+        self._trim_history()
 
         final_content = ""
         for i in range(self.max_iterations):
