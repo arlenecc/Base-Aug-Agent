@@ -148,6 +148,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     Falls back to sentence/whitespace boundaries when possible.
     """
     chunks: List[str] = []
+    seen: set = set()  # O(1) dedup instead of O(n) `in chunks`
     pos = 0  # character position
     text_len = len(text)
 
@@ -167,7 +168,8 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
                     break
 
         chunk = text[pos:end].strip()
-        if chunk and chunk not in chunks:
+        if chunk and chunk not in seen:
+            seen.add(chunk)
             chunks.append(chunk)
 
         if end >= text_len:

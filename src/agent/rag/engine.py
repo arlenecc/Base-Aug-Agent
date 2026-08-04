@@ -114,7 +114,13 @@ class RAGEngine:
         store = self._get_store()
         if force:
             store.clear()
-        added = store.add(chunks)
+        try:
+            added = store.add(chunks)
+        except Exception as e:
+            logger.error("RAG: vector store add failed after clear: %s", e)
+            stats["chunks"] = 0
+            stats["errors"].append(f"Vector store add failed: {e}")
+            return stats
         stats["chunks"] = added
 
         logger.info(

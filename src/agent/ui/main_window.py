@@ -235,6 +235,7 @@ class MainWindow(QMainWindow):
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
         self._fetch_worker: Optional[FetchModelsWorker] = None
+        self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
         self._total_tokens = 0
@@ -328,9 +329,9 @@ class MainWindow(QMainWindow):
         # Row 1: 上下文长度 | 温度 | top_p | min_p | top_k | 重复惩罚 | 超时(秒) | 应用配置
         row1 = QHBoxLayout()
         row1.setSpacing(8)
-        row1.addWidget(QLabel("上下文长度"))
+        row1.addWidget(QLabel("context"))
         row1.addWidget(self.max_tokens_edit)
-        row1.addWidget(QLabel("温度"))
+        row1.addWidget(QLabel("Temp"))
         row1.addWidget(self.temp_edit)
         row1.addWidget(QLabel("top_p"))
         row1.addWidget(self.top_p_edit)
@@ -338,7 +339,7 @@ class MainWindow(QMainWindow):
         row1.addWidget(self.min_p_edit)
         row1.addWidget(QLabel("top_k"))
         row1.addWidget(self.top_k_edit)
-        row1.addWidget(QLabel("重复惩罚"))
+        row1.addWidget(QLabel("repeat-penalty"))
         row1.addWidget(self.repeat_penalty_edit)
         row1.addWidget(QLabel("超时(秒)"))
         row1.addWidget(self.timeout_edit)
@@ -569,6 +570,8 @@ class MainWindow(QMainWindow):
             self.knowledge_base_edit.setText(d)
 
     def _on_sync_knowledge(self) -> None:
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
@@ -581,6 +584,7 @@ class MainWindow(QMainWindow):
         self._sync_worker = SyncKnowledgeWorker(ws, kb)
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
 
     def _on_sync_finished(self, stats: dict) -> None:
@@ -588,6 +592,7 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setText("同步知识")
         self.progress.setRange(0, 1)
         self.status_label.setText("知识库同步完成")
+        self._sync_worker = None
         files = stats.get("files_found", 0)
         chunks = stats.get("chunks", 0)
         QMessageBox.information(
@@ -603,6 +608,7 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setText("同步知识")
         self.progress.setRange(0, 1)
         self.status_label.setText("知识库同步失败")
+        self._sync_worker = None
         QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
 
     def _on_fetch_models(self) -> None:
@@ -617,6 +623,7 @@ class MainWindow(QMainWindow):
         self._fetch_worker = FetchModelsWorker(base_url, api_key)
         self._fetch_worker.fetched.connect(self._on_models_fetched)
         self._fetch_worker.failed.connect(self._on_fetch_failed)
+        self._fetch_worker.finished.connect(self._fetch_worker.deleteLater)
         self._fetch_worker.start()
 
     def _on_models_fetched(self, models: list) -> None:
