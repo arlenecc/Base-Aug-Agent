@@ -23,6 +23,16 @@ class AgentConfig:
     request_timeout: float = 120.0
     max_iterations: int = 15
     max_history: int = 50  # max messages retained in conversation history
+    # Context window budget (tokens). When the estimated prompt size reaches
+    # 90% of this value, the agent proactively summarizes older messages and
+    # persists the summary to memory.md. Also used to recover from
+    # context_length_exceeded errors returned by the LLM API.
+    # Default matches max_tokens (32768) so the shrink threshold tracks the
+    # model's actual context window.
+    max_context_tokens: int = 32768
+    # Shrink ratio: trigger proactive shrink when estimated context size
+    # exceeds this fraction of max_context_tokens.
+    context_shrink_ratio: float = 0.9
 
     # RAG settings
     rag_chunk_size: int = 500       # tokens per chunk
@@ -72,6 +82,16 @@ class AgentConfig:
         }
         if self.rag_embedding_model in _DEPRECATED_EMBEDDING_MODELS:
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5"
+        # Older configs saved max_tokens=4096 (the old LLMClient default).
+        # Bump any sub-8192 value to the current default (32768) so users
+        # upgrading don't keep hitting the tiny old budget.
+        if self.max_tokens < 8192:
+            self.max_tokens = 32768
+        # max_context_tokens was introduced at 32000; older configs that
+        # saved a stale small value should also be bumped. Track max_tokens
+        # so the shrink threshold follows the model's actual window.
+        if self.max_context_tokens < 8192:
+            self.max_context_tokens = self.max_tokens
 
     def save(self, path: str) -> None:
         import json

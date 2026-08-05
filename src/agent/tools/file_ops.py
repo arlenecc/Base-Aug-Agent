@@ -17,9 +17,13 @@ class _FileTool(Tool):
         self.registry = registry
 
     def _resolve(self, path: str) -> str:
-        ws = os.path.abspath(self.config.workspace)
+        # Use realpath (not abspath) so symlinks pointing outside the workspace
+        # are resolved and rejected — abspath leaves symlinks unresolved, which
+        # means a symlink inside the workspace to /etc would pass the prefix
+        # check and allow escaping the workspace.
+        ws = os.path.realpath(self.config.workspace)
         full = path if os.path.isabs(path) else os.path.join(ws, path)
-        full = os.path.abspath(full)
+        full = os.path.realpath(full)
         if not (full == ws or full.startswith(ws + os.sep)):
             raise PermissionError(f"Path '{path}' is outside the workspace")
         return full
@@ -73,8 +77,12 @@ class FileWriteTool(_FileTool):
         except PermissionError as e:
             return ToolResult(False, error=str(e))
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-        with open(full, "w", encoding="utf-8") as f:
+        # Atomic write: write to temp then os.replace. A crash mid-write leaves
+        # the original file intact rather than a truncated/partial one.
+        tmp = full + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(content)
+        os.replace(tmp, full)
         return ToolResult(True, output=f"Wrote {len(content)} chars to {path}")
 
 
@@ -109,6 +117,9 @@ class FileModifyTool(_FileTool):
             text = text.replace(old, new)
         else:
             text = text.replace(old, new, 1)
-        with open(full, "w", encoding="utf-8") as f:
+        # Atomic write: write to temp then os.replace.
+        tmp = full + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
+        os.replace(tmp, full)
         return ToolResult(True, output=f"Modified {path}")

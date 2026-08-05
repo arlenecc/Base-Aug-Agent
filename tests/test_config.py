@@ -113,6 +113,33 @@ def test_migrate_persisted_after_save(tmp_path):
     assert cfg2.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5"
 
 
+def test_migrate_bumps_small_max_tokens(tmp_path):
+    """Older configs saved max_tokens=4096 (the old LLMClient default). Migration
+    must bump any sub-8192 value to the current default (32768) so users
+    upgrading don't keep hitting the tiny old budget."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"max_tokens": 4096, "max_context_tokens": 4096}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.max_tokens == 32768, f"expected 32768, got {cfg.max_tokens}"
+    assert cfg.max_context_tokens == 32768, f"expected 32768, got {cfg.max_context_tokens}"
+
+
+def test_migrate_preserves_large_max_tokens(tmp_path):
+    """If the user explicitly set a large max_tokens, migration must not touch it."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"max_tokens": 16384, "max_context_tokens": 16384}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.max_tokens == 16384
+    assert cfg.max_context_tokens == 16384
+
+
+def test_default_max_tokens_is_32768():
+    """The default max_tokens must be 32768, not the old 4096."""
+    cfg = AgentConfig()
+    assert cfg.max_tokens == 32768
+    assert cfg.max_context_tokens == 32768
+
+
 def test_ensure_workspace_creates_dir(tmp_path):
     cfg = AgentConfig(workspace=str(tmp_path / "ws"))
     cfg.ensure_workspace()

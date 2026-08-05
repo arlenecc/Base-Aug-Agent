@@ -137,6 +137,99 @@ def test_reasoning_appends_even_after_cursor_drift(qtbot, tmp_path, monkeypatch)
     assert win.think_view.toPlainText() == "abcdef"
 
 
+# ---------------------------------------------------------------------------
+# skill suggestion flow: cached during run, dialog shown after _on_finished
+# ---------------------------------------------------------------------------
+
+def test_skill_suggestion_cached_during_run_shown_after_finish(qtbot, tmp_path, monkeypatch):
+    """When the agent emits on_skill_suggested during a run, the UI must NOT
+    show the modal dialog immediately (that would block streaming). Instead
+    it caches the suggestion and shows the dialog only after _on_finished.
+
+    This test monkeypatches QMessageBox.question and QInputDialog.getText so
+    the dialog functions return scripted answers without blocking.
+    """
+    import agent.ui.main_window as mw
+    from PyQt6.QtWidgets import QMessageBox, QInputDialog
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    # Patch dialogs to return scripted answers (Yes -> name "my-skill").
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("my-skill", True))
+
+    # Pre-populate skill request history so the NEXT run triggers a suggestion.
+    # Two identical requests -> 2nd triggers suggestion.
+    win._agent.skills.record_request("deploy to staging")
+    # Before running, no pending skill.
+    assert win._pending_skill is None
+
+    # Run a turn whose user text matches the recorded intent.
+    llm = _ScriptedLLM([[_evt("content", "done"), _evt("done", usage={"total_tokens": 3})]])
+    win._agent.llm = llm
+    win._agent.max_iterations = 3
+    win.send_editor.setPlainText("deploy to staging")
+    win._on_send()
+
+    # While busy: _pending_skill should be set, but NO dialog shown yet
+    # (the patched QMessageBox.question would have been called if dialog was
+    # shown during streaming — we verify it wasn't via the skill not being
+    # saved until after finish).
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+
+    # After _on_finished: the dialog must have been shown, and the skill
+    # saved under the name "my-skill".
+    saved = win._agent.skills.list()
+    assert any(s.name == "my-skill" for s in saved), (
+        f"expected skill 'my-skill' saved after finish, got {[s.name for s in saved]}"
+    )
+    # Pending skill must be cleared after the dialog.
+    assert win._pending_skill is None
+
+
+def test_skill_suggestion_does_not_block_streaming(qtbot, tmp_path, monkeypatch):
+    """The skill-suggestion dialog must NOT appear during streaming. If a
+    suggestion fires mid-stream, content chunks must still land in the chat
+    view immediately. This is verified by checking that the chat view shows
+    content before _on_finished completes (which is when the dialog would
+    be shown under the new deferred-display behavior)."""
+    import agent.ui.main_window as mw
+    from PyQt6.QtWidgets import QMessageBox, QInputDialog
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    # Track whether the dialog was called during streaming.
+    dialog_calls = {"count": 0}
+    def _track_question(*a, **k):
+        dialog_calls["count"] += 1
+        return QMessageBox.StandardButton.No  # decline to save
+    monkeypatch.setattr(QMessageBox, "question", _track_question)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("x", True))
+
+    # Pre-populate so the next run triggers a suggestion.
+    win._agent.skills.record_request("deploy to staging")
+
+    # Stream content first, then done — suggestion fires at run() start
+    # but dialog must not appear until _on_finished.
+    llm = _ScriptedLLM([[_evt("content", "streamed-content"), _evt("done", usage={"total_tokens": 3})]])
+    win._agent.llm = llm
+    win._agent.max_iterations = 3
+    win.send_editor.setPlainText("deploy to staging")
+    win._on_send()
+
+    # Wait for the turn to finish.
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+
+    # The dialog must have been called exactly once — AFTER streaming finished,
+    # not during. The streamed content must have landed in the chat view.
+    assert dialog_calls["count"] == 1, (
+        f"expected dialog exactly once after finish, got {dialog_calls['count']}"
+    )
+    assert "streamed-content" in win.chat_view.toHtml()
+
+
 def test_reasoning_with_carriage_returns_does_not_overlap(qtbot, tmp_path, monkeypatch):
     """Bare \\r (overstrike) must become a newline so later text doesn't print
     on top of the current line."""

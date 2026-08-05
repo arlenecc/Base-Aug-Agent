@@ -71,7 +71,8 @@ RAG_CORE_DEPS: List[DepSpec] = [
 # Version constraints: packages that must be installed together with
 # specific version pins to avoid conflicts.
 VERSION_PINS: Dict[str, str] = {
-    "numpy": "numpy<2.0",  # chromadb/sentence-transformers incompatible with numpy 2.x
+    # FastEmbed (ONNX Runtime) 在 numpy 2.x 上有兼容性问题，需要 pin < 2.0
+    "numpy": "numpy<2.0",
 }
 
 

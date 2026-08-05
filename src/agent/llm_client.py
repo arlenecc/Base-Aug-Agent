@@ -40,7 +40,7 @@ class LLMClient:
         api_key: str,
         model: str,
         timeout: float = 120.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 32768,
         top_p: float = 1.0,
         min_p: float = 0.0,
         top_k: int = 0,

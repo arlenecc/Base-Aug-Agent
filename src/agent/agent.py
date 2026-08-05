@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from .config import AgentConfig
@@ -29,6 +30,7 @@ class AgentCallbacks:
     def on_token_speed(self, total_tokens: int, speed: float) -> None: ...
     def on_skill_suggested(self, skill) -> None: ...
     def on_error(self, message: str) -> None: ...
+    def on_context_shrunk(self, summary: str, reason: str) -> None: ...
 
     def confirm(self, message: str) -> bool:
         return True
@@ -116,6 +118,18 @@ class Agent:
         self.skills = skills or SkillManager(path=os.path.join(config.workspace, ".agent", "skills.json"))
         self.max_iterations = int(getattr(config, "max_iterations", 15))
         self.max_history = int(getattr(config, "max_history", 50))
+        # Context shrink config: shrink proactively when estimated prompt size
+        # exceeds context_shrink_ratio * max_context_tokens, or reactively when
+        # the LLM API returns a context_length_exceeded-style error.
+        self.max_context_tokens = int(getattr(config, "max_context_tokens", 32000))
+        self.context_shrink_ratio = float(getattr(config, "context_shrink_ratio", 0.9))
+        # Cap shrink attempts per run() so a misconfigured LLM can't loop
+        # forever on summarize-then-retry.
+        self._max_shrinks_per_run = 3
+        # Number of recent messages to retain verbatim during a shrink; older
+        # messages are summarized. Tuned to keep the immediate task context
+        # (current user request + latest tool result + assistant reply) intact.
+        self._shrink_keep_recent = 6
         self._history: List[Dict[str, Any]] = []
         self._total_tokens = 0
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
@@ -144,6 +158,257 @@ class Agent:
         del self._history[:cut]
 
     # ------------------------------------------------------------------
+    # Context-size estimation and shrink strategy
+    # ------------------------------------------------------------------
+
+    def _estimate_history_tokens(self) -> int:
+        """Estimate the token count of the full prompt (system + history).
+
+        Includes role overhead per message (~4 tokens) and tool_call function
+        names/arguments, since those count against the model's context window
+        even though they aren't in `content`.
+        """
+        total = _estimate_tokens(self._system_prompt())
+        for msg in self._history:
+            content = msg.get("content")
+            if isinstance(content, str):
+                total += _estimate_tokens(content)
+            elif content:  # list/dict content (rare here, but defensive)
+                total += _estimate_tokens(json.dumps(content, ensure_ascii=False))
+            # tool_calls add tokens beyond content
+            tcs = msg.get("tool_calls") or []
+            for tc in tcs:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                total += _estimate_tokens(fn.get("name", ""))
+                total += _estimate_tokens(fn.get("arguments", "") or "")
+            total += 4  # role + structural overhead per message
+        return total
+
+    def _should_shrink_context(self) -> bool:
+        """Return True if the estimated context size exceeds the shrink
+        threshold (context_shrink_ratio * max_context_tokens)."""
+        if self.max_context_tokens <= 0:
+            return False
+        threshold = int(self.max_context_tokens * self.context_shrink_ratio)
+        return self._estimate_history_tokens() > threshold
+
+    @staticmethod
+    def _is_context_too_long_error(err_str: str) -> bool:
+        """Heuristically detect LLM API errors caused by exceeding the
+        context window. Covers OpenAI, Anthropic, and common local server
+        (vLLM/llama.cpp/Ollama) error message variants."""
+        e = err_str.lower()
+        if "context_length" in e or "context length" in e:
+            return True
+        if "context window" in e or "maximum context" in e:
+            return True
+        if "prompt is too long" in e or "prompt too long" in e:
+            return True
+        if "too many tokens" in e or "token limit" in e or "tokens limit" in e:
+            return True
+        return False
+
+    def _shrink_context(self, reason: str) -> bool:
+        """Summarize older messages, replace them with a summary marker, and
+        append the summary (with timestamp) to workspace/memory.md for
+        long-term/time-based recall.
+
+        Keeps the most recent ``_shrink_keep_recent`` messages verbatim so the
+        agent still has the immediate task context (latest user request, tool
+        results, and assistant reply). Older messages are summarized via the
+        LLM and replaced with a single user-role summary message.
+
+        Returns True if a shrink actually happened, False if there wasn't
+        enough history to shrink (in which case the caller should not retry).
+        """
+        # Need at least keep_recent + a few older messages to make a summary
+        # worthwhile; otherwise we'd just keep what we have.
+        if len(self._history) <= self._shrink_keep_recent + 2:
+            self._log(
+                f"[context] shrink requested ({reason}) but history too small "
+                f"({len(self._history)} msgs) — skipping"
+            )
+            return False
+
+        old_messages = self._history[:-self._shrink_keep_recent]
+        recent_messages = self._history[-self._shrink_keep_recent:]
+
+        # Ensure recent_messages doesn't start with a dangling tool result.
+        # A tool message must follow an assistant message with matching
+        # tool_calls. If the slice boundary falls right after such an assistant
+        # message, the tool result at the start of recent_messages would have
+        # no preceding assistant — the API would reject the request. Pull the
+        # preceding assistant (and any earlier tool messages in the same turn)
+        # back from old_messages into recent_messages.
+        while recent_messages and recent_messages[0].get("role") == "tool":
+            if not old_messages:
+                break
+            recent_messages.insert(0, old_messages.pop())
+
+        transcript = self._format_messages_for_summary(old_messages)
+        summary_prompt = (
+            "请把下面的对话历史压缩成一份精炼的摘要，只保留关键信息：\n"
+            "1. 用户的核心需求和当前任务目标\n"
+            "2. 已经做出的重要决定与原因\n"
+            "3. 已经完成的步骤及其结果（含工具调用的关键输出）\n"
+            "4. 尚未完成的子任务和下一步计划\n"
+            "5. 关键的文件路径、配置值、用户偏好、URL 等具体信息\n"
+            "6. 任何错误、警告或需要后续注意的事项\n\n"
+            "要求：用要点列出，不要复述整段对话；保留所有具体的路径、数值、"
+            "标识符；不要编造未出现过的信息。若某条信息不重要可省略。\n\n"
+            f"对话历史:\n{transcript}"
+        )
+
+        try:
+            summary = self._summarize_via_llm(summary_prompt)
+        except Exception as e:
+            self._log(f"[context] summarize LLM call failed: {e}")
+            summary = ""
+
+        if not summary or not summary.strip():
+            # Fallback: build a minimal structural summary from messages so we
+            # don't lose tool results entirely when the LLM is unavailable.
+            summary = self._fallback_summary(old_messages)
+            if not summary:
+                summary = "(上下文收缩：旧消息已清理，无可用摘要)"
+
+        summary = summary.strip()
+
+        # Persist to memory.md with timestamp for long-term recall.
+        self._append_summary_to_memory(summary, reason)
+
+        # Replace old messages with a single user-role summary marker. Using
+        # role=user (not system) keeps it inside the conversation the model
+        # treats as dialogue rather than instructions, and ensures the very
+        # first history message is never a dangling tool result.
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        summary_msg = {
+            "role": "user",
+            "content": (
+                f"[上下文摘要 - {ts} - 触发原因: {reason}]\n"
+                f"{summary}\n"
+                f"[摘要结束，以下是后续对话]"
+            ),
+        }
+        self._history = [summary_msg] + list(recent_messages)
+
+        self._log(
+            f"[context] shrunk: removed {len(old_messages)} old msgs, "
+            f"kept {len(recent_messages)} recent + 1 summary marker "
+            f"(reason: {reason})"
+        )
+        try:
+            self.callbacks.on_context_shrunk(summary, reason)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return True
+
+    def _format_messages_for_summary(self, messages: List[Dict[str, Any]]) -> str:
+        """Render a list of history messages as a readable transcript for the
+        summarizer LLM. Truncates very long tool outputs to keep the
+        summarization prompt itself within budget."""
+        lines = []
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "?")
+            content = msg.get("content")
+            if isinstance(content, str):
+                text = content
+            elif content is None:
+                text = ""
+            else:
+                text = json.dumps(content, ensure_ascii=False)
+            # Cap individual message text so the summarizer prompt stays bounded.
+            if len(text) > 2000:
+                text = text[:2000] + f"... [truncated, {len(text)} chars total]"
+            if role == "tool":
+                name = msg.get("name", "tool")
+                lines.append(f"[{i}] 工具 {name} 结果: {text}")
+            elif role == "assistant":
+                tcs = msg.get("tool_calls") or []
+                if tcs:
+                    tc_descs = []
+                    for tc in tcs:
+                        fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                        tc_descs.append(f"{fn.get('name','?')}({fn.get('arguments','')})")
+                    lines.append(f"[{i}] 助手(调用工具: {', '.join(tc_descs)}): {text}")
+                else:
+                    lines.append(f"[{i}] 助手: {text}")
+            elif role == "user":
+                lines.append(f"[{i}] 用户: {text}")
+            else:
+                lines.append(f"[{i}] {role}: {text}")
+        return "\n".join(lines)
+
+    def _fallback_summary(self, messages: List[Dict[str, Any]]) -> str:
+        """Build a minimal structural summary without calling the LLM.
+        Extracts user messages and tool names so the agent retains at least
+        a coarse trace of what happened."""
+        if not messages:
+            return ""
+        users = []
+        tools = []
+        for m in messages:
+            r = m.get("role")
+            if r == "user" and isinstance(m.get("content"), str):
+                users.append(m["content"][:200])
+            elif r == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                    if fn.get("name"):
+                        tools.append(fn["name"])
+        parts = []
+        if users:
+            parts.append("用户请求: " + " | ".join(users))
+        if tools:
+            parts.append("调用过的工具: " + ", ".join(tools))
+        return "; ".join(parts) if parts else ""
+
+    def _summarize_via_llm(self, prompt: str) -> str:
+        """Call the LLM (non-interactive, no tools) to produce a summary.
+        Uses a low temperature for determinism. Reuses chat_stream so the
+        same client/transport is used."""
+        messages = [
+            {"role": "system", "content": "You are a precise conversation summarizer. 输出中文要点。"},
+            {"role": "user", "content": prompt},
+        ]
+        out: List[str] = []
+        for ev in self.llm.chat_stream(messages, tools=None, temperature=0.2):
+            if ev.type == "content":
+                out.append(ev.content)
+            elif ev.type == "done":
+                break
+        return "".join(out).strip()
+
+    def _append_summary_to_memory(self, summary: str, reason: str) -> None:
+        """Append the shrink summary to workspace/memory.md with a timestamp
+        header. Creates the file if absent. Uses atomic write (temp + rename)
+        so concurrent shrinks or crashes can't corrupt the log."""
+        try:
+            memory_path = os.path.join(self.config.workspace, "memory.md")
+            os.makedirs(self.config.workspace, exist_ok=True)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry = (
+                f"\n## 上下文摘要 - {now}\n"
+                f"- 触发原因: {reason}\n\n"
+                f"{summary}\n"
+            )
+            # Read existing content (if any) and append. Atomic write to avoid
+            # corruption if the process is killed mid-write.
+            existing = ""
+            if os.path.exists(memory_path):
+                try:
+                    with open(memory_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                except OSError:
+                    existing = ""
+            tmp = memory_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(existing + entry)
+            os.replace(tmp, memory_path)
+        except Exception as e:  # pragma: no cover - defensive
+            self._log(f"[context] failed to append memory.md: {e}")
+
+    # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
         """Process one user turn. Returns the final assistant content."""
         self._log(f"USER: {user_input}")
@@ -161,9 +426,29 @@ class Agent:
         self._trim_history()
 
         final_content = ""
-        for i in range(self.max_iterations):
+        # Use a manual iteration counter instead of `for i in range(...)` so
+        # context-shrink retries don't consume an iteration. A shrink is a
+        # recovery step, not a reasoning step, and shouldn't eat into the
+        # agent's reasoning budget.
+        iteration = 0
+        shrink_count = 0
+        while iteration < self.max_iterations:
+            # --- Proactive context shrink: if estimated prompt size exceeds
+            # context_shrink_ratio * max_context_tokens, summarize older
+            # messages before calling the LLM. Avoids the round-trip of
+            # sending an over-large prompt and getting back an error.
+            if shrink_count < self._max_shrinks_per_run and self._should_shrink_context():
+                pct = int(self.context_shrink_ratio * 100)
+                shrunk = self._shrink_context(
+                    reason=f"主动收缩: 估计上下文已达 {pct}% 阈值"
+                )
+                if shrunk:
+                    shrink_count += 1
+                    continue  # re-evaluate; don't burn an iteration on shrink
+
+            iteration += 1
             messages = self._build_messages()
-            self._log(f"[iter {i+1}] -> LLM ({self.config.model})")
+            self._log(f"[iter {iteration}] -> LLM ({self.config.model})")
 
             content_buf = []
             reasoning_buf = []
@@ -171,11 +456,11 @@ class Agent:
             usage: Dict[str, int] = {}
             t0 = time.time()
             completion_tokens = 0
-            # Accumulated streamed text for live token estimation. Updated on
-            # every reasoning/content chunk; used to emit real-time speed updates
-            # before the API's final usage figure arrives.
-            streamed_chars = 0
+            # Live token-speed every 0.3s during streaming. The first chunk
+            # always emits because last_speed_emit starts at 0.0, so
+            # content-only models (no reasoning) also get live updates.
             last_speed_emit = 0.0  # timestamp of last on_token_speed emission
+            seen_done = False
 
             try:
                 for ev in self.llm.chat_stream(
@@ -184,29 +469,56 @@ class Agent:
                     if ev.type == "content":
                         content_buf.append(ev.content)
                         self.callbacks.on_content(ev.content)
-                        streamed_chars += len(ev.content)
                     elif ev.type == "reasoning":
                         reasoning_buf.append(ev.content)
                         self.callbacks.on_reasoning(ev.content)
-                        streamed_chars += len(ev.content)
-                        now = time.time()
-                        if now - last_speed_emit >= 0.3:
-                            elapsed_so_far = max(now - t0, 1e-6)
-                            est_tokens = _estimate_tokens("".join(reasoning_buf))
-                            live_speed = est_tokens / elapsed_so_far
-                            self.callbacks.on_token_speed(
-                                self._total_tokens + est_tokens, live_speed
-                            )
-                            last_speed_emit = now
                     elif ev.type == "done":
+                        seen_done = True
                         tool_calls = ev.tool_calls
                         usage = ev.usage
                         completion_tokens = usage.get("completion_tokens", 0)
+                        continue  # final speed is emitted below; skip live emit
+                    # Live token-speed every 0.3s during streaming. The first
+                    # chunk always emits because last_speed_emit starts at 0.0,
+                    # so content-only models (no reasoning) also get live updates.
+                    now = time.time()
+                    if now - last_speed_emit >= 0.3:
+                        elapsed_so_far = max(now - t0, 1e-6)
+                        streamed_text = "".join(content_buf) + "".join(reasoning_buf)
+                        est_tokens = _estimate_tokens(streamed_text)
+                        live_speed = est_tokens / elapsed_so_far
+                        self.callbacks.on_token_speed(
+                            self._total_tokens + est_tokens, live_speed
+                        )
+                        last_speed_emit = now
             except Exception as e:
-                self._log(f"[agent] LLM stream error: {e}")
-                self.callbacks.on_error(str(e))
+                err_str = str(e)
+                # --- Reactive context shrink: if the LLM rejected the prompt
+                # for being too long, shrink and retry the same iteration
+                # instead of failing the whole turn.
+                if (
+                    self._is_context_too_long_error(err_str)
+                    and shrink_count < self._max_shrinks_per_run
+                ):
+                    self._log(
+                        f"[context] LLM rejected prompt as too long: {err_str[:200]}; "
+                        f"shrinking and retrying (attempt {shrink_count + 1}/{self._max_shrinks_per_run})"
+                    )
+                    shrunk = self._shrink_context(reason="被动收缩: LLM context_length_exceeded")
+                    if shrunk:
+                        shrink_count += 1
+                        # Don't increment iteration — retry the same turn.
+                        iteration -= 1
+                        continue
+                self._log(f"[agent] LLM stream error: {err_str}")
+                self.callbacks.on_error(err_str)
                 self.callbacks.on_finished()
                 return final_content or ""
+
+            if not seen_done and (content_buf or reasoning_buf or tool_calls):
+                # The stream ended without an explicit "done" event — likely a
+                # network cut or server-side truncation. Log so it's visible.
+                self._log("[agent] warning: LLM stream ended without 'done' event")
 
             elapsed = max(time.time() - t0, 1e-6)
 
@@ -255,7 +567,7 @@ class Agent:
             speed = (speed_tokens / elapsed) if speed_tokens else 0.0
             self.callbacks.on_token_speed(self._total_tokens, speed)
             self._log(
-                f"[iter {i+1}] <- {len(''.join(content_buf))} content chars, "
+                f"[iter {iteration}] <- {len(''.join(content_buf))} content chars, "
                 f"{len(reasoning_text)} reasoning chars (~{reasoning_tokens} tok), "
                 f"{len(tool_calls)} tool_calls, usage={usage}, "
                 f"{speed_tokens} tok / {elapsed:.2f}s = {speed:.1f} tok/s"

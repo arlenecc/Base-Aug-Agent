@@ -113,6 +113,7 @@ def recording_callbacks():
             self.speeds = []
             self.confirms = []
             self.asks = []
+            self.context_shrinks = []  # list of (summary, reason)
             self._confirm_return = True
             self._ask_return = "ok"
 
@@ -136,6 +137,9 @@ def recording_callbacks():
 
         def on_token_speed(self, tokens, speed):
             self.speeds.append((tokens, speed))
+
+        def on_context_shrunk(self, summary, reason):
+            self.context_shrinks.append((summary, reason))
 
         def confirm(self, message):
             self.confirms.append(message)

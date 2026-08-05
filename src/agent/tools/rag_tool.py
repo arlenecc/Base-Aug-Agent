@@ -1,6 +1,7 @@
 """RAG tool — allows the agent to search the local knowledge base."""
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry
@@ -83,7 +84,6 @@ class RagStatusTool(Tool):
             if status["sources"]:
                 lines.append("  已索引文件:")
                 for s in status["sources"]:
-                    import os
                     lines.append(f"    - {os.path.basename(s)}")
             return ToolResult(success=True, output="\n".join(lines))
         except Exception as e:

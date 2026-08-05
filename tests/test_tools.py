@@ -42,6 +42,41 @@ def test_file_read_rejects_escape(config):
     assert "workspace" in res.error.lower() or "outside" in res.error.lower()
 
 
+def test_file_write_rejects_symlink_escape(config, tmp_path):
+    """A symlink inside the workspace pointing outside must not allow writes
+    to escape the workspace. _resolve must use realpath to resolve symlinks."""
+    import os
+    outside = os.path.join(os.path.dirname(config.workspace), "outside_target.txt")
+    if os.path.exists(outside):
+        os.remove(outside)
+    link_path = os.path.join(config.workspace, "escape_link")
+    if not os.path.exists(link_path):
+        os.symlink(outside, link_path)
+    reg = _reg(config)
+    res = reg.execute("file_write", {"path": "escape_link", "content": "escaped"})
+    assert not res.success, "write via symlink to outside must be rejected"
+    assert not os.path.exists(outside), "target outside workspace must not be created"
+
+
+def test_file_write_atomic_no_tmp_leftover(config):
+    """file_write must use atomic write (temp + os.replace); after a successful
+    write no .tmp file should remain in the workspace."""
+    reg = _reg(config)
+    reg.execute("file_write", {"path": "atom.txt", "content": "data"})
+    assert not os.path.exists(os.path.join(config.workspace, "atom.txt.tmp"))
+
+
+def test_file_modify_atomic_no_tmp_leftover(config):
+    """file_modify must use atomic write; no .tmp leftover after success."""
+    with open(os.path.join(config.workspace, "mod.txt"), "w") as f:
+        f.write("hello")
+    reg = _reg(config)
+    reg.execute("file_modify", {"path": "mod.txt", "old": "hello", "new": "world"})
+    with open(os.path.join(config.workspace, "mod.txt")) as f:
+        assert f.read() == "world"
+    assert not os.path.exists(os.path.join(config.workspace, "mod.txt.tmp"))
+
+
 # ---------------------------------------------------------------------------
 # file_write
 # ---------------------------------------------------------------------------

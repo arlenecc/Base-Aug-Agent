@@ -51,3 +51,31 @@ def test_longterm_memory_search_returns_empty_when_no_match(tmp_path):
     mem = LongTermMemory(path=str(tmp_path / "lt.json"))
     mem.add("hello world")
     assert mem.search("zzzz") == []
+
+
+def test_longterm_memory_handles_corrupted_null_facts(tmp_path):
+    """If the store file has {"facts": null} (corruption/partial write), the
+    LongTermMemory must recover to an empty list, not raise TypeError."""
+    p = str(tmp_path / "lt.json")
+    with open(p, "w") as f:
+        f.write('{"facts": null}')
+    # Must not raise
+    mem = LongTermMemory(path=p)
+    assert mem.all() == []
+    # add must work and produce a valid list
+    mem.add("fact one")
+    assert mem.all() == ["fact one"]
+    # add_many must work too
+    mem.add_many(["fact two", "fact three"])
+    assert "fact two" in mem.all()
+    assert "fact three" in mem.all()
+
+
+def test_longterm_memory_add_many_handles_corrupted_store(tmp_path):
+    """add_many on a store with null facts must not crash."""
+    p = str(tmp_path / "lt.json")
+    with open(p, "w") as f:
+        f.write('{"facts": null}')
+    mem = LongTermMemory(path=p)
+    mem.add_many(["a", "b", "c"])
+    assert mem.all() == ["a", "b", "c"]

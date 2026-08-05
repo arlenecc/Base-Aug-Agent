@@ -38,20 +38,38 @@ class SkillManager:
 
     def __init__(self, path: str):
         self._store = _JsonStore(path)
-        if "skills" not in self._store.all():
+        # Defensive: a corrupted store may have null values. isinstance check
+        # resets so callers never iterate None.
+        if not isinstance(self._store.get("skills"), list):
             self._store.set("skills", [])
-        if "requests" not in self._store.all():
+        if not isinstance(self._store.get("requests"), dict):
             self._store.set("requests", {})
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
+    def reload(self) -> None:
+        """Reload the store from disk.
+
+        Called after an external write (e.g. the UI thread saved a new skill
+        via create_skill while the worker thread's SkillManager instance still
+        holds the old in-memory cache). Without this, match() in the worker
+        would keep returning None for the just-saved skill and re-trigger
+        suggestions every turn.
+        """
+        with self._lock:
+            self._store.reload()
+            if not isinstance(self._store.get("skills"), list):
+                self._store.set("skills", [])
+            if not isinstance(self._store.get("requests"), dict):
+                self._store.set("requests", {})
+
     def list(self) -> List[Skill]:
-        return [Skill(**s) for s in self._store.get("skills", [])]
+        return [Skill(**s) for s in (self._store.get("skills") or [])]
 
     def create_skill(self, name: str, keywords: List[str], prompt: str) -> Skill:
         skill = Skill(name=name, keywords=[k.lower() for k in keywords], prompt=prompt)
         with self._lock:
-            skills = list(self._store.get("skills", []))
+            skills = list(self._store.get("skills") or [])
             skills = [s for s in skills if s["name"] != name]
             skills.append(asdict(skill))
             self._store.set("skills", skills)
@@ -59,7 +77,7 @@ class SkillManager:
 
     def delete(self, name: str) -> None:
         with self._lock:
-            skills = [s for s in self._store.get("skills", []) if s["name"] != name]
+            skills = [s for s in (self._store.get("skills") or []) if s["name"] != name]
             self._store.set("skills", skills)
 
     def match(self, text: str) -> Optional[Skill]:
@@ -75,16 +93,36 @@ class SkillManager:
     # ------------------------------------------------------------------
     # request tracking -> suggest固化 after threshold
     # ------------------------------------------------------------------
+    @staticmethod
+    def _request_key(text: str) -> str:
+        """Normalize a request to a stable key for counting similar requests.
+
+        Uses the sorted set of unique keywords (minus stopwords) so paraphrased
+        requests like "deploy to staging" and "deploy staging" map to the same
+        key. The old implementation joined ALL keywords in original order, so
+        dropping or adding a single word produced a different key and the
+        counter never reached the suggestion threshold.
+        """
+        STOPWORDS = {
+            "a", "an", "the", "to", "of", "in", "on", "at", "for",
+            "and", "or", "is", "are", "was", "were", "be", "been",
+            "do", "does", "did", "with", "from", "by", "as", "it",
+            "this", "that", "these", "those", "i", "we", "you",
+            "please", "me", "my", "our",
+        }
+        kws = sorted({w for w in _keywords_of(text) if w not in STOPWORDS})
+        return " ".join(kws)[:80]
+
     def record_request(self, text: str) -> Optional[Skill]:
         """Track a user request. Returns a *suggested* (unsaved) Skill once the
         same intent has been seen SUGGEST_THRESHOLD times. The caller decides
         whether to persist it via create_skill().
         """
-        key = " ".join(_keywords_of(text))[:80]
+        key = self._request_key(text)
         if not key:
             return None
         with self._lock:
-            requests = dict(self._store.get("requests", {}))
+            requests = dict(self._store.get("requests") or {})
             requests[key] = requests.get(key, 0) + 1
             self._store.set("requests", requests)
             count = requests[key]

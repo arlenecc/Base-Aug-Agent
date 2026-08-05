@@ -95,6 +95,7 @@ class VectorStore:
         self._table = None
         self._ef = None  # embedding function
         self._initialized = False
+        self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -132,9 +133,16 @@ class VectorStore:
         logger.info("VectorStore initialized: %d documents in store", count)
 
     def _ensure_table(self) -> Optional[Any]:
-        """Open existing table if it exists, return None if not yet created."""
+        """Open existing table if it exists, return None if not yet created.
+
+        用 _table_checked 标记避免每次调用都触发 table_names() 磁盘扫描：
+        一旦确认表不存在，后续调用直接返回 None，直到 clear() 重置标记。
+        """
         if self._table is not None:
             return self._table
+        if self._table_checked:
+            return None  # 已检查过，表确实不存在
+        self._table_checked = True
         if _TABLE_NAME in self._db.table_names():
             self._table = self._db.open_table(_TABLE_NAME)
         return self._table
@@ -148,14 +156,17 @@ class VectorStore:
         chunks: List[Dict[str, Any]],
         batch_size: int = 100,
     ) -> int:
-        """Add document chunks to the vector store. Returns number of chunks added."""
+        """Add document chunks to the vector store. Returns number of chunks added.
+
+        Upsert 语义：先按 source 删除该来源的全部旧记录（处理文档缩减后
+        残留旧 chunks 的情况），再插入新记录。embedding 分批进行以避免 OOM。
+        """
         self._ensure_initialized()
         if not chunks:
             return 0
 
         # Build records (embed in batches to avoid OOM on large knowledge bases)
         records: List[Dict[str, Any]] = []
-        ids_to_delete: List[str] = []
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [c["text"] for c in batch_chunks]
@@ -165,7 +176,6 @@ class VectorStore:
                 source = chunk.get("source", "unknown")
                 chunk_idx = chunk.get("chunk_index", idx)
                 chunk_id = f"{_hash_source(source)}_{chunk_idx}"
-                ids_to_delete.append(chunk_id)
                 records.append({
                     "id": chunk_id,
                     "text": chunk["text"],
@@ -179,28 +189,184 @@ class VectorStore:
         if table is None:
             # First add: create table with all records
             self._table = self._db.create_table(_TABLE_NAME, records)
+            self._table_checked = True
             logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
             return len(records)
 
-        # Upsert: delete existing records with same IDs, then add
-        for i in range(0, len(ids_to_delete), 100):
-            batch_ids = ids_to_delete[i:i + 100]
-            id_list = ", ".join(f"'{x}'" for x in batch_ids)
+        # Upsert: 按 source 删除该来源的全部旧记录。
+        # 用 source 的 md5 hash 作为 LIKE 模式（hash 是 hex 字符串，无 SQL 注入风险），
+        # 既能覆盖 chunk_index 0..N 的所有旧记录，也能清理文档缩减后多出的旧 chunks。
+        sources_to_replace = sorted({c.get("source", "unknown") for c in chunks})
+        for source in sources_to_replace:
+            h = _hash_source(source)
             try:
-                table.delete(f"id IN ({id_list})")
+                # id 格式为 "{hash}_{chunk_index}"，LIKE '{hash}_%' 匹配该 source 的所有 chunk
+                table.delete(f"id LIKE '{h}_%'")
             except Exception as e:
-                # IDs may not exist yet — log but don't crash the whole ingest
-                logger.debug("VectorStore: delete batch failed (likely new IDs): %s", e)
+                logger.debug("VectorStore: delete by source '%s' failed: %s", source, e)
 
-        # Add records in batches
+        # Add records in batches（单批失败不中断，最大限度保留数据）
         total = 0
+        failed_batches = 0
         for i in range(0, len(records), batch_size):
             batch = records[i:i + batch_size]
-            table.add(batch)
-            total += len(batch)
+            try:
+                table.add(batch)
+                total += len(batch)
+            except Exception as e:
+                failed_batches += 1
+                logger.error(
+                    "VectorStore: add batch %d/%d failed: %s",
+                    i // batch_size + 1, (len(records) + batch_size - 1) // batch_size, e,
+                )
+                if failed_batches >= 3:
+                    # 连续失败太多，可能系统性问题，中断避免持续报错
+                    raise
+        if failed_batches > 0:
+            logger.warning("VectorStore: %d batch(es) failed during add", failed_batches)
 
         logger.info("VectorStore: added %d chunks", total)
         return total
+
+    def delete_by_source(self, source: str) -> int:
+        """删除指定 source 的全部记录。返回删除前的记录数（若可查）。
+
+        用于 force 重新 ingest 时清理已从知识库中删除的文件对应的旧向量。
+        """
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return 0
+        h = _hash_source(source)
+        try:
+            table.delete(f"id LIKE '{h}_%'")
+            logger.info("VectorStore: deleted records for source '%s'", source)
+            return 1
+        except Exception as e:
+            logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
+            return 0
+
+    def add_streaming(
+        self,
+        chunk_iter,
+        batch_size: int = 100,
+        on_batch: Optional[Any] = None,
+    ) -> int:
+        """流式增量写入：接受 chunk 迭代器，每批 embed 完立即写入并释放。
+
+        用于大知识库 ingest，避免 H3 隐患（全部 records 含 vector 同时在内存）。
+        内存占用 = O(batch_size) 而非 O(总 chunks 数)。
+
+        Args:
+            chunk_iter: 产出 chunk dict 的迭代器（必须有 source / chunk_index / text）
+            batch_size: 每批 embed + 写入的 chunk 数
+            on_batch: 可选回调 (batch_added, total_added) -> None
+
+        Returns:
+            成功写入的 chunk 总数
+        """
+        self._ensure_initialized()
+
+        # 第一批特殊处理：用于判断是否需要 create_table
+        first_batch: List[Dict[str, Any]] = []
+        exhausted = False
+        for _ in range(batch_size):
+            try:
+                first_batch.append(next(chunk_iter))
+            except StopIteration:
+                exhausted = True
+                break
+
+        if not first_batch:
+            return 0
+
+        # Embed 第一批
+        first_records = self._embed_chunks(first_batch, 0)
+
+        table = self._ensure_table()
+        if table is None:
+            # 首次：创建表（用第一批 records）
+            self._table = self._db.create_table(_TABLE_NAME, first_records)
+            self._table_checked = True
+            logger.info("LanceDB table '%s' created (streaming)", _TABLE_NAME)
+            total = len(first_records)
+            if on_batch:
+                on_batch(len(first_records), total)
+            if exhausted:
+                return total
+        else:
+            # 已有表：先按 source 删除旧记录
+            sources_seen = {r["source"] for r in first_records}
+            for source in sources_seen:
+                h = _hash_source(source)
+                try:
+                    table.delete(f"id LIKE '{h}_%'")
+                except Exception as e:
+                    logger.debug("VectorStore: delete by source '%s' failed: %s", source, e)
+            # 写入第一批
+            try:
+                table.add(first_records)
+                total = len(first_records)
+                if on_batch:
+                    on_batch(len(first_records), total)
+            except Exception as e:
+                logger.error("VectorStore: streaming add first batch failed: %s", e)
+                raise
+            if exhausted:
+                return total
+
+        # 后续批次：每批 embed 完立即写入，records 用完即释放
+        chunk_idx = len(first_batch)
+        batch_buf: List[Dict[str, Any]] = []
+        for chunk in chunk_iter:
+            batch_buf.append(chunk)
+            if len(batch_buf) >= batch_size:
+                records = self._embed_chunks(batch_buf, chunk_idx)
+                try:
+                    table.add(records)
+                    total += len(records)
+                    if on_batch:
+                        on_batch(len(records), total)
+                except Exception as e:
+                    logger.error("VectorStore: streaming add batch at idx %d failed: %s", chunk_idx, e)
+                    raise
+                chunk_idx += len(batch_buf)
+                batch_buf.clear()
+        # 处理剩余
+        if batch_buf:
+            records = self._embed_chunks(batch_buf, chunk_idx)
+            try:
+                table.add(records)
+                total += len(records)
+                if on_batch:
+                    on_batch(len(records), total)
+            except Exception as e:
+                logger.error("VectorStore: streaming add final batch failed: %s", e)
+                raise
+
+        logger.info("VectorStore: streaming added %d chunks total", total)
+        return total
+
+    def _embed_chunks(
+        self, chunks: List[Dict[str, Any]], start_idx: int,
+    ) -> List[Dict[str, Any]]:
+        """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。"""
+        texts = [c["text"] for c in chunks]
+        vectors = self._ef(texts)
+        records: List[Dict[str, Any]] = []
+        for j, chunk in enumerate(chunks):
+            idx = start_idx + j
+            source = chunk.get("source", "unknown")
+            chunk_idx = chunk.get("chunk_index", idx)
+            chunk_id = f"{_hash_source(source)}_{chunk_idx}"
+            records.append({
+                "id": chunk_id,
+                "text": chunk["text"],
+                "vector": _normalize(vectors[j]),
+                "source": source,
+                "chunk_index": chunk_idx,
+            })
+        return records
 
     def search(
         self,
@@ -230,11 +396,16 @@ class VectorStore:
 
         output: List[Dict[str, Any]] = []
         for r in results:
+            # LanceDB 返回 _distance（L2 距离，越小越相似）。
+            # 转换为相似度分数 [0,1]（越高越相似），统一下游接口语义。
+            distance = float(r.get("_distance", 0.0))
+            # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
+            similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
                 "chunk_index": r.get("chunk_index", 0),
-                "score": r.get("_distance", 0.0),
+                "score": similarity,
             })
 
         return output
@@ -281,15 +452,22 @@ class VectorStore:
 
         reranker = self._get_reranker()
         if reranker is None:
-            # Fallback: LanceDB L2 distance on normalized vectors.
-            # For unit vectors, L2 ranges [0, 2] (0 = identical).
-            # Map to similarity [0, 1] (higher = better).
+            # Fallback: candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
+            # 如果 score 仍是原始 L2 距离（向后兼容），用正确公式转换：
+            # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
             for c in candidates:
                 try:
-                    d = float(c.get("score", 0.0))
+                    s = float(c.get("score", 0.0))
                 except (TypeError, ValueError):
-                    d = 0.0
-                c["score"] = max(0.0, min(1.0, 1.0 - d / 2.0))
+                    # score 不是合法数值（None/字符串等），置为 0 以免
+                    # 后续 sort 因类型不一致崩溃
+                    c["score"] = 0.0
+                    continue
+                # 如果 s > 1，说明是原始 L2 距离（相似度不会 > 1），用正确公式转换
+                if s > 1.0:
+                    c["score"] = max(0.0, 1.0 - (s * s) / 2.0)
+                else:
+                    c["score"] = s
             candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             return candidates[:top_k]
 
@@ -341,6 +519,7 @@ class VectorStore:
             # Drop and recreate empty table
             self._db.drop_table(_TABLE_NAME)
             self._table = None
+            self._table_checked = False  # 重置标记，允许下次 add 重新创建表
             logger.info("VectorStore: cleared %d documents", count)
 
     def count(self) -> int:
@@ -349,19 +528,48 @@ class VectorStore:
             return 0
         return self._table.count_rows()
 
+    def close(self) -> None:
+        """Release heavy resources (LanceDB connection, embedding model, reranker).
+
+        After close(), the VectorStore cannot be used; create a new instance to
+        access the same data (LanceDB persists to disk, so data survives).
+
+        Important: FastEmbed's ONNX Runtime InferenceSession and FlagReranker
+        hold significant C++ heap memory (~130MB + ~500MB). Python's GC may not
+        reclaim these promptly when the Python object is dropped — explicitly
+        nulling the references here ensures the C++ destructors run as soon as
+        possible, which is critical when SyncKnowledgeWorker creates a fresh
+        RAGEngine per sync run.
+        """
+        self._table = None
+        self._db = None
+        self._ef = None
+        if hasattr(self, "_reranker"):
+            self._reranker = None
+        self._initialized = False
+        self._table_checked = False
+        logger.info("VectorStore: resources released")
+
     def list_sources(self) -> List[str]:
         """Return unique source filenames in the store."""
         self._ensure_initialized()
         if self._table is None or self._table.count_rows() == 0:
             return []
-        # Use LanceDB projection to load only the source column, not all data
+        # 用 pyarrow compute 的 unique() 在 Arrow 层去重，
+        # 避免 to_pylist() 把全部行转换成 Python 对象（10 万行 = 10 万字符串）
         try:
-            all_data = self._table.to_arrow(columns=["source"]).to_pylist()
+            import pyarrow.compute as pc
+            arrow_tbl = self._table.to_arrow(columns=["source"])
+            unique_sources = pc.unique(arrow_tbl["source"]).to_pylist()
+            return sorted([s for s in unique_sources if s])
         except Exception:
-            # Fallback: load all columns if projection not supported
-            all_data = self._table.to_arrow().to_pylist()
-        sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
-        return sources
+            # Fallback: load source column and dedupe in Python
+            try:
+                all_data = self._table.to_arrow(columns=["source"]).to_pylist()
+            except Exception:
+                all_data = self._table.to_arrow().to_pylist()
+            sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
+            return sources
 
 
 # ---------------------------------------------------------------------------

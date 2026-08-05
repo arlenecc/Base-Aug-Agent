@@ -59,6 +59,11 @@ class MCPClient:
         self._process: Optional[subprocess.Popen] = None
         self._request_id = 0
         self._lock = threading.Lock()
+        # Separate lock for stdin writes. _lock guards _pending/_results/_request_id
+        # but is released while waiting on the response event — without a dedicated
+        # write lock, two concurrent _call()s could interleave bytes on the stdin
+        # pipe, corrupting JSON-RPC messages (>PIPE_BUF splits).
+        self._write_lock = threading.Lock()
         self._pending: Dict[int, threading.Event] = {}
         self._results: Dict[int, JSONRPCResponse] = {}
         self._reader_thread: Optional[threading.Thread] = None
@@ -235,14 +240,19 @@ class MCPClient:
         self._send(json.dumps(msg))
 
     def _send(self, line: str) -> None:
-        """Write a single JSON-RPC message line to the subprocess stdin."""
+        """Write a single JSON-RPC message line to the subprocess stdin.
+
+        Guarded by _write_lock so concurrent _call() invocations cannot
+        interleave bytes on the pipe (writes >PIPE_BUF are not atomic).
+        """
         if not self._process or not self._process.stdin:
             raise MCPError(f"MCP server '{self.name}': not running")
-        try:
-            self._process.stdin.write(line + "\n")
-            self._process.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise MCPError(f"MCP server '{self.name}': write failed: {e}")
+        with self._write_lock:
+            try:
+                self._process.stdin.write(line + "\n")
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                raise MCPError(f"MCP server '{self.name}': write failed: {e}")
 
     def _drain_stderr(self) -> None:
         """Continuously read stderr to prevent buffer deadlock."""
@@ -288,7 +298,19 @@ class MCPClient:
         except Exception as e:
             logger.debug("MCP server '%s' reader exited: %s", self.name, e)
         finally:
-            self._running = False
+            # The reader is exiting (server crashed, stdin closed, or stop()).
+            # Wake up any pending callers so they don't wait the full timeout.
+            # Store an error response so _call() reports a clear message instead
+            # of a generic "no response".
+            with self._lock:
+                self._running = False
+                for req_id, ev in self._pending.items():
+                    if req_id not in self._results:
+                        self._results[req_id] = JSONRPCResponse(
+                            id=req_id,
+                            error={"message": "MCP server connection closed", "code": -1},
+                        )
+                    ev.set()
 
 
 # ------------------------------------------------------------------

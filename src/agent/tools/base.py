@@ -176,13 +176,22 @@ class ToolRegistry:
         return self._rag_engine
 
     def shutdown(self) -> None:
-        """Stop all MCP server subprocesses."""
+        """Stop all MCP server subprocesses and release RAG engine resources."""
         for client in self._mcp_clients:
             try:
                 client.stop()
             except Exception:
                 pass
         self._mcp_clients.clear()
+        # Release the RAG engine's VectorStore (LanceDB connection + FastEmbed
+        # ONNX model + BGE reranker). Without this, each _rebuild_agent() call
+        # leaks ~600MB of C++ heap memory.
+        if self._rag_engine is not None:
+            try:
+                self._rag_engine.close()
+            except Exception:
+                pass
+            self._rag_engine = None
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)

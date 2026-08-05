@@ -24,6 +24,15 @@ class _JsonStore:
             except (OSError, json.JSONDecodeError):
                 self._data = {}
 
+    def reload(self) -> None:
+        """Re-read the file from disk, discarding the in-memory cache.
+
+        Used after an external write (e.g. another thread / process saved the
+        same store file) so this instance picks up the latest data.
+        """
+        with self._lock:
+            self._load()
+
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         tmp = self.path + ".tmp"
@@ -79,11 +88,13 @@ class LongTermMemory:
 
     def __init__(self, path: str):
         self._store = _JsonStore(path)
-        if "facts" not in self._store.all():
+        # Defensive: a corrupted/partially-written store may have "facts": null.
+        # isinstance check resets to [] so callers never see None.
+        if not isinstance(self._store.get("facts"), list):
             self._store.set("facts", [])
 
     def add(self, fact: str) -> None:
-        facts = list(self._store.get("facts", []))
+        facts = list(self._store.get("facts") or [])
         fact = fact.strip()
         if fact and fact not in facts:
             facts.append(fact)
@@ -92,7 +103,7 @@ class LongTermMemory:
     def add_many(self, facts: List[str]) -> None:
         # Batch: read once, deduplicate, append all, write once.
         # Avoids O(N²) read-write cycles when adding many facts.
-        existing = list(self._store.get("facts", []))
+        existing = list(self._store.get("facts") or [])
         seen = set(existing)
         added = 0
         for f in facts:
@@ -105,7 +116,7 @@ class LongTermMemory:
             self._store.set("facts", existing)
 
     def all(self) -> List[str]:
-        return list(self._store.get("facts", []))
+        return list(self._store.get("facts") or [])
 
     def search(self, query: str) -> List[str]:
         q = query.lower()

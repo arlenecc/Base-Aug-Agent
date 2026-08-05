@@ -185,24 +185,46 @@ class SyncKnowledgeWorker(QThread):
     """Background worker for RAG knowledge base ingestion."""
     finished = pyqtSignal(dict)   # stats dict
     failed = pyqtSignal(str)      # error message
+    progress = pyqtSignal(int, int, str)  # done, total, current_file
 
-    def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = ""):
+    def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
+                 force: bool = False):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
+        self._force = force
+        self._engine: Optional[RAGEngine] = None
 
     def run(self) -> None:  # type: ignore[override]
         try:
-            engine = RAGEngine(
+            self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
             )
-            stats = engine.ingest(force=True)
+            stats = self._engine.ingest(force=self._force, progress_callback=self._on_progress)
             self.finished.emit(stats)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+        finally:
+            # Release the VectorStore's resources (LanceDB connection, FastEmbed
+            # ONNX model ~130MB, BGE reranker ~500MB). Without this, every sync
+            # run leaks ~600MB of C++ heap memory because the ONNX Runtime
+            # InferenceSession is not promptly GC'd by Python.
+            if self._engine is not None:
+                try:
+                    self._engine.close()
+                except Exception:
+                    pass
+
+    def cancel(self) -> None:
+        """请求取消 ingest（在当前文件/批处理完成后生效）。"""
+        if self._engine is not None:
+            self._engine.cancel()
+
+    def _on_progress(self, done: int, total: int, current: str) -> None:
+        self.progress.emit(done, total, current)
 
 
 class InstallDepsWorker(QThread):
@@ -268,6 +290,12 @@ class MainWindow(QMainWindow):
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
         self._total_tokens = 0
+        # Pending skill suggestion — cached when the agent emits
+        # on_skill_suggested during a run, and shown as a dialog AFTER the
+        # run finishes. Showing a modal dialog during streaming would block
+        # the UI event loop and prevent content/reasoning chunks from
+        # rendering, making the app look frozen.
+        self._pending_skill: Optional[Skill] = None
 
         self._build_ui()
         self._wire_signals()
@@ -386,7 +414,15 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.knowledge_base_edit, 1)
         row2.addWidget(self.knowledge_base_btn)
         self.sync_knowledge_btn = QPushButton("同步知识")
-        self.sync_knowledge_btn.setToolTip("解析知识库文档、建立向量索引，支持 RAG 检索")
+        self.sync_knowledge_btn.setToolTip(
+            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
+            "左键：增量同步（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理"
+        )
+        # Right-click context menu: force full reprocess (ignores manifest).
+        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
+        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
         row2.addWidget(self.sync_knowledge_btn)
         lay.addLayout(row2)
 
@@ -535,6 +571,13 @@ class MainWindow(QMainWindow):
             self.config.max_tokens = int(self.max_tokens_edit.text().strip() or "32768")
         except ValueError:
             self.config.max_tokens = 32768
+        # Keep max_context_tokens in sync with max_tokens: the shrink threshold
+        # should track the model's actual context window. If the user has
+        # explicitly set a different max_context_tokens via config.json, only
+        # override when it was smaller than the new max_tokens (i.e. the old
+        # 4096 budget that's now too small).
+        if self.config.max_context_tokens < self.config.max_tokens:
+            self.config.max_context_tokens = self.config.max_tokens
         try:
             self.config.top_p = float(self.top_p_edit.text().strip() or "0.95")
         except ValueError:
@@ -564,6 +607,21 @@ class MainWindow(QMainWindow):
 
     def _rebuild_agent(self) -> None:
         self._gather_config_from_widgets()
+        # Shut down the old agent's resources (MCP subprocesses, httpx client)
+        # before replacing it — otherwise each "应用配置" click leaks a set of
+        # MCP server subprocesses and an open httpx connection.
+        old_agent = getattr(self, "_agent", None)
+        if old_agent is not None:
+            try:
+                old_agent.tools.shutdown()
+            except Exception:
+                pass
+        old_llm = getattr(self, "_llm", None)
+        if old_llm is not None:
+            try:
+                old_llm.close()
+            except Exception:
+                pass
         try:
             self._llm = LLMClient(
                 base_url=self.config.base_url, api_key=self.config.api_key,
@@ -598,7 +656,7 @@ class MainWindow(QMainWindow):
         if d:
             self.knowledge_base_edit.setText(d)
 
-    def _on_sync_knowledge(self) -> None:
+    def _on_sync_knowledge(self, force: bool = False) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
             return
         if self._deps_worker is not None and self._deps_worker.isRunning():
@@ -615,6 +673,7 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         self._pending_sync_ws = ws
         self._pending_sync_kb = kb
+        self._pending_sync_force = force
         self._deps_worker = InstallDepsWorker(kb)
         self._deps_worker.progress.connect(self._on_deps_progress)
         self._deps_worker.finished.connect(self._on_deps_finished)
@@ -642,6 +701,7 @@ class MainWindow(QMainWindow):
         # Step 2: start sync
         ws = getattr(self, "_pending_sync_ws", "")
         kb = getattr(self, "_pending_sync_kb", "")
+        force = getattr(self, "_pending_sync_force", False)
         if not ws or not kb:
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
@@ -649,12 +709,15 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setText("同步中…")
         self.status_label.setText("正在同步知识库…")
         self.progress.setRange(0, 0)
+        self.stop_btn.setEnabled(True)  # 同步期间允许点停止取消
         self._sync_worker = SyncKnowledgeWorker(
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
+            force=force,
         )
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.progress.connect(self._on_sync_progress)
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
 
@@ -662,16 +725,34 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setEnabled(True)
         self.sync_knowledge_btn.setText("同步知识")
         self.progress.setRange(0, 1)
-        self.status_label.setText("知识库同步完成")
         self._sync_worker = None
+        # 仅当不在 agent run 时禁用 stop_btn（agent run 自己管理 stop_btn 状态）
+        if not self._busy:
+            self.stop_btn.setEnabled(False)
+        if stats.get("cancelled"):
+            self.status_label.setText("同步已取消")
+            self._append_log("[rag] 同步已用户取消")
+            return
+        self.status_label.setText("知识库同步完成")
         files = stats.get("files_found", 0)
+        extracted = stats.get("files_extracted", 0)
+        skipped = stats.get("files_skipped", 0)
+        deleted = stats.get("files_deleted", 0)
         chunks = stats.get("chunks", 0)
         errors = stats.get("errors", [])
-        msg = (
-            f"知识库同步完成！\n\n"
-            f"扫描文件：{files} 个\n"
-            f"向量切片：{chunks} 个\n"
-        )
+        # Show incremental stats so the user sees what was actually processed.
+        if extracted == 0 and skipped > 0:
+            summary = f"知识库已是最新（跳过 {skipped} 个未修改文件）\n\n"
+        else:
+            summary = (
+                f"知识库同步完成！\n\n"
+                f"扫描文件：{files} 个\n"
+                f"新增/更新：{extracted} 个   跳过：{skipped} 个\n"
+            )
+            if deleted > 0:
+                summary += f"已清理删除文件：{deleted} 个\n"
+            summary += f"向量切片：{chunks} 个\n"
+        msg = summary
         if errors:
             msg += f"\n⚠ {len(errors)} 个文件提取失败：\n"
             for e in errors[:5]:
@@ -687,6 +768,8 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 1)
         self.status_label.setText("知识库同步失败")
         self._sync_worker = None
+        if not self._busy:
+            self.stop_btn.setEnabled(False)
         QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
 
     def _on_fetch_models(self) -> None:
@@ -753,8 +836,24 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _on_stop(self) -> None:
+        # 优先取消 agent run；如果正在同步知识库则取消同步
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self._sync_worker.cancel()
+            self.status_label.setText("已请求取消同步（将在当前文件完成后生效）")
+            return
         self._callbacks.cancel()
         self.status_label.setText("已请求停止（将在当前工具完成后生效）")
+
+    def _on_sync_progress(self, done: int, total: int, current: str) -> None:
+        """同步进度反馈：更新进度条和状态栏。"""
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(done)
+            pct = done * 100 // total
+            self.status_label.setText(f"同步中 {done}/{total} ({pct}%) — {current}")
+        else:
+            self.progress.setRange(0, 0)
+            self.status_label.setText(f"同步中 — {current}")
 
     def _set_controls_busy(self, busy: bool) -> None:
         self.send_btn.setEnabled(not busy)
@@ -774,7 +873,6 @@ class MainWindow(QMainWindow):
         self._append_chat(f'<p><b class="u">你</b>: {self._escape(text)}</p>')
 
     def _on_content(self, text: str) -> None:
-        import html as _html
         text = _sanitize_stream_text(text)
         if not text:
             return
@@ -787,8 +885,11 @@ class MainWindow(QMainWindow):
         # and a later drift could insert into the middle, overlapping text).
         cursor = self.chat_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        piece = _html.escape(text).replace("\n", "<br>")
-        cursor.insertHtml(piece)
+        # 用 insertText 而非 insertHtml：HTML 的空白折叠规则会丢掉 chunk 之间的
+        # 前导/后随空格（"Hello" + " World" 会被渲染成 "HelloWorld"）。
+        # insertText 保留原始空格，并把 \n 当作真实换行处理。
+        # 思考过程（_on_reasoning）也用 insertPlainText，所以一直显示正常。
+        cursor.insertText(text)
         self.chat_view.setTextCursor(cursor)
         self._scroll_to_bottom(self.chat_view)
 
@@ -836,18 +937,38 @@ class MainWindow(QMainWindow):
         self.speed_label.setText(f"{speed:.1f} tok/s")
 
     def _on_skill_suggested(self, skill) -> None:
+        """Cache the skill suggestion for showing AFTER the run finishes.
+
+        Showing a modal dialog here would block the UI event loop during
+        streaming, preventing content/reasoning chunks from rendering.
+        """
         if not isinstance(skill, Skill):
             return
         if skill.name == "_suggested":
-            reply = QMessageBox.question(
-                self, "固化为技能",
-                f"检测到你多次执行类似任务：\n{skill.prompt[:200]}\n\n是否保存为技能以便下次直接执行？",
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                name, ok = QInputDialog.getText(self, "技能名称", "技能名称：", text="my-skill")
-                if ok and name.strip():
-                    self._agent.skills.create_skill(name.strip(), skill.keywords, skill.prompt)
-                    self._append_log(f"[skill] saved '{name}'")
+            self._pending_skill = skill
+
+    def _show_pending_skill_dialog(self) -> None:
+        """Show the skill-suggestion dialog (called after _on_finished)."""
+        skill = self._pending_skill
+        self._pending_skill = None
+        if skill is None or self._agent is None:
+            return
+        reply = QMessageBox.question(
+            self, "固化为技能",
+            f"检测到你多次执行类似任务：\n{skill.prompt[:200]}\n\n是否保存为技能以便下次直接执行？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            name, ok = QInputDialog.getText(self, "技能名称", "技能名称：", text="my-skill")
+            if ok and name.strip():
+                self._agent.skills.create_skill(name.strip(), skill.keywords, skill.prompt)
+                # Reload so the worker thread's SkillManager picks up the new
+                # skill immediately — otherwise match() in _system_prompt would
+                # still see the old (pre-save) in-memory cache and keep
+                # re-suggesting the same intent every turn.
+                self._agent.skills.reload()
+                self._append_log(f"[skill] saved '{name}'")
 
     def _on_finished(self) -> None:
         if not self._busy:  # guard against double-call from _on_error + bridge.finished
@@ -865,6 +986,10 @@ class MainWindow(QMainWindow):
         self._worker = None
         if worker is not None:
             worker.wait(2000)
+        # Now that streaming is done and the worker thread has joined, it's
+        # safe to show the skill-suggestion modal dialog without blocking
+        # the UI event loop during streaming.
+        self._show_pending_skill_dialog()
 
     def _on_error(self, msg: str) -> None:
         self._append_chat(f'<p class="sys">⚠ {self._escape(msg)}</p>')
@@ -925,6 +1050,25 @@ class MainWindow(QMainWindow):
     def _escape(text: str) -> str:
         import html as _html
         return _html.escape(text).replace("\n", "<br>")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Clean up background resources before the window closes."""
+        # Stop any running sync worker
+        if self._sync_worker is not None and self._sync_worker.isRunning():
+            self._sync_worker.cancel()
+            self._sync_worker.wait(3000)
+        # Shut down MCP subprocesses + close httpx client
+        if self._agent is not None:
+            try:
+                self._agent.tools.shutdown()
+            except Exception:
+                pass
+        if self._llm is not None:
+            try:
+                self._llm.close()
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 def run() -> None:

@@ -10,10 +10,22 @@ import logging
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 全局 OCR 引擎（单例）+ 并发信号量
+# ---------------------------------------------------------------------------
+# RapidOCR ONNX Runtime 单实例约 500MB 内存。如果每个 worker 各加载一份，
+# 4 worker 同时遇到图片 PDF 时会占用 ~2GB 仅仅用于 OCR 模型。
+# 改为全局单例：所有 worker 共享同一个引擎实例，通过信号量串行执行
+# （RapidOCR 可能非线程安全，串行调用 engine(img) 避免竞态）。
+_OCR_SEMAPHORE = threading.Semaphore(1)
+_OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
+_OCR_ENGINE_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Format → extension mapping
@@ -142,25 +154,42 @@ def _extract_pdf(path: Path) -> str:
 
     doc = fitz.open(str(path))
     parts: List[str] = []
-    ocr_engine = None  # lazy-init, reused across pages
+    ocr_engine = None       # lazy-init, 复用同一个引擎实例
+    ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
     ocr_needed = False
 
     for page_num in range(len(doc)):
         page = doc[page_num]
-        text = page.get_text("text")
-        if text.strip() and len(text.strip()) > 50:
+        text = page.get_text("text").strip()
+        if text:
+            # 文字版页面：直接使用提取的文本，不用 OCR
             parts.append(text)
-        else:
-            # Image-based page — try OCR
-            ocr_needed = True
+            continue
+
+        # 无文字层 → 可能是图片版页面。检查是否含图片
+        if not page.get_images(full=True):
+            # 既无文字也无图片 → 跳过（可能是空白页）
+            continue
+
+        # 图片版页面 → 走 OCR（用全局信号量限制并发，避免多 worker 同时跑 OCR 导致 OOM）
+        ocr_needed = True
+        if ocr_unavailable:
+            continue
+        if ocr_engine is None:
+            ocr_engine = _get_ocr_engine()
             if ocr_engine is None:
-                ocr_engine = _get_ocr_engine()
-            if ocr_engine is not None:
-                pix = page.get_pixmap(dpi=200)
-                img_bytes = pix.tobytes("png")
-                ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
-                if ocr_text:
-                    parts.append(ocr_text)
+                ocr_unavailable = True
+                continue
+        with _OCR_SEMAPHORE:
+            # 再次检查引擎：可能在等信号量期间其它 worker 已判定不可用
+            if ocr_engine is None:
+                ocr_unavailable = True
+                continue
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+            ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+        if ocr_text:
+            parts.append(ocr_text)
 
     doc.close()
 
@@ -172,19 +201,33 @@ def _extract_pdf(path: Path) -> str:
 
 
 def _get_ocr_engine():
-    """Lazy-load RapidOCR engine. Returns None if not installed."""
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        return RapidOCR()
-    except ImportError:
-        logger.warning(
-            "rapidocr-onnxruntime is required for OCR on image-based PDFs. "
-            "pip install rapidocr-onnxruntime"
-        )
-        return None
-    except Exception as e:
-        logger.warning("Failed to init RapidOCR: %s", e)
-        return None
+    """Lazy-load RapidOCR engine as a global singleton.
+
+    Returns None if not installed. All workers share the same engine instance
+    (~500MB) — without this, 4 workers loading 4 instances would OOM. The
+    _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
+    invoked by one thread at a time.
+    """
+    global _OCR_ENGINE
+    if _OCR_ENGINE is not None:
+        return _OCR_ENGINE
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is not None:
+            return _OCR_ENGINE
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+            logger.info("RapidOCR engine loaded (global singleton)")
+            return _OCR_ENGINE
+        except ImportError:
+            logger.warning(
+                "rapidocr-onnxruntime is required for OCR on image-based PDFs. "
+                "pip install rapidocr-onnxruntime"
+            )
+            return None
+        except Exception as e:
+            logger.warning("Failed to init RapidOCR: %s", e)
+            return None
 
 
 def _ocr_image_cached(engine, img_bytes: bytes, page_num: int, filename: str) -> str:
@@ -344,12 +387,25 @@ def extract_directory(
     Returns a list of (filepath, extracted_text) tuples.
     If *errors* is provided, extraction failure messages are appended to it.
     """
+    return list(iter_directory(dirpath, recursive=recursive,
+                               extensions=extensions, errors=errors))
+
+
+def iter_directory(
+    dirpath: str,
+    recursive: bool = True,
+    extensions: Optional[set] = None,
+    errors: Optional[List[str]] = None,
+) -> Iterator[Tuple[str, str]]:
+    """流式版本的 extract_directory：逐文件 yield (filepath, text)。
+
+    避免大知识库一次性把全部文件全文累积在内存（H1 隐患）。
+    调用方消费完一个文件后即可释放该文件的全文字符串。
+    """
     if extensions is None:
         extensions = SUPPORTED_EXTENSIONS
 
-    results: List[tuple] = []
     root = Path(dirpath)
-
     iterator = root.rglob("*") if recursive else root.glob("*")
     for filepath in iterator:
         if not filepath.is_file():
@@ -362,7 +418,7 @@ def extract_directory(
         try:
             text = extract_text(str(filepath))
             if text.strip():
-                results.append((str(filepath), text))
+                yield (str(filepath), text)
                 logger.info("Extracted: %s (%d chars)", filepath.name, len(text))
             else:
                 msg = f"{filepath.name}: extracted text is empty"
@@ -374,5 +430,3 @@ def extract_directory(
             logger.warning("Failed to extract '%s': %s", filepath.name, e)
             if errors is not None:
                 errors.append(msg)
-
-    return results
