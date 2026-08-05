@@ -119,11 +119,13 @@ def scan_extensions(kb_path: str) -> Set[str]:
     """Scan a knowledge base directory and return the set of file extensions present."""
     root = Path(kb_path)
     if not root.is_dir():
+        logger.warning("RAG deps: knowledge base dir not found: %s", kb_path)
         return set()
     exts: Set[str] = set()
     for fp in root.rglob("*"):
         if fp.is_file() and not fp.name.startswith("."):
             exts.add(fp.suffix.lower())
+    logger.info("RAG deps: scanned %s — found extensions: %s", kb_path, sorted(exts) if exts else "(none)")
     return exts
 
 
@@ -165,6 +167,13 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
             else:
                 report.missing_optional.append(dep)
 
+    if report.has_missing:
+        logger.info(
+            "RAG deps: check complete — %d required missing, %d optional missing",
+            len(report.missing_required), len(report.missing_optional),
+        )
+    else:
+        logger.info("RAG deps: all %d dependencies satisfied", len(unique_deps))
     return report
 
 
@@ -181,12 +190,15 @@ def install_packages(specs: List[str], progress_callback=None) -> Tuple[bool, st
     if not specs:
         return True, "无需安装。"
 
+    logger.info("RAG deps: installing %s", ", ".join(specs))
+
     # Apply version pins: if a spec doesn't already have a version constraint,
     # check if we need to pin it.
     final_specs: List[str] = []
     for spec in specs:
-        # Extract package name (before any version specifier)
-        pkg_name = spec.split("<")[0].split(">")[0].split("="[0])[0].split("[")[0].strip().lower()
+        # Extract package name (before any version specifier).
+        # Handles: "numpy<2.0", "numpy>=1.0,<2.0", "numpy==1.20", "numpy[extra]"
+        pkg_name = spec.split("<")[0].split(">")[0].split("=")[0].split("[")[0].strip().lower()
         if pkg_name in VERSION_PINS and "<" not in spec and ">" not in spec:
             final_specs.append(VERSION_PINS[pkg_name])
         else:
@@ -205,22 +217,26 @@ def install_packages(specs: List[str], progress_callback=None) -> Tuple[bool, st
         )
         if result.returncode == 0:
             msg = f"安装成功: {' '.join(final_specs)}"
+            logger.info("RAG deps: install succeeded: %s", " ".join(final_specs))
             if progress_callback:
                 progress_callback(msg)
             return True, msg
         else:
             error_tail = result.stderr.strip().split("\n")[-5:] if result.stderr else []
             msg = f"安装失败 (exit {result.returncode}):\n" + "\n".join(error_tail)
+            logger.error("RAG deps: install failed (exit %d): %s", result.returncode, "\n".join(error_tail))
             if progress_callback:
                 progress_callback(msg)
             return False, msg
     except subprocess.TimeoutExpired:
         msg = "安装超时（5 分钟），请手动执行: pip install " + " ".join(final_specs)
+        logger.error("RAG deps: install timed out after 5 min: %s", " ".join(final_specs))
         if progress_callback:
             progress_callback(msg)
         return False, msg
     except Exception as e:
         msg = f"安装异常: {e}"
+        logger.error("RAG deps: install exception: %s", e)
         if progress_callback:
             progress_callback(msg)
         return False, msg
@@ -246,6 +262,8 @@ def ensure_dependencies(
     report = check_dependencies(kb_path, include_core=include_core)
 
     if not report.has_blocking or not auto_install:
+        logger.info("RAG deps: ensure_dependencies — no blocking deps to install (blocking=%s auto=%s)",
+                    report.has_blocking, auto_install)
         return report
 
     # Collect pip specs for missing required deps
@@ -253,6 +271,8 @@ def ensure_dependencies(
     for dep in report.missing_required:
         specs_to_install.append(dep.pip_spec)
 
+    logger.info("RAG deps: auto-installing %d required packages: %s",
+                len(specs_to_install), ", ".join(specs_to_install))
     if progress_callback:
         progress_callback(f"检测到缺少 {len(specs_to_install)} 个必要依赖，开始自动安装…")
 
@@ -261,6 +281,11 @@ def ensure_dependencies(
     if success:
         # Re-check to update the report
         report = check_dependencies(kb_path, include_core=include_core)
+        if report.has_blocking:
+            logger.warning("RAG deps: post-install check — %d deps still missing",
+                           len(report.missing_required))
+        else:
+            logger.info("RAG deps: all required deps installed successfully")
         if progress_callback:
             if report.has_blocking:
                 progress_callback("部分依赖安装后仍无法导入，请手动检查。")

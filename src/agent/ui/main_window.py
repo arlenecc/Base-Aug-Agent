@@ -33,6 +33,48 @@ CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
 
 logger = logging.getLogger(__name__)
 
+# RAG / sync 相关模块的 logger 名称前缀，用于 UI 日志面板过滤
+# 覆盖 RAG 全链路：同步引擎、向量库、解析器、清洗器、切片器、依赖检查、工具调用
+_RAG_LOG_PREFIXES = (
+    "src.agent.rag",
+    "src.agent.tools.rag_tool",
+    "src.agent.tools.base",
+    "src.agent.ui.main_window",
+)
+
+# QSignalLogHandler 实例引用，保存在模块级别以便 closeEvent 清理。
+# _setup_log_bridge() 创建并赋值，closeEvent() 从 root logger 移除。
+_LOG_HANDLER: Optional[Any] = None
+
+
+class QSignalLogHandler(logging.Handler, QObject):
+    """将 Python logging 日志桥接到 Qt UI 的 log_view。
+
+    通过 pyqtSignal 将日志消息安全地传递到 UI 线程，避免跨线程
+    直接操作 QPlainTextEdit 导致的崩溃。
+
+    必须同时继承 QObject 和 logging.Handler，因为 pyqtSignal
+    需要 QObject 作为基类才能正常工作。
+    """
+
+    message_received = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        # 同时继承 QObject 和 logging.Handler 时，super().__init__() 只调用
+        # MRO 中第一个父类的 __init__。logging.Handler.__init__() 不会调用
+        # super().__init__()，因此 QObject.__init__() 被跳过，导致 pyqtSignal
+        # 初始化失败。必须显式调用两个父类的 __init__。
+        QObject.__init__(self)
+        logging.Handler.__init__(self)
+        self.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.message_received.emit(msg)
+        except Exception:
+            self.handleError(record)
+
 
 def _sanitize_stream_text(text: str) -> str:
     """Normalize line endings and drop overstrike carriage returns.
@@ -252,9 +294,21 @@ class SyncKnowledgeWorker(QThread):
             # thread's UI reset / reload_rag() runs against a fully released
             # worker-side engine.
             if emit_error is not None:
+                logger.info("SyncKnowledgeWorker: emitting sync_failed")
                 self.sync_failed.emit(emit_error)
             elif emit_stats is not None:
+                logger.info("SyncKnowledgeWorker: emitting sync_finished with stats keys=%s",
+                            list(emit_stats.keys()) if isinstance(emit_stats, dict) else type(emit_stats))
                 self.sync_finished.emit(emit_stats)
+            else:
+                # 防御：如果 emit_error 和 emit_stats 都是 None（极端情况：
+                # RAGEngine 构造或 ingest 抛出非 Exception 的 BaseException，
+                # 如 KeyboardInterrupt），确保 UI 不会永远卡在"同步中"。
+                logger.error(
+                    "SyncKnowledgeWorker: BOTH emit_error and emit_stats are None! "
+                    "Emitting sync_failed as fallback to unblock UI."
+                )
+                self.sync_failed.emit("Unknown sync error (no stats or error captured)")
 
     def cancel(self) -> None:
         """请求取消 ingest（在当前文件/批处理完成后生效）。"""
@@ -337,6 +391,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._wire_signals()
+        self._setup_log_bridge()
         self._apply_config_to_widgets()
         self._rebuild_agent()
 
@@ -548,6 +603,7 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setFont(font)
+        self.log_view.setMaximumBlockCount(5000)  # 限制日志行数，防止内存无限增长
         rlay.addWidget(self.log_view, 1)
         hsplit.addWidget(right)
 
@@ -713,14 +769,17 @@ class MainWindow(QMainWindow):
 
     def _on_sync_knowledge(self, force: bool = False) -> None:
         if self._sync_worker is not None and self._sync_worker.isRunning():
+            logger.warning("Sync already running, ignoring duplicate request")
             return
         if self._deps_worker is not None and self._deps_worker.isRunning():
+            logger.warning("Deps check already running, ignoring duplicate request")
             return
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
             QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
             return
+        logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
         # Step 1: check dependencies before starting sync
         self.sync_knowledge_btn.setEnabled(False)
         self.sync_knowledge_btn.setText("检查依赖…")
@@ -746,6 +805,7 @@ class MainWindow(QMainWindow):
         self._deps_worker = None
         if report is not None and report.has_blocking:
             # Required deps still missing after auto-install attempt
+            logger.warning("Deps check: blocking dependencies missing, aborting sync")
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
@@ -779,10 +839,11 @@ class MainWindow(QMainWindow):
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)
         self._sync_worker.sync_progress.connect(self._on_sync_progress)
-        # Connect deleteLater to QThread's built-in finished signal (emitted
-        # by Qt AFTER run() returns), NOT the custom sync_finished (emitted
-        # inside run()). This ensures the worker object isn't scheduled for
-        # deletion while the thread is still winding down.
+        # 兜底：如果 sync_finished / sync_failed 信号因任何原因未被正确处理
+        # （例如信号槽连接断开、emit 在 Qt 事件队列中被丢弃），QThread.finished
+        # 信号会在 run() 返回后由 Qt 自动发射。此时检查按钮状态，如果仍处于
+        # "同步中"状态则强制恢复。
+        self._sync_worker.finished.connect(self._on_sync_thread_finished)
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
 
@@ -854,6 +915,31 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("同步完成（显示结果时出错）")
             except Exception:
                 pass
+
+    def _on_sync_thread_finished(self) -> None:
+        """兜底检查：QThread.finished 信号在 run() 返回后自动发射。
+
+        如果 sync_finished / sync_failed 信号已正常处理，此时按钮应该已经
+        恢复为"同步知识"状态。如果按钮仍处于"同步中"状态，说明同步结束信号
+        未被正确处理，需要强制恢复 UI 状态以避免用户界面永久卡住。
+        """
+        if (self._sync_worker is not None
+                and self.sync_knowledge_btn.text() == "同步中…"):
+            logger.warning(
+                "UI: sync thread finished but button still in 'syncing' state. "
+                "sync_finished/sync_failed signal may have been lost. "
+                "Forcing UI reset."
+            )
+            try:
+                self.sync_knowledge_btn.setEnabled(True)
+                self.sync_knowledge_btn.setText("同步知识")
+                self.stop_sync_btn.setEnabled(False)
+                self.progress.setRange(0, 1)
+                self.progress.setValue(0)
+                self.status_label.setText("知识库同步完成（状态已自动恢复）")
+            except Exception:
+                pass
+            self._sync_worker = None
 
     def _on_sync_failed(self, error: str) -> None:
         logger.info("UI: _on_sync_failed called: %s", error[:200])
@@ -953,6 +1039,7 @@ class MainWindow(QMainWindow):
         ingest 循环在处理完当前文件后检查该标志并退出。
         """
         if self._sync_worker is not None and self._sync_worker.isRunning():
+            logger.info("User requested sync cancellation")
             self._sync_worker.cancel()
             self.stop_sync_btn.setEnabled(False)  # 防止重复点击
             self.status_label.setText("已请求停止同步（将在当前文件完成后生效）")
@@ -960,6 +1047,7 @@ class MainWindow(QMainWindow):
             return
         # deps 检查阶段没有 cancel 机制，只能等它结束（通常很快）
         if self._deps_worker is not None and self._deps_worker.isRunning():
+            logger.info("User requested stop during deps check (no cancel mechanism)")
             self.status_label.setText("依赖检查中，请稍候…")
             return
 
@@ -1149,6 +1237,54 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def _setup_log_bridge(self) -> None:
+        """将 RAG/sync 模块的 logger 输出桥接到 UI 的 log_view。
+
+        通过 QSignalLogHandler 把 Python logging 消息安全地转发到
+        UI 线程，让用户可以在日志面板中实时看到知识同步的详细进度。
+
+        实现方式：将 handler 注册到 root logger，通过 Filter 只放行
+        匹配 _RAG_LOG_PREFIXES 的日志记录。这样做的好处是：
+        1. 不依赖 Python logging 层级传播（某些运行时环境下子 logger
+           的 propagate 可能被意外关闭）
+        2. 后续动态创建的 logger（如 RAG 模块的延迟导入）也会被覆盖
+        3. 线程安全：QSignalLogHandler 通过 pyqtSignal 将日志从工作
+           线程安全地转发到 UI 线程
+        """
+        global _LOG_HANDLER
+        # 防止重复添加：先移除旧的 handler。
+        if _LOG_HANDLER is not None:
+            root = logging.getLogger()
+            try:
+                root.removeHandler(_LOG_HANDLER)
+            except Exception:
+                pass
+
+        self._log_handler = QSignalLogHandler()
+        self._log_handler.message_received.connect(self._append_log)
+        self._log_handler.setLevel(logging.DEBUG)
+
+        # 添加 Filter：只放行 RAG 相关模块的日志
+        class _RagLogFilter(logging.Filter):
+            def filter(self, record):
+                return any(
+                    record.name.startswith(p) for p in _RAG_LOG_PREFIXES
+                )
+
+        self._log_handler.addFilter(_RagLogFilter())
+
+        # 将 handler 挂到 root logger，配合 Filter 实现精确过滤。
+        # 同时将相关父 logger 的 level 设为 DEBUG，确保子 logger 的
+        # INFO 级别日志能通过有效级别检查。
+        root = logging.getLogger()
+        root.addHandler(self._log_handler)
+        for prefix in _RAG_LOG_PREFIXES:
+            logging.getLogger(prefix).setLevel(logging.DEBUG)
+
+        # 保存到模块级变量，供 closeEvent 清理使用。
+        _LOG_HANDLER = self._log_handler
+        logger.info("Log bridge: RAG/sync logs forwarded to UI panel")
+
     def _append_chat(self, html: str) -> None:
         self.chat_view.append(html)
         self._scroll_to_bottom(self.chat_view)
@@ -1273,6 +1409,18 @@ class MainWindow(QMainWindow):
                 self._llm.close()
             except Exception as e:
                 logger.warning("UI: llm close error: %s", e)
+
+        # --- Remove the QSignalLogHandler from the root logger.
+        # Without this, the handler (which holds a reference to the QPlainTextEdit
+        # via its signal slot) keeps a C++ object reference alive after the widget
+        # is destroyed. Any subsequent log call will emit message_received into
+        # freed memory → RuntimeError.
+        if _LOG_HANDLER is not None:
+            root = logging.getLogger()
+            try:
+                root.removeHandler(_LOG_HANDLER)
+            except Exception:
+                pass
         super().closeEvent(event)
 
 

@@ -5,8 +5,11 @@ Chunk sizes are measured in *tokens* (estimated via character-based heuristic:
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,8 @@ def chunk_documents(
     for doc in documents:
         source = doc.get("source", "unknown")
         text = doc.get("text", "")
+        total_tokens = estimate_tokens(text)
+        logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
         chunks = chunk_text(text, chunk_size, chunk_overlap)
         for i, chunk in enumerate(chunks):
             all_chunks.append({

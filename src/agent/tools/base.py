@@ -206,9 +206,11 @@ class ToolRegistry:
         # leaks ~600MB of C++ heap memory.
         if self._rag_engine is not None:
             try:
+                logger.info("🔌 正在释放 RAG 引擎资源 (向量库连接 + 嵌入模型 + Reranker)...")
                 self._rag_engine.close()
-            except Exception:
-                pass
+                logger.info("✅ RAG 引擎资源已释放")
+            except Exception as e:
+                logger.warning("⚠ RAG 引擎资源释放异常: %s", e)
             self._rag_engine = None
 
     def get(self, name: str) -> Optional[Tool]:

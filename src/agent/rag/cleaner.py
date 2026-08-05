@@ -1,8 +1,11 @@
 """Text cleaner — removes garbage, tags, and normalizes whitespace."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 
 def clean_text(text: str) -> str:
@@ -10,6 +13,7 @@ def clean_text(text: str) -> str:
     strip non-printable characters, and collapse redundant blank lines."""
     if not text:
         return ""
+    logger.debug("      清洗文本: 原始 %d 字符", len(text))
 
     # 1. Remove entire script/style blocks (including their content)
     text = re.sub(r'<script[^>]*>[\s\S]*?</script>', ' ', text, flags=re.IGNORECASE)
@@ -27,25 +31,25 @@ def clean_text(text: str) -> str:
     text = re.sub(r'&#\d+;', ' ', text)
     text = re.sub(r'&#x[0-9a-fA-F]+;', ' ', text)
 
-    # 3. Remove URLs
+    # 5. Remove URLs
     text = re.sub(r'https?://\S+', ' ', text)
 
-    # 4. Remove email addresses
+    # 6. Remove email addresses
     text = re.sub(r'\S+@\S+\.\S+', ' ', text)
 
-    # 5. Remove control characters except common whitespace (\n, \t, \r)
+    # 7. Remove control characters except common whitespace (\n, \t, \r)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
 
-    # 6. Replace various Unicode whitespace with normal space
+    # 8. Replace various Unicode whitespace with normal space
     text = re.sub(r'[\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]', ' ', text)
 
-    # 7. Remove zero-width characters
+    # 9. Remove zero-width characters
     text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]', '', text)
 
-    # 8. Collapse multiple spaces (but preserve newlines)
+    # 10. Collapse multiple spaces (but preserve newlines)
     text = re.sub(r'[ \t]+', ' ', text)
 
-    # 9. Remove lines that are just garbage (very short, no letters/digits)
+    # 11. Remove lines that are just garbage (very short, no letters/digits)
     lines = text.split('\n')
     cleaned_lines: List[str] = []
     for line in lines:
@@ -77,6 +81,7 @@ def clean_text(text: str) -> str:
     # 11. Strip leading/trailing whitespace
     text = text.strip()
 
+    logger.debug("      清洗文本完成: %d 字符", len(text))
     return text
 
 
@@ -88,6 +93,7 @@ def normalize_markdown(text: str) -> str:
     """
     if not text:
         return ""
+    logger.debug("      转换 Markdown: %d 字符", len(text))
 
     lines = text.split('\n')
     result: List[str] = []
@@ -125,4 +131,6 @@ def normalize_markdown(text: str) -> str:
     while result and not result[-1].strip():
         result.pop()
 
-    return '\n'.join(result)
+    output = '\n'.join(result)
+    logger.debug("      转换 Markdown 完成: %d 行", len(result))
+    return output

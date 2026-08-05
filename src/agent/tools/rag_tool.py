@@ -47,12 +47,12 @@ class RagSearchTool(Tool):
         if not query.strip():
             return ToolResult(success=False, error="请提供搜索查询词")
 
-        logger.info("rag_search: query=%r top_k=%d", query[:60], top_k)
+        logger.info("🔍 RAG 工具调用: rag_search(query=%r, top_k=%d)", query[:80], top_k)
         try:
             results = self._engine.search_formatted(query, top_k=top_k)
             return ToolResult(success=True, output=results)
         except Exception as e:
-            logger.error("rag_search failed: %s", e, exc_info=True)
+            logger.error("❌ RAG 搜索失败: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库搜索失败: {e}")
 
 
@@ -121,7 +121,7 @@ class RagIngestTool(Tool):
         pass
 
     def run(self, force: bool = False, **kwargs) -> ToolResult:
-        logger.info("rag_ingest: force=%s", force)
+        logger.info("📥 RAG 工具调用: rag_ingest(force=%s)", force)
         try:
             stats = self._engine.ingest(force=force)
             if "error" in stats:

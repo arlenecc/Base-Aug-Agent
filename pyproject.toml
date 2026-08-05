@@ -16,6 +16,21 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+# RAG / knowledge base support: vector store + embedding + reranker + parsers
+rag = [
+    "lancedb>=0.17.0",
+    "fastembed>=0.4.0",
+    "FlagEmbedding>=1.3.0",
+    "python-docx>=1.0.0",
+    "openpyxl>=3.0.0",
+    "python-pptx>=0.6.0",
+    "PyMuPDF>=1.23.0",
+    "ebooklib>=0.18",
+]
+# PDF OCR (optional, heavy dependency ~500MB)
+ocr = ["rapidocr-onnxruntime>=1.0.0"]
+# All optional features
+all = ["base-agent[test,rag,ocr]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

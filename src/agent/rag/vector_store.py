@@ -43,9 +43,9 @@ class FastEmbedEmbeddingFunction:
     def _ensure_model(self):
         if self._model is None:
             from fastembed import TextEmbedding
-            logger.info("Loading FastEmbed model: %s ...", self._model_name)
+            logger.info("  🔧 正在加载嵌入模型: %s (首次加载, 约 130MB)...", self._model_name)
             self._model = TextEmbedding(model_name=self._model_name)
-            logger.info("FastEmbed model loaded: %s", self._model_name)
+            logger.info("  ✅ 嵌入模型加载完成: %s", self._model_name)
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         """Embed a list of document texts. Returns a list of embedding vectors."""
@@ -130,7 +130,7 @@ class VectorStore:
 
         self._initialized = True
         count = self._table.count_rows() if self._table is not None else 0
-        logger.info("VectorStore initialized: %d documents in store", count)
+        logger.info("  向量库初始化完成: 当前存储 %d 条向量记录", count)
 
     def _ensure_table(self) -> Optional[Any]:
         """Open existing table if it exists, return None if not yet created.
@@ -256,6 +256,7 @@ class VectorStore:
         chunk_iter,
         batch_size: int = 100,
         on_batch: Optional[Any] = None,
+        is_cancelled: Optional[Any] = None,
     ) -> int:
         """流式增量写入：接受 chunk 迭代器，每批 embed 完立即写入并释放。
 
@@ -266,9 +267,10 @@ class VectorStore:
             chunk_iter: 产出 chunk dict 的迭代器（必须有 source / chunk_index / text）
             batch_size: 每批 embed + 写入的 chunk 数
             on_batch: 可选回调 (batch_added, total_added) -> None
+            is_cancelled: 可选回调 () -> bool，返回 True 时中断写入并返回当前计数
 
         Returns:
-            成功写入的 chunk 总数
+            成功写入的 chunk 总数（取消时返回已写入数）
         """
         self._ensure_initialized()
 
@@ -283,31 +285,37 @@ class VectorStore:
                 break
 
         if not first_batch:
-            logger.info("VectorStore.add_streaming: no chunks to write (empty iterator)")
+            logger.info("  向量化写入: 无切片需要写入（空迭代器）")
+            return 0
+
+        # 第一批处理前检查取消标志
+        if is_cancelled is not None and is_cancelled():
+            logger.info("  向量化写入: 写入前检测到取消信号，跳过")
             return 0
 
         # Embed 第一批
+        logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
         first_records = self._embed_chunks(first_batch, 0)
+        logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
         table = self._ensure_table()
         if table is None:
             # 首次：创建表（用第一批 records）
             self._table = self._db.create_table(_TABLE_NAME, first_records)
             self._table_checked = True
-            logger.info("LanceDB table '%s' created (streaming) with %d records",
-                        _TABLE_NAME, len(first_records))
+            logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
             if on_batch:
                 on_batch(len(first_records), total)
             if exhausted:
+                logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
                 return total
         else:
             # 已有表：先按 source 删除旧记录
             existing_count = table.count_rows()
             sources_seen = {r["source"] for r in first_records}
             logger.info(
-                "VectorStore.add_streaming: opened existing table (%d rows), "
-                "replacing %d sources",
+                "  ├─ 向量库: 已有表 (%d 行), 将替换 %d 个来源的旧数据",
                 existing_count, len(sources_seen),
             )
             for source in sources_seen:
@@ -320,12 +328,14 @@ class VectorStore:
             try:
                 table.add(first_records)
                 total = len(first_records)
+                logger.info("  ├─ 向量库写入: 首批 %d 条记录", total)
                 if on_batch:
                     on_batch(len(first_records), total)
             except Exception as e:
-                logger.error("VectorStore: streaming add first batch failed: %s", e)
+                logger.error("  向量库写入失败(首批): %s", e)
                 raise
             if exhausted:
+                logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
                 return total
 
         # 后续批次：每批 embed 完立即写入，records 用完即释放
@@ -335,37 +345,50 @@ class VectorStore:
         for chunk in chunk_iter:
             batch_buf.append(chunk)
             if len(batch_buf) >= batch_size:
+                # 每批处理前检查取消标志
+                if is_cancelled is not None and is_cancelled():
+                    logger.info(
+                        "  ⚠ 向量化写入取消: 第 %d 批前, 已写入 %d 切片, 丢弃缓冲区 %d 切片",
+                        batch_num, total, len(batch_buf),
+                    )
+                    return total
+                batch_num += 1
+                logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
                 records = self._embed_chunks(batch_buf, chunk_idx)
                 try:
                     table.add(records)
                     total += len(records)
-                    batch_num += 1
-                    if batch_num % 5 == 0:  # 每 5 批打一次，避免日志爆炸
-                        logger.debug(
-                            "VectorStore.add_streaming: batch %d written, %d chunks total",
-                            batch_num, total,
-                        )
+                    logger.info("  ├─ 向量库写入: 第 %d 批 %d 条 (累计 %d)", batch_num, len(records), total)
                     if on_batch:
                         on_batch(len(records), total)
                 except Exception as e:
-                    logger.error("VectorStore: streaming add batch at idx %d failed: %s", chunk_idx, e)
+                    logger.error("  向量库写入失败(第 %d 批): %s", batch_num, e)
                     raise
                 chunk_idx += len(batch_buf)
                 batch_buf.clear()
         # 处理剩余
         if batch_buf:
+            # 处理剩余批次前检查取消标志
+            if is_cancelled is not None and is_cancelled():
+                logger.info(
+                    "  ⚠ 向量化写入取消: 最后批次前, 已写入 %d 切片, 丢弃缓冲区 %d 切片",
+                    total, len(batch_buf),
+                )
+                return total
+            batch_num += 1
+            logger.info("  ├─ 向量化: 最后批次 (%d 切片) 正在嵌入...", len(batch_buf))
             records = self._embed_chunks(batch_buf, chunk_idx)
             try:
                 table.add(records)
                 total += len(records)
-                batch_num += 1
+                logger.info("  ├─ 向量库写入: 最后批次 %d 条 (累计 %d)", len(records), total)
                 if on_batch:
                     on_batch(len(records), total)
             except Exception as e:
-                logger.error("VectorStore: streaming add final batch failed: %s", e)
+                logger.error("  向量库写入失败(最后批次): %s", e)
                 raise
 
-        logger.info("VectorStore: streaming added %d chunks total (%d batches)", total, batch_num)
+        logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
         return total
 
     def _embed_chunks(
@@ -402,36 +425,41 @@ class VectorStore:
         self._ensure_initialized()
         table = self._ensure_table()
         if table is None:
-            logger.info("VectorStore.search: table does not exist yet (query=%r)", query[:60])
+            logger.info("  向量检索: 向量表不存在 (查询=%r)", query[:60])
             return []
         row_count = table.count_rows()
         if row_count == 0:
-            logger.info("VectorStore.search: table exists but is empty (query=%r)", query[:60])
+            logger.info("  向量检索: 向量表为空 (查询=%r)", query[:60])
             return []
 
         # Embed query (use embed_query for proper prefix handling)
+        logger.info("  ├─ 查询向量化: 将查询文本转为向量...")
         if hasattr(self._ef, 'embed_query'):
             query_vec = _normalize(self._ef.embed_query(query))
         else:
             query_vec = _normalize(self._ef([query])[0])
 
         # Vector search
+        logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
         search = table.search(query_vec).limit(top_k)
         if where:
             search = search.where(where)
         results = search.to_list()
-        logger.debug(
-            "VectorStore.search: %d candidates from %d rows (top_k=%d)",
-            len(results), row_count, top_k,
-        )
+        logger.info("  ├─ 向量检索完成: 获得 %d 个候选切片", len(results))
 
         output: List[Dict[str, Any]] = []
         for r in results:
             # LanceDB 返回 _distance（L2 距离，越小越相似）。
             # 转换为相似度分数 [0,1]（越高越相似），统一下游接口语义。
-            distance = float(r.get("_distance", 0.0))
-            # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
-            similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
+            if "_distance" in r:
+                distance = float(r["_distance"])
+                # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
+                similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
+            else:
+                # _distance 字段缺失（罕见：表 schema 不兼容或旧表迁移）。
+                # 使用中等分数避免将无效结果排到最前或最后。
+                logger.debug("VectorStore.search: _distance field missing for result, using default score 0.5")
+                similarity = 0.5
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
@@ -450,19 +478,19 @@ class VectorStore:
         if not hasattr(self, "_reranker"):
             try:
                 from FlagEmbedding import FlagReranker
+                logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
                 self._reranker = FlagReranker(
                     self._rerank_model,
                     use_fp16=False,
                 )
-                logger.info("BGE reranker loaded: %s", self._rerank_model)
+                logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
             except ImportError:
                 logger.warning(
-                    "FlagEmbedding not installed — reranking disabled. "
-                    "pip install FlagEmbedding"
+                    "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
                 )
                 self._reranker = None
             except Exception as e:
-                logger.warning("Failed to load reranker: %s", e)
+                logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
                 self._reranker = None
         return self._reranker
 
@@ -484,26 +512,24 @@ class VectorStore:
         reranker = self._get_reranker()
         if reranker is None:
             # Fallback: candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
-            # 如果 score 仍是原始 L2 距离（向后兼容），用正确公式转换：
-            # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
-            logger.info("VectorStore.rerank: BGE reranker unavailable, using distance-based fallback")
+            logger.info("  ├─ 重排序: BGE Reranker 不可用, 使用向量距离排序 (回退模式)")
             for c in candidates:
                 try:
                     s = float(c.get("score", 0.0))
                 except (TypeError, ValueError):
-                    # score 不是合法数值（None/字符串等），置为 0 以免
-                    # 后续 sort 因类型不一致崩溃
                     c["score"] = 0.0
                     continue
-                # 如果 s > 1，说明是原始 L2 距离（相似度不会 > 1），用正确公式转换
                 if s > 1.0:
                     c["score"] = max(0.0, 1.0 - (s * s) / 2.0)
                 else:
                     c["score"] = s
             candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-            return candidates[:top_k]
+            result = candidates[:top_k]
+            logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
+            return result
 
         # Build pairs for reranker
+        logger.info("  ├─ BGE Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
         pairs = [[query, c["text"]] for c in candidates]
         # normalize=True applies sigmoid so scores land in [0, 1].
         scores = reranker.compute_score(pairs, normalize=True)
@@ -522,6 +548,13 @@ class VectorStore:
         results = candidates[:top_k]
         for r in results:
             r["score"] = r.get("rerank_score", r.get("score", 0))
+
+        # 输出重排序前后的分数变化
+        if results:
+            logger.info("  ├─ BGE 重排序完成: %d → %d 条结果", len(candidates), len(results))
+            for i, r in enumerate(results[:3]):
+                source = os.path.basename(r.get("source", ""))
+                logger.info("  │   [%d] %s (重排序分: %.4f)", i + 1, source, r["score"])
         return results
 
     def search_with_rerank(

@@ -50,14 +50,18 @@ def _load_manifest(rag_dir: str) -> Dict[str, Dict[str, Any]]:
     """
     path = _manifest_path(rag_dir)
     if not os.path.exists(path):
+        logger.debug("RAG: manifest not found at %s (first sync)", path)
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("files"), dict):
+            logger.debug("RAG: loaded manifest with %d entries from %s", len(data["files"]), path)
             return data["files"]
+        logger.warning("RAG: manifest has unexpected format, ignoring")
         return {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("RAG: failed to load manifest: %s", e)
         return {}
 
 
@@ -154,6 +158,7 @@ class RAGEngine:
 
     def cancel(self) -> None:
         """请求取消正在进行的 ingest。各阶段检查 _cancelled 后提前退出。"""
+        logger.info("RAG: cancel requested")
         self._cancelled.set()
 
     def _reset_cancel(self) -> None:
@@ -190,10 +195,20 @@ class RAGEngine:
             logger.warning("RAG ingest: knowledge base dir not found: %s", self._knowledge_base)
             return {"error": f"Knowledge base directory not found: {self._knowledge_base}"}
 
+        t_start = time.monotonic()
         logger.info(
-            "RAG ingest start: kb=%s force=%s workers=%d chunk_size=%d overlap=%d",
-            self._knowledge_base, force, self._parallel_workers,
-            self._chunk_size, self._chunk_overlap,
+            "══════════════════════════════════════════"
+        )
+        logger.info(
+            "▶ 知识库同步开始: 目录=%s 模式=%s 并发数=%d 切片大小=%d 重叠=%d",
+            self._knowledge_base,
+            "强制全量" if force else "增量同步",
+            self._parallel_workers,
+            self._chunk_size,
+            self._chunk_overlap,
+        )
+        logger.info(
+            "══════════════════════════════════════════"
         )
         os.makedirs(self._rag_dir, exist_ok=True)
         os.makedirs(self._markdown_dir, exist_ok=True)
@@ -212,16 +227,23 @@ class RAGEngine:
         stats_lock = threading.Lock()
 
         # Step 1: 扫描知识库目录，收集所有支持的文件
-        logger.info("RAG: scanning %s", self._knowledge_base)
+        logger.info("━━━ Step 1/6: 扫描知识库目录 ━━━")
+        logger.info("  正在扫描: %s", self._knowledge_base)
         root = Path(self._knowledge_base)
         all_files: List[str] = []
+        ext_counts: Dict[str, int] = {}
         for fp in root.rglob("*"):
             if (fp.is_file()
                     and fp.suffix.lower() in SUPPORTED_EXTENSIONS
                     and not fp.name.startswith(".")):
                 all_files.append(str(fp))
+                ext = fp.suffix.lower()
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
         total_files = len(all_files)
         stats["files_found"] = total_files
+        # 按文件类型汇总
+        ext_summary = ", ".join(f"{ext}({cnt})" for ext, cnt in sorted(ext_counts.items()))
+        logger.info("  扫描完成: 共发现 %d 个文件 [%s]", total_files, ext_summary if ext_summary else "无")
         if total_files == 0:
             # Even with no files, clean up manifest entries for deleted sources
             # and save the (now empty) manifest so the deletion persists.
@@ -238,9 +260,16 @@ class RAGEngine:
             return stats
 
         # Step 2: load manifest and partition files into "to-process" vs "skip"
+        logger.info("━━━ Step 2/6: 增量对比（Manifest） ━━━")
         manifest = _load_manifest(self._rag_dir)
+        if manifest:
+            logger.info("  已加载同步记录: %d 个文件有历史记录", len(manifest))
+        else:
+            logger.info("  无历史同步记录，将全量处理")
         new_manifest: Dict[str, Dict[str, Any]] = {}
         files_to_process: List[str] = []  # new/modified files needing full pipeline
+        skipped_detail: List[str] = []
+        new_detail: List[str] = []
         for filepath in all_files:
             sig = _file_signature(filepath)
             prev = manifest.get(filepath)
@@ -252,13 +281,23 @@ class RAGEngine:
                 new_manifest[filepath] = prev
                 with stats_lock:
                     stats["files_skipped"] += 1
+                skipped_detail.append(f"  ✓ 跳过(未修改): {os.path.basename(filepath)}")
                 if progress_callback is not None:
                     progress_callback(stats["files_extracted"] + stats["files_skipped"],
                                       total_files, os.path.basename(filepath))
             else:
                 files_to_process.append(filepath)
+                reason = "新增" if prev is None else "已修改"
+                new_detail.append(f"  → 待处理({reason}): {os.path.basename(filepath)}")
+        # 汇总输出
+        if skipped_detail:
+            for line in skipped_detail:
+                logger.info(line)
+        if new_detail:
+            for line in new_detail:
+                logger.info(line)
         logger.info(
-            "RAG: %d files found, %d to process, %d unchanged (skipped)",
+            "  对比结果: 总计%d 文件, %d 个待处理, %d 个跳过(未修改)",
             total_files, len(files_to_process), stats["files_skipped"],
         )
 
@@ -267,37 +306,48 @@ class RAGEngine:
         # Step 3: worker 并行解析+chunk，主线程消费并增量写入
         # 只有 files_to_process 才进入 worker 池——跳过的文件不解析不 chunk
         if files_to_process:
+            logger.info("━━━ Step 3/6: 解析文档 + 清洗 + 切片（%d 个文件，%d 个并行 Worker） ━━━",
+                        len(files_to_process), self._parallel_workers)
             q: "queue.Queue[Any]" = queue.Queue(maxsize=self._parallel_workers * _QUEUE_CAPACITY_FACTOR)
+
+            # 全局文件序号计数器（用于日志显示 "文件 3/10"）
+            _file_counter = [0]  # 用 list 包装以在闭包中修改
+            _file_counter_lock = threading.Lock()
 
             def _worker(filepaths: List[str]) -> None:
                 """单个 worker：处理分配给它的文件列表，把 chunks 推入队列。"""
+                worker_id = threading.get_ident()
+                logger.info("  [Worker-%d] 启动，负责 %d 个文件", worker_id % 1000, len(filepaths))
                 try:
                     for filepath in filepaths:
                         if self._is_cancelled():
+                            logger.info("  [Worker-%d] 收到取消信号，退出", worker_id % 1000)
                             return
+                        # 获取全局文件序号
+                        with _file_counter_lock:
+                            _file_counter[0] += 1
+                            file_no = _file_counter[0]
+                        fname = os.path.basename(filepath)
                         t0 = time.monotonic()
+                        logger.info("  [%d/%d] 开始处理: %s", file_no, len(files_to_process), fname)
                         try:
-                            # ---- 整个文件处理流程（extract → clean → chunk → put）----
-                            # 包在一个 try 块中，任何阶段出错都记录到 errors
-                            # 并跳过该文件，而不是让 worker 静默退出。
+                            # ---- 1. 解析文件 ----
+                            logger.info("    ├─ 解析文件: %s", fname)
                             text = extract_text(filepath)
+                            t_extract = time.monotonic() - t0
+                            logger.info("    ├─ 解析完成: %s (提取 %d 字符, 耗时 %.2fs)", fname, len(text), t_extract)
                         except Exception as e:
                             msg = f"{os.path.basename(filepath)}: {e}"
-                            logger.warning("RAG: extract failed for '%s' after %.2fs: %s",
-                                           filepath, time.monotonic() - t0, e)
+                            logger.warning("    └─ ❌ 解析失败: %s (耗时 %.2fs): %s", fname, time.monotonic() - t0, e)
                             with stats_lock:
                                 stats["errors"].append(msg)
                             continue
                         if not text.strip():
                             msg = f"{os.path.basename(filepath)}: extracted text is empty"
-                            logger.warning(msg)
+                            logger.warning("    └─ ⚠ 提取文本为空: %s", fname)
                             with stats_lock:
                                 stats["errors"].append(msg)
                             continue
-                        logger.debug(
-                            "RAG: extracted %s (%d chars in %.2fs)",
-                            os.path.basename(filepath), len(text), time.monotonic() - t0,
-                        )
                         # clean → chunk → put 包在 try 中，避免 clean_text/
                         # normalize_markdown/chunk_documents 异常导致 worker
                         # 静默退出（异常会丢失，不记录到 stats["errors"]）。
@@ -308,24 +358,39 @@ class RAGEngine:
                             if (not force
                                     and os.path.exists(md_path)
                                     and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
+                                # ---- 2. 使用缓存的 Markdown ----
                                 try:
                                     with open(md_path, "r", encoding="utf-8") as f:
                                         cleaned = f.read()
+                                    logger.info("    ├─ 清洗文本: %s (使用缓存 Markdown, %d 字符)", fname, len(cleaned))
                                 except OSError:
                                     cleaned = ""
-                            else:
+                            if not (not force and os.path.exists(md_path)
+                                    and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
+                                # ---- 2. 清洗文本 ----
+                                t_clean = time.monotonic()
+                                logger.info("    ├─ 清洗文本: %s (原始 %d 字符)", fname, len(text))
                                 cleaned = clean_text(text)
+                                t_clean_end = time.monotonic()
+                                logger.info("    ├─ 清洗完成: %s → %d 字符 (耗时 %.2fs)", fname, len(cleaned), t_clean_end - t_clean)
+                                # ---- 3. 转换为 Markdown ----
+                                logger.info("    ├─ 转换 Markdown: %s", fname)
                                 cleaned = normalize_markdown(cleaned)
+                                logger.info("    ├─ Markdown 完成: %s (%d 字符)", fname, len(cleaned))
                                 try:
                                     with open(md_path, "w", encoding="utf-8") as f:
                                         f.write(cleaned)
+                                    logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
-                                    logger.warning("RAG: failed to write markdown cache for %s: %s", filepath, e)
+                                    logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
                             del text
 
                             if not cleaned.strip():
+                                logger.warning("    └─ ⚠ 清洗后文本为空: %s", fname)
                                 continue
 
+                            # ---- 4. 文档切片 ----
+                            t_chunk = time.monotonic()
                             c_hash = _content_hash(cleaned)
                             cleaned_len = len(cleaned)
                             doc_chunks = chunk_documents(
@@ -333,16 +398,17 @@ class RAGEngine:
                                 chunk_size=self._chunk_size,
                                 chunk_overlap=self._chunk_overlap,
                             )
-                            logger.debug(
-                                "RAG: chunked %s → %d chunks in %.2fs",
-                                os.path.basename(filepath), len(doc_chunks),
-                                time.monotonic() - t0,
+                            t_chunk_end = time.monotonic()
+                            logger.info(
+                                "    ├─ 文档切片: %s → %d 个切片 (每片约 %d tokens, 重叠 %d tokens, 耗时 %.2fs)",
+                                fname, len(doc_chunks), self._chunk_size, self._chunk_overlap,
+                                t_chunk_end - t_chunk,
                             )
                             del cleaned
                         except Exception as e:
                             # clean/chunk 阶段异常：记录并跳过该文件，不中断整个同步。
                             msg = f"{os.path.basename(filepath)}: clean/chunk failed: {e}"
-                            logger.error("RAG: %s", msg, exc_info=True)
+                            logger.error("    └─ ❌ 清洗/切片失败: %s: %s", fname, e, exc_info=True)
                             with stats_lock:
                                 stats["errors"].append(msg)
                             continue
@@ -350,6 +416,12 @@ class RAGEngine:
                         with stats_lock:
                             stats["files_extracted"] += 1
                             stats["total_chars"] += cleaned_len
+
+                        # 文件处理完成总耗时
+                        logger.info(
+                            "    └─ ✅ 文件处理完成: %s (%d 切片, 总耗时 %.2fs)",
+                            fname, len(doc_chunks), time.monotonic() - t0,
+                        )
 
                         if self._is_cancelled():
                             return
@@ -371,12 +443,13 @@ class RAGEngine:
                         del doc_chunks, item
                 except Exception as e:
                     # 兜底：任何未预期的异常都记录，避免 worker 静默死亡。
-                    logger.error("RAG worker unexpected error: %s", e, exc_info=True)
+                    logger.error("  [Worker-%d] 异常退出: %s", worker_id % 1000, e, exc_info=True)
                     with stats_lock:
                         stats["errors"].append(f"worker: {e}")
                 finally:
                     # 投递哨兵也要带超时，防止队列满且主线程已退出消费时
                     # worker 永久卡在 put。
+                    logger.info("  [Worker-%d] 完成所有文件，发送完成信号", worker_id % 1000)
                     try:
                         q.put(_SENTINEL, timeout=5.0)
                     except queue.Full:
@@ -396,38 +469,43 @@ class RAGEngine:
                 threads.append(t)
 
             # Step 4: 主线程消费队列，逐文件增量写入 vector store
+            logger.info("━━━ Step 4/6: 向量化 + 存入向量库 ━━━")
             def _chunk_iter() -> Iterator[Dict[str, Any]]:
                 sentinels_seen = 0
                 expected_sentinels = self._parallel_workers
                 empty_streak = 0
+                # 使用较短的 q.get 超时（0.5s），确保取消后最多 0.5s 内能响应。
+                _QGET_TIMEOUT = 0.5
+                # 总超时 = empty_streak * _QGET_TIMEOUT，设为 15s（30 次 × 0.5s）
+                _MAX_EMPTY_STREAK = 30
+                consumer_file_no = 0
                 while sentinels_seen < expected_sentinels:
                     if self._is_cancelled():
                         return
                     try:
-                        item = q.get(timeout=2.0)
+                        item = q.get(timeout=_QGET_TIMEOUT)
                         empty_streak = 0
                     except queue.Empty:
                         empty_streak += 1
-                        # Safety: if the queue has been empty for a long time
-                        # AND all worker threads have exited, a sentinel was
-                        # likely lost (worker couldn't put it due to a full
-                        # queue + cancellation). Exit to avoid hanging forever.
-                        if empty_streak >= 5 and all(not t.is_alive() for t in threads):
+                        if empty_streak >= _MAX_EMPTY_STREAK and all(not t.is_alive() for t in threads):
                             logger.warning(
-                                "RAG: %d/%d sentinels received, all workers done — "
-                                "exiting consumer (sentinel likely lost)",
+                                "  向量化消费者: %d/%d 个 Worker 完成信号已收到, 所有 Worker 已退出, 退出消费",
                                 sentinels_seen, expected_sentinels,
                             )
                             return
                         continue
                     if item is _SENTINEL:
                         sentinels_seen += 1
+                        logger.info("  收到 Worker 完成信号 (%d/%d)", sentinels_seen, expected_sentinels)
                         continue
                     filepath, doc_chunks, c_hash, n_chunks = item
+                    consumer_file_no += 1
+                    fname = os.path.basename(filepath)
+                    logger.info(
+                        "  [消费 %d] 向量化排队: %s (%d 个切片等待嵌入)",
+                        consumer_file_no, fname, n_chunks,
+                    )
                     # Update manifest for this processed file.
-                    # _file_signature 可能因文件被删除/权限问题抛 OSError，
-                    # 隔离异常避免整个 ingest 失败——跳过 manifest 更新即可，
-                    # chunks 已写入向量库，下次同步会重新处理（manifest 未更新）。
                     try:
                         new_manifest[filepath] = {
                             **_file_signature(filepath),
@@ -439,7 +517,6 @@ class RAGEngine:
                     for c in doc_chunks:
                         yield c
                     # 进度反馈：每消费完一个文件回调一次。
-                    # 隔离回调异常，避免 UI 端异常中断整个 ingest。
                     if progress_callback is not None:
                         try:
                             with stats_lock:
@@ -449,59 +526,105 @@ class RAGEngine:
                             logger.warning("RAG: progress_callback error: %s", e)
 
             def _on_batch(batch_added: int, total_added: int) -> None:
+                logger.info("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:
                     try:
                         progress_callback(stats["files_extracted"] + stats["files_skipped"],
-                                          total_files, f"已写入 {total_added} chunks")
+                                          total_files, f"已写入 {total_added} 切片")
                     except Exception as e:
                         logger.warning("RAG: on_batch callback error: %s", e)
 
             try:
-                logger.info("RAG: starting add_streaming (batch_size=100)")
-                added = store.add_streaming(_chunk_iter(), batch_size=100, on_batch=_on_batch)
+                logger.info("  开始流式向量化写入 (每批 %d 个切片)", 100)
+                added = store.add_streaming(
+                    _chunk_iter(),
+                    batch_size=100,
+                    on_batch=_on_batch,
+                    is_cancelled=self._is_cancelled,
+                )
                 stats["chunks"] = added
-                logger.info("RAG: add_streaming complete — %d chunks written", added)
+                logger.info("  向量化写入完成: 共 %d 个切片已存入向量库", added)
             except Exception as e:
-                logger.error("RAG: streaming add failed: %s", e, exc_info=True)
-                # Cancel workers so they stop producing chunks into a queue
-                # that no one is consuming. Without this, workers keep running
-                # (blocked on q.put with timeout loops) until they've processed
-                # all their files — wasting CPU and holding memory.
+                logger.error("  向量化写入失败: %s", e, exc_info=True)
                 self.cancel()
                 stats["chunks"] = store.count()
                 stats["errors"].append(f"Vector store add failed: {e}")
 
             # 等待所有 worker 线程结束
-            for t in threads:
+            logger.info("  等待所有 Worker 线程结束...")
+            for i, t in enumerate(threads):
                 t.join(timeout=5.0)
+                if t.is_alive():
+                    logger.warning("  Worker 线程 %d 未在 5s 内结束", i + 1)
+            logger.info("  所有 Worker 线程已结束")
         else:
             # All files skipped — no new chunks written. Report current store count.
             stats["chunks"] = store.count()
-            logger.info("RAG: all %d files skipped (already synced)", total_files)
+            logger.info("  所有 %d 个文件均未修改，无需重新处理", total_files)
 
-        if self._is_cancelled():
+        cancelled = self._is_cancelled()
+        if cancelled:
             stats["cancelled"] = True
             stats["chunks"] = store.count()
-            logger.info("RAG ingest cancelled: %d/%d files extracted, %d chunks stored",
+            logger.info("⚠ 同步已被用户取消: %d/%d 文件已提取, %d 切片已存储",
                         stats["files_extracted"], stats["files_found"], stats["chunks"])
-            return stats
 
         # Step 5: 清理已删除文件对应的旧向量 + manifest 条目
+        logger.info("━━━ Step 5/6: 清理已删除文件 ━━━")
         self._cleanup_deleted_files(all_files, stats, stats_lock, manifest, new_manifest)
+        if stats["files_deleted"] > 0:
+            logger.info("  已清理 %d 个已删除文件的旧向量", stats["files_deleted"])
+        else:
+            logger.info("  无已删除文件需要清理")
 
-        # Step 6: 保存 manifest（即使全部 skip 也保存，以更新删除的条目）
+        # Step 6: 保存 manifest
+        logger.info("━━━ Step 6/6: 保存同步记录 ━━━")
         try:
             _save_manifest(self._rag_dir, new_manifest)
-            logger.info("RAG: manifest saved (%d entries) to %s",
+            logger.info("  同步记录已保存: %d 个文件条目 → %s",
                         len(new_manifest), _manifest_path(self._rag_dir))
         except OSError as e:
-            logger.warning("RAG: failed to save manifest: %s", e)
+            logger.warning("  同步记录保存失败: %s", e)
 
+        if cancelled:
+            t_total = time.monotonic() - t_start
+            logger.info(
+                "══════════════════════════════════════════"
+            )
+            logger.info(
+                "⏹ 知识库同步已取消 (耗时 %.1fs): 扫描 %d 文件, 提取 %d, 跳过 %d, 切片 %d",
+                t_total, stats["files_found"], stats["files_extracted"],
+                stats["files_skipped"], stats["chunks"],
+            )
+            logger.info(
+                "══════════════════════════════════════════"
+            )
+            return stats
+
+        t_total = time.monotonic() - t_start
         logger.info(
-            "RAG ingestion complete: %d found, %d extracted, %d skipped, "
-            "%d deleted, %d chunks stored (cancelled=%s)",
-            stats["files_found"], stats["files_extracted"], stats["files_skipped"],
-            stats["files_deleted"], stats["chunks"], stats["cancelled"],
+            "══════════════════════════════════════════"
+        )
+        logger.info(
+            "✅ 知识库同步完成 (耗时 %.1fs)", t_total,
+        )
+        logger.info(
+            "   扫描文件: %d | 新增/更新: %d | 跳过(未修改): %d | 清理删除: %d",
+            stats["files_found"], stats["files_extracted"],
+            stats["files_skipped"], stats["files_deleted"],
+        )
+        logger.info(
+            "   总字符数: %d | 向量切片: %d | 错误: %d",
+            stats["total_chars"], stats["chunks"], len(stats.get("errors", [])),
+        )
+        if stats.get("errors"):
+            logger.info("   错误详情:")
+            for err in stats["errors"][:10]:
+                logger.info("     - %s", err)
+            if len(stats["errors"]) > 10:
+                logger.info("     ... (还有 %d 个错误)", len(stats["errors"]) - 10)
+        logger.info(
+            "══════════════════════════════════════════"
         )
         return stats
 
@@ -526,13 +649,14 @@ class RAGEngine:
         removed = [fp for fp in old_manifest if fp not in current_set]
         if not removed:
             return
+        logger.info("  发现 %d 个已删除文件，清理对应向量...", len(removed))
         store = self._get_store()
         for source in removed:
             store.delete_by_source(source)
             new_manifest.pop(source, None)
             with stats_lock:
                 stats["files_deleted"] += 1
-            logger.info("RAG: removed deleted file from store: %s", source)
+            logger.info("  🗑 已清理: %s", os.path.basename(source))
 
     # ------------------------------------------------------------------
     # retrieval
@@ -548,17 +672,24 @@ class RAGEngine:
         store = self._get_store()
         store_count = store.count()
         if store_count == 0:
-            logger.info("RAG search: store empty, returning 0 results (query=%r)", query[:60])
+            logger.info("🔍 知识库检索: 向量库为空，无结果返回 (查询=%r)", query[:60])
             return []
         logger.info(
-            "RAG search: query=%r top_k=%d store_count=%d",
-            query[:60], top_k, store_count,
+            "🔍 知识库检索开始: 查询=%r 目标结果数=%d 向量库总量=%d",
+            query[:80], top_k, store_count,
         )
+        logger.info("  ├─ 初检: 从 %d 个向量中检索 top %d 候选", store_count, top_k * 4)
         results = store.search_with_rerank(query, top_k=top_k)
-        logger.info(
-            "RAG search: returned %d results in %.2fs",
-            len(results), time.monotonic() - t0,
-        )
+        t_total = time.monotonic() - t0
+        if results:
+            logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)
+            for i, r in enumerate(results, 1):
+                source = os.path.basename(r.get("source", ""))
+                score = r.get("score", 0)
+                text_preview = r.get("text", "")[:80].replace("\n", " ")
+                logger.info("      [%d] %s (相关度: %.4f) | %s...", i, source, score, text_preview)
+        else:
+            logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
 
     def search_formatted(self, query: str, top_k: int = 3) -> str:
@@ -582,16 +713,20 @@ class RAGEngine:
     def status(self) -> Dict[str, Any]:
         """Return current status of the knowledge base."""
         store = self._get_store()
+        chunk_count = store.count()
+        sources = store.list_sources()
+        logger.info("📊 知识库状态查询: 切片数=%d 来源文件数=%d", chunk_count, len(sources))
         return {
             "knowledge_base": self._knowledge_base,
             "rag_dir": self._rag_dir,
-            "chunks_stored": store.count(),
-            "sources": store.list_sources(),
+            "chunks_stored": chunk_count,
+            "sources": sources,
             "has_knowledge_base": bool(self._knowledge_base and os.path.isdir(self._knowledge_base)),
         }
 
     def clear(self) -> None:
         """Clear all stored vectors, cached markdown files, and manifest."""
+        logger.info("🗑 正在清空知识库...")
         store = self._get_store()
         store.clear()
         # Also clear cached markdown
@@ -599,15 +734,17 @@ class RAGEngine:
             import shutil
             shutil.rmtree(self._markdown_dir, ignore_errors=True)
             os.makedirs(self._markdown_dir, exist_ok=True)
+            logger.info("  已清除缓存 Markdown 文件")
         # Clear the incremental-sync manifest so the next ingest processes
         # everything from scratch (no stale "already processed" entries).
         manifest = _manifest_path(self._rag_dir)
         if os.path.exists(manifest):
             try:
                 os.remove(manifest)
+                logger.info("  已清除同步记录文件")
             except OSError as e:
-                logger.warning("RAG: failed to remove manifest: %s", e)
-        logger.info("RAG: knowledge base cleared")
+                logger.warning("  同步记录文件删除失败: %s", e)
+        logger.info("  知识库已清空")
 
     def close(self) -> None:
         """Release the underlying VectorStore's resources.

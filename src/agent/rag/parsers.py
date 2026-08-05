@@ -55,6 +55,21 @@ def extract_text(filepath: str) -> str:
         raise FileNotFoundError(f"File not found: {filepath}")
     suffix = path.suffix.lower()
 
+    # 文件类型→解析器映射（用于日志）
+    _PARSER_LABELS = {
+        ".docx": "Word 文档", ".doc": "Word 文档",
+        ".xlsx": "Excel 表格", ".xls": "Excel 表格",
+        ".pptx": "PPT 幻灯片", ".ppt": "PPT 幻灯片",
+        ".pdf": "PDF 文档",
+        ".epub": "EPUB 电子书",
+        ".mobi": "MOBI 电子书", ".azw3": "AZW3 电子书", ".azw": "AZW 电子书",
+        ".txt": "纯文本", ".md": "Markdown", ".markdown": "Markdown", ".rst": "reStructuredText",
+        ".csv": "CSV 表格", ".tsv": "TSV 表格",
+        ".html": "HTML 网页", ".htm": "HTML 网页",
+    }
+    label = _PARSER_LABELS.get(suffix, suffix)
+    logger.debug("    解析文件类型: %s (%s)", path.name, label)
+
     if suffix in (".docx", ".doc"):
         return _extract_docx(path)
     elif suffix in (".xlsx", ".xls"):

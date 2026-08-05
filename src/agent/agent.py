@@ -137,12 +137,17 @@ class Agent:
         self._shrink_keep_recent = 6
         self._history: List[Dict[str, Any]] = []
         self._total_tokens = 0
+        self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._history = []
         self._total_tokens = 0
+        self._history_token_count = 0
+        # Invalidate cached prompt
+        self._cached_prompt_turn = -1
+        self._cached_prompt = ""
 
     def history(self) -> List[Dict[str, Any]]:
         return list(self._history)
@@ -160,33 +165,49 @@ class Agent:
         cut = len(self._history) - limit
         while cut < len(self._history) and self._history[cut].get("role") == "tool":
             cut += 1
+        # Update incremental token counter for removed messages.
+        for msg in self._history[:cut]:
+            self._history_token_count -= self._msg_token_count(msg)
         del self._history[:cut]
 
     # ------------------------------------------------------------------
     # Context-size estimation and shrink strategy
     # ------------------------------------------------------------------
+    # Incremental counter to avoid O(n) re-scan of _history on every turn.
+    # Updated via _add_history_token_count / _set_history_token_count.
+    # _history_token_count caches the total without system prompt.
+    _history_token_count: int = 0
+
+    def _msg_token_count(self, msg: Dict[str, Any]) -> int:
+        """Token count for a single message (role + content + tool_calls)."""
+        count = 4  # role + structural overhead per message
+        content = msg.get("content")
+        if isinstance(content, str):
+            count += _estimate_tokens(content)
+        elif content:
+            count += _estimate_tokens(json.dumps(content, ensure_ascii=False))
+        tcs = msg.get("tool_calls") or []
+        for tc in tcs:
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            count += _estimate_tokens(fn.get("name", ""))
+            count += _estimate_tokens(fn.get("arguments", "") or "")
+        return count
 
     def _estimate_history_tokens(self) -> int:
         """Estimate the token count of the full prompt (system + history).
 
-        Includes role overhead per message (~4 tokens) and tool_call function
-        names/arguments, since those count against the model's context window
-        even though they aren't in `content`.
+        Uses the incrementally-maintained _history_token_count for the
+        history portion, and recomputes the system prompt (which is cached
+        per-turn by _system_prompt). Falls back to O(n) scan if the
+        incremental counter is out of sync (e.g. after _shrink_context).
         """
-        total = _estimate_tokens(self._system_prompt())
+        system_tokens = _estimate_tokens(self._system_prompt())
+        if self._history_token_count >= 0:
+            return system_tokens + self._history_token_count
+        # Fallback: full scan (shouldn't normally happen).
+        total = system_tokens
         for msg in self._history:
-            content = msg.get("content")
-            if isinstance(content, str):
-                total += _estimate_tokens(content)
-            elif content:  # list/dict content (rare here, but defensive)
-                total += _estimate_tokens(json.dumps(content, ensure_ascii=False))
-            # tool_calls add tokens beyond content
-            tcs = msg.get("tool_calls") or []
-            for tc in tcs:
-                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                total += _estimate_tokens(fn.get("name", ""))
-                total += _estimate_tokens(fn.get("arguments", "") or "")
-            total += 4  # role + structural overhead per message
+            total += self._msg_token_count(msg)
         return total
 
     def _should_shrink_context(self) -> bool:
@@ -296,6 +317,11 @@ class Agent:
             ),
         }
         self._history = [summary_msg] + list(recent_messages)
+        # Recompute incremental counter after shrink (cheaper than full O(n) scan
+        # on every turn, and only runs when context actually shrinks).
+        self._history_token_count = 0
+        for msg in self._history:
+            self._history_token_count += self._msg_token_count(msg)
 
         self._log(
             f"[context] shrunk: removed {len(old_messages)} old msgs, "
@@ -416,6 +442,10 @@ class Agent:
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
         """Process one user turn. Returns the final assistant content."""
+        self._turn_idx += 1
+        # Invalidate per-turn cached prompt so it's rebuilt with current memory/skills.
+        self._cached_prompt_turn = -1
+        self._cached_prompt = ""
         self._log(f"USER: {user_input}")
 
         # skill suggestion (固化) - non-blocking
@@ -427,6 +457,7 @@ class Agent:
             self._log(f"[skills] record_request error: {e}")
 
         self._history.append({"role": "user", "content": user_input})
+        self._history_token_count += self._msg_token_count(self._history[-1])
 
         self._trim_history()
 
@@ -619,6 +650,7 @@ class Agent:
                         tc["id"] = f"call_{self._tool_call_counter}_{idx}"
                 assistant_msg["tool_calls"] = tool_calls
             self._history.append(assistant_msg)
+            self._history_token_count += self._msg_token_count(self._history[-1])
             final_content = assistant_msg.get("content") or ""
 
             if not tool_calls:
@@ -645,7 +677,9 @@ class Agent:
                     self.callbacks.on_tool_start(name, {"_raw_arguments": raw_args})
                     res = ToolResult(False, error=str(e))
                     self.callbacks.on_tool_end(name, res)
-                    self._history.append(self._tool_message(tc, res))
+                    msg = self._tool_message(tc, res)
+                    self._history.append(msg)
+                    self._history_token_count += self._msg_token_count(msg)
                     continue
 
                 tool = self.tools.get(name)
@@ -658,7 +692,9 @@ class Agent:
                     self.callbacks.on_tool_start(name, args)
                     res = self.tools.execute(name, args)  # returns unknown error
                     self.callbacks.on_tool_end(name, res)
-                    self._history.append(self._tool_message(tc, res))
+                    msg = self._tool_message(tc, res)
+                    self._history.append(msg)
+                    self._history_token_count += self._msg_token_count(msg)
                     continue
 
                 if needs_confirm:
@@ -672,7 +708,9 @@ class Agent:
                         # that "never started" semantics are preserved.
                         res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
                         self.callbacks.on_tool_end(name, res)
-                        self._history.append(self._tool_message(tc, res))
+                        msg = self._tool_message(tc, res)
+                        self._history.append(msg)
+                        self._history_token_count += self._msg_token_count(msg)
                         continue
 
                 self.callbacks.on_tool_start(name, args)
@@ -680,7 +718,9 @@ class Agent:
                 self.callbacks.on_tool_end(name, res)
                 self._log(f"[tool] {name} -> success={res.success} "
                           f"out_len={len(res.output)} err={(res.error or '')[:120]}")
-                self._history.append(self._tool_message(tc, res))
+                msg = self._tool_message(tc, res)
+                self._history.append(msg)
+                self._history_token_count += self._msg_token_count(msg)
 
         self._log("[agent] max iterations reached, stopping.")
         self.callbacks.on_finished()
@@ -693,6 +733,18 @@ class Agent:
         return msgs
 
     def _system_prompt(self) -> str:
+        """Build the full system prompt: base + memory + matched skill.
+
+        Caches the prompt within a single agent turn (self._turn_idx) so that
+        _estimate_history_tokens() and _build_messages() don't recompute it
+        twice for the same turn.  Memory and skill match results are stable
+        within one LLM call cycle.
+        """
+        if (hasattr(self, "_cached_prompt_turn")
+                and self._cached_prompt_turn == self._turn_idx
+                and hasattr(self, "_cached_prompt")):
+            return self._cached_prompt
+
         base = SYSTEM_PROMPT
         try:
             from .tools.memory import _work_memory, _long_memory
@@ -720,6 +772,9 @@ class Agent:
                 base += f"\n\n# Active skill: {matched.name}\n{matched.prompt}"
         except Exception:  # pragma: no cover
             pass
+
+        self._cached_prompt_turn = self._turn_idx
+        self._cached_prompt = base
         return base
 
     def _tool_message(self, tool_call: Dict[str, Any], result) -> Dict[str, Any]:
