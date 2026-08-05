@@ -48,8 +48,30 @@ class AgentConfig:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             known = {k for k in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-            return cls(**{k: v for k, v in data.items() if k in known})
+            cfg = cls(**{k: v for k, v in data.items() if k in known})
+            cfg._migrate()
+            return cfg
         return cls()
+
+    def _migrate(self) -> None:
+        """Normalize obsolete config values from older versions.
+
+        Runs after loading from disk so that stale values saved before a
+        migration don't break the current code. Silently rewrites the
+        in-memory config; the next ``save()`` persists the fix.
+        """
+        # Pre-LanceDB era used sentence-transformers model names or
+        # ChromaDB defaults that FastEmbed doesn't recognize. Map any
+        # unsupported embedding model to the current default.
+        _DEPRECATED_EMBEDDING_MODELS = {
+            "all-MiniLM-L6-v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "BAAI/bge-small-zh-v1.5",
+            "BAAI/bge-large-zh-v1.5",
+            "",
+        }
+        if self.rag_embedding_model in _DEPRECATED_EMBEDDING_MODELS:
+            self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5"
 
     def save(self, path: str) -> None:
         import json
