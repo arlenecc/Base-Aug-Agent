@@ -138,6 +138,7 @@ class ToolRegistry:
         """Initialize RAG engine and register RAG tools."""
         kb = getattr(self.config, "knowledge_base", "") or ""
         if not kb:
+            logger.debug("RAG tools not registered: no knowledge_base configured")
             return
 
         try:
@@ -147,6 +148,11 @@ class ToolRegistry:
             logger.warning("RAG module not available: %s", e)
             return
 
+        logger.info(
+            "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
+            self.config.workspace, kb,
+            getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5"),
+        )
         engine = RAGEngine(
             workspace=self.config.workspace,
             knowledge_base=kb,
@@ -154,26 +160,38 @@ class ToolRegistry:
         )
         self._rag_engine = engine
 
+        registered = []
         for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine)]:
             if t.name not in self._tools:
                 t.bind(self.config, self)
                 self._tools[t.name] = t
+                registered.append(t.name)
+        logger.info("RAG: tools registered: %s", ", ".join(registered))
 
-        # Auto-ingest if configured
-        if getattr(self.config, "rag_auto_ingest", True):
-            try:
-                stats = engine.ingest(force=False)
-                logger.info(
-                    "RAG auto-ingest: %d files processed, %d chunks",
-                    stats.get("files_extracted", 0) + stats.get("files_skipped", 0),
-                    stats.get("chunks", 0),
-                )
-            except Exception as e:
-                logger.warning("RAG auto-ingest error: %s", e)
+        # NOTE: auto-ingest is intentionally NOT performed here.
+        # _register_rag_tools() runs in ToolRegistry.__init__, which is called
+        # from the UI main thread (via _rebuild_agent). Synchronous ingest would
+        # block the UI for minutes on first run (model download + parsing +
+        # embedding of all files). The UI provides SyncKnowledgeWorker (async,
+        # on a background thread) for this purpose. For non-UI usage, call
+        # engine.ingest() explicitly after construction.
 
     def get_rag_engine(self):
         """Return the RAG engine instance, or None if not configured."""
         return self._rag_engine
+
+    def reload_rag(self) -> None:
+        """Refresh the RAG engine's table handle so new sync data is visible.
+
+        Call this after SyncKnowledgeWorker finishes — the agent's RAGEngine
+        holds a stale LanceDB table snapshot that won't reflect newly written
+        rows until the table is re-opened.
+        """
+        if self._rag_engine is not None:
+            try:
+                self._rag_engine.reload()
+            except Exception as e:
+                logger.warning("ToolRegistry.reload_rag error: %s", e)
 
     def shutdown(self) -> None:
         """Stop all MCP server subprocesses and release RAG engine resources."""

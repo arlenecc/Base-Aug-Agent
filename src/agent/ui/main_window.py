@@ -6,6 +6,7 @@ with threading.Event so the worker blocks until the user answers.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -29,6 +30,8 @@ from ..rag.engine import RAGEngine
 
 
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_stream_text(text: str) -> str:
@@ -182,10 +185,17 @@ class FetchModelsWorker(QThread):
 
 
 class SyncKnowledgeWorker(QThread):
-    """Background worker for RAG knowledge base ingestion."""
-    finished = pyqtSignal(dict)   # stats dict
-    failed = pyqtSignal(str)      # error message
-    progress = pyqtSignal(int, int, str)  # done, total, current_file
+    """Background worker for RAG knowledge base ingestion.
+
+    IMPORTANT: Custom signals are prefixed with `sync_` to avoid shadowing
+    QThread's built-in `finished` signal. Shadowing `finished` breaks Qt's
+    thread lifecycle management — `deleteLater` connected to the custom
+    signal fires *inside* run() (before cleanup), while the built-in
+    `finished` (emitted after run() returns) is left with no listeners.
+    """
+    sync_finished = pyqtSignal(dict)   # stats dict
+    sync_failed = pyqtSignal(str)       # error message
+    sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
                  force: bool = False):
@@ -197,6 +207,18 @@ class SyncKnowledgeWorker(QThread):
         self._engine: Optional[RAGEngine] = None
 
     def run(self) -> None:  # type: ignore[override]
+        logger.info(
+            "SyncKnowledgeWorker start: workspace=%s kb=%s force=%s embedding=%s",
+            self._workspace, self._knowledge_base, self._force,
+            self._embedding_model or "(default)",
+        )
+        # Use a flag + deferred emit so the sync_finished signal is emitted
+        # AFTER the finally block completes cleanup (engine.close). Emitting
+        # before close() causes the main thread to reset the UI / call
+        # reload_rag() while the worker thread is still holding LanceDB /
+        # ONNX resources — a potential race.
+        emit_stats: Optional[dict] = None
+        emit_error: Optional[str] = None
         try:
             self._engine = RAGEngine(
                 workspace=self._workspace,
@@ -204,9 +226,17 @@ class SyncKnowledgeWorker(QThread):
                 embedding_model=self._embedding_model,
             )
             stats = self._engine.ingest(force=self._force, progress_callback=self._on_progress)
-            self.finished.emit(stats)
+            logger.info(
+                "SyncKnowledgeWorker done: found=%d extracted=%d skipped=%d deleted=%d chunks=%d errors=%d cancelled=%s",
+                stats.get("files_found", 0), stats.get("files_extracted", 0),
+                stats.get("files_skipped", 0), stats.get("files_deleted", 0),
+                stats.get("chunks", 0), len(stats.get("errors", [])),
+                stats.get("cancelled", False),
+            )
+            emit_stats = stats
         except Exception as e:
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            logger.error("SyncKnowledgeWorker failed: %s", e, exc_info=True)
+            emit_error = f"{type(e).__name__}: {e}"
         finally:
             # Release the VectorStore's resources (LanceDB connection, FastEmbed
             # ONNX model ~130MB, BGE reranker ~500MB). Without this, every sync
@@ -215,8 +245,16 @@ class SyncKnowledgeWorker(QThread):
             if self._engine is not None:
                 try:
                     self._engine.close()
-                except Exception:
-                    pass
+                    logger.info("SyncKnowledgeWorker: RAG engine closed")
+                except Exception as e:
+                    logger.warning("SyncKnowledgeWorker: engine close failed: %s", e)
+            # Emit the signal only after cleanup is complete so the main
+            # thread's UI reset / reload_rag() runs against a fully released
+            # worker-side engine.
+            if emit_error is not None:
+                self.sync_failed.emit(emit_error)
+            elif emit_stats is not None:
+                self.sync_finished.emit(emit_stats)
 
     def cancel(self) -> None:
         """请求取消 ingest（在当前文件/批处理完成后生效）。"""
@@ -224,7 +262,7 @@ class SyncKnowledgeWorker(QThread):
             self._engine.cancel()
 
     def _on_progress(self, done: int, total: int, current: str) -> None:
-        self.progress.emit(done, total, current)
+        self.sync_progress.emit(done, total, current)
 
 
 class InstallDepsWorker(QThread):
@@ -274,7 +312,7 @@ class SendEditor(QPlainTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Base Agent")
+        self.setWindowTitle("Base Augment Agent")
         self.resize(1280, 820)
 
         self.config = AgentConfig.load(CONFIG_PATH)
@@ -368,7 +406,7 @@ class MainWindow(QMainWindow):
         self.connect_btn = QPushButton("应用配置")
         self.connect_btn.setStyleSheet("font-weight:600;")
         self.clear_btn = QPushButton("清空对话")
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton("终止对话")
         self.stop_btn.setEnabled(False)
 
         # Row 0: Base URL | API Key | 模型 | 获取模型
@@ -424,6 +462,12 @@ class MainWindow(QMainWindow):
         self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
         self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
         row2.addWidget(self.sync_knowledge_btn)
+        # Stop-sync button: enabled only while a sync is running. Cancels
+        # the ingest after the current file completes (cooperative cancel).
+        self.stop_sync_btn = QPushButton("停止同步")
+        self.stop_sync_btn.setEnabled(False)
+        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
+        row2.addWidget(self.stop_sync_btn)
         lay.addLayout(row2)
 
         return box
@@ -521,6 +565,7 @@ class MainWindow(QMainWindow):
         self.workspace_btn.clicked.connect(self._on_pick_workspace)
         self.knowledge_base_btn.clicked.connect(self._on_pick_knowledge_base)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
+        self.stop_sync_btn.clicked.connect(self._on_stop_sync)
         self.clear_btn.clicked.connect(self._on_clear_chat)
         self.log_clear_btn.clicked.connect(self.log_view.clear)
         self.send_btn.clicked.connect(self._on_send)
@@ -641,6 +686,16 @@ class MainWindow(QMainWindow):
     # config actions
     # ------------------------------------------------------------------
     def _on_apply_config(self) -> None:
+        # Guard: if the agent is currently running, rebuilding would shut down
+        # the old agent's tools/MCP/httpx mid-execution, causing the running
+        # AgentWorker to crash when its next tool call hits destroyed tools.
+        # The user must wait for the current turn to finish (or stop it first).
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再应用配置。",
+            )
+            return
         self.config.save(CONFIG_PATH)
         self._rebuild_agent()
         self._append_log(f"[cfg] applied: {self.config.base_url} model={self.config.model}")
@@ -669,6 +724,9 @@ class MainWindow(QMainWindow):
         # Step 1: check dependencies before starting sync
         self.sync_knowledge_btn.setEnabled(False)
         self.sync_knowledge_btn.setText("检查依赖…")
+        # Enable stop-sync during the deps-check phase too so the user can
+        # abort the whole pipeline before sync even starts.
+        self.stop_sync_btn.setEnabled(True)
         self.status_label.setText("正在检查依赖…")
         self.progress.setRange(0, 0)
         self._pending_sync_ws = ws
@@ -690,6 +748,7 @@ class MainWindow(QMainWindow):
             # Required deps still missing after auto-install attempt
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
             self.status_label.setText("依赖缺失，无法同步")
             QMessageBox.critical(
@@ -705,72 +764,119 @@ class MainWindow(QMainWindow):
         if not ws or not kb:
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
             return
         self.sync_knowledge_btn.setText("同步中…")
         self.status_label.setText("正在同步知识库…")
         self.progress.setRange(0, 0)
-        self.stop_btn.setEnabled(True)  # 同步期间允许点停止取消
+        # stop_sync_btn stays enabled (it was enabled in _on_sync_knowledge)
+        # so the user can cancel mid-sync.
         self._sync_worker = SyncKnowledgeWorker(
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
             force=force,
         )
-        self._sync_worker.finished.connect(self._on_sync_finished)
-        self._sync_worker.failed.connect(self._on_sync_failed)
-        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.sync_finished.connect(self._on_sync_finished)
+        self._sync_worker.sync_failed.connect(self._on_sync_failed)
+        self._sync_worker.sync_progress.connect(self._on_sync_progress)
+        # Connect deleteLater to QThread's built-in finished signal (emitted
+        # by Qt AFTER run() returns), NOT the custom sync_finished (emitted
+        # inside run()). This ensures the worker object isn't scheduled for
+        # deletion while the thread is still winding down.
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
 
     def _on_sync_finished(self, stats: dict) -> None:
-        self.sync_knowledge_btn.setEnabled(True)
-        self.sync_knowledge_btn.setText("同步知识")
-        self.progress.setRange(0, 1)
-        self._sync_worker = None
-        # 仅当不在 agent run 时禁用 stop_btn（agent run 自己管理 stop_btn 状态）
-        if not self._busy:
-            self.stop_btn.setEnabled(False)
-        if stats.get("cancelled"):
-            self.status_label.setText("同步已取消")
-            self._append_log("[rag] 同步已用户取消")
-            return
-        self.status_label.setText("知识库同步完成")
-        files = stats.get("files_found", 0)
-        extracted = stats.get("files_extracted", 0)
-        skipped = stats.get("files_skipped", 0)
-        deleted = stats.get("files_deleted", 0)
-        chunks = stats.get("chunks", 0)
-        errors = stats.get("errors", [])
-        # Show incremental stats so the user sees what was actually processed.
-        if extracted == 0 and skipped > 0:
-            summary = f"知识库已是最新（跳过 {skipped} 个未修改文件）\n\n"
-        else:
-            summary = (
-                f"知识库同步完成！\n\n"
-                f"扫描文件：{files} 个\n"
-                f"新增/更新：{extracted} 个   跳过：{skipped} 个\n"
-            )
-            if deleted > 0:
-                summary += f"已清理删除文件：{deleted} 个\n"
-            summary += f"向量切片：{chunks} 个\n"
-        msg = summary
-        if errors:
-            msg += f"\n⚠ {len(errors)} 个文件提取失败：\n"
-            for e in errors[:5]:
-                msg += f"  - {e}\n"
-            if len(errors) > 5:
-                msg += f"  …（还有 {len(errors) - 5} 个）\n"
-        msg += "\n后续对话将自动参考知识库内容进行回答。"
-        QMessageBox.information(self, "同步完成", msg)
+        logger.info("UI: _on_sync_finished called")
+        try:
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
+            # Fully reset the progress bar: both range AND value. Without
+            # setValue(0), a stale value from the last _on_sync_progress
+            # call can persist (clamped to the new max), making the bar
+            # look "stuck" at 100%.
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self._sync_worker = None
+            # 刷新 agent 的 RAG 引擎表句柄，让下一次搜索看到新写入的数据。
+            # LanceDB 表对象在打开时获取版本快照，同步后不重新打开会看到旧数据。
+            if self._agent is not None:
+                try:
+                    self._agent.tools.reload_rag()
+                except Exception as e:
+                    logger.warning("UI: reload_rag after sync: %s", e)
+            # 防御：stats 可能不是 dict（极端情况下为 None）
+            if not isinstance(stats, dict):
+                stats = {}
+            if stats.get("cancelled"):
+                self.status_label.setText("同步已取消")
+                self._append_log("[rag] 同步已用户取消")
+                return
+            self.status_label.setText("知识库同步完成")
+            files = stats.get("files_found", 0)
+            extracted = stats.get("files_extracted", 0)
+            skipped = stats.get("files_skipped", 0)
+            deleted = stats.get("files_deleted", 0)
+            chunks = stats.get("chunks", 0)
+            errors = stats.get("errors", [])
+            # Show incremental stats so the user sees what was actually processed.
+            if extracted == 0 and skipped > 0:
+                summary = f"知识库已是最新（跳过 {skipped} 个未修改文件）\n\n"
+            else:
+                summary = (
+                    f"知识库同步完成！\n\n"
+                    f"扫描文件：{files} 个\n"
+                    f"新增/更新：{extracted} 个   跳过：{skipped} 个\n"
+                )
+                if deleted > 0:
+                    summary += f"已清理删除文件：{deleted} 个\n"
+                summary += f"向量切片：{chunks} 个\n"
+            msg = summary
+            if errors:
+                msg += f"\n⚠ {len(errors)} 个文件提取失败：\n"
+                for e in errors[:5]:
+                    msg += f"  - {e}\n"
+                if len(errors) > 5:
+                    msg += f"  …（还有 {len(errors) - 5} 个）\n"
+            msg += "\n后续对话将自动参考知识库内容进行回答。"
+            QMessageBox.information(self, "同步完成", msg)
+        except Exception as e:
+            logger.error("UI: _on_sync_finished error: %s", e, exc_info=True)
+            # 确保按钮状态恢复，即使弹窗失败
+            try:
+                self.sync_knowledge_btn.setEnabled(True)
+                self.sync_knowledge_btn.setText("同步知识")
+                self.stop_sync_btn.setEnabled(False)
+                self.progress.setRange(0, 1)
+                self.progress.setValue(0)
+                self._sync_worker = None
+                self.status_label.setText("同步完成（显示结果时出错）")
+            except Exception:
+                pass
 
     def _on_sync_failed(self, error: str) -> None:
-        self.sync_knowledge_btn.setEnabled(True)
-        self.sync_knowledge_btn.setText("同步知识")
-        self.progress.setRange(0, 1)
-        self.status_label.setText("知识库同步失败")
-        self._sync_worker = None
-        if not self._busy:
-            self.stop_btn.setEnabled(False)
-        QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
+        logger.info("UI: _on_sync_failed called: %s", error[:200])
+        try:
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.status_label.setText("知识库同步失败")
+            self._sync_worker = None
+            QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
+        except Exception as e:
+            logger.error("UI: _on_sync_failed error: %s", e, exc_info=True)
+            try:
+                self.sync_knowledge_btn.setEnabled(True)
+                self.sync_knowledge_btn.setText("同步知识")
+                self.stop_sync_btn.setEnabled(False)
+                self.progress.setRange(0, 1)
+                self.progress.setValue(0)
+                self._sync_worker = None
+            except Exception:
+                pass
 
     def _on_fetch_models(self) -> None:
         base_url = self.base_url_edit.text().strip()
@@ -836,24 +942,51 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _on_stop(self) -> None:
-        # 优先取消 agent run；如果正在同步知识库则取消同步
+        # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
+        self._callbacks.cancel()
+        self.status_label.setText("已请求终止对话（将在当前工具完成后生效）")
+
+    def _on_stop_sync(self) -> None:
+        """停止知识库同步：在当前文件处理完成后协作式取消。
+
+        sync_worker.cancel() 设置 RAGEngine 内部的取消标志，
+        ingest 循环在处理完当前文件后检查该标志并退出。
+        """
         if self._sync_worker is not None and self._sync_worker.isRunning():
             self._sync_worker.cancel()
-            self.status_label.setText("已请求取消同步（将在当前文件完成后生效）")
+            self.stop_sync_btn.setEnabled(False)  # 防止重复点击
+            self.status_label.setText("已请求停止同步（将在当前文件完成后生效）")
+            self._append_log("[rag] 用户请求停止同步")
             return
-        self._callbacks.cancel()
-        self.status_label.setText("已请求停止（将在当前工具完成后生效）")
+        # deps 检查阶段没有 cancel 机制，只能等它结束（通常很快）
+        if self._deps_worker is not None and self._deps_worker.isRunning():
+            self.status_label.setText("依赖检查中，请稍候…")
+            return
 
     def _on_sync_progress(self, done: int, total: int, current: str) -> None:
         """同步进度反馈：更新进度条和状态栏。"""
-        if total > 0:
-            self.progress.setRange(0, total)
-            self.progress.setValue(done)
-            pct = done * 100 // total
-            self.status_label.setText(f"同步中 {done}/{total} ({pct}%) — {current}")
-        else:
-            self.progress.setRange(0, 0)
-            self.status_label.setText(f"同步中 — {current}")
+        try:
+            # Guard against late progress signals arriving after sync_finished
+            # has already reset the UI. While signals are queued in order, a
+            # modal dialog (QMessageBox.information in _on_sync_finished) runs
+            # a nested event loop that CAN process stale queued signals. This
+            # guard prevents such a late signal from overwriting the
+            # "知识库同步完成" status back to "同步中…".
+            if self._sync_worker is None:
+                return
+            if total > 0:
+                self.progress.setRange(0, total)
+                self.progress.setValue(done)
+                pct = done * 100 // total
+                self.status_label.setText(f"同步中 {done}/{total} ({pct}%) — {current}")
+            else:
+                self.progress.setRange(0, 0)
+                self.status_label.setText(f"同步中 — {current}")
+        except RuntimeError as e:
+            # 控件可能已被销毁（窗口关闭后信号仍可能到达）
+            logger.debug("UI: _on_sync_progress ignored (control deleted): %s", e)
+        except Exception as e:
+            logger.warning("UI: _on_sync_progress error: %s", e)
 
     def _set_controls_busy(self, busy: bool) -> None:
         self.send_btn.setEnabled(not busy)
@@ -928,8 +1061,12 @@ class MainWindow(QMainWindow):
         self._append_log(line)
 
     def _on_usage(self, usage: dict) -> None:
-        self._total_tokens = usage.get("total_tokens", self._total_tokens)
-        self.token_label.setText(f"总计 {self._total_tokens} tokens")
+        # Don't overwrite _total_tokens here — agent.run() already maintains
+        # a running total that includes estimated reasoning tokens when the API
+        # underreports. _on_speed (called immediately after) carries the
+        # authoritative total. Overwriting here would cause the displayed total
+        # to jump between API total (no estimate) and agent total (with estimate).
+        pass
 
     def _on_speed(self, total_tokens: int, speed: float) -> None:
         self._total_tokens = total_tokens
@@ -1052,22 +1189,90 @@ class MainWindow(QMainWindow):
         return _html.escape(text).replace("\n", "<br>")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        """Clean up background resources before the window closes."""
-        # Stop any running sync worker
-        if self._sync_worker is not None and self._sync_worker.isRunning():
-            self._sync_worker.cancel()
-            self._sync_worker.wait(3000)
-        # Shut down MCP subprocesses + close httpx client
+        """Clean up background resources before the window closes.
+
+        All QThread workers must be stopped here. If a worker thread is still
+        running when the window's widgets are destroyed, the worker's signals
+        fire into deleted C++ objects → ``RuntimeError: wrapped C/C++ object
+        has been deleted``. For each worker we:
+        1. Disconnect signals (so emit() becomes a no-op even if the thread
+           sneaks in one last emit before we wait()).
+        2. Request cooperative cancel (if the worker supports it).
+        3. wait() with a timeout; if it doesn't finish, terminate() as a last
+           resort — unsafe, but safer than the crash.
+        """
+        # --- AgentWorker: cancel the agent run and join the thread.
+        # Without this, closing the window during an agent run leaves the
+        # worker thread alive; its bridge.finished/error/content signals
+        # will emit into the already-destroyed Bridge → RuntimeError.
+        if self._worker is not None:
+            try:
+                self._worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            # Cooperative cancel: set the _cancelled flag so the agent loop
+            # exits after the current tool/chunk. This is faster than
+            # terminate() and avoids corrupting tool state mid-execution.
+            try:
+                self._callbacks.cancel()
+            except Exception:
+                pass
+            if self._worker.isRunning():
+                self._worker.wait(3000)
+                if self._worker.isRunning():
+                    logger.warning("UI: agent worker did not finish in 3s, terminating")
+                    self._worker.terminate()
+                    self._worker.wait(2000)
+            self._worker = None
+        # --- FetchModelsWorker: a quick HTTP call, usually finishes fast.
+        if self._fetch_worker is not None:
+            try:
+                self._fetch_worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if self._fetch_worker.isRunning():
+                self._fetch_worker.wait(2000)
+                if self._fetch_worker.isRunning():
+                    self._fetch_worker.terminate()
+                    self._fetch_worker.wait(1000)
+            self._fetch_worker = None
+        # --- SyncKnowledgeWorker: cooperative cancel (finishes current file).
+        if self._sync_worker is not None:
+            try:
+                self._sync_worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if self._sync_worker.isRunning():
+                self._sync_worker.cancel()
+                self._sync_worker.wait(3000)
+                if self._sync_worker.isRunning():
+                    logger.warning("UI: sync worker did not finish in 3s, terminating")
+                    self._sync_worker.terminate()
+                    self._sync_worker.wait(2000)
+            self._sync_worker = None
+        # --- InstallDepsWorker: no cancel mechanism, just wait.
+        if self._deps_worker is not None:
+            try:
+                self._deps_worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            if self._deps_worker.isRunning():
+                self._deps_worker.wait(2000)
+                if self._deps_worker.isRunning():
+                    self._deps_worker.terminate()
+                    self._deps_worker.wait(1000)
+            self._deps_worker = None
+        # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:
             try:
                 self._agent.tools.shutdown()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("UI: shutdown error: %s", e)
         if self._llm is not None:
             try:
                 self._llm.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("UI: llm close error: %s", e)
         super().closeEvent(event)
 
 

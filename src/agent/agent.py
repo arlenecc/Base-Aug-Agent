@@ -61,7 +61,12 @@ Confirmation policy: operations confined to the workspace (file_read, file_write
 
 Tool calling: when you need to take an action, emit a tool_call with the tool name and JSON arguments. The agent will execute it locally and return the result (stdout, stderr, errors, or file contents) as a tool message in the next turn. Use this feedback to decide the next step. You may chain multiple tool calls across turns until the task is done.
 
-Knowledge base: if a local knowledge base is configured and indexed, you can use `rag_search` to find relevant information from the user's documents. Use `rag_status` to check what's available, and `rag_ingest` to re-index after new files are added to the knowledge base directory. Always prefer searching the knowledge base when the user's question relates to their own documents or specialized knowledge."""
+Knowledge base: if a local knowledge base is configured and indexed, you MUST proactively use `rag_search` to retrieve relevant context BEFORE answering any user question that could be answered from the user's own documents. Use `rag_status` to check what's available, and `rag_ingest` to re-index after new files are added to the knowledge base directory. Workflow:
+1. At the start of a conversation turn, if the user's question could relate to indexed documents, call `rag_status` first to check whether the knowledge base is available and non-empty.
+2. If the knowledge base has data, call `rag_search` with a relevant query derived from the user's question.
+3. Use the retrieved context to ground your answer. If no relevant context is found, say so and answer from your general knowledge.
+4. After the user adds new files to the knowledge base directory, call `rag_ingest` to index them (this is incremental — only new/modified files are processed).
+Always prefer knowledge base context over general knowledge when answering questions about the user's documents or specialized domain."""
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +460,22 @@ class Agent:
             tool_calls: List[Dict[str, Any]] = []
             usage: Dict[str, int] = {}
             t0 = time.time()
+            ttfb = None  # time to first byte — set on first content/reasoning chunk
             completion_tokens = 0
-            # Live token-speed every 0.3s during streaming. The first chunk
-            # always emits because last_speed_emit starts at 0.0, so
-            # content-only models (no reasoning) also get live updates.
-            last_speed_emit = 0.0  # timestamp of last on_token_speed emission
+            # Live token-speed every 0.3s during streaming.
+            # Start at None (not 0.0) so the first chunk doesn't immediately
+            # emit a misleading speed based on TTFB (which includes network
+            # latency + model prefill, not generation speed).
+            last_speed_emit: Optional[float] = None
             seen_done = False
+            # Incremental token estimate: instead of joining the full
+            # content_buf + reasoning_buf every 0.3s (O(N) join + O(N)
+            # char scan, where N grows linearly per turn — 10K chars means
+            # 10K iterations every 0.3s), we accumulate the token count
+            # chunk-by-chunk. Each _estimate_tokens call is O(chunk_len)
+            # which is tiny. The total is O(Σ chunk_len) = O(N) across the
+            # whole turn, versus O(N²/0.3) for the naive approach.
+            live_est_tokens = 0
 
             try:
                 for ev in self.llm.chat_stream(
@@ -469,27 +484,34 @@ class Agent:
                     if ev.type == "content":
                         content_buf.append(ev.content)
                         self.callbacks.on_content(ev.content)
+                        live_est_tokens += _estimate_tokens(ev.content)
                     elif ev.type == "reasoning":
                         reasoning_buf.append(ev.content)
                         self.callbacks.on_reasoning(ev.content)
+                        live_est_tokens += _estimate_tokens(ev.content)
                     elif ev.type == "done":
                         seen_done = True
                         tool_calls = ev.tool_calls
                         usage = ev.usage
                         completion_tokens = usage.get("completion_tokens", 0)
                         continue  # final speed is emitted below; skip live emit
-                    # Live token-speed every 0.3s during streaming. The first
-                    # chunk always emits because last_speed_emit starts at 0.0,
-                    # so content-only models (no reasoning) also get live updates.
+                    # Live token-speed every 0.3s during streaming.
+                    # First chunk: record TTFB but don't emit yet (we need at
+                    # least 0.3s of generation to compute a meaningful speed).
                     now = time.time()
-                    if now - last_speed_emit >= 0.3:
-                        elapsed_so_far = max(now - t0, 1e-6)
-                        streamed_text = "".join(content_buf) + "".join(reasoning_buf)
-                        est_tokens = _estimate_tokens(streamed_text)
-                        live_speed = est_tokens / elapsed_so_far
-                        self.callbacks.on_token_speed(
-                            self._total_tokens + est_tokens, live_speed
-                        )
+                    if ttfb is None:
+                        ttfb = now
+                    if last_speed_emit is None:
+                        last_speed_emit = now
+                    elif now - last_speed_emit >= 0.3:
+                        # Use generation time (now - ttfb), not total time
+                        # (now - t0), to exclude TTFB from the speed calc.
+                        gen_elapsed = max(now - ttfb, 1e-6)
+                        if live_est_tokens > 0:
+                            live_speed = live_est_tokens / gen_elapsed
+                            self.callbacks.on_token_speed(
+                                self._total_tokens + live_est_tokens, live_speed
+                            )
                         last_speed_emit = now
             except Exception as e:
                 err_str = str(e)
@@ -520,7 +542,11 @@ class Agent:
                 # network cut or server-side truncation. Log so it's visible.
                 self._log("[agent] warning: LLM stream ended without 'done' event")
 
+            # Total elapsed time (includes TTFB, used for total turn timing)
             elapsed = max(time.time() - t0, 1e-6)
+            # Generation-only elapsed (excludes TTFB, used for speed calc).
+            # If ttfb is None (no chunks arrived), fall back to elapsed.
+            gen_elapsed = max((time.time() - ttfb), 1e-6) if ttfb is not None else elapsed
 
             # Determine reasoning token count for this turn.
             # 1. If the API provides completion_tokens_details.reasoning_tokens,
@@ -561,16 +587,16 @@ class Agent:
             if usage:
                 self.callbacks.on_usage(usage)
             # Final speed: use the turn's total token count (including reasoning)
-            # divided by elapsed time. Fall back to completion_tokens if we
-            # somehow have no estimate.
+            # divided by generation-only time (excludes TTFB).
+            # Fall back to completion_tokens if we somehow have no estimate.
             speed_tokens = turn_tokens if turn_tokens else completion_tokens
-            speed = (speed_tokens / elapsed) if speed_tokens else 0.0
+            speed = (speed_tokens / gen_elapsed) if speed_tokens else 0.0
             self.callbacks.on_token_speed(self._total_tokens, speed)
             self._log(
                 f"[iter {iteration}] <- {len(''.join(content_buf))} content chars, "
                 f"{len(reasoning_text)} reasoning chars (~{reasoning_tokens} tok), "
                 f"{len(tool_calls)} tool_calls, usage={usage}, "
-                f"{speed_tokens} tok / {elapsed:.2f}s = {speed:.1f} tok/s"
+                f"{speed_tokens} tok / {gen_elapsed:.2f}s = {speed:.1f} tok/s"
             )
 
             assistant_msg: Dict[str, Any] = {"role": "assistant"}

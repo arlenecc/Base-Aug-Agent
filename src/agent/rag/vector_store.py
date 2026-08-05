@@ -135,16 +135,21 @@ class VectorStore:
     def _ensure_table(self) -> Optional[Any]:
         """Open existing table if it exists, return None if not yet created.
 
-        用 _table_checked 标记避免每次调用都触发 table_names() 磁盘扫描：
-        一旦确认表不存在，后续调用直接返回 None，直到 clear() 重置标记。
+        Re-checks ``table_names()`` on every call when ``_table`` is None,
+        because the table may have been created by another RAGEngine instance
+        (e.g. SyncKnowledgeWorker) after this VectorStore was first initialized.
+        Caching "table doesn't exist" was a premature optimization that caused
+        a real bug: after sync wrote data via a separate engine, this engine's
+        search() still returned empty because it never re-checked.
+
+        LanceDB's ``table_names()`` is cheap (directory listing), so the
+        per-call cost is acceptable for correctness.
         """
         if self._table is not None:
             return self._table
-        if self._table_checked:
-            return None  # 已检查过，表确实不存在
-        self._table_checked = True
         if _TABLE_NAME in self._db.table_names():
             self._table = self._db.open_table(_TABLE_NAME)
+            self._table_checked = True
         return self._table
 
     # ------------------------------------------------------------------
@@ -278,6 +283,7 @@ class VectorStore:
                 break
 
         if not first_batch:
+            logger.info("VectorStore.add_streaming: no chunks to write (empty iterator)")
             return 0
 
         # Embed 第一批
@@ -288,7 +294,8 @@ class VectorStore:
             # 首次：创建表（用第一批 records）
             self._table = self._db.create_table(_TABLE_NAME, first_records)
             self._table_checked = True
-            logger.info("LanceDB table '%s' created (streaming)", _TABLE_NAME)
+            logger.info("LanceDB table '%s' created (streaming) with %d records",
+                        _TABLE_NAME, len(first_records))
             total = len(first_records)
             if on_batch:
                 on_batch(len(first_records), total)
@@ -296,7 +303,13 @@ class VectorStore:
                 return total
         else:
             # 已有表：先按 source 删除旧记录
+            existing_count = table.count_rows()
             sources_seen = {r["source"] for r in first_records}
+            logger.info(
+                "VectorStore.add_streaming: opened existing table (%d rows), "
+                "replacing %d sources",
+                existing_count, len(sources_seen),
+            )
             for source in sources_seen:
                 h = _hash_source(source)
                 try:
@@ -318,6 +331,7 @@ class VectorStore:
         # 后续批次：每批 embed 完立即写入，records 用完即释放
         chunk_idx = len(first_batch)
         batch_buf: List[Dict[str, Any]] = []
+        batch_num = 1
         for chunk in chunk_iter:
             batch_buf.append(chunk)
             if len(batch_buf) >= batch_size:
@@ -325,6 +339,12 @@ class VectorStore:
                 try:
                     table.add(records)
                     total += len(records)
+                    batch_num += 1
+                    if batch_num % 5 == 0:  # 每 5 批打一次，避免日志爆炸
+                        logger.debug(
+                            "VectorStore.add_streaming: batch %d written, %d chunks total",
+                            batch_num, total,
+                        )
                     if on_batch:
                         on_batch(len(records), total)
                 except Exception as e:
@@ -338,13 +358,14 @@ class VectorStore:
             try:
                 table.add(records)
                 total += len(records)
+                batch_num += 1
                 if on_batch:
                     on_batch(len(records), total)
             except Exception as e:
                 logger.error("VectorStore: streaming add final batch failed: %s", e)
                 raise
 
-        logger.info("VectorStore: streaming added %d chunks total", total)
+        logger.info("VectorStore: streaming added %d chunks total (%d batches)", total, batch_num)
         return total
 
     def _embed_chunks(
@@ -379,7 +400,13 @@ class VectorStore:
         Returns list of {text, source, chunk_index, score} dicts.
         """
         self._ensure_initialized()
-        if self._table is None or self._table.count_rows() == 0:
+        table = self._ensure_table()
+        if table is None:
+            logger.info("VectorStore.search: table does not exist yet (query=%r)", query[:60])
+            return []
+        row_count = table.count_rows()
+        if row_count == 0:
+            logger.info("VectorStore.search: table exists but is empty (query=%r)", query[:60])
             return []
 
         # Embed query (use embed_query for proper prefix handling)
@@ -389,10 +416,14 @@ class VectorStore:
             query_vec = _normalize(self._ef([query])[0])
 
         # Vector search
-        search = self._table.search(query_vec).limit(top_k)
+        search = table.search(query_vec).limit(top_k)
         if where:
             search = search.where(where)
         results = search.to_list()
+        logger.debug(
+            "VectorStore.search: %d candidates from %d rows (top_k=%d)",
+            len(results), row_count, top_k,
+        )
 
         output: List[Dict[str, Any]] = []
         for r in results:
@@ -455,6 +486,7 @@ class VectorStore:
             # Fallback: candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
             # 如果 score 仍是原始 L2 距离（向后兼容），用正确公式转换：
             # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
+            logger.info("VectorStore.rerank: BGE reranker unavailable, using distance-based fallback")
             for c in candidates:
                 try:
                     s = float(c.get("score", 0.0))
@@ -506,15 +538,22 @@ class VectorStore:
         """
         candidates = self.search(query, top_k=top_k * candidate_multiplier, where=where)
         if not candidates:
+            logger.info("VectorStore.search_with_rerank: no candidates from vector search")
             return []
-        return self.rerank(query, candidates, top_k=top_k)
+        results = self.rerank(query, candidates, top_k=top_k)
+        logger.info(
+            "VectorStore.search_with_rerank: %d candidates → %d after rerank (top_k=%d)",
+            len(candidates), len(results), top_k,
+        )
+        return results
 
     def clear(self) -> None:
         """Delete all documents from the store."""
         self._ensure_initialized()
-        if self._table is None:
+        table = self._ensure_table()
+        if table is None:
             return
-        count = self._table.count_rows()
+        count = table.count_rows()
         if count > 0:
             # Drop and recreate empty table
             self._db.drop_table(_TABLE_NAME)
@@ -524,9 +563,10 @@ class VectorStore:
 
     def count(self) -> int:
         self._ensure_initialized()
-        if self._table is None:
+        table = self._ensure_table()
+        if table is None:
             return 0
-        return self._table.count_rows()
+        return table.count_rows()
 
     def close(self) -> None:
         """Release heavy resources (LanceDB connection, embedding model, reranker).
@@ -537,37 +577,85 @@ class VectorStore:
         Important: FastEmbed's ONNX Runtime InferenceSession and FlagReranker
         hold significant C++ heap memory (~130MB + ~500MB). Python's GC may not
         reclaim these promptly when the Python object is dropped — explicitly
-        nulling the references here ensures the C++ destructors run as soon as
-        possible, which is critical when SyncKnowledgeWorker creates a fresh
+        nulling the references here ensures the C++ destructors run as soon
+        as possible, which is critical when SyncKnowledgeWorker creates a fresh
         RAGEngine per sync run.
         """
+        # Try to explicitly release the ONNX InferenceSession held by
+        # FastEmbed's OnnxEmbeddings. FastEmbed wraps the model in a
+        # `model` attribute (ort.InferenceSession). Calling .release() on
+        # the session frees the C++ memory immediately instead of waiting
+        # for Python's cyclic GC to eventually notice the dead reference.
+        # This is best-effort: if the attribute layout changes in a future
+        # FastEmbed version, the AttributeError is swallowed and we fall
+        # back to simply dropping the Python reference.
         self._table = None
         self._db = None
-        self._ef = None
+        if self._ef is not None:
+            try:
+                # FastEmbed OnnxEmbeddings stores the InferenceSession at
+                # .model.session or .model (depending on version).
+                inner = getattr(self._ef, "model", None) or getattr(self._ef, "_model", None)
+                if inner is not None:
+                    session = getattr(inner, "session", None) or getattr(inner, "_session", None)
+                    if session is not None and hasattr(session, "release"):
+                        try:
+                            session.release()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self._ef = None
         if hasattr(self, "_reranker"):
+            # FlagReranker holds a transformers model with PyTorch tensors.
+            # Try to move it to CPU and del before nulling, so CUDA/PyTorch
+            # resources are freed promptly.
+            reranker = self._reranker
+            try:
+                model = getattr(reranker, "model", None)
+                if model is not None and hasattr(model, "cpu"):
+                    model.cpu()
+            except Exception:
+                pass
             self._reranker = None
         self._initialized = False
         self._table_checked = False
         logger.info("VectorStore: resources released")
 
+    def reload(self) -> None:
+        """Drop the cached table handle so the next operation re-opens it.
+
+        LanceDB table objects hold a version snapshot at open time. When another
+        VectorStore instance (e.g. SyncKnowledgeWorker's) writes new rows to the
+        same table, this instance's cached table object won't see them —
+        count_rows() and search() still return the old snapshot's data.
+
+        Call this after a sync completes to ensure the agent's VectorStore sees
+        the freshly written data on its next search.
+        """
+        self._table = None
+        self._table_checked = False
+        logger.debug("VectorStore: table handle dropped for reload")
+
     def list_sources(self) -> List[str]:
         """Return unique source filenames in the store."""
         self._ensure_initialized()
-        if self._table is None or self._table.count_rows() == 0:
+        table = self._ensure_table()
+        if table is None or table.count_rows() == 0:
             return []
         # 用 pyarrow compute 的 unique() 在 Arrow 层去重，
         # 避免 to_pylist() 把全部行转换成 Python 对象（10 万行 = 10 万字符串）
         try:
             import pyarrow.compute as pc
-            arrow_tbl = self._table.to_arrow(columns=["source"])
+            arrow_tbl = table.to_arrow(columns=["source"])
             unique_sources = pc.unique(arrow_tbl["source"]).to_pylist()
             return sorted([s for s in unique_sources if s])
         except Exception:
             # Fallback: load source column and dedupe in Python
             try:
-                all_data = self._table.to_arrow(columns=["source"]).to_pylist()
+                all_data = table.to_arrow(columns=["source"]).to_pylist()
             except Exception:
-                all_data = self._table.to_arrow().to_pylist()
+                all_data = table.to_arrow().to_pylist()
             sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
             return sources
 

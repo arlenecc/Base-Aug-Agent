@@ -1,10 +1,13 @@
 """RAG tool — allows the agent to search the local knowledge base."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..rag.engine import RAGEngine
@@ -44,10 +47,12 @@ class RagSearchTool(Tool):
         if not query.strip():
             return ToolResult(success=False, error="请提供搜索查询词")
 
+        logger.info("rag_search: query=%r top_k=%d", query[:60], top_k)
         try:
             results = self._engine.search_formatted(query, top_k=top_k)
             return ToolResult(success=True, output=results)
         except Exception as e:
+            logger.error("rag_search failed: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库搜索失败: {e}")
 
 
@@ -116,9 +121,11 @@ class RagIngestTool(Tool):
         pass
 
     def run(self, force: bool = False, **kwargs) -> ToolResult:
+        logger.info("rag_ingest: force=%s", force)
         try:
             stats = self._engine.ingest(force=force)
             if "error" in stats:
+                logger.warning("rag_ingest returned error: %s", stats["error"])
                 return ToolResult(success=False, error=stats["error"])
             lines = [
                 "知识库索引完成:",
@@ -133,4 +140,5 @@ class RagIngestTool(Tool):
                 lines.append(f"  错误: {len(errors)} 个")
             return ToolResult(success=True, output="\n".join(lines))
         except Exception as e:
+            logger.error("rag_ingest failed: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库索引失败: {e}")

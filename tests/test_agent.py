@@ -239,9 +239,22 @@ def test_speed_emitted_during_reasoning_streaming(config, recording_callbacks):
     """While reasoning chunks are streaming in, the agent must emit real-time
     on_token_speed updates so the UI can show tokens/sec live -- not just a
     single update at the very end."""
+    import time
     # A long reasoning stream followed by a short content + done.
+    # Inter-chunk delay simulates real streaming so the 0.3s throttle triggers.
     reasoning_chunks = [_evt("reasoning", "thinking " * 20) for _ in range(5)]
-    mock = MockLLM([reasoning_chunks + [_evt("content", "answer"),
+
+    class SlowMockLLM(MockLLM):
+        def chat_stream(self, messages, tools=None, temperature=0.7):
+            self.calls.append({"messages": messages, "tools": tools, "temperature": temperature})
+            script = self._scripts.pop(0)
+            def gen():
+                for ev in script:
+                    time.sleep(0.08)  # 80ms per chunk → 5 chunks = 400ms > 0.3s throttle
+                    yield ev
+            return gen()
+
+    mock = SlowMockLLM([reasoning_chunks + [_evt("content", "answer"),
                                         _evt("done", usage={"total_tokens": 50, "completion_tokens": 50})]])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
     agent.run("think hard")
@@ -257,8 +270,20 @@ def test_speed_emitted_during_content_only_streaming(config, recording_callbacks
     """For models that emit only content (no reasoning), the agent must still
     emit real-time on_token_speed updates during streaming — not just a single
     update at the end. Otherwise the UI looks frozen until the turn completes."""
+    import time
     content_chunks = [_evt("content", "word " * 20) for _ in range(5)]
-    mock = MockLLM([content_chunks + [_evt("done", usage={"total_tokens": 50, "completion_tokens": 50})]])
+
+    class SlowMockLLM(MockLLM):
+        def chat_stream(self, messages, tools=None, temperature=0.7):
+            self.calls.append({"messages": messages, "tools": tools, "temperature": temperature})
+            script = self._scripts.pop(0)
+            def gen():
+                for ev in script:
+                    time.sleep(0.08)
+                    yield ev
+            return gen()
+
+    mock = SlowMockLLM([content_chunks + [_evt("done", usage={"total_tokens": 50, "completion_tokens": 50})]])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
     agent.run("write something")
 
@@ -929,4 +954,140 @@ def test_fallback_summary_when_llm_unavailable(config, recording_callbacks):
     assert len(recording_callbacks.context_shrinks) == 1
     summary, _ = recording_callbacks.context_shrinks[0]
     assert "deploy to staging" in summary or "shell_run" in summary
+
+
+# ---------------------------------------------------------------------------
+# RAG integration: agent discovers and calls rag_status / rag_search
+# ---------------------------------------------------------------------------
+
+def test_agent_calls_rag_tools_when_knowledge_base_configured(
+    config, recording_callbacks, tmp_path, fake_ef, monkeypatch
+):
+    """End-to-end RAG tool invocation through the agent loop.
+
+    When a knowledge_base is configured, the agent must:
+    1. Expose rag_status / rag_search / rag_ingest in the tool schema list
+       passed to the LLM.
+    2. Actually dispatch LLM-emitted tool_calls to the RAGEngine.
+    3. Feed the rag_search result back to the LLM as a tool message so the
+       next turn can ground its answer in retrieved context.
+
+    Uses fake_ef (no FastEmbed model download) by monkeypatching
+    RAGEngine in the engine module — ToolRegistry's _register_rag_tools
+    imports RAGEngine lazily inside the function, so the patch is picked up.
+    """
+    import json as _json
+
+    from agent.rag import engine as engine_mod
+    from agent.tools.base import ToolRegistry
+
+    # 1. Set up a knowledge base with a unique fact the LLM cannot know.
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    unique_fact = "ZetaCloud 内部代号 ProjectAurora2024"
+    (kb / "company_faq.md").write_text(
+        f"# 公司内部 FAQ\n\n"
+        f"## 项目代号\n\n{unique_fact}\n"
+        f"该项目于 2024 年第三季度启动，负责人是张工。\n",
+        encoding="utf-8",
+    )
+
+    # 2. Patch RAGEngine so the registry's _register_rag_tools uses fake_ef
+    #    (no FastEmbed / ONNX model download).
+    class _FakeRAGEngine(engine_mod.RAGEngine):
+        def __init__(self, workspace, knowledge_base="", **kwargs):
+            kwargs.setdefault("embedding_function", fake_ef)
+            super().__init__(workspace=workspace, knowledge_base=knowledge_base, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "RAGEngine", _FakeRAGEngine)
+
+    # 3. Configure knowledge_base and build the registry.
+    config.knowledge_base = str(kb)
+    registry = ToolRegistry(config=config, callbacks=recording_callbacks)
+
+    # 4. Verify RAG tools are exposed to the LLM via schemas().
+    schema_names = {s["function"]["name"] for s in registry.schemas()}
+    assert "rag_search" in schema_names, "rag_search must be in tool schemas"
+    assert "rag_status" in schema_names, "rag_status must be in tool schemas"
+    assert "rag_ingest" in schema_names, "rag_ingest must be in tool schemas"
+
+    # 5. Ingest synchronously so the vector store has data to search.
+    rag_engine = registry.get_rag_engine()
+    assert rag_engine is not None, "RAG engine was not initialized"
+    stats = rag_engine.ingest(force=True)
+    assert stats["chunks"] > 0, f"ingest produced no chunks: {stats}"
+    # Refresh the LanceDB table handle so the upcoming search sees new rows.
+    registry.reload_rag()
+
+    # 6. Script the LLM: turn 1 calls rag_status, turn 2 calls rag_search,
+    #    turn 3 produces the final grounded answer.
+    tc_status = [{"id": "c1", "function": {"name": "rag_status",
+                  "arguments": "{}"}}]
+    tc_search = [{"id": "c2", "function": {"name": "rag_search",
+                  "arguments": _json.dumps({"query": "项目代号是什么"})}}]
+    mock = MockLLM([
+        [_evt("reasoning", "First check what's in the knowledge base."),
+         _evt("done", tool_calls=tc_status, usage={"total_tokens": 5})],
+        [_evt("reasoning", "Now search for the project codename."),
+         _evt("done", tool_calls=tc_search, usage={"total_tokens": 5})],
+        [_evt("content", f"根据知识库，{unique_fact}。"),
+         _evt("done", usage={"total_tokens": 20})],
+    ])
+
+    # 7. Run the agent.
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks,
+                  tool_registry=registry)
+    agent.run("公司项目的代号是什么？")
+
+    # 8. Both RAG tools must have been dispatched, in order.
+    called = [n for n, _ in recording_callbacks.tool_starts]
+    assert called == ["rag_status", "rag_search"], (
+        f"expected [rag_status, rag_search], got {called}"
+    )
+
+    # 9. Both tool calls must have succeeded.
+    for name, res in recording_callbacks.tool_ends:
+        assert res.success, f"{name} failed: {res.error}"
+
+    # 10. The rag_search result must carry the unique fact.
+    search_name, search_result = recording_callbacks.tool_ends[1]
+    assert search_name == "rag_search"
+    assert unique_fact in search_result.output, (
+        f"rag_search result missing unique fact: {search_result.output[:300]}"
+    )
+
+    # 11. The rag_search result must be in the third LLM call's history so
+    #     the model can ground its final answer in retrieved context.
+    third_msgs = mock.calls[2]["messages"]
+    rag_tool_msgs = [m for m in third_msgs
+                     if m.get("role") == "tool" and m.get("name") == "rag_search"]
+    assert rag_tool_msgs, "rag_search result not in third LLM call history"
+    assert unique_fact in rag_tool_msgs[0]["content"], (
+        "RAG context not propagated to LLM for the final answer"
+    )
+
+    # 12. The agent's final visible reply should reference the retrieved fact.
+    assert unique_fact in "".join(recording_callbacks.content), (
+        "agent final reply did not include the retrieved knowledge base fact"
+    )
+
+    # 13. Release RAG engine resources (no leak across tests).
+    registry.shutdown()
+
+
+def test_agent_does_not_register_rag_tools_without_knowledge_base(
+    config, recording_callbacks
+):
+    """When no knowledge_base is configured, the agent's tool list must NOT
+    advertise rag_search / rag_status / rag_ingest to the LLM. This prevents
+    the model from emitting tool_calls that would fail at dispatch time."""
+    from agent.tools.base import ToolRegistry
+
+    config.knowledge_base = ""
+    registry = ToolRegistry(config=config, callbacks=recording_callbacks)
+    schema_names = {s["function"]["name"] for s in registry.schemas()}
+    assert "rag_search" not in schema_names
+    assert "rag_status" not in schema_names
+    assert "rag_ingest" not in schema_names
+    registry.shutdown()
 

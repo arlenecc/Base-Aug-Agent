@@ -1,4 +1,4 @@
-# Base Agent
+# Base Augment Agent
 
 本地自主 Agent，基于 PyQt6 图形界面，支持 OpenAI 兼容的大语言模型，内置可插拔工具系统和本地 RAG 知识库。
 
@@ -11,10 +11,11 @@
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime+size+content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
-- **资源管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + ONNX 模型；OCR 引擎全局单例避免多 worker 重复加载；窗口关闭时统一清理
+- **资源管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 显式 `release()` 立即回收 C++ 堆内存（~130MB embedding + ~500MB reranker）；OCR 引擎全局单例避免多 worker 重复加载；窗口关闭时统一清理所有 QThread worker（AgentWorker / FetchModelsWorker / SyncKnowledgeWorker / InstallDepsWorker）
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
 - **技能系统** — 自动识别用户意图，匹配并激活预定义技能提示词
+- **流式性能** — token 速度估算采用增量计数（O(N) 总开销，避免 O(N²) 全量 join）；0.3s 节流发射实时速度；TTFB 排除出速度计算以准确反映生成速度
 
 ## 界面布局
 
@@ -22,9 +23,9 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │ [Base URL] [API Key] [模型] [获取模型]                    Row 0  │
 │ [上下文长度] [温度] [top_p] [min_p] [top_k] [重复惩罚] [超时] [应用配置] │
-│ [工作目录] [知识库] [同步知识]                              Row 2  │
+│ [工作目录] [知识库] [同步知识] [停止同步]                   Row 2  │
 ├──────────────────────────────┬───────────────────────────────────┤
-│ [对话] — [清空对话] [停止]    │ 思考过程 / 日志                    │
+│ [对话] — [清空对话] [终止对话] │ 思考过程 / 日志                    │
 │                              │                                   │
 │ 对话内容...                   │ 推理过程实时显示...                 │
 │                              │                                   │
@@ -34,6 +35,12 @@
 │ [状态栏]                                   [进度条] [token 速度]  │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+**按钮说明**：
+- 「同步知识」：增量同步知识库（右键可强制全量重处理）
+- 「停止同步」：仅在同步进行中启用，协作式取消（完成当前文件后退出）
+- 「终止对话」：终止当前 agent 对话（完成当前工具后退出）
+- 「应用配置」：在 agent 运行期间会被阻止，需先终止当前对话
 
 ## 快速开始
 
@@ -109,7 +116,7 @@ python main.py
 - **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
 - **批量嵌入**：嵌入按批次进行（默认 100 条/批），避免大知识库一次性嵌入导致 OOM。
-- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker；OCR 引擎全局单例共享；取消机制可在文件/批处理边界退出。
+- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker；`VectorStore.close()` 尝试显式调用 ONNX `InferenceSession.release()` 和 PyTorch `model.cpu()` 立即回收 C++ 堆内存（而非等待 Python GC）；OCR 引擎全局单例共享；取消机制可在文件/批处理边界退出；`SyncKnowledgeWorker` 的 `sync_finished` 信号在 `finally` 清理完成后才发射，避免主线程 reload_rag() 与 worker 侧资源释放竞态。
 
 ### 支持的文档格式
 
@@ -217,7 +224,7 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步）、依赖检查、技能系统、UI Bridge、内存存储等。当前 180+ 测试用例（不含 e2e）。
+测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统、UI Bridge、内存存储等。当前 100+ 测试用例。
 
 ## 部署
 

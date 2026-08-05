@@ -319,3 +319,116 @@ def test_empty_kb_cleans_up_deleted_files(tmp_path):
     # Manifest must be empty
     manifest = _load_manifest(engine._rag_dir)
     assert len(manifest) == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: agent's VectorStore must see table created by sync worker
+# ---------------------------------------------------------------------------
+
+def test_vector_store_rechecks_table_after_external_creation(tmp_path, vector_store_factory):
+    """Regression: VectorStore must re-check table existence on every call.
+
+    Previously _ensure_table() cached "table doesn't exist" via _table_checked
+    flag. When SyncKnowledgeWorker (separate RAGEngine) later created the
+    table, the agent's VectorStore still returned None forever → empty search
+    results despite data being on disk.
+    """
+    persist = str(tmp_path / "vectors")
+
+    # Agent's VectorStore, created at app startup BEFORE any sync.
+    agent_store = vector_store_factory(persist)
+    agent_store._ensure_initialized()
+    # Table doesn't exist yet → _ensure_table returns None
+    assert agent_store._ensure_table() is None
+
+    # SyncKnowledgeWorker creates a SEPARATE VectorStore pointing to the same
+    # dir and writes data (creates the table on disk).
+    sync_store = vector_store_factory(persist)
+    sync_store._ensure_initialized()
+    sync_store.add([{
+        "source": "doc1.md",
+        "chunk_index": 0,
+        "text": "hello world",
+    }])
+    assert sync_store.count() == 1
+    sync_store.close()
+
+    # Agent's VectorStore must now see the table (re-check, not cached None).
+    table = agent_store._ensure_table()
+    assert table is not None, "agent_store should see table created by sync_store"
+    assert agent_store.count() == 1
+    # Search must return results, not empty.
+    results = agent_store.search("hello", top_k=5)
+    assert len(results) >= 1
+    assert results[0]["text"] == "hello world"
+    agent_store.close()
+
+
+def test_rag_engine_search_sees_data_written_by_another_engine(tmp_path, rag_engine_factory):
+    """End-to-end regression: two RAGEngine instances pointing to the same
+    workspace. The first (agent's, created at startup) must find data written
+    by the second (SyncKnowledgeWorker) without needing a restart.
+    """
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    (kb / "note.txt").write_text("LanceDB is a columnar vector database.")
+
+    # Agent's engine, created at startup (table doesn't exist yet).
+    agent_engine = rag_engine_factory(str(tmp_path), str(kb))
+    # Trigger lazy init by calling search (returns empty, table not yet created).
+    results_before = agent_engine.search("database", top_k=3)
+    assert results_before == []
+
+    # SyncKnowledgeWorker's engine writes data.
+    sync_engine = rag_engine_factory(str(tmp_path), str(kb))
+    sync_engine.ingest(force=False)
+    sync_engine.close()
+
+    # Agent's engine must now find the data WITHOUT restart.
+    results_after = agent_engine.search("database", top_k=3)
+    assert len(results_after) >= 1
+    assert "LanceDB" in results_after[0]["text"]
+    agent_engine.close()
+
+
+def test_incremental_sync_visible_to_existing_engine(tmp_path, rag_engine_factory):
+    """增量同步后，已存在的 agent 引擎应立即看到新数据，无需重启。
+
+    场景：agent 引擎先同步 doc1 并搜索（打开表），然后 sync 引擎追加 doc2，
+    agent 引擎立即搜索 doc2 内容应能命中。验证 LanceDB 的表对象不缓存数据，
+    agent 持有的旧表对象能看到新写入的行。
+    """
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    (kb / "doc1.txt").write_text("First document about Python basics.")
+
+    # Agent 的引擎：首次同步 + 触发一次搜索（让 VectorStore 打开表）
+    agent_engine = rag_engine_factory(str(tmp_path), str(kb))
+    agent_engine.ingest(force=False)
+    r1 = agent_engine.search("Python", top_k=3)
+    assert len(r1) >= 1, "首次同步后应能搜到 doc1"
+
+    # 添加新文件
+    (kb / "doc2.txt").write_text("Second document about JavaScript and web development.")
+
+    # SyncKnowledgeWorker 的引擎：增量同步
+    sync_engine = rag_engine_factory(str(tmp_path), str(kb))
+    stats = sync_engine.ingest(force=False)
+    assert stats["files_extracted"] == 1, "应增量处理 doc2"
+    assert stats["files_skipped"] == 1, "应跳过 doc1"
+    sync_engine.close()
+
+    # 模拟 UI _on_sync_finished 中的 reload_rag() 调用：
+    # 刷新 agent 引擎的表句柄，让下一次搜索看到新写入的数据。
+    # LanceDB 表对象在打开时获取版本快照，不刷新会看到旧数据。
+    agent_engine.reload()
+
+    # Agent 的引擎立即搜索新内容（不重启、不重建）
+    r2 = agent_engine.search("JavaScript", top_k=3)
+    assert len(r2) >= 1, "增量同步后应立即搜到 doc2"
+    assert "JavaScript" in r2[0]["text"]
+
+    # 旧内容仍可搜到
+    r3 = agent_engine.search("Python", top_k=3)
+    assert len(r3) >= 1, "旧内容仍应可搜到"
+    agent_engine.close()

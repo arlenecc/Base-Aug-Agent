@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -186,8 +187,14 @@ class RAGEngine:
         """
         self._reset_cancel()
         if not self._knowledge_base or not os.path.isdir(self._knowledge_base):
+            logger.warning("RAG ingest: knowledge base dir not found: %s", self._knowledge_base)
             return {"error": f"Knowledge base directory not found: {self._knowledge_base}"}
 
+        logger.info(
+            "RAG ingest start: kb=%s force=%s workers=%d chunk_size=%d overlap=%d",
+            self._knowledge_base, force, self._parallel_workers,
+            self._chunk_size, self._chunk_overlap,
+        )
         os.makedirs(self._rag_dir, exist_ok=True)
         os.makedirs(self._markdown_dir, exist_ok=True)
 
@@ -268,11 +275,16 @@ class RAGEngine:
                     for filepath in filepaths:
                         if self._is_cancelled():
                             return
+                        t0 = time.monotonic()
                         try:
+                            # ---- 整个文件处理流程（extract → clean → chunk → put）----
+                            # 包在一个 try 块中，任何阶段出错都记录到 errors
+                            # 并跳过该文件，而不是让 worker 静默退出。
                             text = extract_text(filepath)
                         except Exception as e:
                             msg = f"{os.path.basename(filepath)}: {e}"
-                            logger.warning("RAG: extract failed for '%s': %s", filepath, e)
+                            logger.warning("RAG: extract failed for '%s' after %.2fs: %s",
+                                           filepath, time.monotonic() - t0, e)
                             with stats_lock:
                                 stats["errors"].append(msg)
                             continue
@@ -282,50 +294,59 @@ class RAGEngine:
                             with stats_lock:
                                 stats["errors"].append(msg)
                             continue
-                        # clean → chunk
-                        rel_path = os.path.relpath(filepath, self._knowledge_base)
-                        md_name = _safe_filename(rel_path) + ".md"
-                        md_path = os.path.join(self._markdown_dir, md_name)
-                        # Markdown cache is still used to avoid re-cleaning when
-                        # force=True but content hasn't changed. Under force the
-                        # markdown cache freshness check is bypassed (we always
-                        # re-clean), so this branch only helps non-force re-runs
-                        # that were interrupted before manifest was saved.
-                        if (not force
-                                and os.path.exists(md_path)
-                                and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
-                            try:
-                                with open(md_path, "r", encoding="utf-8") as f:
-                                    cleaned = f.read()
-                            except OSError:
-                                cleaned = ""
-                        else:
-                            cleaned = clean_text(text)
-                            cleaned = normalize_markdown(cleaned)
-                            try:
-                                with open(md_path, "w", encoding="utf-8") as f:
-                                    f.write(cleaned)
-                            except OSError as e:
-                                logger.warning("RAG: failed to write markdown cache for %s: %s", filepath, e)
-                        # 释放原始全文，cleaned 通常更小
-                        del text
+                        logger.debug(
+                            "RAG: extracted %s (%d chars in %.2fs)",
+                            os.path.basename(filepath), len(text), time.monotonic() - t0,
+                        )
+                        # clean → chunk → put 包在 try 中，避免 clean_text/
+                        # normalize_markdown/chunk_documents 异常导致 worker
+                        # 静默退出（异常会丢失，不记录到 stats["errors"]）。
+                        try:
+                            rel_path = os.path.relpath(filepath, self._knowledge_base)
+                            md_name = _safe_filename(rel_path) + ".md"
+                            md_path = os.path.join(self._markdown_dir, md_name)
+                            if (not force
+                                    and os.path.exists(md_path)
+                                    and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
+                                try:
+                                    with open(md_path, "r", encoding="utf-8") as f:
+                                        cleaned = f.read()
+                                except OSError:
+                                    cleaned = ""
+                            else:
+                                cleaned = clean_text(text)
+                                cleaned = normalize_markdown(cleaned)
+                                try:
+                                    with open(md_path, "w", encoding="utf-8") as f:
+                                        f.write(cleaned)
+                                except OSError as e:
+                                    logger.warning("RAG: failed to write markdown cache for %s: %s", filepath, e)
+                            del text
 
-                        if not cleaned.strip():
+                            if not cleaned.strip():
+                                continue
+
+                            c_hash = _content_hash(cleaned)
+                            cleaned_len = len(cleaned)
+                            doc_chunks = chunk_documents(
+                                [{"source": filepath, "text": cleaned}],
+                                chunk_size=self._chunk_size,
+                                chunk_overlap=self._chunk_overlap,
+                            )
+                            logger.debug(
+                                "RAG: chunked %s → %d chunks in %.2fs",
+                                os.path.basename(filepath), len(doc_chunks),
+                                time.monotonic() - t0,
+                            )
+                            del cleaned
+                        except Exception as e:
+                            # clean/chunk 阶段异常：记录并跳过该文件，不中断整个同步。
+                            msg = f"{os.path.basename(filepath)}: clean/chunk failed: {e}"
+                            logger.error("RAG: %s", msg, exc_info=True)
+                            with stats_lock:
+                                stats["errors"].append(msg)
                             continue
 
-                        # Compute content hash and length before chunking —
-                        # chunk_documents creates new string copies, so holding
-                        # `cleaned` past this point doubles peak memory per file.
-                        c_hash = _content_hash(cleaned)
-                        cleaned_len = len(cleaned)
-                        doc_chunks = chunk_documents(
-                            [{"source": filepath, "text": cleaned}],
-                            chunk_size=self._chunk_size,
-                            chunk_overlap=self._chunk_overlap,
-                        )
-                        # chunks hold their own copies of the text slices;
-                        # the full cleaned text is no longer needed.
-                        del cleaned
                         with stats_lock:
                             stats["files_extracted"] += 1
                             stats["total_chars"] += cleaned_len
@@ -348,6 +369,11 @@ class RAGEngine:
                         # the next file is loaded (important for large PDFs:
                         # without this, doc_chunks stays alive until next iter).
                         del doc_chunks, item
+                except Exception as e:
+                    # 兜底：任何未预期的异常都记录，避免 worker 静默死亡。
+                    logger.error("RAG worker unexpected error: %s", e, exc_info=True)
+                    with stats_lock:
+                        stats["errors"].append(f"worker: {e}")
                 finally:
                     # 投递哨兵也要带超时，防止队列满且主线程已退出消费时
                     # worker 永久卡在 put。
@@ -398,30 +424,45 @@ class RAGEngine:
                         sentinels_seen += 1
                         continue
                     filepath, doc_chunks, c_hash, n_chunks = item
-                    # Update manifest for this processed file
-                    new_manifest[filepath] = {
-                        **_file_signature(filepath),
-                        "content_hash": c_hash,
-                        "chunk_count": n_chunks,
-                    }
+                    # Update manifest for this processed file.
+                    # _file_signature 可能因文件被删除/权限问题抛 OSError，
+                    # 隔离异常避免整个 ingest 失败——跳过 manifest 更新即可，
+                    # chunks 已写入向量库，下次同步会重新处理（manifest 未更新）。
+                    try:
+                        new_manifest[filepath] = {
+                            **_file_signature(filepath),
+                            "content_hash": c_hash,
+                            "chunk_count": n_chunks,
+                        }
+                    except OSError as e:
+                        logger.warning("RAG: failed to update manifest for %s: %s", filepath, e)
                     for c in doc_chunks:
                         yield c
-                    # 进度反馈：每消费完一个文件回调一次
+                    # 进度反馈：每消费完一个文件回调一次。
+                    # 隔离回调异常，避免 UI 端异常中断整个 ingest。
                     if progress_callback is not None:
-                        with stats_lock:
-                            done = stats["files_extracted"] + stats["files_skipped"]
-                        progress_callback(done, total_files, os.path.basename(filepath))
+                        try:
+                            with stats_lock:
+                                done = stats["files_extracted"] + stats["files_skipped"]
+                            progress_callback(done, total_files, os.path.basename(filepath))
+                        except Exception as e:
+                            logger.warning("RAG: progress_callback error: %s", e)
 
             def _on_batch(batch_added: int, total_added: int) -> None:
                 if progress_callback is not None:
-                    progress_callback(stats["files_extracted"] + stats["files_skipped"],
-                                      total_files, f"已写入 {total_added} chunks")
+                    try:
+                        progress_callback(stats["files_extracted"] + stats["files_skipped"],
+                                          total_files, f"已写入 {total_added} chunks")
+                    except Exception as e:
+                        logger.warning("RAG: on_batch callback error: %s", e)
 
             try:
+                logger.info("RAG: starting add_streaming (batch_size=100)")
                 added = store.add_streaming(_chunk_iter(), batch_size=100, on_batch=_on_batch)
                 stats["chunks"] = added
+                logger.info("RAG: add_streaming complete — %d chunks written", added)
             except Exception as e:
-                logger.error("RAG: streaming add failed: %s", e)
+                logger.error("RAG: streaming add failed: %s", e, exc_info=True)
                 # Cancel workers so they stop producing chunks into a queue
                 # that no one is consuming. Without this, workers keep running
                 # (blocked on q.put with timeout loops) until they've processed
@@ -436,10 +477,13 @@ class RAGEngine:
         else:
             # All files skipped — no new chunks written. Report current store count.
             stats["chunks"] = store.count()
+            logger.info("RAG: all %d files skipped (already synced)", total_files)
 
         if self._is_cancelled():
             stats["cancelled"] = True
             stats["chunks"] = store.count()
+            logger.info("RAG ingest cancelled: %d/%d files extracted, %d chunks stored",
+                        stats["files_extracted"], stats["files_found"], stats["chunks"])
             return stats
 
         # Step 5: 清理已删除文件对应的旧向量 + manifest 条目
@@ -448,6 +492,8 @@ class RAGEngine:
         # Step 6: 保存 manifest（即使全部 skip 也保存，以更新删除的条目）
         try:
             _save_manifest(self._rag_dir, new_manifest)
+            logger.info("RAG: manifest saved (%d entries) to %s",
+                        len(new_manifest), _manifest_path(self._rag_dir))
         except OSError as e:
             logger.warning("RAG: failed to save manifest: %s", e)
 
@@ -498,10 +544,22 @@ class RAGEngine:
         Retrieves top_k * 4 candidates from vector search, then uses BGE
         reranker to pick the most relevant top_k results.
         """
+        t0 = time.monotonic()
         store = self._get_store()
-        if store.count() == 0:
+        store_count = store.count()
+        if store_count == 0:
+            logger.info("RAG search: store empty, returning 0 results (query=%r)", query[:60])
             return []
-        return store.search_with_rerank(query, top_k=top_k)
+        logger.info(
+            "RAG search: query=%r top_k=%d store_count=%d",
+            query[:60], top_k, store_count,
+        )
+        results = store.search_with_rerank(query, top_k=top_k)
+        logger.info(
+            "RAG search: returned %d results in %.2fs",
+            len(results), time.monotonic() - t0,
+        )
+        return results
 
     def search_formatted(self, query: str, top_k: int = 3) -> str:
         """Search and return formatted results as a string."""
@@ -568,6 +626,21 @@ class RAGEngine:
                     except Exception as e:
                         logger.debug("RAG: VectorStore close error: %s", e)
                     self._store = None
+
+    def reload(self) -> None:
+        """Drop the cached table handle so the next search sees fresh data.
+
+        Call this after SyncKnowledgeWorker finishes writing — the agent's
+        RAGEngine holds a stale table snapshot that won't reflect newly
+        written rows until the table is re-opened.
+        """
+        with self._store_lock:
+            if self._store is not None:
+                try:
+                    self._store.reload()
+                    logger.info("RAG: VectorStore reloaded (table handle refreshed)")
+                except Exception as e:
+                    logger.warning("RAG: VectorStore reload error: %s", e)
 
     # ------------------------------------------------------------------
     # internal
