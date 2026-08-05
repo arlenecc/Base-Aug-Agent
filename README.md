@@ -8,6 +8,7 @@
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计
 - **工具调用** — 内置 13 个工具，支持模型自主决策和工具链式调用
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
+- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
 - **技能系统** — 自动识别用户意图，匹配并激活预定义技能提示词
@@ -36,19 +37,18 @@
 ### 安装
 
 ```bash
-# 核心依赖
-pip install base-agent
-
-# 或从源码安装
+# 从源码安装
 git clone https://github.com/arlenecc/Base-Aug-Agent.git
 cd Base-Aug-Agent
 pip install -e .
 ```
 
+核心依赖：`PyQt6`、`httpx`、`beautifulsoup4`、`mcp`。RAG 子系统的依赖（`lancedb`、`fastembed` 等）会在首次同步知识库时自动检测并安装。
+
 ### 启动
 
 ```bash
-python -m src.agent.ui.main_window
+python main.py
 ```
 
 ### 配置
@@ -93,10 +93,17 @@ python -m src.agent.ui.main_window
 ### 工作流程
 
 ```
-文档目录 → 文本提取 → 清洗 → 切片 (500 tokens/10% overlap)
-→ 向量化 (all-MiniLM-L6-v2) → ChromaDB 存储
+文档目录 → 文本提取 → 清洗 → 切片 (500 tokens / 10% overlap)
+→ 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX) → LanceDB 存储
 → 检索时: 初检 12 条 → BGE Reranker 精排 → 返回 top 3
 ```
+
+**关键设计**：
+- **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5`，通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。首次下载约 130MB（量化后），之后离线可用。
+- **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。
+- **重排序**：可选 BGE Reranker (`BAAI/bge-reranker-base`)，对初检结果精排，提升召回精度。无重排序依赖时自动回退到距离排序。
+- **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
+- **批量嵌入**：嵌入按批次进行（默认 100 条/批），避免大知识库一次性嵌入导致 OOM。
 
 ### 支持的文档格式
 
@@ -111,23 +118,22 @@ python -m src.agent.ui.main_window
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
 | HTML | `.html`, `.htm` | `beautifulsoup4` |
 
-### 安装 RAG 依赖
+### 依赖自动管理
 
-```bash
-# 核心（必装）
-pip install chromadb sentence-transformers
+点击「同步知识」时会自动：
 
-# 文档解析（按需）
-pip install python-docx openpyxl python-pptx PyMuPDF ebooklib
+1. 扫描知识库目录，识别所有文件扩展名
+2. 对照依赖表（`EXTENSION_DEPS`）检查所需 Python 包是否已安装
+3. 缺失的依赖自动 `pip install`（含版本约束，如 `numpy<2.0`）
+4. 核心依赖（`lancedb`、`fastembed`）也会一并检查
+5. 安装完成后自动开始同步
 
-# 重排序（推荐，提升检索精度）
-pip install FlagEmbedding
-```
+若自动安装失败（如网络问题），会弹出提示列出需手动安装的包。
 
 ### 使用方式
 
 1. 在界面第三行「知识库」中输入文档目录路径（或点击 `…` 选择）
-2. 点击「同步知识」，后台自动完成文档提取、清洗、切片、向量化
+2. 点击「同步知识」，后台自动完成依赖检查、文档提取、清洗、切片、向量化
 3. 同步完成后，对话中模型会自动调用 `rag_search` 检索相关知识
 
 ### Token 控制
@@ -166,7 +172,8 @@ src/agent/
 │   ├── parsers.py        # 文档解析器
 │   ├── cleaner.py        # 文本清洗
 │   ├── chunker.py        # Token 级别切片
-│   └── vector_store.py   # ChromaDB 向量存储 + BGE 重排序
+│   ├── vector_store.py   # LanceDB 向量存储 + BGE 重排序
+│   └── deps.py           # 依赖检查与自动安装
 ├── tools/
 │   ├── base.py           # 工具注册中心
 │   ├── file_ops.py       # 文件读写工具
@@ -187,12 +194,11 @@ src/agent/
 ```bash
 pip install -e ".[test]"
 
-# 离线环境（无法访问 HuggingFace）
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 pytest tests/ -v
-
-# 全部 146 个测试
+# 全部 185 个测试
 pytest tests/ -v
 ```
+
+测试覆盖：Agent 推理循环、工具调用、LLM 客户端、RAG 全流程（端到端 + 集成）、依赖检查、技能系统、UI Bridge、内存存储等。
 
 ## 部署
 
