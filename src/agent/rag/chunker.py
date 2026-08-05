@@ -101,7 +101,7 @@ def _split_recursive(
         return [text] if text.strip() else []
 
     # Try each separator in priority order
-    for sep in separators:
+    for sep_idx, sep in enumerate(separators):
         if sep == "":
             # Character-level split
             return _split_by_tokens(text, chunk_size, chunk_overlap)
@@ -112,24 +112,52 @@ def _split_recursive(
         parts = text.split(sep)
         chunks: List[str] = []
         current = ""
+        # Maintain running counts to avoid O(n²) rescans of `current`
+        cur_cjk = 0
+        cur_other = 0
 
         for part in parts:
-            candidate = current + (sep if current else "") + part
-            if _token_count(candidate) <= chunk_size:
-                current = candidate
+            if current:
+                sep_cjk, sep_other = _char_counts(sep)
+                part_cjk, part_other = _char_counts(part)
+                new_cjk = cur_cjk + sep_cjk + part_cjk
+                new_other = cur_other + sep_other + part_other
+                new_tokens = new_cjk // 2 + new_other // 3
+                if new_tokens <= chunk_size:
+                    cur_cjk = new_cjk
+                    cur_other = new_other
+                    current = current + sep + part
+                else:
+                    if current.strip():
+                        chunks.append(current)
+                    # If a single part is too large, split it further
+                    if _token_count(part) > chunk_size:
+                        sub_chunks = _split_recursive(
+                            part, separators[sep_idx + 1:],
+                            chunk_size, chunk_overlap,
+                        )
+                        chunks.extend(sub_chunks)
+                        current = ""
+                        cur_cjk = 0
+                        cur_other = 0
+                    else:
+                        current = part
+                        cur_cjk, cur_other = _char_counts(part)
             else:
-                if current.strip():
-                    chunks.append(current)
-                # If a single part is too large, split it further
-                if _token_count(part) > chunk_size:
+                # First part
+                part_cjk, part_other = _char_counts(part)
+                if part_cjk // 2 + part_other // 3 <= chunk_size:
+                    current = part
+                    cur_cjk = part_cjk
+                    cur_other = part_other
+                else:
+                    # Single part is too large — split further
                     sub_chunks = _split_recursive(
-                        part, separators[separators.index(sep) + 1:],
+                        part, separators[sep_idx + 1:],
                         chunk_size, chunk_overlap,
                     )
                     chunks.extend(sub_chunks)
-                    current = ""
-                else:
-                    current = part
+                    # Don't reset current — next part starts fresh
 
         if current.strip():
             chunks.append(current)
@@ -137,8 +165,20 @@ def _split_recursive(
         if chunks:
             return _merge_overlap(chunks, chunk_overlap, sep)
 
-    # Fallback: return as-is
-    return [text]
+    # Fallback: character-level split (was previously returning an oversized chunk)
+    return _split_by_tokens(text, chunk_size, chunk_overlap)
+
+
+def _char_counts(text: str) -> tuple:
+    """Return (cjk_count, other_count) for incremental token estimation."""
+    cjk = 0
+    other = 0
+    for ch in text:
+        if 0x4e00 <= ord(ch) <= 0x9fff:
+            cjk += 1
+        else:
+            other += 1
+    return cjk, other
 
 
 def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
@@ -206,7 +246,12 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
 
 
 def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
-    """Add token-based overlap between consecutive chunks."""
+    """Add token-based overlap between consecutive chunks.
+
+    Prepends the tail of the previous chunk to the current chunk so that
+    retrieval has surrounding context at chunk boundaries. The separator
+    is included so the result remains a substring of the original text.
+    """
     if overlap <= 0 or len(chunks) <= 1:
         return chunks
 
@@ -215,7 +260,7 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
         prev = merged[-1]
         curr = chunks[i]
 
-        # Find the overlap boundary: take last N tokens from prev.
+        # Take last N tokens from prev as overlap.
         # Incremental: walk backward, maintaining running counts.
         if _token_count(prev) > overlap:
             boundary = len(prev)
@@ -232,10 +277,12 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
                     break
             prev_end = prev[boundary:]
 
-            # Find where this overlap appears in curr
-            idx = curr.find(prev_end)
-            if idx >= 0:
-                merged.append(curr[idx:])
+            # Prepend overlap to current chunk for context continuity.
+            # prev_end + sep + curr is still a substring of the source text
+            # because prev_end is a suffix of the previous segment and curr
+            # is the next segment in the original split.
+            if prev_end.strip():
+                merged.append(prev_end + sep + curr)
             else:
                 merged.append(curr)
         else:

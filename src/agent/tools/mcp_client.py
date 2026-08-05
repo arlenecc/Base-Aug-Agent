@@ -62,6 +62,7 @@ class MCPClient:
         self._pending: Dict[int, threading.Event] = {}
         self._results: Dict[int, JSONRPCResponse] = {}
         self._reader_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
         self._running = False
         self._server_info: Dict[str, Any] = {}
         self._tools: List[Dict[str, Any]] = []

@@ -11,16 +11,11 @@ stateful stages (ingest, re-ingest, clear) execute in the prescribed
 sequence while sharing one ingested knowledge base.
 
 Run:
-  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \\
   python3 -m pytest tests/test_rag_full_pipeline.py -v --tb=short
 """
 from __future__ import annotations
 
 import os
-
-# Stay offline for the whole test session so we never hit HF Hub.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import pytest
 
@@ -262,10 +257,9 @@ def workspace(tmp_path_factory):
 
 
 @pytest.fixture(scope="class")
-def engine(workspace, kb_dir):
+def engine(workspace, kb_dir, rag_engine_factory):
     """A shared RAGEngine. Ingestion happens in the first test."""
-    from src.agent.rag.engine import RAGEngine
-    return RAGEngine(workspace=workspace, knowledge_base=kb_dir)
+    return rag_engine_factory(workspace=workspace, knowledge_base=kb_dir)
 
 
 @pytest.fixture(scope="class")
@@ -362,9 +356,7 @@ class TestRagFullPipeline:
 
     # -- 4. vector storage persistence ------------------------------------
 
-    def test_vector_storage_persistence(self, engine, workspace, kb_dir, shared):
-        from src.agent.rag.engine import RAGEngine
-
+    def test_vector_storage_persistence(self, engine, workspace, kb_dir, shared, rag_engine_factory):
         store = engine._get_store()
         count_before = store.count()
         assert count_before > 0, "vector store is empty after ingest"
@@ -382,7 +374,7 @@ class TestRagFullPipeline:
         assert not missing, f"missing sources in store: {missing}"
 
         # brand-new engine pointing at the same workspace must see the vectors
-        new_engine = RAGEngine(workspace=workspace, knowledge_base=kb_dir)
+        new_engine = rag_engine_factory(workspace=workspace, knowledge_base=kb_dir)
         new_store = new_engine._get_store()
         assert new_store.count() == count_before, (
             "persistence broken: new engine sees different vector count"
@@ -494,11 +486,10 @@ class TestRagFullPipeline:
 
     # -- 11. rag tool integration -----------------------------------------
 
-    def test_rag_tool_integration(self, kb_dir, tmp_path):
-        from src.agent.rag.engine import RAGEngine
+    def test_rag_tool_integration(self, kb_dir, tmp_path, rag_engine_factory):
         from src.agent.tools.rag_tool import RagSearchTool
 
-        eng = RAGEngine(workspace=str(tmp_path), knowledge_base=kb_dir)
+        eng = rag_engine_factory(workspace=str(tmp_path), knowledge_base=kb_dir)
         stats = eng.ingest(force=True)
         assert stats["chunks"] > 0, "tool-integration engine failed to ingest"
 

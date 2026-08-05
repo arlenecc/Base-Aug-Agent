@@ -90,8 +90,19 @@ class LongTermMemory:
             self._store.set("facts", facts)
 
     def add_many(self, facts: List[str]) -> None:
+        # Batch: read once, deduplicate, append all, write once.
+        # Avoids O(N²) read-write cycles when adding many facts.
+        existing = list(self._store.get("facts", []))
+        seen = set(existing)
+        added = 0
         for f in facts:
-            self.add(f)
+            f = f.strip()
+            if f and f not in seen:
+                existing.append(f)
+                seen.add(f)
+                added += 1
+        if added:
+            self._store.set("facts", existing)
 
     def all(self) -> List[str]:
         return list(self._store.get("facts", []))

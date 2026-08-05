@@ -385,14 +385,12 @@ class TestVectorStore:
         yield tmp
         shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_store_init_and_count(self, store_dir):
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+    def test_store_init_and_count(self, store_dir, vector_store_factory):
+        store = vector_store_factory(persist_dir=store_dir)
         assert store.count() == 0
 
-    def test_add_and_search(self, store_dir):
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+    def test_add_and_search(self, store_dir, vector_store_factory):
+        store = vector_store_factory(persist_dir=store_dir)
 
         chunks = [
             {"source": "doc1.md", "chunk_index": 0,
@@ -413,15 +411,13 @@ class TestVectorStore:
         assert "RAG" in results[0]["text"]
         assert results[0]["source"] == "doc1.md"
 
-    def test_search_empty_store(self, store_dir):
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+    def test_search_empty_store(self, store_dir, vector_store_factory):
+        store = vector_store_factory(persist_dir=store_dir)
         results = store.search("query", top_k=3)
         assert results == []
 
-    def test_list_sources(self, store_dir):
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+    def test_list_sources(self, store_dir, vector_store_factory):
+        store = vector_store_factory(persist_dir=store_dir)
 
         chunks = [
             {"source": "/path/a.md", "chunk_index": 0, "text": "内容A"},
@@ -434,19 +430,17 @@ class TestVectorStore:
         assert "/path/a.md" in sources
         assert "/path/b.md" in sources
 
-    def test_clear(self, store_dir):
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+    def test_clear(self, store_dir, vector_store_factory):
+        store = vector_store_factory(persist_dir=store_dir)
 
         store.add([{"source": "doc.md", "chunk_index": 0, "text": "test"}])
         assert store.count() == 1
         store.clear()
         assert store.count() == 0
 
-    def test_search_with_rerank_fallback(self, store_dir):
+    def test_search_with_rerank_fallback(self, store_dir, vector_store_factory):
         """When reranker is unavailable, should fall back to top_k directly."""
-        from src.agent.rag.vector_store import VectorStore
-        store = VectorStore(persist_dir=store_dir)
+        store = vector_store_factory(persist_dir=store_dir)
 
         chunks = [
             {"source": "doc.md", "chunk_index": i,
@@ -464,16 +458,14 @@ class TestVectorStore:
             assert "source" in r
             assert "score" in r
 
-    def test_persistence(self, store_dir):
+    def test_persistence(self, store_dir, vector_store_factory):
         """Data added to one store should be visible in another instance."""
-        from src.agent.rag.vector_store import VectorStore
-
-        store1 = VectorStore(persist_dir=store_dir)
+        store1 = vector_store_factory(persist_dir=store_dir)
         store1.add([{"source": "p.md", "chunk_index": 0, "text": "持久化测试内容"}])
         assert store1.count() == 1
 
         # New instance pointing to same dir
-        store2 = VectorStore(persist_dir=store_dir)
+        store2 = vector_store_factory(persist_dir=store_dir)
         assert store2.count() == 1
         results = store2.search("持久化测试", top_k=1)
         assert len(results) == 1
@@ -486,9 +478,8 @@ class TestRAGEngine:
     """Test the full RAG engine: ingest → search → status."""
 
     @pytest.fixture
-    def engine(self, test_workspace, test_kb):
-        from src.agent.rag.engine import RAGEngine
-        eng = RAGEngine(workspace=test_workspace, knowledge_base=test_kb)
+    def engine(self, test_workspace, test_kb, rag_engine_factory):
+        eng = rag_engine_factory(workspace=test_workspace, knowledge_base=test_kb)
         return eng
 
     def test_ingest_creates_rag_structure(self, engine):
@@ -573,12 +564,11 @@ class TestRAGEngine:
         combined = " ".join(r["text"] for r in results)
         assert "Token" in combined or "token" in combined
 
-    def test_search_empty_query(self):
+    def test_search_empty_query(self, rag_engine_factory):
         """Search with empty knowledge base should return empty."""
-        from src.agent.rag.engine import RAGEngine
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            eng = RAGEngine(workspace=tmp, knowledge_base="")
+            eng = rag_engine_factory(workspace=tmp, knowledge_base="")
             results = eng.search("anything")
             assert results == []
 
@@ -607,11 +597,10 @@ class TestRAGEngine:
         assert len(status["sources"]) >= 5
         assert status["has_knowledge_base"] is True
 
-    def test_status_no_knowledge_base(self):
-        from src.agent.rag.engine import RAGEngine
+    def test_status_no_knowledge_base(self, rag_engine_factory):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            eng = RAGEngine(workspace=tmp, knowledge_base="")
+            eng = rag_engine_factory(workspace=tmp, knowledge_base="")
             status = eng.status()
             assert status["chunks_stored"] == 0
             assert status["has_knowledge_base"] is False
@@ -628,9 +617,8 @@ class TestRAGEngine:
             md_files = [f for f in os.listdir(engine.markdown_dir) if f.endswith(".md")]
             assert len(md_files) == 0
 
-    def test_ingest_no_knowledge_base(self, test_workspace):
-        from src.agent.rag.engine import RAGEngine
-        eng = RAGEngine(workspace=test_workspace, knowledge_base="/nonexistent/path")
+    def test_ingest_no_knowledge_base(self, test_workspace, rag_engine_factory):
+        eng = rag_engine_factory(workspace=test_workspace, knowledge_base="/nonexistent/path")
         stats = eng.ingest()
         assert "error" in stats
 
@@ -641,9 +629,8 @@ class TestRAGTools:
     """Test the tool interface that the agent uses."""
 
     @pytest.fixture
-    def engine(self, test_workspace, test_kb):
-        from src.agent.rag.engine import RAGEngine
-        eng = RAGEngine(workspace=test_workspace, knowledge_base=test_kb)
+    def engine(self, test_workspace, test_kb, rag_engine_factory):
+        eng = rag_engine_factory(workspace=test_workspace, knowledge_base=test_kb)
         eng.ingest(force=True)
         return eng
 
@@ -691,10 +678,9 @@ class TestRAGTools:
         assert "切片数" in result.output
         assert "索引完成" in result.output
 
-    def test_rag_ingest_tool_no_kb(self, test_workspace):
-        from src.agent.rag.engine import RAGEngine
+    def test_rag_ingest_tool_no_kb(self, test_workspace, rag_engine_factory):
         from src.agent.tools.rag_tool import RagIngestTool
-        eng = RAGEngine(workspace=test_workspace, knowledge_base="/nonexistent")
+        eng = rag_engine_factory(workspace=test_workspace, knowledge_base="/nonexistent")
         tool = RagIngestTool(eng)
         result = tool.run()
         assert result.success is False
@@ -707,9 +693,8 @@ class TestEndToEndPipeline:
     """Full pipeline: create docs → ingest → search → verify relevance."""
 
     @pytest.fixture
-    def setup(self, test_workspace, test_kb):
-        from src.agent.rag.engine import RAGEngine
-        engine = RAGEngine(workspace=test_workspace, knowledge_base=test_kb)
+    def setup(self, test_workspace, test_kb, rag_engine_factory):
+        engine = rag_engine_factory(workspace=test_workspace, knowledge_base=test_kb)
         return engine
 
     def test_full_pipeline_with_rerank(self, setup):

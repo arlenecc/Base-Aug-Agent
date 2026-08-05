@@ -21,12 +21,26 @@ class RAGEngine:
     cleans it, chunks it, embeds it, and stores vectors for retrieval.
     """
 
-    def __init__(self, workspace: str, knowledge_base: str = ""):
+    def __init__(
+        self,
+        workspace: str,
+        knowledge_base: str = "",
+        embedding_model: str = "",
+        embedding_function: Any = None,
+        chunk_size: int = 500,
+        chunk_overlap: int = 50,
+        rerank_model: str = "BAAI/bge-reranker-base",
+    ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._rag_dir = os.path.join(workspace, "rag")
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
+        self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5"
+        self._custom_ef = embedding_function  # for testing injection
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+        self._rerank_model = rerank_model
         self._store: Optional[VectorStore] = None
 
     # ------------------------------------------------------------------
@@ -101,8 +115,15 @@ class RAGEngine:
             md_name = _safe_filename(rel_path) + ".md"
             md_path = os.path.join(self._markdown_dir, md_name)
 
-            if os.path.exists(md_path) and not force:
-                # Already processed — read from cache
+            # Use cache only when not forced AND source file hasn't changed
+            # since the cache was written (prevents stale cache after edits).
+            cache_fresh = (
+                not force
+                and os.path.exists(md_path)
+                and os.path.exists(filepath)
+                and os.path.getmtime(filepath) <= os.path.getmtime(md_path)
+            )
+            if cache_fresh:
                 with open(md_path, "r", encoding="utf-8") as f:
                     cleaned = f.read()
                 stats["files_skipped"] += 1
@@ -118,7 +139,7 @@ class RAGEngine:
                 stats["total_chars"] += len(cleaned)
 
         # Step 3: Chunk documents
-        chunks = chunk_documents(documents)
+        chunks = chunk_documents(documents, chunk_size=self._chunk_size, chunk_overlap=self._chunk_overlap)
         logger.info("RAG: %d documents -> %d chunks", len(documents), len(chunks))
 
         # Step 4: Embed and store
@@ -201,14 +222,25 @@ class RAGEngine:
 
     def _get_store(self) -> VectorStore:
         if self._store is None:
-            self._store = VectorStore(persist_dir=self._vector_dir)
+            self._store = VectorStore(
+                persist_dir=self._vector_dir,
+                embedding_model=self._embedding_model,
+                embedding_function=self._custom_ef,
+            )
         return self._store
 
 
 def _safe_filename(path: str) -> str:
-    """Convert a relative path to a safe filename."""
-    # Replace path separators and special chars
-    safe = path.replace(os.sep, "_").replace(" ", "_")
-    # Remove any remaining problematic chars
-    safe = "".join(c for c in safe if c.isalnum() or c in "._-")
-    return safe or "document"
+    """Convert a relative path to a safe, collision-free filename.
+
+    Uses a short hash of the full relative path to avoid collisions between
+    e.g. ``dir1/file.txt`` and ``dir1_file.txt`` which would otherwise produce
+    the same safe name.
+    """
+    import hashlib
+    h = hashlib.md5(path.encode("utf-8")).hexdigest()[:12]
+    # Build a readable prefix from the basename for easier debugging
+    base = os.path.basename(path)
+    safe_base = "".join(c for c in base if c.isalnum() or c in "._-")[:32]
+    prefix = safe_base or "document"
+    return f"{prefix}_{h}"

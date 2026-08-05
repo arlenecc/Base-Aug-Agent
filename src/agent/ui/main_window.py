@@ -95,6 +95,8 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.speed.emit(total_tokens, speed)
     def on_skill_suggested(self, skill) -> None:
         self.bridge.skill.emit(skill)
+    def on_error(self, message: str) -> None:
+        self.bridge.error.emit(message)
     def on_finished(self) -> None:
         self.bridge.finished.emit()
 
@@ -184,16 +186,18 @@ class SyncKnowledgeWorker(QThread):
     finished = pyqtSignal(dict)   # stats dict
     failed = pyqtSignal(str)      # error message
 
-    def __init__(self, workspace: str, knowledge_base: str):
+    def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = ""):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
+        self._embedding_model = embedding_model
 
     def run(self) -> None:  # type: ignore[override]
         try:
             engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
+                embedding_model=self._embedding_model,
             )
             stats = engine.ingest(force=True)
             self.finished.emit(stats)
@@ -645,7 +649,10 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setText("同步中…")
         self.status_label.setText("正在同步知识库…")
         self.progress.setRange(0, 0)
-        self._sync_worker = SyncKnowledgeWorker(ws, kb)
+        self._sync_worker = SyncKnowledgeWorker(
+            ws, kb,
+            embedding_model=self.config.rag_embedding_model,
+        )
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.failed.connect(self._on_sync_failed)
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
@@ -754,6 +761,10 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(busy)
         self.connect_btn.setEnabled(not busy)
         self.fetch_btn.setEnabled(not busy)
+        self.clear_btn.setEnabled(not busy)
+        self.workspace_btn.setEnabled(not busy)
+        self.knowledge_base_btn.setEnabled(not busy)
+        self.sync_knowledge_btn.setEnabled(not busy)
         self.progress.setRange(0, 0 if busy else 1)
 
     # ------------------------------------------------------------------

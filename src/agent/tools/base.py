@@ -150,6 +150,7 @@ class ToolRegistry:
         engine = RAGEngine(
             workspace=self.config.workspace,
             knowledge_base=kb,
+            embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5"),
         )
         self._rag_engine = engine
 

@@ -64,8 +64,8 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
 
 # Core RAG infrastructure dependencies (always needed for vector search)
 RAG_CORE_DEPS: List[DepSpec] = [
-    DepSpec("chromadb", "chromadb", "向量数据库"),
-    DepSpec("sentence_transformers", "sentence-transformers", "嵌入模型"),
+    DepSpec("lancedb", "lancedb", "向量数据库"),
+    DepSpec("fastembed", "fastembed", "嵌入模型 (ONNX Runtime)"),
 ]
 
 # Version constraints: packages that must be installed together with

@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import hashlib
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,71 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
+
+
+# ---------------------------------------------------------------------------
+# Fake embedding function — deterministic, no network, no model download.
+# Used by all RAG tests via the `fake_ef` fixture.
+# ---------------------------------------------------------------------------
+
+class FakeEmbeddingFunction:
+    """Deterministic embedding function for testing.
+
+    Generates a 128-dimensional vector from the MD5 hash of the text,
+    repeated to fill the vector. This gives stable, reproducible embeddings
+    without requiring any API or model download.
+    """
+
+    def __call__(self, input):
+        results = []
+        for text in input:
+            h = hashlib.md5(text.encode("utf-8")).digest()
+            # Repeat hash bytes to fill 128 floats, normalize to [0, 1]
+            vec = []
+            for i in range(128):
+                vec.append(h[i % len(h)] / 255.0)
+            results.append(vec)
+        return results
+
+    def embed_query(self, text: str):
+        """Embed a single query string. Returns one vector."""
+        return self.__call__([text])[0]
+
+    def name(self):
+        return "fake-embedding"
+
+
+@pytest.fixture(scope="session")
+def fake_ef():
+    """Return a FakeEmbeddingFunction instance."""
+    return FakeEmbeddingFunction()
+
+
+@pytest.fixture(scope="session")
+def rag_engine_factory(fake_ef):
+    """Factory that creates RAGEngine instances with the fake embedding function."""
+    def _make(workspace, knowledge_base="", **kwargs):
+        from agent.rag.engine import RAGEngine
+        return RAGEngine(
+            workspace=workspace,
+            knowledge_base=knowledge_base,
+            embedding_function=fake_ef,
+            **kwargs,
+        )
+    return _make
+
+
+@pytest.fixture(scope="session")
+def vector_store_factory(fake_ef):
+    """Factory that creates VectorStore instances with the fake embedding function."""
+    def _make(persist_dir, **kwargs):
+        from agent.rag.vector_store import VectorStore
+        return VectorStore(
+            persist_dir=persist_dir,
+            embedding_function=fake_ef,
+            **kwargs,
+        )
+    return _make
 
 
 @pytest.fixture()

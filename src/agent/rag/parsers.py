@@ -142,6 +142,7 @@ def _extract_pdf(path: Path) -> str:
 
     doc = fitz.open(str(path))
     parts: List[str] = []
+    ocr_engine = None  # lazy-init, reused across pages
     ocr_needed = False
 
     for page_num in range(len(doc)):
@@ -152,11 +153,14 @@ def _extract_pdf(path: Path) -> str:
         else:
             # Image-based page — try OCR
             ocr_needed = True
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
-            ocr_text = _ocr_image(img_bytes, page_num + 1, path.name)
-            if ocr_text:
-                parts.append(ocr_text)
+            if ocr_engine is None:
+                ocr_engine = _get_ocr_engine()
+            if ocr_engine is not None:
+                pix = page.get_pixmap(dpi=200)
+                img_bytes = pix.tobytes("png")
+                ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+                if ocr_text:
+                    parts.append(ocr_text)
 
     doc.close()
 
@@ -167,19 +171,25 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def _ocr_image(img_bytes: bytes, page_num: int, filename: str) -> str:
-    """Run OCR on an image using RapidOCR."""
+def _get_ocr_engine():
+    """Lazy-load RapidOCR engine. Returns None if not installed."""
     try:
         from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR()
     except ImportError:
         logger.warning(
             "rapidocr-onnxruntime is required for OCR on image-based PDFs. "
             "pip install rapidocr-onnxruntime"
         )
-        return ""
+        return None
+    except Exception as e:
+        logger.warning("Failed to init RapidOCR: %s", e)
+        return None
 
+
+def _ocr_image_cached(engine, img_bytes: bytes, page_num: int, filename: str) -> str:
+    """Run OCR using a pre-loaded engine instance."""
     try:
-        engine = RapidOCR()
         result, _ = engine(img_bytes)
         if not result:
             return ""

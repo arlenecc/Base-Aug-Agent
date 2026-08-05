@@ -88,7 +88,7 @@ class TestCheckDependencies:
     def test_check_core_deps_included(self, tmp_path):
         (tmp_path / "notes.txt").write_text("x")
         report = check_dependencies(str(tmp_path), include_core=True)
-        # chromadb and sentence_transformers should be checked
+        # lancedb should be checked
         all_imports = {d.import_name for d in report.all_missing}
         # If they're installed, they won't be in missing; if not, they will
         for dep in RAG_CORE_DEPS:

@@ -28,6 +28,7 @@ class AgentCallbacks:
     def on_usage(self, usage: Dict[str, int]) -> None: ...
     def on_token_speed(self, total_tokens: int, speed: float) -> None: ...
     def on_skill_suggested(self, skill) -> None: ...
+    def on_error(self, message: str) -> None: ...
 
     def confirm(self, message: str) -> bool:
         return True
@@ -117,6 +118,7 @@ class Agent:
         self.max_history = int(getattr(config, "max_history", 50))
         self._history: List[Dict[str, Any]] = []
         self._total_tokens = 0
+        self._tool_call_counter = 0  # stable id generator for missing tool_call ids
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -275,7 +277,8 @@ class Agent:
                 # request. We synthesize stable ids before recording history.
                 for idx, tc in enumerate(tool_calls):
                     if not tc.get("id"):
-                        tc["id"] = f"call_{idx}_{id(tc):x}"
+                        self._tool_call_counter += 1
+                        tc["id"] = f"call_{self._tool_call_counter}_{idx}"
                 assistant_msg["tool_calls"] = tool_calls
             self._history.append(assistant_msg)
             final_content = assistant_msg.get("content") or ""
@@ -299,6 +302,9 @@ class Agent:
                 except ValueError as e:
                     self._log(f"[tool] {name} arg-parse error: {e}")
                     from .tools import ToolResult
+                    # Notify UI of start (with raw args for visibility) before
+                    # reporting the failure, so the UI shows a complete cycle.
+                    self.callbacks.on_tool_start(name, {"_raw_arguments": raw_args})
                     res = ToolResult(False, error=str(e))
                     self.callbacks.on_tool_end(name, res)
                     self._history.append(self._tool_message(tc, res))
@@ -310,8 +316,9 @@ class Agent:
                 self._log(f"[tool] {name}({raw_args}) needs_confirm={needs_confirm}")
 
                 if tool is None:
-                    res = self.tools.execute(name, args)  # returns unknown error
+                    # Unknown tool: still notify UI of start for a complete cycle.
                     self.callbacks.on_tool_start(name, args)
+                    res = self.tools.execute(name, args)  # returns unknown error
                     self.callbacks.on_tool_end(name, res)
                     self._history.append(self._tool_message(tc, res))
                     continue
@@ -321,9 +328,11 @@ class Agent:
                     if not self.callbacks.confirm(confirm_msg):
                         self._log(f"[tool] {name} DENIED by user")
                         from .tools import ToolResult
-
+                        # Tool never actually started (user declined before
+                        # invocation); only report the denial result. The UI
+                        # intentionally does not receive on_tool_start here so
+                        # that "never started" semantics are preserved.
                         res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
-                        # Tool never actually started; only report the denial result.
                         self.callbacks.on_tool_end(name, res)
                         self._history.append(self._tool_message(tc, res))
                         continue
@@ -360,7 +369,15 @@ class Agent:
             pass
         # inject matched skill prompt
         try:
-            matched = self.skills.match(self._history[-1]["content"]) if self._history else None
+            # Find the latest user message — skills match user intents, not
+            # assistant/tool messages. self._history[-1] after the first turn
+            # is an assistant message whose content may be None.
+            user_text = ""
+            for msg in reversed(self._history):
+                if msg.get("role") == "user" and msg.get("content"):
+                    user_text = msg["content"]
+                    break
+            matched = self.skills.match(user_text) if user_text else None
             if matched:
                 base += f"\n\n# Active skill: {matched.name}\n{matched.prompt}"
         except Exception:  # pragma: no cover
