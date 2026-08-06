@@ -72,6 +72,33 @@ class QSignalLogHandler(logging.Handler, QObject):
         self._emit_errors = 0
         self._sync_active = False  # 同步期间为 True，跳过 RAG 日志避免并发崩溃
 
+    def close(self) -> None:
+        """Override close() to also remove this handler from
+        logging._handlerList IN-PLACE.
+
+        The base Handler.close() only removes the handler from the _handlers
+        dict (by name) and sets _closed = True.  But logging.shutdown() —
+        registered via atexit — iterates _handlerList, a global list of weak
+        references.  If the underlying Qt C++ object has already been
+        deleted by the time atexit fires, getattr(h, 'flushOnClose') raises
+        RuntimeError: wrapped C/C++ object has been deleted.
+
+        Note: we must use slice assignment (_handlerList[:] = [...]) to
+        mutate the list in-place, because shutdown()'s default argument
+        binds to the list object at function definition time.  Replacing
+        _handlerList with a new list would leave the default argument
+        pointing at the stale list.
+        """
+        try:
+            import logging as _logging
+            _logging._handlerList[:] = [
+                wr for wr in _logging._handlerList
+                if wr() is not self
+            ]
+        except Exception:
+            pass
+        super().close()
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             # 同步期间跳过 RAG 日志——这些日志由 _log_buffer + QTimer 处理，
@@ -1428,7 +1455,20 @@ class MainWindow(QMainWindow):
                 root.removeHandler(_LOG_HANDLER)
             except Exception:
                 pass
-
+            # Remove from _handlerList in-place (see QSignalLogHandler.close
+            # for the slice-assignment rationale) then close the old handler.
+            try:
+                import logging as _logging
+                _logging._handlerList[:] = [
+                    wr for wr in _logging._handlerList
+                    if wr() is not _LOG_HANDLER
+                ]
+            except Exception:
+                pass
+            try:
+                _LOG_HANDLER.close()
+            except Exception:
+                pass
         self._log_handler = QSignalLogHandler()
         self._log_handler.message_received.connect(self._append_log)
         self._log_handler.setLevel(logging.DEBUG)
@@ -1605,6 +1645,32 @@ class MainWindow(QMainWindow):
             root = logging.getLogger()
             try:
                 root.removeHandler(_LOG_HANDLER)
+            except Exception:
+                pass
+            # Remove the handler from logging._handlerList IN-PLACE.
+            #
+            # logging.shutdown() is registered via atexit and its signature is
+            #   def shutdown(handlerList=_handlerList):
+            # The default argument binds to the list object at function
+            # definition time.  If we replace _handlerList with a new list
+            # (_handlerList = [...]), the default argument still points to the
+            # OLD list, so shutdown() would still see the deleted handler.
+            # Using slice assignment (_handlerList[:] = [...]) mutates the
+            # list IN-PLACE, so the default argument sees the updated list.
+            #
+            # Without this, atexit shutdown() calls getattr(h, 'flushOnClose')
+            # on a QSignalLogHandler whose Qt C++ object is already deleted,
+            # raising RuntimeError.
+            import logging as _logging
+            try:
+                _logging._handlerList[:] = [
+                    wr for wr in _logging._handlerList
+                    if wr() is not _LOG_HANDLER
+                ]
+            except Exception:
+                pass
+            try:
+                _LOG_HANDLER.close()
             except Exception:
                 pass
         super().closeEvent(event)
