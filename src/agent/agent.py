@@ -759,6 +759,43 @@ class Agent:
         except Exception:  # pragma: no cover
             pass
 
+        # Dynamically inject knowledge base status so the agent knows RAG
+        # tools are available and whether the KB has indexed content.  Without
+        # this the agent has no way to discover that a local KB exists and
+        # will never proactively call rag_search / rag_status.
+        try:
+            rag_engine = self.tools.get_rag_engine() if self.tools else None
+            if rag_engine is not None:
+                status = rag_engine.status()
+                chunks = status.get("chunks_stored", 0)
+                sources = status.get("sources", [])
+                if chunks > 0:
+                    source_list = ", ".join(
+                        os.path.basename(s) for s in sources[:10]
+                    ) + ("..." if len(sources) > 10 else "")
+                    base += (
+                        f"\n\n# Local knowledge base (ACTIVE)\n"
+                        f"A local knowledge base is available with {chunks} indexed "
+                        f"text chunks from {len(sources)} file(s): {source_list}\n"
+                        f"You have the tools `rag_search`, `rag_status`, and "
+                        f"`rag_ingest` to interact with it.  When the user asks a "
+                        f"question that could be answered from these documents, "
+                        f"MUST call `rag_search` first before answering.\n"
+                        f"知识库已就绪，包含 {chunks} 个文本切片，来自 {len(sources)} 个文件。"
+                        f"回答与用户文档相关的问题时，必须先调用 `rag_search` 检索相关内容。"
+                    )
+                else:
+                    base += (
+                        f"\n\n# Local knowledge base (EMPTY)\n"
+                        f"A knowledge base is configured but has no indexed content yet. "
+                        f"Use `rag_ingest` to index documents from the knowledge base "
+                        f"directory, then use `rag_search` to query them.\n"
+                        f"知识库已配置但尚未索引任何文档。可使用 `rag_ingest` 索引文档后，"
+                        f"再用 `rag_search` 进行检索。"
+                    )
+        except Exception:  # pragma: no cover
+            pass
+
         self._cached_prompt_turn = self._turn_idx
         self._cached_prompt = base
         return base
