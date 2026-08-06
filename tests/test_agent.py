@@ -1075,19 +1075,19 @@ def test_agent_calls_rag_tools_when_knowledge_base_configured(
     registry.shutdown()
 
 
-def test_agent_does_not_register_rag_tools_without_knowledge_base(
+def test_agent_registers_rag_tools_with_default_knowledge_base(
     config, recording_callbacks
 ):
-    """When no knowledge_base is configured, the agent's tool list must NOT
-    advertise rag_search / rag_status / rag_ingest to the LLM. This prevents
-    the model from emitting tool_calls that would fail at dispatch time."""
+    """When knowledge_base is empty, the agent defaults to
+    <workspace>/knowledge_base and registers RAG tools so the agent can
+    discover the local knowledge base."""
     from agent.tools.base import ToolRegistry
 
     config.knowledge_base = ""
     registry = ToolRegistry(config=config, callbacks=recording_callbacks)
     schema_names = {s["function"]["name"] for s in registry.schemas()}
-    assert "rag_search" not in schema_names
-    assert "rag_status" not in schema_names
-    assert "rag_ingest" not in schema_names
+    assert "rag_search" in schema_names
+    assert "rag_status" in schema_names
+    assert "rag_ingest" in schema_names
     registry.shutdown()
 

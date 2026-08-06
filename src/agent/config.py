@@ -19,6 +19,8 @@ class AgentConfig:
     top_k: int = 20
     repetition_penalty: float = 1.0
     workspace: str = field(default_factory=lambda: os.path.expanduser("~/base-agent-workspace"))
+    # Default to <workspace>/knowledge_base so RAG tools are available out of
+    # the box.  Users can override via the UI or config.json.
     knowledge_base: str = ""
     request_timeout: float = 120.0
     max_iterations: int = 15

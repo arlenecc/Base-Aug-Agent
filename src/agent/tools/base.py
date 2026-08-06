@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -137,9 +138,20 @@ class ToolRegistry:
     def _register_rag_tools(self) -> None:
         """Initialize RAG engine and register RAG tools."""
         kb = getattr(self.config, "knowledge_base", "") or ""
+        # If knowledge_base is not explicitly set, default to
+        # <workspace>/knowledge_base so that RAG tools are available out of
+        # the box when users place documents there (or have previously
+        # synced knowledge).  Without this, the agent never registers RAG
+        # tools and cannot discover the local knowledge base.
         if not kb:
-            logger.debug("RAG tools not registered: no knowledge_base configured")
-            return
+            kb = os.path.join(self.config.workspace, "knowledge_base")
+            logger.info(
+                "RAG: knowledge_base not configured, defaulting to %s", kb
+            )
+
+        # Create the directory if it doesn't exist so that RAGEngine
+        # initialization doesn't fail on a missing path.
+        os.makedirs(kb, exist_ok=True)
 
         try:
             from ..rag.engine import RAGEngine

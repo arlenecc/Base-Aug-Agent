@@ -800,6 +800,10 @@ class MainWindow(QMainWindow):
             self.config.workspace = ws
         self.config.ensure_workspace()
         kb = self.knowledge_base_edit.text().strip()
+        if not kb:
+            # Default to <workspace>/knowledge_base so RAG tools work out of
+            # the box even when the user hasn't explicitly set a path.
+            kb = os.path.join(self.config.workspace, "knowledge_base")
         self.config.knowledge_base = kb
 
     def _rebuild_agent(self) -> None:

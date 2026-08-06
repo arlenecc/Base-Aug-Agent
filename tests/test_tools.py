@@ -372,14 +372,16 @@ def test_registry_exposes_function_schemas(config):
 # RAG tool registration
 # ---------------------------------------------------------------------------
 
-def test_rag_tools_not_registered_without_knowledge_base(config):
-    """No knowledge_base configured → RAG tools should not be registered."""
+def test_rag_tools_registered_with_default_knowledge_base(config):
+    """Empty knowledge_base → defaults to <workspace>/knowledge_base,
+    RAG tools should still be registered."""
     config.knowledge_base = ""
     reg = _reg(config)
     names = {s["function"]["name"] for s in reg.schemas()}
-    assert "rag_search" not in names
-    assert "rag_status" not in names
-    assert "rag_ingest" not in names
+    assert "rag_search" in names
+    assert "rag_status" in names
+    assert "rag_ingest" in names
+    reg.shutdown()
 
 
 def test_rag_tools_registered_with_knowledge_base(config, tmp_path):
