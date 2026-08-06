@@ -301,7 +301,9 @@ def _extract_mobi(path: Path) -> str:
             if result.returncode == 0 and os.path.exists(txt_path):
                 with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
                     return f.read()
-        except (subprocess.TimeoutExpired, Exception) as e:
+        except subprocess.TimeoutExpired:
+            logger.warning("ebook-convert timed out for '%s'", path.name)
+        except Exception as e:
             logger.warning("ebook-convert failed for '%s': %s", path.name, e)
         finally:
             try:

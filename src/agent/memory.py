@@ -1,11 +1,13 @@
 """In-process memory stores: work memory (scratchpad) and long-term memory."""
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import threading
 import time
+import weakref
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,17 @@ class _JsonStore:
         self._dirty = False
         self._last_save = 0.0
         self._load()
+        # Register atexit to flush dirty data on process exit so debounced
+        # writes don't get lost. Use weakref so the store can still be GC'd
+        # (atexit holds a strong ref to the callback, weakref breaks the cycle).
+        _store_ref = weakref.ref(self)
+
+        def _atexit_flush():
+            store = _store_ref()
+            if store is not None:
+                store.flush(force=True)
+
+        atexit.register(_atexit_flush)
 
     def _load(self) -> None:
         if os.path.exists(self.path):
@@ -67,6 +80,17 @@ class _JsonStore:
             return
         if time.monotonic() - self._last_save >= self._FLUSH_INTERVAL:
             self._save()
+
+    def flush(self, force: bool = False) -> None:
+        """Force-write pending changes to disk.
+
+        When ``force=True`` the debounce interval is bypassed — used by the
+        atexit hook and by callers that need the data on disk immediately
+        (e.g. before spawning a subprocess that reads the same store file).
+        """
+        with self._lock:
+            if self._dirty and (force or time.monotonic() - self._last_save >= self._FLUSH_INTERVAL):
+                self._save()
 
     def set(self, key: str, value) -> None:
         with self._lock:
@@ -122,8 +146,11 @@ class LongTermMemory:
         self._store = _JsonStore(path)
         # Defensive: a corrupted/partially-written store may have "facts": null.
         # isinstance check resets to [] so callers never see None.
-        if not isinstance(self._store.get("facts"), list):
-            self._store.set("facts", [])
+        # Directly modify _data to avoid triggering a debounced _save()
+        # which would set _last_save and delay subsequent writes.
+        with self._store._lock:
+            if not isinstance(self._store._data.get("facts"), list):
+                self._store._data["facts"] = []
 
     def add(self, fact: str) -> None:
         facts = list(self._store.get("facts") or [])

@@ -135,29 +135,40 @@ class MCPClient:
 
     def stop(self) -> None:
         """Terminate the MCP server subprocess and wait for threads."""
+        # Signal the reader thread to stop first. We set _running=False under
+        # the lock so the reader sees it on its next loop iteration.
         with self._lock:
+            if not self._running:
+                # Already stopped — avoid double-cleanup.
+                return
             self._running = False
-        if self._process:
+        # Close stdin / terminate the process OUTSIDE the lock so the reader
+        # thread (which may be in its finally block trying to acquire the lock)
+        # doesn't deadlock waiting for us to release it.
+        process = self._process
+        if process:
             try:
-                self._process.stdin.close()
+                process.stdin.close()
             except Exception:
                 pass
             try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
+                process.terminate()
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
+                process.kill()
+                process.wait()
             except Exception:
                 pass
-            self._process = None
-        # Wake up any waiters
+        # Clear the process reference under the lock.
         with self._lock:
+            self._process = None
+            # Wake up any waiters
             for ev in self._pending.values():
                 ev.set()
             self._pending.clear()
             self._results.clear()
-        # Wait for reader threads to finish
+        # Wait for reader threads to finish (they should exit once _running is
+        # False and stdin is closed, causing readline() to return "").
         for t in (self._reader_thread, self._stderr_thread):
             if t and t.is_alive():
                 t.join(timeout=3)

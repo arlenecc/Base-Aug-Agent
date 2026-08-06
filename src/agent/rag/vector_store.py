@@ -44,8 +44,11 @@ class FastEmbedEmbeddingFunction:
         if self._model is None:
             from fastembed import TextEmbedding
             logger.info("  🔧 正在加载嵌入模型: %s (首次加载, 约 130MB)...", self._model_name)
+            import time as _time
+            _time.sleep(0.01)  # 释放 GIL 让 UI 更新
             self._model = TextEmbedding(model_name=self._model_name)
             logger.info("  ✅ 嵌入模型加载完成: %s", self._model_name)
+            _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         """Embed a list of document texts. Returns a list of embedding vectors."""
@@ -105,6 +108,7 @@ class VectorStore:
         if self._initialized:
             return
 
+        logger.info("  正在初始化向量库...")
         try:
             import lancedb
         except ImportError:
@@ -114,15 +118,18 @@ class VectorStore:
 
         os.makedirs(self._persist_dir, exist_ok=True)
 
+        logger.info("  连接 LanceDB: %s", self._persist_dir)
         self._db = lancedb.connect(self._persist_dir)
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
             self._ef = self._custom_ef
         else:
+            logger.info("  加载嵌入模型: %s", self._embedding_model)
             self._ef = FastEmbedEmbeddingFunction(
                 model_name=self._embedding_model,
             )
+            logger.info("  嵌入模型加载完成")
 
         # Open existing table or defer creation until first add
         if _TABLE_NAME in self._db.table_names():
@@ -290,7 +297,6 @@ class VectorStore:
 
         # 第一批处理前检查取消标志
         if is_cancelled is not None and is_cancelled():
-            logger.info("  向量化写入: 写入前检测到取消信号，跳过")
             return 0
 
         # Embed 第一批
@@ -299,12 +305,15 @@ class VectorStore:
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
         table = self._ensure_table()
+        # 跟踪已删除过旧数据的 source，避免后续批次重复写入时新旧数据共存。
+        sources_seen: set = set()
         if table is None:
-            # 首次：创建表（用第一批 records）
+            # 首次：创建表（用第一批 records），无需删除旧数据。
             self._table = self._db.create_table(_TABLE_NAME, first_records)
             self._table_checked = True
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
+            sources_seen = {r["source"] for r in first_records}
             if on_batch:
                 on_batch(len(first_records), total)
             if exhausted:
@@ -338,22 +347,28 @@ class VectorStore:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
                 return total
 
-        # 后续批次：每批 embed 完立即写入，records 用完即释放
+        # 后续批次
         chunk_idx = len(first_batch)
         batch_buf: List[Dict[str, Any]] = []
         batch_num = 1
+        deleted_sources: set = sources_seen.copy() if table is not None else set()
         for chunk in chunk_iter:
             batch_buf.append(chunk)
             if len(batch_buf) >= batch_size:
-                # 每批处理前检查取消标志
                 if is_cancelled is not None and is_cancelled():
-                    logger.info(
-                        "  ⚠ 向量化写入取消: 第 %d 批前, 已写入 %d 切片, 丢弃缓冲区 %d 切片",
-                        batch_num, total, len(batch_buf),
-                    )
                     return total
                 batch_num += 1
                 logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
+                if table is not None:
+                    new_sources = {c["source"] for c in batch_buf} - deleted_sources
+                    if new_sources:
+                        for source in new_sources:
+                            h = _hash_source(source)
+                            try:
+                                table.delete(f"id LIKE '{h}_%'")
+                            except Exception:
+                                pass
+                        deleted_sources.update(new_sources)
                 records = self._embed_chunks(batch_buf, chunk_idx)
                 try:
                     table.add(records)
@@ -368,15 +383,19 @@ class VectorStore:
                 batch_buf.clear()
         # 处理剩余
         if batch_buf:
-            # 处理剩余批次前检查取消标志
             if is_cancelled is not None and is_cancelled():
-                logger.info(
-                    "  ⚠ 向量化写入取消: 最后批次前, 已写入 %d 切片, 丢弃缓冲区 %d 切片",
-                    total, len(batch_buf),
-                )
                 return total
             batch_num += 1
             logger.info("  ├─ 向量化: 最后批次 (%d 切片) 正在嵌入...", len(batch_buf))
+            if table is not None:
+                new_sources = {c["source"] for c in batch_buf} - deleted_sources
+                if new_sources:
+                    for source in new_sources:
+                        h = _hash_source(source)
+                        try:
+                            table.delete(f"id LIKE '{h}_%'")
+                        except Exception:
+                            pass
             records = self._embed_chunks(batch_buf, chunk_idx)
             try:
                 table.add(records)
@@ -394,9 +413,26 @@ class VectorStore:
     def _embed_chunks(
         self, chunks: List[Dict[str, Any]], start_idx: int,
     ) -> List[Dict[str, Any]]:
-        """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。"""
+        """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。
+
+        将每批拆分为更小的子批次（每子批 5 个 chunk）进行 embedding，
+        每个子批次完成后主动 time.sleep() 释放 GIL，让主线程有机会
+        处理 Qt 事件（日志渲染、进度更新）。ONNX Runtime 的 embed()
+        在 C++ 计算期间持有 GIL，整批一次性嵌入会导致 UI 长时间冻结。
+        """
+        import time as _time
+        _SUB_BATCH = 5  # 每子批 5 个 chunk，平衡吞吐与 UI 响应
         texts = [c["text"] for c in chunks]
-        vectors = self._ef(texts)
+        all_vectors: List[List[float]] = []
+        for sub_start in range(0, len(texts), _SUB_BATCH):
+            sub_texts = texts[sub_start:sub_start + _SUB_BATCH]
+            sub_vectors = self._ef(sub_texts)
+            all_vectors.extend(sub_vectors)
+            # 每个子批次完成后释放 GIL，让 Qt 事件循环有机会处理
+            # 排队的日志/进度信号。这是关键：ONNX Runtime 在 embed()
+            # 期间持有 GIL，只有在 Python 层主动 sleep 时才释放。
+            _time.sleep(0.01)
+        vectors = all_vectors
         records: List[Dict[str, Any]] = []
         for j, chunk in enumerate(chunks):
             idx = start_idx + j

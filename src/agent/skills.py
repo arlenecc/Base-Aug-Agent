@@ -38,12 +38,14 @@ class SkillManager:
 
     def __init__(self, path: str):
         self._store = _JsonStore(path)
-        # Defensive: a corrupted store may have null values. isinstance check
-        # resets so callers never iterate None.
-        if not isinstance(self._store.get("skills"), list):
-            self._store.set("skills", [])
-        if not isinstance(self._store.get("requests"), dict):
-            self._store.set("requests", {})
+        # Defensive: a corrupted store may have null values. Directly modify
+        # _data to avoid triggering a debounced _save() which would set
+        # _last_save and delay subsequent real writes.
+        with self._store._lock:
+            if not isinstance(self._store._data.get("skills"), list):
+                self._store._data["skills"] = []
+            if not isinstance(self._store._data.get("requests"), dict):
+                self._store._data["requests"] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -64,7 +66,8 @@ class SkillManager:
                 self._store.set("requests", {})
 
     def list(self) -> List[Skill]:
-        return [Skill(**s) for s in (self._store.get("skills") or [])]
+        with self._lock:
+            return [Skill(**s) for s in (self._store.get("skills") or [])]
 
     def create_skill(self, name: str, keywords: List[str], prompt: str) -> Skill:
         skill = Skill(name=name, keywords=[k.lower() for k in keywords], prompt=prompt)

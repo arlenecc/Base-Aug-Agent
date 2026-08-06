@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 from agent.agent import AgentCallbacks
@@ -261,7 +262,15 @@ def test_web_scan_extracts_text(monkeypatch, config):
         def raise_for_status(self):
             pass
 
-    monkeypatch.setattr(web_mod.httpx, "get", lambda url, **kw: FakeResp())
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    # The tool now uses a shared httpx.Client instance (_http attribute).
+    # Patch the Client.get method to return our fake response.
+    monkeypatch.setattr(httpx.Client, "get", lambda self, url, **kw: FakeResp())
     reg = _reg(config)
     res = reg.execute("web_scan", {"url": "https://example.com"})
     assert res.success

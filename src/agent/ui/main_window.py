@@ -6,13 +6,14 @@ with threading.Event so the worker blocks until the user answers.
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
 import sys
 import threading
 from typing import Any, Dict, Optional
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -67,13 +68,43 @@ class QSignalLogHandler(logging.Handler, QObject):
         QObject.__init__(self)
         logging.Handler.__init__(self)
         self.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+        self._emit_count = 0
+        self._emit_errors = 0
+        self._sync_active = False  # 同步期间为 True，跳过 RAG 日志避免并发崩溃
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # 同步期间跳过 RAG 日志——这些日志由 _log_buffer + QTimer 处理，
+            # 避免 QSignalLogHandler 的 queued signal 和 _poll_sync_logs 的
+            # appendPlainText 同时操作 log_view 导致的并发崩溃。
+            if self._sync_active and any(
+                record.name.startswith(p) for p in _RAG_LOG_PREFIXES
+            ):
+                return
             msg = self.format(record)
+            self._emit_count += 1
             self.message_received.emit(msg)
+        except RuntimeError:
+            # Qt 对象在 atexit/logging.shutdown 时可能已被销毁，
+            # 忽略以避免 "wrapped C/C++ object has been deleted" 异常。
+            pass
         except Exception:
+            self._emit_errors += 1
             self.handleError(record)
+
+    def flush(self) -> None:
+        """Override flush to prevent RuntimeError during logging.shutdown."""
+        try:
+            super().flush()
+        except RuntimeError:
+            pass
+
+    def close(self) -> None:
+        """Override close to prevent RuntimeError during logging.shutdown."""
+        try:
+            super().close()
+        except RuntimeError:
+            pass
 
 
 def _sanitize_stream_text(text: str) -> str:
@@ -247,27 +278,60 @@ class SyncKnowledgeWorker(QThread):
         self._embedding_model = embedding_model
         self._force = force
         self._engine: Optional[RAGEngine] = None
+        # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
+        # 用 Lock 保护，避免多 worker 线程 append 与主线程清空之间的竞态。
+        self._log_buffer: list = []
+        self._log_buffer_lock = threading.Lock()
+
+    def _emit_log(self, msg: str) -> None:
+        """将日志追加到缓冲区，由 _poll_sync_logs 消费写入日志面板。"""
+        with self._log_buffer_lock:
+            self._log_buffer.append(msg)
 
     def run(self) -> None:  # type: ignore[override]
+        self._emit_log("[rag] ────────── 同步引擎启动 ──────────")
         logger.info(
             "SyncKnowledgeWorker start: workspace=%s kb=%s force=%s embedding=%s",
             self._workspace, self._knowledge_base, self._force,
             self._embedding_model or "(default)",
         )
-        # Use a flag + deferred emit so the sync_finished signal is emitted
-        # AFTER the finally block completes cleanup (engine.close). Emitting
-        # before close() causes the main thread to reset the UI / call
-        # reload_rag() while the worker thread is still holding LanceDB /
-        # ONNX resources — a potential race.
-        emit_stats: Optional[dict] = None
-        emit_error: Optional[str] = None
+        # 安装临时 handler：捕获 RAG 各模块通过 logging 输出的日志
+        # （如 vector_store 的向量化过程日志），写入 _log_buffer。
+        # engine.py 的 _log() 则直接通过 log_callback 写 buffer，
+        # 不依赖 logging handler。
+        _tmp_handler = logging.StreamHandler(io.StringIO())
+        _tmp_handler.setLevel(logging.INFO)
+        _tmp_handler.setFormatter(
+            logging.Formatter("%(message)s")
+        )
+        def _on_rag_log(record):
+            msg = _tmp_handler.format(record)
+            with self._log_buffer_lock:
+                self._log_buffer.append(msg)
+        _tmp_handler.emit = _on_rag_log
+        _rag_loggers = [
+            'src.agent.rag', 'src.agent.rag.engine', 'src.agent.rag.vector_store',
+            'src.agent.rag.chunker', 'src.agent.rag.cleaner',
+            'src.agent.rag.parsers', 'src.agent.rag.deps',
+        ]
+        for _name in _rag_loggers:
+            _l = logging.getLogger(_name)
+            _l.setLevel(logging.INFO)
+            _l.addHandler(_tmp_handler)
+        emit_stats = None
+        emit_error = None
         try:
             self._engine = RAGEngine(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
             )
-            stats = self._engine.ingest(force=self._force, progress_callback=self._on_progress)
+            self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
+            stats = self._engine.ingest(
+                force=self._force,
+                progress_callback=self._on_progress,
+                log_callback=self._emit_log,
+            )
             logger.info(
                 "SyncKnowledgeWorker done: found=%d extracted=%d skipped=%d deleted=%d chunks=%d errors=%d cancelled=%s",
                 stats.get("files_found", 0), stats.get("files_extracted", 0),
@@ -275,11 +339,23 @@ class SyncKnowledgeWorker(QThread):
                 stats.get("chunks", 0), len(stats.get("errors", [])),
                 stats.get("cancelled", False),
             )
+            self._emit_log(
+                f"[rag] 同步完成: 扫描{stats.get('files_found',0)}文件, "
+                f"提取{stats.get('files_extracted',0)}, 跳过{stats.get('files_skipped',0)}, "
+                f"切片{stats.get('chunks',0)}"
+            )
             emit_stats = stats
         except Exception as e:
+            self._emit_log(f"[rag] ❌ 同步失败: {e}")
             logger.error("SyncKnowledgeWorker failed: %s", e, exc_info=True)
             emit_error = f"{type(e).__name__}: {e}"
         finally:
+            # 移除临时 handler
+            for _name in _rag_loggers:
+                try:
+                    logging.getLogger(_name).removeHandler(_tmp_handler)
+                except Exception:
+                    pass
             # Release the VectorStore's resources (LanceDB connection, FastEmbed
             # ONNX model ~130MB, BGE reranker ~500MB). Without this, every sync
             # run leaks ~600MB of C++ heap memory because the ONNX Runtime
@@ -327,9 +403,18 @@ class InstallDepsWorker(QThread):
     def __init__(self, kb_path: str):
         super().__init__()
         self._kb_path = kb_path
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Signal the worker to stop (best-effort, pip install can't be interrupted)."""
+        self._cancelled.set()
 
     def run(self) -> None:  # type: ignore[override]
         try:
+            if self._cancelled.is_set():
+                self.progress.emit("依赖检查已取消")
+                self.finished.emit(None)
+                return
             from ..rag.deps import ensure_dependencies
             report = ensure_dependencies(
                 self._kb_path,
@@ -337,6 +422,10 @@ class InstallDepsWorker(QThread):
                 include_core=True,
                 progress_callback=self.progress.emit,
             )
+            if self._cancelled.is_set():
+                self.progress.emit("依赖检查已取消")
+                self.finished.emit(None)
+                return
             self.finished.emit(report)
         except Exception as e:
             self.progress.emit(f"依赖检查异常: {e}")
@@ -379,9 +468,16 @@ class MainWindow(QMainWindow):
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
+        self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
         self._total_tokens = 0
+        # 日志轮询定时器：每 100ms 检查 sync_worker._log_buffer，
+        # 把新日志追加到 log_view。绕过 Qt queued signal 机制，
+        # 避免在 GIL 竞争下信号无法被主线程处理的问题。
+        self._log_poll_timer = QTimer()
+        self._log_poll_timer.setInterval(100)  # 100ms
+        self._log_poll_timer.timeout.connect(self._poll_sync_logs)
         # Pending skill suggestion — cached when the agent emits
         # on_skill_suggested during a run, and shown as a dialog AFTER the
         # run finishes. Showing a modal dialog during streaming would block
@@ -791,6 +887,8 @@ class MainWindow(QMainWindow):
         self._pending_sync_ws = ws
         self._pending_sync_kb = kb
         self._pending_sync_force = force
+        logger.info("UI: starting sync — kb=%s force=%s", kb, force)
+        self._append_log("[rag] ────────── 开始知识库同步 ──────────")
         self._deps_worker = InstallDepsWorker(kb)
         self._deps_worker.progress.connect(self._on_deps_progress)
         self._deps_worker.finished.connect(self._on_deps_finished)
@@ -803,6 +901,18 @@ class MainWindow(QMainWindow):
 
     def _on_deps_finished(self, report) -> None:
         self._deps_worker = None
+        # 检查用户是否在依赖检查期间点击了停止同步
+        if self._deps_cancelled:
+            self._deps_cancelled = False
+            logger.info("Deps check finished but user cancelled — aborting sync")
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.status_label.setText("已取消同步")
+            self._append_log("[rag] 已取消同步")
+            return
         if report is not None and report.has_blocking:
             # Required deps still missing after auto-install attempt
             logger.warning("Deps check: blocking dependencies missing, aborting sync")
@@ -831,6 +941,12 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 0)
         # stop_sync_btn stays enabled (it was enabled in _on_sync_knowledge)
         # so the user can cancel mid-sync.
+        self._append_log("[rag] 依赖检查完成，启动同步引擎...")
+        # 同步期间临时禁用 QSignalLogHandler 的 RAG 日志过滤，
+        # 避免 QSignalLogHandler 和 _poll_sync_logs 同时操作 log_view
+        # 导致的并发崩溃。RAG 日志在同步期间完全由 _log_buffer + QTimer 处理。
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = True
         self._sync_worker = SyncKnowledgeWorker(
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
@@ -839,16 +955,20 @@ class MainWindow(QMainWindow):
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)
         self._sync_worker.sync_progress.connect(self._on_sync_progress)
-        # 兜底：如果 sync_finished / sync_failed 信号因任何原因未被正确处理
-        # （例如信号槽连接断开、emit 在 Qt 事件队列中被丢弃），QThread.finished
-        # 信号会在 run() 返回后由 Qt 自动发射。此时检查按钮状态，如果仍处于
-        # "同步中"状态则强制恢复。
         self._sync_worker.finished.connect(self._on_sync_thread_finished)
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
+        # 启动日志轮询定时器：每 100ms 消费 _log_buffer，实时显示同步日志
+        self._log_poll_timer.start()
 
     def _on_sync_finished(self, stats: dict) -> None:
         logger.info("UI: _on_sync_finished called")
+        self._log_poll_timer.stop()
+        # 恢复 QSignalLogHandler 的 RAG 日志过滤
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = False
+        # 最后消费一次 _log_buffer，确保残余日志被显示
+        self._poll_sync_logs()
         try:
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
@@ -859,6 +979,10 @@ class MainWindow(QMainWindow):
             # look "stuck" at 100%.
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
+            # 输出诊断信息：确认信号已正确接收
+            if hasattr(self, '_log_handler') and self._log_handler is not None:
+                logger.info("UI: sync_finished received, emit_count=%d emit_errors=%d",
+                            self._log_handler._emit_count, self._log_handler._emit_errors)
             self._sync_worker = None
             # 刷新 agent 的 RAG 引擎表句柄，让下一次搜索看到新写入的数据。
             # LanceDB 表对象在打开时获取版本快照，同步后不重新打开会看到旧数据。
@@ -920,15 +1044,23 @@ class MainWindow(QMainWindow):
         """兜底检查：QThread.finished 信号在 run() 返回后自动发射。
 
         如果 sync_finished / sync_failed 信号已正常处理，此时按钮应该已经
-        恢复为"同步知识"状态。如果按钮仍处于"同步中"状态，说明同步结束信号
+        恢复为"同步知识"状态。如果按钮仍处于同步相关状态，说明同步结束信号
         未被正确处理，需要强制恢复 UI 状态以避免用户界面永久卡住。
+
+        注意：不检查 self._sync_worker is not None，因为 _on_sync_finished
+        可能在异常路径中已将其设为 None，但按钮状态未恢复。
         """
-        if (self._sync_worker is not None
-                and self.sync_knowledge_btn.text() == "同步中…"):
+        self._log_poll_timer.stop()
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = False
+        self._poll_sync_logs()
+        btn_text = self.sync_knowledge_btn.text()
+        if btn_text in ("同步中…", "检查依赖…", "正在同步知识库…"):
             logger.warning(
-                "UI: sync thread finished but button still in 'syncing' state. "
+                "UI: sync thread finished but button still in '%s' state. "
                 "sync_finished/sync_failed signal may have been lost. "
-                "Forcing UI reset."
+                "Forcing UI reset.",
+                btn_text,
             )
             try:
                 self.sync_knowledge_btn.setEnabled(True)
@@ -939,10 +1071,19 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("知识库同步完成（状态已自动恢复）")
             except Exception:
                 pass
+        # 清理 worker 引用，防止后续误判
+        if self._sync_worker is not None:
             self._sync_worker = None
 
     def _on_sync_failed(self, error: str) -> None:
         logger.info("UI: _on_sync_failed called: %s", error[:200])
+        self._log_poll_timer.stop()
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = False
+        self._poll_sync_logs()
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            logger.info("UI: sync_failed received, emit_count=%d emit_errors=%d",
+                        self._log_handler._emit_count, self._log_handler._emit_errors)
         try:
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
@@ -1045,22 +1186,20 @@ class MainWindow(QMainWindow):
             self.status_label.setText("已请求停止同步（将在当前文件完成后生效）")
             self._append_log("[rag] 用户请求停止同步")
             return
-        # deps 检查阶段没有 cancel 机制，只能等它结束（通常很快）
+        # deps 检查阶段：记录取消意图，deps 完成后不启动同步。
         if self._deps_worker is not None and self._deps_worker.isRunning():
-            logger.info("User requested stop during deps check (no cancel mechanism)")
-            self.status_label.setText("依赖检查中，请稍候…")
+            logger.info("User requested stop during deps check — will abort after deps")
+            self._deps_worker.cancel()
+            self._deps_cancelled = True
+            self.stop_sync_btn.setEnabled(False)
+            self.status_label.setText("正在取消…")
+            self._append_log("[rag] 用户请求停止同步（依赖检查完成后取消）")
             return
 
     def _on_sync_progress(self, done: int, total: int, current: str) -> None:
-        """同步进度反馈：更新进度条和状态栏。"""
+        """同步进度反馈。日志刷新由 _poll_sync_logs 定时器独立处理。"""
         try:
-            # Guard against late progress signals arriving after sync_finished
-            # has already reset the UI. While signals are queued in order, a
-            # modal dialog (QMessageBox.information in _on_sync_finished) runs
-            # a nested event loop that CAN process stale queued signals. This
-            # guard prevents such a late signal from overwriting the
-            # "知识库同步完成" status back to "同步中…".
-            if self._sync_worker is None:
+            if done < 0:
                 return
             if total > 0:
                 self.progress.setRange(0, total)
@@ -1070,11 +1209,37 @@ class MainWindow(QMainWindow):
             else:
                 self.progress.setRange(0, 0)
                 self.status_label.setText(f"同步中 — {current}")
-        except RuntimeError as e:
-            # 控件可能已被销毁（窗口关闭后信号仍可能到达）
-            logger.debug("UI: _on_sync_progress ignored (control deleted): %s", e)
-        except Exception as e:
-            logger.warning("UI: _on_sync_progress error: %s", e)
+        except Exception:
+            pass
+
+    def _poll_sync_logs(self) -> None:
+        """定时轮询 sync_worker._log_buffer，把新日志追加到 log_view。
+
+        绕过 Qt queued signal 机制——ONNX Runtime 在 embedding 期间持有
+        GIL，sync_progress 信号虽然是 queued 但主线程可能无法及时处理。
+        用 QTimer 直接在主线程事件循环中轮询 buffer，只要 GIL 短暂释放
+        （_embed_chunks 中的 sleep(0.01)），定时器回调就能执行。
+
+        注意：本方法只负责日志区域的输出，不更新底部状态栏。
+        状态栏由 _on_sync_progress 根据进度回调单独更新，避免重复。
+        """
+        try:
+            worker = self._sync_worker
+            if worker is None:
+                return
+            with worker._log_buffer_lock:
+                if not worker._log_buffer:
+                    return
+                buf = worker._log_buffer
+                worker._log_buffer = []
+            # 批量插入：用 QTextCursor 一次性插入所有行，比逐行
+            # appendPlainText 快得多（后者每次触发一次重绘）。
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText("\n" + "\n".join(buf))
+            self._scroll_to_bottom(self.log_view)
+        except Exception:
+            pass
 
     def _set_controls_busy(self, busy: bool) -> None:
         self.send_btn.setEnabled(not busy)
@@ -1280,10 +1445,22 @@ class MainWindow(QMainWindow):
         root.addHandler(self._log_handler)
         for prefix in _RAG_LOG_PREFIXES:
             logging.getLogger(prefix).setLevel(logging.DEBUG)
+        # 同时设置已知子 logger 的 level，防止子 logger 从 root 继承
+        # WARNING(30) 导致 INFO(20) 日志在传播到 handler 前被拦截。
+        for _name in ('src.agent.rag.engine', 'src.agent.rag.vector_store',
+                       'src.agent.rag.chunker', 'src.agent.rag.cleaner',
+                       'src.agent.rag.parsers', 'src.agent.rag.deps'):
+            logging.getLogger(_name).setLevel(logging.DEBUG)
 
         # 保存到模块级变量，供 closeEvent 清理使用。
         _LOG_HANDLER = self._log_handler
+        # 验证日志桥接：这条消息应同时出现在终端和 UI 日志面板中。
+        # 如果终端能看到但 UI 面板没有，说明信号槽或 Filter 有问题。
+        # 如果 UI 面板能看到，说明桥接完全正常。
         logger.info("Log bridge: RAG/sync logs forwarded to UI panel")
+        # 直接追加一条测试消息到 UI 日志面板（绕过 logger 桥接），
+        # 验证 log_view 本身可以正常显示文本。
+        # 日志桥接已就绪，不输出提示信息到日志区域
 
     def _append_chat(self, html: str) -> None:
         self.chat_view.append(html)
@@ -1337,6 +1514,11 @@ class MainWindow(QMainWindow):
         3. wait() with a timeout; if it doesn't finish, terminate() as a last
            resort — unsafe, but safer than the crash.
         """
+        # --- 停止日志轮询定时器
+        try:
+            self._log_poll_timer.stop()
+        except Exception:
+            pass
         # --- AgentWorker: cancel the agent run and join the thread.
         # Without this, closing the window during an agent run leaves the
         # worker thread alive; its bridge.finished/error/content signals

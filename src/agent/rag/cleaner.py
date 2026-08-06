@@ -75,10 +75,10 @@ def clean_text(text: str) -> str:
 
     text = '\n'.join(cleaned_lines)
 
-    # 10. Collapse 3+ consecutive newlines into 2
+    # 12. Collapse 3+ consecutive newlines into 2
     text = re.sub(r'\n{3,}', '\n\n', text)
 
-    # 11. Strip leading/trailing whitespace
+    # 13. Strip leading/trailing whitespace
     text = text.strip()
 
     logger.debug("      清洗文本完成: %d 字符", len(text))

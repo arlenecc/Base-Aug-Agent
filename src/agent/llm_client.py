@@ -74,10 +74,10 @@ class LLMClient:
     # ------------------------------------------------------------------
     def list_models(self) -> List[str]:
         url = f"{self.base_url}/models"
-        resp = self._http.get(url, headers=self._headers())
-        if resp.status_code >= 400:
-            raise LLMError(f"list_models failed: HTTP {resp.status_code} {resp.text[:200]}")
-        data = resp.json()
+        with self._http.get(url, headers=self._headers()) as resp:
+            if resp.status_code >= 400:
+                raise LLMError(f"list_models failed: HTTP {resp.status_code} {resp.text[:200]}")
+            data = resp.json()
         items = data.get("data", []) if isinstance(data, dict) else data
         ids = [it["id"] for it in items if isinstance(it, dict) and it.get("id")]
         return sorted(ids)
@@ -115,7 +115,10 @@ class LLMClient:
 
         with self._http.stream("POST", url, headers=self._headers(), content=json.dumps(payload)) as resp:
             if resp.status_code >= 400:
-                body = resp.read().decode("utf-8", errors="replace")
+                try:
+                    body = resp.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
                 raise LLMError(f"chat_stream failed: HTTP {resp.status_code} {body[:300]}")
 
             for raw in resp.iter_lines():

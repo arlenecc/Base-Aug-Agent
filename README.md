@@ -11,7 +11,7 @@
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
-- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
+- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
 - **内存管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + FastEmbed ONNX 模型（~130MB）+ BGE reranker（~500MB）；ONNX Runtime InferenceSession 显式 `release()` 立即回收 C++ 堆内存；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
@@ -195,7 +195,7 @@ python main.py
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
 - **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
-- **批量嵌入**：嵌入按批次进行（默认 100 条/批），避免大知识库一次性嵌入导致 OOM。每批次嵌入前检查取消标志，及时响应停止请求。
+- **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 
@@ -291,7 +291,7 @@ src/agent/
 │   ├── mcp_client.py     # MCP JSON-RPC 客户端
 │   └── mcp_tool.py       # MCP 工具适配
 └── ui/
-    └── main_window.py    # PyQt6 主窗口（日志桥接、信号槽、QThread worker）
+    └── main_window.py    # PyQt6 主窗口（QTimer 日志轮询、信号槽、QThread worker）
 ```
 
 ## 运行测试

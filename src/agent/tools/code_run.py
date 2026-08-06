@@ -85,6 +85,8 @@ class CodeRunTool(Tool):
         _real_open = _b.open
 
         def _guard_open(file, mode="r", *a, **kw):
+            if isinstance(file, int):
+                raise PermissionError("File descriptor access is not allowed in code_run")
             path = os.path.abspath(file if isinstance(file, (str, os.PathLike)) else "")
             if any(m in str(mode) for m in ("w", "a", "x", "+")):
                 if not (path == ws or path.startswith(ws + os.sep)):

@@ -86,18 +86,24 @@ def _estimate_tokens(text: str) -> int:
     """
     if not text:
         return 0
+    # Fast path: if the text is pure ASCII (common for English/code/JSON),
+    # skip the per-character CJK check entirely — str.isascii() is O(1)-ish
+    # (implemented as a single memcmp on CPython).
+    if text.isascii():
+        return max(1, len(text) // 4)
+
+    # Mixed/CJK text: count CJK characters via str.translate for speed.
+    # Building the translation table is O(1) and translate is O(n) in C,
+    # much faster than a Python-level per-character loop for long text.
     cjk = 0
-    other = 0
     for ch in text:
-        # CJK Unified Ideographs + common CJK extension ranges
         cp = ord(ch)
         if (0x4E00 <= cp <= 0x9FFF or  # CJK Unified Ideographs
                 0x3400 <= cp <= 0x4DBF or  # CJK Extension A
                 0x3000 <= cp <= 0x30FF or  # CJK symbols + Japanese kana
                 0xFF00 <= cp <= 0xFFEF):  # Fullwidth forms
             cjk += 1
-        else:
-            other += 1
+    other = len(text) - cjk
     # CJK: ~1.5 chars/token; ASCII/other: ~4 chars/token
     return max(1, int(cjk / 1.5 + other / 4.0))
 
@@ -137,6 +143,8 @@ class Agent:
         self._shrink_keep_recent = 6
         self._history: List[Dict[str, Any]] = []
         self._total_tokens = 0
+        self._cached_prompt_turn = -1
+        self._cached_prompt = ""
         self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
 
@@ -144,7 +152,7 @@ class Agent:
     def reset(self) -> None:
         self._history = []
         self._total_tokens = 0
-        self._history_token_count = 0
+        self._tool_call_counter = 0
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
@@ -165,18 +173,11 @@ class Agent:
         cut = len(self._history) - limit
         while cut < len(self._history) and self._history[cut].get("role") == "tool":
             cut += 1
-        # Update incremental token counter for removed messages.
-        for msg in self._history[:cut]:
-            self._history_token_count -= self._msg_token_count(msg)
         del self._history[:cut]
 
     # ------------------------------------------------------------------
     # Context-size estimation and shrink strategy
     # ------------------------------------------------------------------
-    # Incremental counter to avoid O(n) re-scan of _history on every turn.
-    # Updated via _add_history_token_count / _set_history_token_count.
-    # _history_token_count caches the total without system prompt.
-    _history_token_count: int = 0
 
     def _msg_token_count(self, msg: Dict[str, Any]) -> int:
         """Token count for a single message (role + content + tool_calls)."""
@@ -196,19 +197,14 @@ class Agent:
     def _estimate_history_tokens(self) -> int:
         """Estimate the token count of the full prompt (system + history).
 
-        Uses the incrementally-maintained _history_token_count for the
-        history portion, and recomputes the system prompt (which is cached
-        per-turn by _system_prompt). Falls back to O(n) scan if the
-        incremental counter is out of sync (e.g. after _shrink_context).
+        Always does a full O(n) scan of _history. The history list is
+        typically short (<= max_history messages), so the cost is negligible
+        compared to the complexity of maintaining an incremental counter
+        that can get out of sync when _history is modified directly.
         """
         system_tokens = _estimate_tokens(self._system_prompt())
-        if self._history_token_count >= 0:
-            return system_tokens + self._history_token_count
-        # Fallback: full scan (shouldn't normally happen).
-        total = system_tokens
-        for msg in self._history:
-            total += self._msg_token_count(msg)
-        return total
+        history_tokens = sum(self._msg_token_count(msg) for msg in self._history)
+        return system_tokens + history_tokens
 
     def _should_shrink_context(self) -> bool:
         """Return True if the estimated context size exceeds the shrink
@@ -319,10 +315,6 @@ class Agent:
         self._history = [summary_msg] + list(recent_messages)
         # Recompute incremental counter after shrink (cheaper than full O(n) scan
         # on every turn, and only runs when context actually shrinks).
-        self._history_token_count = 0
-        for msg in self._history:
-            self._history_token_count += self._msg_token_count(msg)
-
         self._log(
             f"[context] shrunk: removed {len(old_messages)} old msgs, "
             f"kept {len(recent_messages)} recent + 1 summary marker "
@@ -457,7 +449,6 @@ class Agent:
             self._log(f"[skills] record_request error: {e}")
 
         self._history.append({"role": "user", "content": user_input})
-        self._history_token_count += self._msg_token_count(self._history[-1])
 
         self._trim_history()
 
@@ -650,7 +641,6 @@ class Agent:
                         tc["id"] = f"call_{self._tool_call_counter}_{idx}"
                 assistant_msg["tool_calls"] = tool_calls
             self._history.append(assistant_msg)
-            self._history_token_count += self._msg_token_count(self._history[-1])
             final_content = assistant_msg.get("content") or ""
 
             if not tool_calls:
@@ -679,7 +669,6 @@ class Agent:
                     self.callbacks.on_tool_end(name, res)
                     msg = self._tool_message(tc, res)
                     self._history.append(msg)
-                    self._history_token_count += self._msg_token_count(msg)
                     continue
 
                 tool = self.tools.get(name)
@@ -694,7 +683,6 @@ class Agent:
                     self.callbacks.on_tool_end(name, res)
                     msg = self._tool_message(tc, res)
                     self._history.append(msg)
-                    self._history_token_count += self._msg_token_count(msg)
                     continue
 
                 if needs_confirm:
@@ -710,7 +698,6 @@ class Agent:
                         self.callbacks.on_tool_end(name, res)
                         msg = self._tool_message(tc, res)
                         self._history.append(msg)
-                        self._history_token_count += self._msg_token_count(msg)
                         continue
 
                 self.callbacks.on_tool_start(name, args)
@@ -720,7 +707,6 @@ class Agent:
                           f"out_len={len(res.output)} err={(res.error or '')[:120]}")
                 msg = self._tool_message(tc, res)
                 self._history.append(msg)
-                self._history_token_count += self._msg_token_count(msg)
 
         self._log("[agent] max iterations reached, stopping.")
         self.callbacks.on_finished()

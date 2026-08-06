@@ -125,7 +125,7 @@ class _FakeStore:
         self.deleted_sources = []
         self._count = 0
 
-    def add_streaming(self, chunk_iter, batch_size=100, on_batch=None):
+    def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
         added = 0
         for chunk in chunk_iter:
             self.records.append(chunk)

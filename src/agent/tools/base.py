@@ -201,6 +201,14 @@ class ToolRegistry:
             except Exception:
                 pass
         self._mcp_clients.clear()
+        # Close shared httpx clients in web tools to release connection pools.
+        for tool in self._tools.values():
+            http_client = getattr(tool, "_http", None)
+            if http_client is not None:
+                try:
+                    http_client.close()
+                except Exception:
+                    pass
         # Release the RAG engine's VectorStore (LanceDB connection + FastEmbed
         # ONNX model + BGE reranker). Without this, each _rebuild_agent() call
         # leaks ~600MB of C++ heap memory.

@@ -30,20 +30,25 @@ class WebScanTool(Tool):
 
     config: AgentConfig
     registry: ToolRegistry
+    _http: httpx.Client  # shared connection pool (lazy-init per instance)
 
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+        self._http = httpx.Client(timeout=30.0, follow_redirects=True,
+                                  headers={"User-Agent": "base-agent/0.1"})
 
     def run(self, url: str, raw: bool = False) -> ToolResult:
         try:
-            resp = httpx.get(url, timeout=30.0, follow_redirects=True,
-                             headers={"User-Agent": "base-agent/0.1"})
+            resp = self._http.get(url)
         except Exception as e:
             return ToolResult(False, error=f"Request failed: {e}")
-        if resp.status_code >= 400:
-            return ToolResult(False, error=f"HTTP {resp.status_code}")
-        text = resp.text
+        # Use with-statement to ensure the response body stream is closed
+        # even when an exception occurs mid-processing.
+        with resp:
+            if resp.status_code >= 400:
+                return ToolResult(False, error=f"HTTP {resp.status_code}")
+            text = resp.text
         if raw:
             return ToolResult(True, output=text[:20000])
         if BeautifulSoup is not None:
@@ -86,10 +91,12 @@ class WebExecJsTool(Tool):
 
     config: AgentConfig
     registry: ToolRegistry
+    _http: httpx.Client  # shared connection pool (lazy-init per instance)
 
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+        self._http = httpx.Client(timeout=60.0)
 
     def run(self, script: str, url: str = "", action: str = "",
             selector: str = "", value: str = "") -> ToolResult:
@@ -102,10 +109,11 @@ class WebExecJsTool(Tool):
         payload = {"url": url, "script": script, "action": action,
                    "selector": selector, "value": value}
         try:
-            resp = httpx.post(endpoint.rstrip("/") + "/exec", json=payload, timeout=60.0)
+            resp = self._http.post(endpoint.rstrip("/") + "/exec", json=payload)
         except Exception as e:
             return ToolResult(False, error=f"Browser bridge error: {e}")
-        if resp.status_code >= 400:
-            return ToolResult(False, error=f"HTTP {resp.status_code}: {resp.text[:500]}")
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"result": resp.text}
+        with resp:
+            if resp.status_code >= 400:
+                return ToolResult(False, error=f"HTTP {resp.status_code}: {resp.text[:500]}")
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"result": resp.text}
         return ToolResult(True, output=json.dumps(data, ensure_ascii=False)[:8000])
