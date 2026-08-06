@@ -74,10 +74,13 @@ class LLMClient:
     # ------------------------------------------------------------------
     def list_models(self) -> List[str]:
         url = f"{self.base_url}/models"
-        with self._http.get(url, headers=self._headers()) as resp:
+        resp = self._http.get(url, headers=self._headers())
+        try:
             if resp.status_code >= 400:
                 raise LLMError(f"list_models failed: HTTP {resp.status_code} {resp.text[:200]}")
             data = resp.json()
+        finally:
+            resp.close()
         items = data.get("data", []) if isinstance(data, dict) else data
         ids = [it["id"] for it in items if isinstance(it, dict) and it.get("id")]
         return sorted(ids)

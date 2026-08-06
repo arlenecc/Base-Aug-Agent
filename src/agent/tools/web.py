@@ -43,12 +43,12 @@ class WebScanTool(Tool):
             resp = self._http.get(url)
         except Exception as e:
             return ToolResult(False, error=f"Request failed: {e}")
-        # Use with-statement to ensure the response body stream is closed
-        # even when an exception occurs mid-processing.
-        with resp:
+        try:
             if resp.status_code >= 400:
                 return ToolResult(False, error=f"HTTP {resp.status_code}")
             text = resp.text
+        finally:
+            resp.close()
         if raw:
             return ToolResult(True, output=text[:20000])
         if BeautifulSoup is not None:
@@ -112,8 +112,10 @@ class WebExecJsTool(Tool):
             resp = self._http.post(endpoint.rstrip("/") + "/exec", json=payload)
         except Exception as e:
             return ToolResult(False, error=f"Browser bridge error: {e}")
-        with resp:
+        try:
             if resp.status_code >= 400:
                 return ToolResult(False, error=f"HTTP {resp.status_code}: {resp.text[:500]}")
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"result": resp.text}
+        finally:
+            resp.close()
         return ToolResult(True, output=json.dumps(data, ensure_ascii=False)[:8000])

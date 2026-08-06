@@ -262,10 +262,7 @@ def test_web_scan_extracts_text(monkeypatch, config):
         def raise_for_status(self):
             pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
+        def close(self):
             pass
 
     # The tool now uses a shared httpx.Client instance (_http attribute).
