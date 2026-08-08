@@ -13,6 +13,7 @@ import importlib
 import logging
 import os
 import subprocess
+import warnings
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -275,11 +276,14 @@ def _is_embedding_model_cached() -> bool:
         from fastembed import TextEmbedding
         cache_dir = _get_fastembed_cache_dir()
         # lazy_load=True: don't load ONNX Runtime, just resolve the model path
-        model = TextEmbedding(
-            model_name=FASTEMBED_MODEL_NAME,
-            cache_dir=cache_dir,
-            lazy_load=True,
-        )
+        # Suppress FastEmbed's "model has been updated" UserWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            model = TextEmbedding(
+                model_name=FASTEMBED_MODEL_NAME,
+                cache_dir=cache_dir,
+                lazy_load=True,
+            )
         # Check if the model directory actually has the ONNX file
         model_dir = getattr(model.model, "_model_dir", None)
         if model_dir and os.path.isdir(model_dir):
@@ -318,7 +322,9 @@ def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
         # own cache directory.  Use the same persistent cache_dir as
         # vector_store.py to avoid re-downloads after macOS temp cleanup.
         cache_dir = _get_fastembed_cache_dir()
-        TextEmbedding(model_name=FASTEMBED_MODEL_NAME, cache_dir=cache_dir)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            TextEmbedding(model_name=FASTEMBED_MODEL_NAME, cache_dir=cache_dir)
         logger.info("RAG deps: embedding model downloaded and cached by FastEmbed")
         if progress_callback:
             progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")

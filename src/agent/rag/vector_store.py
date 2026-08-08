@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import threading
+import warnings
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -64,10 +65,15 @@ class FastEmbedEmbeddingFunction:
                     "fastembed",
                 )
                 os.makedirs(cache_dir, exist_ok=True)
-                self._model = TextEmbedding(
-                    model_name=self._model_name,
-                    cache_dir=cache_dir,
-                )
+                # Suppress FastEmbed's "model has been updated on HuggingFace"
+                # UserWarning — it fires on every instantiation and is not
+                # actionable for the user.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    self._model = TextEmbedding(
+                        model_name=self._model_name,
+                        cache_dir=cache_dir,
+                    )
             except Exception as e:
                 # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
                 # 下载 ONNX 模型文件（约 130MB），但网络无法访问 huggingface.co。
