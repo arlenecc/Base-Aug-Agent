@@ -45,28 +45,22 @@ class AgentCallbacks:
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are base-agent, a local autonomous agent that completes the user's task by reasoning, planning, and calling tools.
+SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
-Operating principles:
-1. Analyze the user's request and any prior context. Plan the steps needed.
-2. Call tools to gather information and take actions. After each tool result, decide the next step.
-3. Prefer the least destructive path. For any risky/irreversible action, the user will be asked to confirm.
-4. If information is missing or ambiguous, use the `ask_user` tool rather than guessing.
-5. Use `work_memory` to keep short-term notes across steps; use `memory_extract` to persist reusable facts.
-6. When you have the final answer, reply with a concise summary in plain text (no tool calls). The visible reply comes from your `content` field; your `reasoning_content` (if any) is shown separately as the thinking trace.
+Principles:
+1. Plan, then call tools to gather info and take actions. After each tool result, decide the next step.
+2. Prefer the least destructive path. Risky/irreversible actions need user confirmation.
+3. If info is missing, use `ask_user` rather than guessing.
+4. Use `work_memory` for short-term notes. Use `memory_graph` to store entities/relations/observations. Use `memory_search` to recall facts before answering.
+5. When done, reply concisely in plain text (no tool calls). Your `content` field is the visible reply; `reasoning_content` is the thinking trace.
 
-Tools available operate inside the workspace directory. File paths are relative to the workspace.
+Paths are relative to the workspace. Workspace-only ops (file_read/write/modify, work_memory, memory_graph, memory_search, web_scan, ask_user) run without confirmation. `code_run` and `shell_run` need confirmation.
 
-Confirmation policy: operations confined to the workspace (file_read, file_write, file_modify, work_memory, memory_extract, web_scan, webexec_js, ask_user) run immediately without asking. Only `code_run` and `shell_run` prompt the user first, because they can execute arbitrary system-affecting code. If you intend a genuinely destructive or irreversible action, still prefer to ask via `ask_user` first.
+To call a tool, emit a tool_call with name + JSON args. The result returns as a tool message next turn. Chain calls across turns until done."""
 
-Tool calling: when you need to take an action, emit a tool_call with the tool name and JSON arguments. The agent will execute it locally and return the result (stdout, stderr, errors, or file contents) as a tool message in the next turn. Use this feedback to decide the next step. You may chain multiple tool calls across turns until the task is done.
-
-Knowledge base: if a local knowledge base is configured and indexed, you MUST proactively use `rag_search` to retrieve relevant context BEFORE answering any user question that could be answered from the user's own documents. Use `rag_status` to check what's available, and `rag_ingest` to re-index after new files are added to the knowledge base directory. Workflow:
-1. At the start of a conversation turn, if the user's question could relate to indexed documents, call `rag_status` first to check whether the knowledge base is available and non-empty.
-2. If the knowledge base has data, call `rag_search` with a relevant query derived from the user's question.
-3. Use the retrieved context to ground your answer. If no relevant context is found, say so and answer from your general knowledge.
-4. After the user adds new files to the knowledge base directory, call `rag_ingest` to index them (this is incremental — only new/modified files are processed).
-Always prefer knowledge base context over general knowledge when answering questions about the user's documents or specialized domain."""
+# Appended only when a local knowledge base is configured and non-empty.
+_KB_PROMPT = """
+Knowledge base: if the local knowledge base has indexed data, use `rag_search` to retrieve context BEFORE answering questions about the user's documents. Use `rag_status` to check availability. Use `rag_ingest` to index new files (incremental). Prefer knowledge base context over general knowledge for domain-specific questions."""
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +425,80 @@ class Agent:
         except Exception as e:  # pragma: no cover - defensive
             self._log(f"[context] failed to append memory.md: {e}")
 
+    def _maybe_extract_facts_async(self, assistant_reply: str) -> None:
+        """Launch fact extraction in a daemon thread.
+
+        The extraction calls the LLM (200ms-2s) and we don't want to delay
+        on_finished() — the user should get their reply immediately.  The
+        thread is a daemon so it won't block process exit if the user
+        closes the app right after a reply.
+        """
+        import threading
+        thread = threading.Thread(
+            target=self._extract_facts_sync,
+            args=(assistant_reply,),
+            daemon=True,
+            name="fact-extraction",
+        )
+        thread.start()
+
+    def _extract_facts_sync(self, assistant_reply: str) -> None:
+        """Best-effort: use the LLM to extract entities/relations/observations
+        from the latest conversation turn and persist them to the knowledge
+        graph.  Non-blocking — any failure is logged and swallowed.
+
+        Only runs when the conversation has meaningful content (skips tiny
+        replies like "done" or "ok").  Uses a low-temperature non-streaming
+        call so it doesn't interfere with the main reasoning loop.
+        """
+        try:
+            # Gather the last user message + assistant reply
+            user_text = ""
+            for msg in reversed(self._history):
+                if msg.get("role") == "user" and msg.get("content"):
+                    user_text = msg["content"]
+                    break
+            if not user_text or len(user_text.strip()) < 20:
+                # Skip trivial conversations
+                return
+            if not assistant_reply or len(assistant_reply.strip()) < 20:
+                return
+
+            conversation = f"User: {user_text}\n\nAssistant: {assistant_reply}"
+            from .graph_memory import extract_facts_via_llm
+            data = extract_facts_via_llm(self.llm, conversation)
+
+            entities = data.get("entities", [])
+            relations = data.get("relations", [])
+            if not entities and not relations:
+                return
+
+            from .tools.memory import _get_long_memory
+            lm = _get_long_memory(self.tools, self.config)
+            g = lm.graph
+            added = 0
+            for ent in entities:
+                name = ent.get("name", "").strip()
+                if not name:
+                    continue
+                etype = ent.get("type", "")
+                obs = [o.strip() for o in ent.get("observations", []) if o and o.strip()]
+                if obs:
+                    g.add_observations(name, obs)
+                    added += len(obs)
+                elif etype:
+                    g.create_entity(name, entity_type=etype)
+            for rel in relations:
+                src = rel.get("source", "").strip()
+                tgt = rel.get("target", "").strip()
+                lbl = rel.get("label", "").strip()
+                if src and tgt and lbl:
+                    g.create_relation(src, tgt, lbl)
+            if added:
+                self._log(f"[memory] extracted {added} observations + {len(relations)} relations into graph")
+        except Exception as e:  # pragma: no cover — best-effort
+            self._log(f"[memory] fact extraction skipped: {e}")
+
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
         """Process one user turn. Returns the final assistant content."""
@@ -608,17 +676,29 @@ class Agent:
 
             if usage:
                 self.callbacks.on_usage(usage)
-            # Final speed: use the turn's total token count (including reasoning)
+            # Final speed: use ONLY the completion token count (output tokens)
             # divided by generation-only time (excludes TTFB).
-            # Fall back to completion_tokens if we somehow have no estimate.
-            speed_tokens = turn_tokens if turn_tokens else completion_tokens
+            #
+            # BUG FIX: previously used `turn_tokens` which includes
+            # prompt_tokens (input).  Dividing total_tokens by generation
+            # time produced wildly inflated speeds (e.g. 8000 prompt + 300
+            # completion tokens / 20s = 415 t/s instead of 15 t/s).
+            #
+            # If the API provides reasoning_tokens separately and they're
+            # NOT included in completion_tokens, add them.  If they ARE
+            # included (api_reasoning_tokens > 0), completion_tokens already
+            # covers everything.
+            if api_reasoning_tokens:
+                speed_tokens = completion_tokens  # already includes reasoning
+            else:
+                speed_tokens = completion_tokens + extra_reasoning_tokens
             speed = (speed_tokens / gen_elapsed) if speed_tokens else 0.0
             self.callbacks.on_token_speed(self._total_tokens, speed)
             self._log(
                 f"[iter {iteration}] <- {len(''.join(content_buf))} content chars, "
                 f"{len(reasoning_text)} reasoning chars (~{reasoning_tokens} tok), "
                 f"{len(tool_calls)} tool_calls, usage={usage}, "
-                f"{speed_tokens} tok / {gen_elapsed:.2f}s = {speed:.1f} tok/s"
+                f"{speed_tokens} completion_tok / {gen_elapsed:.2f}s = {speed:.1f} tok/s"
             )
 
             assistant_msg: Dict[str, Any] = {"role": "assistant"}
@@ -645,6 +725,11 @@ class Agent:
 
             if not tool_calls:
                 # no further action -> done
+                # Best-effort: extract facts from this conversation turn and
+                # persist them to the long-term knowledge graph.  Runs in a
+                # daemon thread so the user gets their reply immediately
+                # without waiting for the extraction LLM call.
+                self._maybe_extract_facts_async(final_content)
                 self.callbacks.on_finished()
                 return final_content
 
@@ -732,15 +817,38 @@ class Agent:
             return self._cached_prompt
 
         base = SYSTEM_PROMPT
-        try:
-            from .tools.memory import _work_memory, _long_memory
 
+        # Conditionally append knowledge-base instructions — only when RAG
+        # is actually configured and has data.  Saves ~70 tokens per turn
+        # when no KB is available (the common case for non-RAG workflows).
+        try:
+            if self.tools.is_rag_available():
+                base += _KB_PROMPT
+        except Exception:  # pragma: no cover
+            pass
+
+        try:
+            from .tools.memory import _work_memory, _get_long_memory
+
+            # Work memory: only inject keys that exist (not the full values
+            # when they're long).  Keeps the prompt compact.
             wm = _work_memory(self.config).list()
-            lt = _long_memory(self.config).all()
             if wm:
-                base += "\n\n# Work memory\n" + json.dumps(wm, ensure_ascii=False, indent=2)
-            if lt:
-                base += "\n\n# Long-term memory\n" + json.dumps(lt, ensure_ascii=False, indent=2)
+                # Truncate each value to 200 chars to avoid prompt bloat.
+                compact_wm = {}
+                for k, v in wm.items():
+                    s = str(v)
+                    compact_wm[k] = s[:200] + "…" if len(s) > 200 else s
+                # Compact JSON (no indent) to save tokens
+                base += "\n\n# Work memory\n" + json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":"))
+
+            # Long-term memory: inject a compact snapshot (not full dump).
+            # The snapshot caps at ~10 most-salient items, keeping the
+            # prompt lean even with a large knowledge graph.
+            lm = _get_long_memory(self.tools, self.config)
+            snap = lm.snapshot(max_items=10)
+            if snap:
+                base += "\n\n# Long-term memory (snapshot)\n" + snap
         except Exception:  # pragma: no cover
             pass
         # inject matched skill prompt

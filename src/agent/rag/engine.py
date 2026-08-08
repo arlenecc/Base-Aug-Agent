@@ -122,7 +122,7 @@ class RAGEngine:
         self._rag_dir = os.path.join(workspace, "rag")
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
-        self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5"
+        self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5-Q"
         self._custom_ef = embedding_function  # for testing injection
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap

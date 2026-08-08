@@ -43,10 +43,9 @@ _leaked_threads_lock = threading.Lock()
 class CodeRunTool(Tool):
     name = "code_run"
     description = (
-        "Execute arbitrary Python code (multi-line scripts allowed). stdout/stderr "
-        "are captured and returned. You may `import` and `pip install` packages, "
-        "call external APIs, and write files inside the workspace. "
-        f"Execution is killed after a {int(_DEFAULT_TIMEOUT)}s timeout unless overridden."
+        "Execute Python code (multi-line). stdout/stderr captured. "
+        "Can import and pip install packages, call APIs, write files in workspace. "
+        f"Killed after {int(_DEFAULT_TIMEOUT)}s unless overridden."
     )
     destructive = True
     parameters = {

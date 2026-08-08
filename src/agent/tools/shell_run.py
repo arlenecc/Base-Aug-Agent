@@ -23,9 +23,8 @@ _DEFAULT_TIMEOUT = 120
 class ShellRunTool(Tool):
     name = "shell_run"
     description = (
-        "Execute a shell command in the workspace and return stdout+stderr. "
-        "Use this for running CLI tools, git, pip, build scripts, etc. "
-        "The command runs with the workspace as the working directory."
+        "Run a shell command in the workspace, return stdout+stderr. "
+        "For CLI tools, git, pip, build scripts, etc."
     )
     destructive = True
     parameters = {

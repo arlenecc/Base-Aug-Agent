@@ -13,7 +13,7 @@ from agent.config import AgentConfig
 def test_load_returns_defaults_when_missing(tmp_path):
     p = tmp_path / "missing.json"
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5"
+    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
     assert cfg.base_url == "https://api.openai.com/v1"
 
 
@@ -23,7 +23,7 @@ def test_load_preserves_known_keys(tmp_path):
         "base_url": "https://api.deepseek.com/v1",
         "api_key": "sk-abc",
         "model": "deepseek-chat",
-        "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5",
+        "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
         "rag_chunk_size": 800,
     }))
     cfg = AgentConfig.load(str(p))
@@ -80,7 +80,7 @@ def test_migrate_deprecated_embedding_models(stale_name, tmp_path):
         "rag_embedding_model": stale_name,
     }))
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5"
+    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
 
 
 def test_migrate_preserves_valid_embedding_model(tmp_path):
@@ -90,10 +90,24 @@ def test_migrate_preserves_valid_embedding_model(tmp_path):
         "base_url": "http://x",
         "api_key": "",
         "model": "m",
+        "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+
+
+def test_migrate_nonquantized_to_quantized(tmp_path):
+    """Non-quantized nomic-embed-text-v1.5 (~548MB) must be migrated to the
+    quantized -Q variant (~137MB) on load: same 768-dim, 4x smaller."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "base_url": "http://x",
+        "api_key": "",
+        "model": "m",
         "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5",
     }))
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5"
+    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
 
 
 def test_migrate_persisted_after_save(tmp_path):
@@ -110,7 +124,7 @@ def test_migrate_persisted_after_save(tmp_path):
     cfg.save(str(p))  # persist the migrated value
     # Reload — should now read the corrected value from disk directly.
     cfg2 = AgentConfig.load(str(p))
-    assert cfg2.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5"
+    assert cfg2.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
 
 
 def test_migrate_bumps_small_max_tokens(tmp_path):

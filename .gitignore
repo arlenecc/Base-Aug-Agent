@@ -10,3 +10,5 @@ venv/
 .env
 .DS_Store
 *.sqlite3
+BaseAgent.iconset/
+generated-images/

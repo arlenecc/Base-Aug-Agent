@@ -140,48 +140,79 @@ class WorkMemory:
 
 
 class LongTermMemory:
-    """A list of extracted facts, searchable by keyword."""
+    """Knowledge-graph long-term memory backed by GraphMemoryStore.
 
-    def __init__(self, path: str):
-        self._store = _JsonStore(path)
-        # Defensive: a corrupted/partially-written store may have "facts": null.
-        # isinstance check resets to [] so callers never see None.
-        # Directly modify _data to avoid triggering a debounced _save()
-        # which would set _last_save and delay subsequent writes.
-        with self._store._lock:
-            if not isinstance(self._store._data.get("facts"), list):
-                self._store._data["facts"] = []
+    Replaces the old flat fact-list with a structured graph of entities,
+    observations, and relations.  Observations are embedded via FastEmbed
+    (nomic-embed-text-v1.5-Q) and indexed in LanceDB for semantic recall.
+
+    The public API stays compatible with the old one (add / add_many /
+    search / all / clear) so callers that treat memory as a string list
+    keep working — each fact is stored as a single observation on a
+    generic "General" entity.  The graph CRUD methods are exposed via
+    the ``graph`` attribute (a GraphMemoryStore).
+    """
+
+    def __init__(self, path: str, embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"):
+        from .graph_memory import GraphMemoryStore
+        # path is like .../long_memory.json; the graph file is the same
+        # path but with .json → .graph.json so old flat-memory files are
+        # not clobbered.
+        graph_path = path.replace(".json", ".graph.json") if path.endswith(".json") else path + ".graph"
+        self._graph = GraphMemoryStore(path=graph_path, embedding_model=embedding_model)
+        self._legacy_store = _JsonStore(path)
+        # Migrate old flat facts into the graph on first use.
+        self._migrate_legacy_facts()
+
+    @property
+    def graph(self) -> "GraphMemoryStore":
+        """Direct access to the underlying knowledge-graph store."""
+        return self._graph
+
+    def _migrate_legacy_facts(self) -> None:
+        """One-time migration: old long_memory.json had {"facts": [...]}."""
+        facts = self._legacy_store.get("facts")
+        if not isinstance(facts, list) or not facts:
+            return
+        # Only migrate facts not already in the graph.
+        existing = {o for e in self._graph.list_entities() for o in e.get("observations", [])}
+        new = [f for f in facts if f and f not in existing]
+        if new:
+            self._graph.add_observations("General", new)
+            logger.info("long_memory: migrated %d legacy facts into graph", len(new))
+        # Clear the old file so we don't re-migrate.
+        self._legacy_store.set("facts", [])
+
+    # -- compatible API (thin wrappers over the graph) --
 
     def add(self, fact: str) -> None:
-        facts = list(self._store.get("facts") or [])
-        fact = fact.strip()
-        if fact and fact not in facts:
-            facts.append(fact)
-            self._store.set("facts", facts)
+        """Add a single fact as an observation on the General entity."""
+        self._graph.add_observations("General", [fact])
 
     def add_many(self, facts: List[str]) -> None:
-        # Batch: read once, deduplicate, append all, write once.
-        # Avoids O(N²) read-write cycles when adding many facts.
-        existing = list(self._store.get("facts") or [])
-        seen = set(existing)
-        added = 0
-        for f in facts:
-            f = f.strip()
-            if f and f not in seen:
-                existing.append(f)
-                seen.add(f)
-                added += 1
-        if added:
-            self._store.set("facts", existing)
+        """Add many facts as observations on the General entity."""
+        self._graph.add_observations("General", facts)
 
     def all(self) -> List[str]:
-        return list(self._store.get("facts") or [])
+        """Return all observations across all entities (flat list, legacy)."""
+        out = []
+        for e in self._graph.list_entities():
+            out.extend(e.get("observations", []))
+        return out
 
-    def search(self, query: str) -> List[str]:
-        q = query.lower()
-        if not q:
-            return list(self.all())
-        return [f for f in self.all() if q in f.lower()]
+    def search(self, query: str, top_k: int = 8) -> List[str]:
+        """Semantic search over observations. Returns observation texts."""
+        results = self._graph.search(query, top_k=top_k)
+        return [r["text"] for r in results]
 
     def clear(self) -> None:
-        self._store.set("facts", [])
+        self._graph.clear()
+
+    def close(self) -> None:
+        self._graph.close()
+
+    # -- snapshot for prompt injection --
+
+    def snapshot(self, max_items: int = 10) -> str:
+        """Compact text digest for prompt injection."""
+        return self._graph.snapshot(max_items=max_items)

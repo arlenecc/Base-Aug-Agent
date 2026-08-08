@@ -6,11 +6,14 @@ import sys
 
 
 def main() -> None:
-    # Make the bundled `agent` package importable when running from source.
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, "src")
-    if os.path.isdir(src) and src not in sys.path:
-        sys.path.insert(0, src)
+    # When running from source, add src/ to the path so the `agent` package
+    # is importable.  When running as a PyInstaller-frozen binary, the
+    # package is already bundled and sys.path is set up automatically.
+    if not getattr(sys, "frozen", False):
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "src")
+        if os.path.isdir(src) and src not in sys.path:
+            sys.path.insert(0, src)
 
     from agent.ui.main_window import run
 

@@ -6,14 +6,15 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计
-- **工具调用** — 内置 13 个工具，支持模型自主决策和工具链式调用
+- **工具调用** — 内置 14 个工具，支持模型自主决策和工具链式调用
+- **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
-- **内存管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + FastEmbed ONNX 模型（~130MB）+ BGE reranker（~500MB）；ONNX Runtime InferenceSession 显式 `release()` 立即回收 C++ 堆内存；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
+- **内存管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + FastEmbed ONNX 模型（~137MB 量化版）+ BGE reranker（~500MB）；ONNX Runtime InferenceSession 显式 `release()` 立即回收 C++ 堆内存；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
 - **技能系统** — 自动识别用户意图，匹配并激活预定义技能提示词
@@ -112,8 +113,9 @@ python main.py
 | `web_scan` | 抓取网页内容 | ❌ |
 | `webexec_js` | 浏览器执行 JS | ❌ |
 | `ask_user` | 向用户提问 | ❌ |
-| `work_memory` | 短期工作记忆 | ❌ |
-| `memory_extract` | 持久化记忆提取 | ❌ |
+| `work_memory` | 短期工作记忆（键值对 scratchpad） | ❌ |
+| `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
+| `memory_search` | 长期记忆语义检索 | ❌ |
 | `rag_search` | 搜索本地知识库 | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
 | `rag_ingest` | 重新索引知识库 | ❌ |
@@ -189,7 +191,7 @@ python main.py
 
 ### 关键设计
 
-- **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5`，通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。首次下载约 130MB（量化后），之后离线可用。
+- **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5-Q`（Q4 量化版，~137MB），通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。768 维向量，量化后 4x 更小，质量无损。首次下载后离线可用。
 - **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。
 - **重排序**：BGE Reranker (`BAAI/bge-reranker-base`)，对初检结果精排，提升召回精度。无重排序依赖时自动回退到距离排序。
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
@@ -235,6 +237,82 @@ python main.py
 
 每次 RAG 检索最多返回 3 条结果，单次消耗 ≤ 1500 tokens（在 32768 上下文窗口中占比 < 5%），确保响应速度不受影响。
 
+## 知识图谱记忆
+
+长期记忆采用**知识图谱**架构，模仿 Memory MCP Server 的设计模式，用本地 JSON 文件 + LanceDB 语义索引实现，无需外部数据库。
+
+### 数据模型
+
+```
+Entity（实体）    = {name, type, observations: [str], created_at}
+Relation（关系）  = {source: name, target: name, label: str}
+Observation（观察）= 挂在实体上的自由文本事实
+```
+
+图以实体 **name**（大小写不敏感）为主键，创建同名实体会合并观察。
+
+### 文件布局
+
+```
+workspace/.agent/
+├── work_memory.json           # 短期工作记忆（键值对 scratchpad）
+├── long_memory.graph.json     # 知识图谱 JSON（实体 + 关系）
+└── long_memory.graph.json.vectors/  # LanceDB 观察向量索引
+```
+
+### 自动事实抽取
+
+每次 agent 对话结束（无 tool_calls 的最终回复）后，自动调用 LLM 从「用户消息 + 助手回复」中抽取实体、关系和观察，写入知识图谱：
+
+```
+对话结束 → _maybe_extract_facts()
+  ├─ 跳过过短对话（< 20 字符）
+  ├─ LLM 低温度(0.1)抽取 JSON: {entities: [...], relations: [...]}
+  ├─ 写入 GraphMemoryStore（去重 + 向量索引）
+  └─ 失败静默跳过（best-effort，不阻塞用户回复）
+```
+
+### 语义检索
+
+观察通过 `nomic-embed-text-v1.5-Q` 嵌入后存入 LanceDB，支持语义检索：
+
+```
+memory_search(query) → GraphMemoryStore.search()
+  ├─ LanceDB 向量检索 top_k 条观察
+  ├─ 返回 {entity, text, score}
+  └─ 向量索引不可用时回退到关键词子串匹配
+```
+
+### 精简 Prompt 注入
+
+**旧方案**：全量注入所有工作记忆 + 所有长期记忆事实 → 记忆多时 prompt 膨胀，拖慢响应。
+
+**新方案**：
+- **工作记忆**：只注入 key，value 截断到 200 字符
+- **长期记忆**：只注入精简 snapshot（最多 10 条最显著事实 + 少量关系），而非全量
+
+```
+# Work memory
+{key: "value[:200]…"}
+
+# Long-term memory (snapshot)
+- PostgreSQL (tool): 用 16.3 版本; 连接池 50
+- Alice (person): 负责 API 层
+- Alice --[works_on]--> API Gateway
+```
+
+### 工具
+
+| 工具 | 操作 |
+|------|------|
+| `work_memory` | `set` / `get` / `list` / `clear`（短期 scratchpad） |
+| `memory_graph` | `create_entity` / `delete_entity` / `add_observations` / `create_relation` / `list_entities` / `get_entity` / `snapshot` / `clear` |
+| `memory_search` | 语义检索观察，返回 `{entity, text, score}` |
+
+### 兼容性
+
+旧的 `long_memory.json`（扁平事实列表）在首次加载时自动迁移到知识图谱（作为 "General" 实体的观察），迁移后旧文件清空。
+
 ## 上下文收缩
 
 Agent 在长对话中会自动管理上下文窗口，避免超出模型 token 限制：
@@ -267,10 +345,11 @@ Agent 在长对话中会自动管理上下文窗口，避免超出模型 token �
 
 ```
 src/agent/
-├── agent.py              # 核心 Agent 推理循环（含增量 token 计数、prompt 缓存）
+├── agent.py              # 核心 Agent 推理循环（含增量 token 计数、prompt 缓存、自动事实抽取）
 ├── config.py             # 配置管理
 ├── llm_client.py         # LLM 流式客户端
-├── memory.py             # 工作记忆 / 长期记忆（节流写盘）
+├── memory.py             # 工作记忆 / 长期记忆（知识图谱，节流写盘）
+├── graph_memory.py       # 知识图谱存储引擎（Entity/Relation/Observation + LanceDB 语义检索）
 ├── skills.py             # 技能系统
 ├── rag/
 │   ├── engine.py         # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
@@ -286,7 +365,7 @@ src/agent/
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
 │   ├── web.py            # 网页抓取 / JS 执行
 │   ├── interact.py       # 用户交互
-│   ├── memory.py         # 记忆工具
+│   ├── memory.py         # 记忆工具（work_memory / memory_graph / memory_search）
 │   ├── rag_tool.py       # RAG 检索工具
 │   ├── mcp_client.py     # MCP JSON-RPC 客户端
 │   └── mcp_tool.py       # MCP 工具适配

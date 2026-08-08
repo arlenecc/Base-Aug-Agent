@@ -76,17 +76,27 @@ class ToolRegistry:
         from .shell_run import ShellRunTool
         from .web import WebScanTool, WebExecJsTool
         from .interact import AskUserTool
-        from .memory import WorkMemoryTool, MemoryExtractTool
+        from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
 
-        for t in [
+        tools_to_register = [
             FileReadTool(), FileWriteTool(), FileModifyTool(),
             CodeRunTool(),
             ShellRunTool(),
-            WebScanTool(), WebExecJsTool(),
+            WebScanTool(),
             AskUserTool(),
             WorkMemoryTool(),
-            MemoryExtractTool(),
-        ]:
+            MemoryGraphTool(),
+            MemorySearchTool(),
+        ]
+
+        # webexec_js: only register when browser_endpoint is configured.
+        # Saves ~146 tokens of schema when no browser bridge is available
+        # (the common case).  Without an endpoint the tool just returns
+        # guidance text — no functional value.
+        if getattr(self.config, "browser_endpoint", ""):
+            tools_to_register.append(WebExecJsTool())
+
+        for t in tools_to_register:
             t.bind(self.config, self)
             self._tools[t.name] = t
 
@@ -163,12 +173,12 @@ class ToolRegistry:
         logger.info(
             "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
             self.config.workspace, kb,
-            getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5"),
+            getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
         )
         engine = RAGEngine(
             workspace=self.config.workspace,
             knowledge_base=kb,
-            embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5"),
+            embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
         )
         self._rag_engine = engine
 
@@ -232,6 +242,17 @@ class ToolRegistry:
             except Exception as e:
                 logger.warning("⚠ RAG 引擎资源释放异常: %s", e)
             self._rag_engine = None
+        # Release the singleton LongTermMemory's GraphMemoryStore (LanceDB +
+        # FastEmbed ONNX model ~137MB).  Without this, each _rebuild_agent()
+        # call leaks the model loaded for the knowledge graph.
+        from .memory import _LONG_MEMORY_SINGLETON_ATTR
+        lm = getattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
+        if lm is not None:
+            try:
+                lm.close()
+            except Exception as e:
+                logger.warning("⚠ 长期记忆资源释放异常: %s", e)
+            setattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
@@ -241,6 +262,27 @@ class ToolRegistry:
 
     def schemas(self) -> List[Dict[str, Any]]:
         return [t.schema() for t in self._tools.values()]
+
+    # ------------------------------------------------------------------
+    def is_rag_available(self) -> bool:
+        """Check whether the RAG knowledge base is configured and non-empty.
+
+        Used to conditionally inject KB instructions into the system prompt
+        (saves ~70 tokens when no KB is available) and to decide whether
+        to include RAG tool schemas.
+        """
+        kb_dir = getattr(self.config, "knowledge_base_dir", "") or ""
+        if not kb_dir:
+            return False
+        if not os.path.isdir(kb_dir):
+            return False
+        # Quick check: any files in the KB directory?
+        try:
+            for _ in os.scandir(kb_dir):
+                return True
+            return False
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:

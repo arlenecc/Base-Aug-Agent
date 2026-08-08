@@ -28,7 +28,11 @@ class _ScriptedLLM:
 
     def chat_stream(self, messages, tools=None, temperature=0.7):
         self.calls.append({"messages": messages, "tools": tools})
-        return iter(self._scripts.pop(0))
+        if self._scripts:
+            return iter(self._scripts.pop(0))
+        # Exhausted: return an empty done event so best-effort calls
+        # (e.g. fact extraction) don't crash the test.
+        return iter([_evt("done", usage={})])
 
 
 def test_e2e_reads_file_and_summarizes(config, recording_callbacks):
@@ -53,7 +57,10 @@ def test_e2e_reads_file_and_summarizes(config, recording_callbacks):
     assert recording_callbacks.usages[-1]["total_tokens"] == 12
     # tool schemas were sent to the LLM
     assert recording_callbacks and llm.calls[0]["tools"] is not None
-    assert len(llm.calls) == 2
+    # 2 reasoning turns.  A 3rd best-effort fact-extraction call may or
+    # may not have started yet (it runs in a daemon thread) — we accept
+    # either 2 or 3 to keep the test deterministic.
+    assert len(llm.calls) in (2, 3)
 
 
 def test_e2e_workspace_write_runs_without_confirmation(config, recording_callbacks):

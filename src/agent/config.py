@@ -39,7 +39,7 @@ class AgentConfig:
     # RAG settings
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
-    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
     rag_rerank_model: str = "BAAI/bge-reranker-base"  # bge-reranker for precise scoring
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
@@ -83,7 +83,11 @@ class AgentConfig:
             "",
         }
         if self.rag_embedding_model in _DEPRECATED_EMBEDDING_MODELS:
-            self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5"
+            self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+        # Non-quantized nomic-embed-text-v1.5 (~548MB) → quantized -Q (~137MB).
+        # Same 768-dim embeddings, 4x smaller download, same quality.
+        elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
+            self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
         # Older configs saved max_tokens=4096 (the old LLMClient default).
         # Bump any sub-8192 value to the current default (32768) so users
         # upgrading don't keep hitting the tiny old budget.

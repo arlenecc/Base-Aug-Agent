@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ class FastEmbedEmbeddingFunction:
     Loads nomic-ai/nomic-embed-text-v1.5 via ONNX Runtime — no GPU, no
     HuggingFace network calls, no PyTorch dependency. The model is cached
     after first download (~130MB quantized).
+
+    Thread-safety: ONNX Runtime InferenceSession.run() is thread-safe,
+    so a single instance can be shared across RAG, graph_memory, etc.
+    Use get_or_create_embedding_function() to get a shared singleton.
     """
 
     def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
@@ -96,6 +101,35 @@ class FastEmbedEmbeddingFunction:
 
 
 # ---------------------------------------------------------------------------
+# Process-level embedding function singleton
+# ---------------------------------------------------------------------------
+
+_EF_SINGLETONS: Dict[str, "FastEmbedEmbeddingFunction"] = {}
+_EF_SINGLETONS_LOCK = threading.Lock()
+
+
+def get_or_create_embedding_function(
+    model_name: str = DEFAULT_EMBEDDING_MODEL,
+) -> "FastEmbedEmbeddingFunction":
+    """Return a process-wide shared FastEmbedEmbeddingFunction.
+
+    The ONNX model (~137MB) is loaded once and shared across all callers
+    (RAG VectorStore, graph_memory GraphMemoryStore, etc.).  ONNX Runtime
+    InferenceSession.run() is thread-safe, so concurrent callers can share
+    a single model instance without locking on inference.
+
+    This avoids loading multiple copies of the same ~137MB model when both
+    RAG and graph_memory are active (which previously cost ~274MB).
+    """
+    with _EF_SINGLETONS_LOCK:
+        ef = _EF_SINGLETONS.get(model_name)
+        if ef is None:
+            ef = FastEmbedEmbeddingFunction(model_name=model_name)
+            _EF_SINGLETONS[model_name] = ef
+        return ef
+
+
+# ---------------------------------------------------------------------------
 # Vector store backed by LanceDB
 # ---------------------------------------------------------------------------
 
@@ -149,11 +183,9 @@ class VectorStore:
         if self._custom_ef is not None:
             self._ef = self._custom_ef
         else:
-            logger.info("  加载嵌入模型: %s", self._embedding_model)
-            self._ef = FastEmbedEmbeddingFunction(
-                model_name=self._embedding_model,
-            )
-            logger.info("  嵌入模型加载完成")
+            # Use the process-wide shared singleton to avoid loading
+            # multiple copies of the ~137MB ONNX model (RAG + graph_memory).
+            self._ef = get_or_create_embedding_function(self._embedding_model)
 
         # Open existing table or defer creation until first add
         if _TABLE_NAME in self._db.table_names():
@@ -724,19 +756,24 @@ class VectorStore:
         self._table = None
         self._db = None
         if self._ef is not None:
-            try:
-                # FastEmbed OnnxEmbeddings stores the InferenceSession at
-                # .model.session or .model (depending on version).
-                inner = getattr(self._ef, "model", None) or getattr(self._ef, "_model", None)
-                if inner is not None:
-                    session = getattr(inner, "session", None) or getattr(inner, "_session", None)
-                    if session is not None and hasattr(session, "release"):
-                        try:
-                            session.release()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            # Only release the ONNX session if this VectorStore owns a
+            # private (non-shared) embedding function.  When using the
+            # process-wide singleton (get_or_create_embedding_function),
+            # the session may still be in use by graph_memory or another
+            # VectorStore — releasing it would crash those callers.
+            is_shared = self._ef in _EF_SINGLETONS.values()
+            if not is_shared:
+                try:
+                    inner = getattr(self._ef, "model", None) or getattr(self._ef, "_model", None)
+                    if inner is not None:
+                        session = getattr(inner, "session", None) or getattr(inner, "_session", None)
+                        if session is not None and hasattr(session, "release"):
+                            try:
+                                session.release()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             self._ef = None
         if hasattr(self, "_reranker"):
             # FlagReranker holds a transformers model with PyTorch tensors.

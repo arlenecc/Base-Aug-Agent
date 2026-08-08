@@ -308,15 +308,24 @@ def test_work_memory_set_get_list_clear(config):
 
 
 # ---------------------------------------------------------------------------
-# memory_extract
+# memory_graph / memory_search
 # ---------------------------------------------------------------------------
 
-def test_memory_extract_persists_facts(config):
+def test_memory_graph_create_and_search(config):
     reg = _reg(config)
-    res = reg.execute("memory_extract", {"facts": ["user prefers dark mode", "user uses python"]})
+    # add_observations creates the entity + observations
+    res = reg.execute("memory_graph", {
+        "op": "add_observations",
+        "name": "TestUser",
+        "observations": ["prefers dark mode", "uses python"],
+    })
     assert res.success
-    res2 = reg.execute("memory_extract", {"op": "search", "query": "python"})
+    # search should find the observation
+    res2 = reg.execute("memory_search", {"query": "python", "top_k": 5})
+    assert res2.success
     assert "python" in res2.output.lower()
+    # cleanup
+    reg.execute("memory_graph", {"op": "clear"})
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +346,14 @@ def test_destructive_flags(config):
     assert reg.get("code_run").destructive is True
     assert reg.get("shell_run").destructive is True
     assert reg.get("web_scan").destructive is False
-    assert reg.get("webexec_js").destructive is False
+    # webexec_js is only registered when browser_endpoint is configured
+    webexec = reg.get("webexec_js")
+    if webexec is not None:
+        assert webexec.destructive is False
     assert reg.get("ask_user").destructive is False
     assert reg.get("work_memory").destructive is False
-    assert reg.get("memory_extract").destructive is False
+    assert reg.get("memory_graph").destructive is False
+    assert reg.get("memory_search").destructive is False
 
 
 def test_should_confirm_default_follows_destructive(config):
@@ -363,7 +376,8 @@ def test_registry_exposes_function_schemas(config):
     names = {s["function"]["name"] for s in schemas}
     expected = {
         "code_run", "shell_run", "file_read", "file_write", "file_modify",
-        "web_scan", "webexec_js", "ask_user", "work_memory", "memory_extract",
+        "web_scan", "ask_user",
+        "work_memory", "memory_graph", "memory_search",
     }
     assert expected <= names
 
