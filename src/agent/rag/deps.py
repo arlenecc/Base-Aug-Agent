@@ -92,9 +92,21 @@ _EMBEDDING_REQUIRED_FILES = [
     "vocab.txt",                   # vocabulary (~0.2MB)
 ]
 
-# Reranker model (used at search time, not ingest — only warn if missing)
+# Reranker model (used at search time, not ingest — pre-download to avoid
+# blocking the first search). ~500MB download, optional: search falls back
+# to distance-based ranking if unavailable.
 RERANK_MODEL_ID = "BAAI/bge-reranker-base"
-RERANK_MODEL_LABEL = "重排序模型 bge-reranker-base (~500MB)"
+RERANK_MODEL_LABEL = "重排序模型 bge-reranker-base (~500MB, 可选)"
+
+# Files needed for the BGE reranker (minimal set for FlagEmbedding).
+_RERANKER_REQUIRED_FILES = [
+    "pytorch_model.bin",   # PyTorch weights (~500MB)
+    "config.json",         # model config
+    "tokenizer.json",      # tokenizer
+    "tokenizer_config.json",
+    "vocab.txt",
+    "sentencepiece.bpe.model",
+]
 
 # Version pins: packages that need specific version constraints
 VERSION_PINS: Dict[str, str] = {
@@ -548,6 +560,18 @@ def ensure_dependencies(
         else:
             report.install_errors.append(f"嵌入模型下载失败: {msg}")
 
+    # ---- Step 3: Pre-download reranker model (optional, non-blocking) ----
+    if report.reranker_model_missing:
+        if progress_callback:
+            progress_callback(f"重排序模型未缓存，开始后台下载 {RERANK_MODEL_LABEL}…")
+        success, msg = _download_reranker_model(progress_callback)
+        if success:
+            report.reranker_model_missing = False
+            installed_anything = True
+        else:
+            # Reranker is optional — don't block sync if download fails
+            report.install_errors.append(f"重排序模型下载失败（可选，不影响同步）: {msg}")
+
     if installed_anything and progress_callback:
         progress_callback("依赖检查完成。")
 
@@ -583,3 +607,66 @@ def _is_reranker_cached() -> bool:
         return False
     except Exception:
         return False
+
+
+def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
+    """Pre-download only the files FlagEmbedding needs for BGE reranker.
+
+    Uses hf_hub_download for individual files instead of snapshot_download
+    to avoid pulling the entire repo (~1GB+ with unused formats).
+    """
+    logger.info(
+        "RAG deps: downloading reranker model files (%d files)...",
+        len(_RERANKER_REQUIRED_FILES),
+    )
+    if progress_callback:
+        progress_callback(f"正在下载{RERANK_MODEL_LABEL}（仅必需文件）...")
+
+    env = os.environ.copy()
+    env["HF_HUB_DISABLE_XET"] = "1"
+    if "HF_ENDPOINT" not in env:
+        env["HF_ENDPOINT"] = "https://huggingface.co"
+
+    lines = [
+        "from huggingface_hub import hf_hub_download",
+        f"model_id = '{RERANK_MODEL_ID}'",
+        f"files = {_RERANKER_REQUIRED_FILES!r}",
+        "import sys",
+        "for filename in files:",
+        "    print(f'  Downloading {filename}...', file=sys.stderr)",
+        "    local = hf_hub_download(repo_id=model_id, filename=filename)",
+        "    print(f'    -> {local}', file=sys.stderr)",
+        "print('ALL_FILES_DOWNLOADED')",
+    ]
+    script = "\n".join(lines)
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=900,  # 15 minutes for ~500MB
+            env=env,
+        )
+        if result.returncode == 0 and "ALL_FILES_DOWNLOADED" in result.stdout:
+            logger.info("RAG deps: reranker model files downloaded")
+            if progress_callback:
+                progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")
+            return True, "下载成功"
+        else:
+            error_tail = result.stderr.strip().split("\n")[-3:] if result.stderr else ["unknown error"]
+            msg = "\n".join(error_tail)
+            logger.warning("RAG deps: reranker download failed: %s", msg)
+            if progress_callback:
+                progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
+            return False, msg
+    except subprocess.TimeoutExpired:
+        msg = "下载超时（15 分钟）"
+        logger.warning("RAG deps: reranker download timed out")
+        if progress_callback:
+            progress_callback(f"⚠ 重排序模型{msg}（可选，不影响同步）")
+        return False, msg
+    except Exception as e:
+        msg = str(e)
+        logger.warning("RAG deps: reranker download exception: %s", e)
+        return False, msg

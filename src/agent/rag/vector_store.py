@@ -535,21 +535,59 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     def _get_reranker(self):
-        """Lazy-load the BGE reranker model."""
+        """Lazy-load the BGE reranker model with timeout protection.
+
+        Returns the reranker instance, or None if loading fails (network
+        timeout, missing dependency, etc.). Callers must handle None by
+        falling back to distance-based ranking.
+        """
         if not hasattr(self, "_reranker"):
             try:
                 from FlagEmbedding import FlagReranker
-                logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
-                self._reranker = FlagReranker(
-                    self._rerank_model,
-                    use_fp16=False,
-                )
-                logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
             except ImportError:
                 logger.warning(
                     "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
                 )
                 self._reranker = None
+                return self._reranker
+
+            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
+            import time as _time
+            _time.sleep(0.01)  # 释放 GIL 让 UI 更新
+
+            try:
+                # 模型加载可能在首次下载时卡住（网络问题）。
+                # 用 thread + join(timeout) 做超时保护，避免永久阻塞。
+                import threading
+                result = [None]
+                error = [None]
+
+                def _load():
+                    try:
+                        result[0] = FlagReranker(
+                            self._rerank_model,
+                            use_fp16=False,
+                        )
+                    except Exception as e:
+                        error[0] = e
+
+                t = threading.Thread(target=_load, daemon=True)
+                t.start()
+                t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
+
+                if t.is_alive():
+                    logger.warning(
+                        "  ⚠ BGE Reranker 加载超时 (2 分钟) — 可能正在下载模型但网络较慢。"
+                        " 重排序将回退到向量距离排序。"
+                        " 下次同步时依赖检查会自动预下载 reranker 模型。"
+                    )
+                    self._reranker = None
+                elif error[0] is not None:
+                    logger.warning("  ⚠ BGE Reranker 加载失败: %s", error[0])
+                    self._reranker = None
+                else:
+                    self._reranker = result[0]
+                    logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
             except Exception as e:
                 logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
                 self._reranker = None
