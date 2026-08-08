@@ -335,6 +335,7 @@ class VectorStore:
             # 首次：创建表（用第一批 records），无需删除旧数据。
             self._table = self._db.create_table(_TABLE_NAME, first_records)
             self._table_checked = True
+            table = self._table  # 更新局部变量，后续批次需要 table 引用
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
             sources_seen = {r["source"] for r in first_records}
