@@ -72,8 +72,25 @@ RAG_CORE_DEPS: List[DepSpec] = [
 ]
 
 # Embedding model info for pre-download
+# Embedding model: quantized ONNX variant — only 137MB (vs 548MB for FP32).
+# FastEmbed uses model_quantized.onnx; we download only the required files
+# instead of the full snapshot (which is ~1.6GB with all quantization formats).
 EMBEDDING_MODEL_ID = "nomic-ai/nomic-embed-text-v1.5"
-EMBEDDING_MODEL_LABEL = "嵌入模型 nomic-embed-text-v1.5 (~130MB)"
+EMBEDDING_MODEL_LABEL = "嵌入模型 nomic-embed-text-v1.5 (~137MB, 仅下载 ONNX 量化版)"
+
+# FastEmbed model name — uses the -Q variant (quantized ONNX, model_quantized.onnx).
+# Same 768-dim embeddings, 4x smaller than FP32, 12x smaller than full snapshot.
+FASTEMBED_MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5-Q"
+
+# Files actually needed by FastEmbed for the quantized model.
+# Only these files are downloaded — not the entire ~1.6GB repo snapshot.
+_EMBEDDING_REQUIRED_FILES = [
+    "onnx/model_quantized.onnx",   # quantized ONNX model (~137MB)
+    "tokenizer.json",              # tokenizer (~0.7MB)
+    "config.json",                 # model config (~3KB)
+    "tokenizer_config.json",       # tokenizer config (~4KB)
+    "vocab.txt",                   # vocabulary (~0.2MB)
+]
 
 # Reranker model (used at search time, not ingest — only warn if missing)
 RERANK_MODEL_ID = "BAAI/bge-reranker-base"
@@ -131,12 +148,13 @@ class DependencyReport:
                 lines.append(f"  - {d.label} (pip install {d.pip_spec})")
         if self.embedding_model_missing:
             lines.append(f"缺少嵌入模型：{EMBEDDING_MODEL_LABEL}")
-            lines.append(f"  → 模型 ID: {EMBEDDING_MODEL_ID}")
-            lines.append(f"  → 下载命令：")
+            lines.append(f"  → 模型 ID: {EMBEDDING_MODEL_ID} (仅需 {len(_EMBEDDING_REQUIRED_FILES)} 个文件)")
+            lines.append(f"  → 手动下载命令：")
             lines.append(f"     export HF_ENDPOINT=https://hf-mirror.com")
             lines.append(f"     export HF_HUB_DISABLE_XET=1")
-            lines.append(f'     python3 -c "from huggingface_hub import snapshot_download; '
-                         f"snapshot_download('{EMBEDDING_MODEL_ID}')\"")
+            lines.append(f'     python3 -c "from huggingface_hub import hf_hub_download; '
+                         f"[hf_hub_download('{EMBEDDING_MODEL_ID}', f) for f in {_EMBEDDING_REQUIRED_FILES}]\"")
+
         if self.has_image_pdf and not self.ocr_installed:
             lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
             lines.append("  - rapidocr-onnxruntime (pip install rapidocr-onnxruntime)")
@@ -223,21 +241,20 @@ def _pdf_has_image_pages(kb_path: str, max_pages_per_pdf: int = 10) -> bool:
 
 
 def _is_embedding_model_cached() -> bool:
-    """Check whether the embedding model is already cached locally."""
+    """Check whether the embedding model is already cached locally.
+
+    Checks for the quantized ONNX file (model_quantized.onnx) used by
+    the FastEmbed -Q variant. If any required file is missing, returns False.
+    """
     try:
         from huggingface_hub import try_to_load_from_cache
-        # Check a key file to determine if the model is cached.
-        # snapshot_download downloads multiple files; checking one is enough.
-        key_files = ["onnx/model.onnx", "model.onnx", "pytorch_model.bin"]
-        for kf in key_files:
-            cached = try_to_load_from_cache(EMBEDDING_MODEL_ID, kf)
-            if cached is not None:
-                logger.debug("RAG deps: embedding model found in cache: %s", cached)
-                return True
+        # Check the quantized model file (the one FastEmbed actually loads)
+        cached = try_to_load_from_cache(EMBEDDING_MODEL_ID, "onnx/model_quantized.onnx")
+        if cached is not None:
+            logger.debug("RAG deps: embedding model found in cache: %s", cached)
+            return True
         return False
     except ImportError:
-        # huggingface_hub not installed — fastembed depends on it, so this
-        # means fastembed itself is missing (caught by package check).
         return False
     except Exception as e:
         logger.debug("RAG deps: cache check error: %s", e)
@@ -245,38 +262,50 @@ def _is_embedding_model_cached() -> bool:
 
 
 def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
-    """Pre-download the embedding model from HuggingFace.
+    """Pre-download only the files FastEmbed actually needs.
 
-    Sets HF_HUB_DISABLE_XET=1 because the default Xet transfer protocol
-    is often blocked or unsupported on mirror sites in certain regions.
+    Downloads individual files via huggingface_hub.hf_hub_download instead
+    of snapshot_download. This avoids pulling the entire ~1.6GB repo snapshot
+    (which includes FP32, FP16, INT8, Q4, and PyTorch formats). FastEmbed
+    only needs the quantized ONNX model (~137MB) + tokenizer files (~1MB).
     """
-    logger.info("RAG deps: pre-downloading embedding model '%s'...", EMBEDDING_MODEL_ID)
+    logger.info(
+        "RAG deps: downloading embedding model files (%d files, ~%s)...",
+        len(_EMBEDDING_REQUIRED_FILES),
+        "140MB",
+    )
     if progress_callback:
-        progress_callback(f"正在下载{EMBEDDING_MODEL_LABEL}...")
+        progress_callback(f"正在下载{EMBEDDING_MODEL_LABEL}（仅必需文件）...")
 
     env = os.environ.copy()
-    # Disable Xet transfer — mirror sites and restricted networks often
-    # can't reach cas-server.xethub.hf.co for CAS reconstruction.
     env["HF_HUB_DISABLE_XET"] = "1"
-
-    # Respect user's HF_ENDPOINT if already set, otherwise default to official.
     if "HF_ENDPOINT" not in env:
         env["HF_ENDPOINT"] = "https://huggingface.co"
 
+    # Build a Python script that downloads individual files via hf_hub_download
+    lines = [
+        "from huggingface_hub import hf_hub_download",
+        f"model_id = '{EMBEDDING_MODEL_ID}'",
+        f"files = {_EMBEDDING_REQUIRED_FILES!r}",
+        "import sys",
+        "for filename in files:",
+        "    print(f'  Downloading {filename}...', file=sys.stderr)",
+        "    local = hf_hub_download(repo_id=model_id, filename=filename)",
+        "    print(f'    -> {local}', file=sys.stderr)",
+        "print('ALL_FILES_DOWNLOADED')",
+    ]
+    script = "\n".join(lines)
+
     try:
         result = subprocess.run(
-            [
-                sys.executable, "-c",
-                f"from huggingface_hub import snapshot_download; "
-                f"snapshot_download('{EMBEDDING_MODEL_ID}')",
-            ],
+            [sys.executable, "-c", script],
             capture_output=True,
             text=True,
-            timeout=600,  # 10 minutes for 130MB download
+            timeout=600,
             env=env,
         )
-        if result.returncode == 0:
-            logger.info("RAG deps: embedding model downloaded successfully")
+        if result.returncode == 0 and "ALL_FILES_DOWNLOADED" in result.stdout:
+            logger.info("RAG deps: embedding model files downloaded (%d files)", len(_EMBEDDING_REQUIRED_FILES))
             if progress_callback:
                 progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")
             return True, "下载成功"

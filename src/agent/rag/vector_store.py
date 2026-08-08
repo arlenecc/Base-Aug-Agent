@@ -13,8 +13,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default embedding model — nomic-embed-text-v1.5 via FastEmbed (ONNX Runtime)
-DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+# Default embedding model — quantized nomic-embed-text-v1.5 via FastEmbed (ONNX Runtime).
+# Using the -Q variant: model_quantized.onnx (~137MB) instead of model.onnx (~548MB).
+# Same 768-dim embeddings, same quality, 4x smaller download.
+DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
 _TABLE_NAME = "knowledge_base"
 
