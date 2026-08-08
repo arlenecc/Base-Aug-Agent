@@ -584,7 +584,10 @@ class RAGEngine:
                 _log("  向量化写入完成: 共 %d 个切片已存入向量库", added)
             except Exception as e:
                 logger.error("  向量化写入失败: %s", e, exc_info=True)
-                self.cancel()
+                # 注意：这里不能调用 self.cancel()——向量化写入异常（如模型下载
+                # 失败、磁盘满、LanceDB 写入异常）不是用户主动取消，不应该设置
+                # cancelled 标志。否则 UI 会错误地显示"同步已取消"并丢弃已
+                # 解析的数据。改为将异常记录到 errors，让 ingest 正常结束。
                 stats["chunks"] = store.count()
                 stats["errors"].append(f"Vector store add failed: {e}")
 

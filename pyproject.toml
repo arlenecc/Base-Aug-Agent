@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "base-agent"
 version = "0.1.0"
 description = "A streamlined local agent with PyQt6 GUI, OpenAI-compatible LLM, and pluggable tools."
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "PyQt6>=6.5",
     "httpx>=0.27",
@@ -31,6 +31,9 @@ rag = [
 ocr = ["rapidocr-onnxruntime>=1.0.0"]
 # All optional features
 all = ["base-agent[test,rag,ocr]"]
+
+[project.scripts]
+base-agent = "agent.ui.main_window:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

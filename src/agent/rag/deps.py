@@ -1,8 +1,11 @@
-"""Dependency check and auto-install for RAG document parsing.
+"""Dependency check, auto-install, and model pre-download for RAG.
 
-Scans the knowledge base directory for supported file types, checks whether
-the required Python packages are installed, and offers to auto-install any
-that are missing via pip.
+Covers three layers:
+1. Python packages (lancedb, fastembed, PyMuPDF, python-docx, etc.)
+2. OCR engine (rapidocr-onnxruntime) — auto-detected if PDF has image pages
+3. Embedding model (nomic-ai/nomic-embed-text-v1.5) — pre-downloaded from HF
+
+Runs before every sync so users never hit missing-dependency errors mid-ingest.
 """
 from __future__ import annotations
 
@@ -18,8 +21,9 @@ from typing import Dict, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Dependency registry: extension → list of (import_name, pip_spec)
+# Dependency registry
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DepSpec:
@@ -27,11 +31,10 @@ class DepSpec:
     import_name: str       # module to check with importlib
     pip_spec: str          # pip install spec (e.g., "python-docx", "numpy<2.0")
     label: str             # human-readable label
-    required: bool = True  # if False, only warn (e.g., OCR is optional)
+    required: bool = True  # if False, only warn (e.g., OCR is optional unless needed)
 
 
 # Map each file extension to its required dependencies.
-# The `required` flag distinguishes hard failures from optional enhancements.
 EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".docx": [DepSpec("docx", "python-docx", "Word 文档解析")],
     ".doc":  [DepSpec("docx", "python-docx", "Word 文档解析")],
@@ -41,17 +44,17 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".ppt":  [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
     ".pdf":  [
         DepSpec("fitz", "PyMuPDF", "PDF 文字解析"),
+        # OCR is conditional: only required when the PDF actually has image pages.
+        # check_dependencies() will upgrade it to required if image pages are detected.
         DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别", required=False),
     ],
     ".epub": [
         DepSpec("ebooklib", "ebooklib", "EPUB 电子书解析"),
         DepSpec("bs4", "beautifulsoup4", "HTML 内容清洗"),
     ],
-    # .mobi/.azw3 use calibre CLI or raw extraction — no hard Python deps
     ".mobi": [],
     ".azw3": [],
     ".azw":  [],
-    # Plain text formats — no external deps
     ".txt": [],
     ".md": [],
     ".markdown": [],
@@ -62,17 +65,23 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".htm":  [DepSpec("bs4", "beautifulsoup4", "HTML 解析")],
 }
 
-# Core RAG infrastructure dependencies (always needed for vector search)
+# Core RAG infrastructure (always checked, always required)
 RAG_CORE_DEPS: List[DepSpec] = [
     DepSpec("lancedb", "lancedb", "向量数据库"),
     DepSpec("fastembed", "fastembed", "嵌入模型 (ONNX Runtime)"),
 ]
 
-# Version constraints: packages that must be installed together with
-# specific version pins to avoid conflicts.
+# Embedding model info for pre-download
+EMBEDDING_MODEL_ID = "nomic-ai/nomic-embed-text-v1.5"
+EMBEDDING_MODEL_LABEL = "嵌入模型 nomic-embed-text-v1.5 (~130MB)"
+
+# Reranker model (used at search time, not ingest — only warn if missing)
+RERANK_MODEL_ID = "BAAI/bge-reranker-base"
+RERANK_MODEL_LABEL = "重排序模型 bge-reranker-base (~500MB)"
+
+# Version pins: packages that need specific version constraints
 VERSION_PINS: Dict[str, str] = {
-    # FastEmbed (ONNX Runtime) 在 numpy 2.x 上有兼容性问题，需要 pin < 2.0
-    "numpy": "numpy<2.0",
+    "numpy": "numpy<2.0",  # FastEmbed ONNX Runtime compat
 }
 
 
@@ -82,10 +91,23 @@ VERSION_PINS: Dict[str, str] = {
 
 @dataclass
 class DependencyReport:
-    """Result of a dependency check."""
+    """Result of a full dependency check (packages + models)."""
+    # Python packages
     missing_required: List[DepSpec] = field(default_factory=list)
     missing_optional: List[DepSpec] = field(default_factory=list)
     scanned_extensions: Set[str] = field(default_factory=set)
+
+    # Models
+    embedding_model_missing: bool = False
+    reranker_model_missing: bool = False
+
+    # OCR detection
+    has_image_pdf: bool = False   # knowledge base contains image-based PDF pages
+    ocr_installed: bool = False
+
+    # Install results
+    installed_packages: List[str] = field(default_factory=list)
+    install_errors: List[str] = field(default_factory=list)
 
     @property
     def all_missing(self) -> List[DepSpec]:
@@ -97,21 +119,41 @@ class DependencyReport:
 
     @property
     def has_blocking(self) -> bool:
-        """True if any *required* deps are missing."""
-        return bool(self.missing_required)
+        """True if any *required* deps or the embedding model is missing."""
+        return bool(self.missing_required) or self.embedding_model_missing
 
     def summary(self) -> str:
+        """Human-readable summary of what's missing."""
         lines: List[str] = []
         if self.missing_required:
-            lines.append("缺少必要依赖：")
+            lines.append("缺少必要 Python 包：")
             for d in self.missing_required:
                 lines.append(f"  - {d.label} (pip install {d.pip_spec})")
+        if self.embedding_model_missing:
+            lines.append(f"缺少嵌入模型：{EMBEDDING_MODEL_LABEL}")
+            lines.append(f"  → 模型 ID: {EMBEDDING_MODEL_ID}")
+            lines.append(f"  → 下载命令：")
+            lines.append(f"     export HF_ENDPOINT=https://hf-mirror.com")
+            lines.append(f"     export HF_HUB_DISABLE_XET=1")
+            lines.append(f'     python3 -c "from huggingface_hub import snapshot_download; '
+                         f"snapshot_download('{EMBEDDING_MODEL_ID}')\"")
+        if self.has_image_pdf and not self.ocr_installed:
+            lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
+            lines.append("  - rapidocr-onnxruntime (pip install rapidocr-onnxruntime)")
         if self.missing_optional:
             lines.append("缺少可选依赖（部分功能受限）：")
             for d in self.missing_optional:
                 lines.append(f"  - {d.label} (pip install {d.pip_spec})")
+        if self.installed_packages:
+            lines.append(f"已自动安装 {len(self.installed_packages)} 个包：")
+            for pkg in self.installed_packages:
+                lines.append(f"  ✅ {pkg}")
+        if self.install_errors:
+            lines.append("安装失败：")
+            for err in self.install_errors:
+                lines.append(f"  ❌ {err}")
         if not lines:
-            lines.append("所有依赖已就绪。")
+            lines.append("所有依赖已就绪（Python 包 + 嵌入模型 + OCR 引擎）。")
         return "\n".join(lines)
 
 
@@ -129,21 +171,156 @@ def scan_extensions(kb_path: str) -> Set[str]:
     return exts
 
 
+# ---------------------------------------------------------------------------
+# PDF image-page detection
+# ---------------------------------------------------------------------------
+
+
+def _pdf_has_image_pages(kb_path: str, max_pages_per_pdf: int = 10) -> bool:
+    """Quickly sample PDF files to check if any have image-based pages.
+
+    Only checks the first ``max_pages_per_pdf`` pages of each PDF to keep
+    the pre-sync check fast. Returns True as soon as one image page is found.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        # Can't check without PyMuPDF — assume no image PDFs
+        return False
+
+    root = Path(kb_path)
+    pdf_files = list(root.rglob("*.pdf")) + list(root.rglob("*.PDF"))
+    if not pdf_files:
+        return False
+
+    logger.info("RAG deps: checking %d PDF(s) for image-based pages...", len(pdf_files))
+    for pdf_path in pdf_files:
+        if pdf_path.name.startswith("."):
+            continue
+        try:
+            doc = fitz.open(str(pdf_path))
+            pages_to_check = min(len(doc), max_pages_per_pdf)
+            for i in range(pages_to_check):
+                page = doc[i]
+                text = page.get_text("text").strip()
+                if not text and page.get_images(full=True):
+                    doc.close()
+                    logger.info(
+                        "RAG deps: found image-based page in '%s' (page %d)",
+                        pdf_path.name, i + 1,
+                    )
+                    return True
+            doc.close()
+        except Exception as e:
+            logger.debug("RAG deps: failed to check PDF '%s': %s", pdf_path.name, e)
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Embedding model pre-download
+# ---------------------------------------------------------------------------
+
+
+def _is_embedding_model_cached() -> bool:
+    """Check whether the embedding model is already cached locally."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        # Check a key file to determine if the model is cached.
+        # snapshot_download downloads multiple files; checking one is enough.
+        key_files = ["onnx/model.onnx", "model.onnx", "pytorch_model.bin"]
+        for kf in key_files:
+            cached = try_to_load_from_cache(EMBEDDING_MODEL_ID, kf)
+            if cached is not None:
+                logger.debug("RAG deps: embedding model found in cache: %s", cached)
+                return True
+        return False
+    except ImportError:
+        # huggingface_hub not installed — fastembed depends on it, so this
+        # means fastembed itself is missing (caught by package check).
+        return False
+    except Exception as e:
+        logger.debug("RAG deps: cache check error: %s", e)
+        return False
+
+
+def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
+    """Pre-download the embedding model from HuggingFace.
+
+    Sets HF_HUB_DISABLE_XET=1 because the default Xet transfer protocol
+    is often blocked or unsupported on mirror sites in certain regions.
+    """
+    logger.info("RAG deps: pre-downloading embedding model '%s'...", EMBEDDING_MODEL_ID)
+    if progress_callback:
+        progress_callback(f"正在下载{EMBEDDING_MODEL_LABEL}...")
+
+    env = os.environ.copy()
+    # Disable Xet transfer — mirror sites and restricted networks often
+    # can't reach cas-server.xethub.hf.co for CAS reconstruction.
+    env["HF_HUB_DISABLE_XET"] = "1"
+
+    # Respect user's HF_ENDPOINT if already set, otherwise default to official.
+    if "HF_ENDPOINT" not in env:
+        env["HF_ENDPOINT"] = "https://huggingface.co"
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                f"from huggingface_hub import snapshot_download; "
+                f"snapshot_download('{EMBEDDING_MODEL_ID}')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,  # 10 minutes for 130MB download
+            env=env,
+        )
+        if result.returncode == 0:
+            logger.info("RAG deps: embedding model downloaded successfully")
+            if progress_callback:
+                progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")
+            return True, "下载成功"
+        else:
+            error_tail = result.stderr.strip().split("\n")[-5:] if result.stderr else ["unknown error"]
+            msg = "\n".join(error_tail)
+            logger.error("RAG deps: embedding model download failed: %s", msg)
+            if progress_callback:
+                progress_callback(f"❌ 模型下载失败: {msg}")
+            return False, msg
+    except subprocess.TimeoutExpired:
+        msg = "下载超时（10 分钟），请手动下载"
+        logger.error("RAG deps: embedding model download timed out")
+        if progress_callback:
+            progress_callback(f"❌ {msg}")
+        return False, msg
+    except Exception as e:
+        msg = str(e)
+        logger.error("RAG deps: embedding model download exception: %s", e)
+        if progress_callback:
+            progress_callback(f"❌ 模型下载异常: {msg}")
+        return False, msg
+
+
+# ---------------------------------------------------------------------------
+# Package checks
+# ---------------------------------------------------------------------------
+
+
 def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyReport:
-    """Check which dependencies are missing for the files in the knowledge base.
+    """Check Python packages, embedding model, and OCR engine availability.
 
     Args:
         kb_path: Path to the knowledge base directory.
-        include_core: Also check RAG core dependencies (chromadb, sentence-transformers).
+        include_core: Also check RAG core dependencies (lancedb, fastembed).
 
     Returns:
-        DependencyReport with missing required and optional deps.
+        DependencyReport with full status of all dependencies.
     """
     report = DependencyReport()
     exts = scan_extensions(kb_path)
     report.scanned_extensions = exts
 
-    # Collect all deps to check
+    # ---- Python packages ----
     deps_to_check: List[DepSpec] = []
     if include_core:
         deps_to_check.extend(RAG_CORE_DEPS)
@@ -151,7 +328,7 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
         if ext in EXTENSION_DEPS:
             deps_to_check.extend(EXTENSION_DEPS[ext])
 
-    # Deduplicate by pip_spec while preserving order
+    # Deduplicate by pip_spec
     seen: Set[str] = set()
     unique_deps: List[DepSpec] = []
     for d in deps_to_check:
@@ -159,7 +336,6 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
             seen.add(d.pip_spec)
             unique_deps.append(d)
 
-    # Check each dependency
     for dep in unique_deps:
         if not _is_importable(dep.import_name):
             if dep.required:
@@ -167,13 +343,38 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
             else:
                 report.missing_optional.append(dep)
 
-    if report.has_missing:
+    # ---- OCR engine: upgrade from optional to required if image PDFs exist ----
+    if ".pdf" in exts:
+        has_images = _pdf_has_image_pages(kb_path)
+        report.has_image_pdf = has_images
+        # Check if OCR is installed
+        report.ocr_installed = _is_importable("rapidocr_onnxruntime")
+        if has_images and not report.ocr_installed:
+            # Move OCR from optional to required
+            ocr_spec = DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别")
+            if ocr_spec not in report.missing_required:
+                report.missing_required.append(ocr_spec)
+
+    # ---- Embedding model ----
+    if include_core:
+        report.embedding_model_missing = not _is_embedding_model_cached()
+
+    # ---- Reranker model (optional, only warn) ----
+    report.reranker_model_missing = not _is_reranker_cached()
+
+    # Log summary
+    if report.has_missing or report.embedding_model_missing:
         logger.info(
-            "RAG deps: check complete — %d required missing, %d optional missing",
+            "RAG deps: check complete — %d required pkgs missing, %d optional, "
+            "embedding_model=%s, ocr=%s, image_pdf=%s",
             len(report.missing_required), len(report.missing_optional),
+            "MISSING" if report.embedding_model_missing else "OK",
+            "OK" if report.ocr_installed else "MISSING",
+            report.has_image_pdf,
         )
     else:
-        logger.info("RAG deps: all %d dependencies satisfied", len(unique_deps))
+        logger.info("RAG deps: all %d packages + embedding model + OCR are ready", len(unique_deps))
+
     return report
 
 
@@ -192,12 +393,9 @@ def install_packages(specs: List[str], progress_callback=None) -> Tuple[bool, st
 
     logger.info("RAG deps: installing %s", ", ".join(specs))
 
-    # Apply version pins: if a spec doesn't already have a version constraint,
-    # check if we need to pin it.
+    # Apply version pins
     final_specs: List[str] = []
     for spec in specs:
-        # Extract package name (before any version specifier).
-        # Handles: "numpy<2.0", "numpy>=1.0,<2.0", "numpy==1.20", "numpy[extra]"
         pkg_name = spec.split("<")[0].split(">")[0].split("=")[0].split("[")[0].strip().lower()
         if pkg_name in VERSION_PINS and "<" not in spec and ">" not in spec:
             final_specs.append(VERSION_PINS[pkg_name])
@@ -248,52 +446,81 @@ def ensure_dependencies(
     include_core: bool = True,
     progress_callback=None,
 ) -> DependencyReport:
-    """Check and optionally auto-install missing dependencies.
+    """Check and optionally auto-install ALL missing dependencies.
+
+    This is the main entry point called by InstallDepsWorker before every sync.
+    It handles:
+    1. Python packages (auto-install via pip)
+    2. Embedding model (pre-download from HuggingFace)
+    3. OCR engine (auto-install if image-based PDFs are detected)
 
     Args:
         kb_path: Path to knowledge base directory.
-        auto_install: If True, install missing required deps automatically.
+        auto_install: If True, install missing deps automatically.
         include_core: Also check RAG core dependencies.
         progress_callback: Optional callable(str) for progress updates.
 
     Returns:
-        DependencyReport describing what was missing (and what was installed).
+        DependencyReport describing what was missing and what was installed.
     """
     report = check_dependencies(kb_path, include_core=include_core)
 
-    if not report.has_blocking or not auto_install:
-        logger.info("RAG deps: ensure_dependencies — no blocking deps to install (blocking=%s auto=%s)",
-                    report.has_blocking, auto_install)
+    if not auto_install:
         return report
 
-    # Collect pip specs for missing required deps
-    specs_to_install: List[str] = []
-    for dep in report.missing_required:
-        specs_to_install.append(dep.pip_spec)
+    installed_anything = False
 
-    logger.info("RAG deps: auto-installing %d required packages: %s",
-                len(specs_to_install), ", ".join(specs_to_install))
-    if progress_callback:
-        progress_callback(f"检测到缺少 {len(specs_to_install)} 个必要依赖，开始自动安装…")
+    # ---- Step 1: Install missing Python packages ----
+    if report.has_missing:
+        specs_to_install: List[str] = []
+        for dep in report.missing_required:
+            specs_to_install.append(dep.pip_spec)
+        for dep in report.missing_optional:
+            specs_to_install.append(dep.pip_spec)
 
-    success, msg = install_packages(specs_to_install, progress_callback)
+        if specs_to_install:
+            logger.info("RAG deps: auto-installing %d packages: %s",
+                        len(specs_to_install), ", ".join(specs_to_install))
+            if progress_callback:
+                progress_callback(f"检测到缺少 {len(specs_to_install)} 个依赖，开始自动安装…")
 
-    if success:
-        # Re-check to update the report
-        report = check_dependencies(kb_path, include_core=include_core)
-        if report.has_blocking:
-            logger.warning("RAG deps: post-install check — %d deps still missing",
-                           len(report.missing_required))
-        else:
-            logger.info("RAG deps: all required deps installed successfully")
-        if progress_callback:
-            if report.has_blocking:
-                progress_callback("部分依赖安装后仍无法导入，请手动检查。")
+            success, msg = install_packages(specs_to_install, progress_callback)
+
+            if success:
+                report.installed_packages.extend(specs_to_install)
+                installed_anything = True
+                # Re-check to update the report
+                report = check_dependencies(kb_path, include_core=include_core)
+                # Preserve install info
+                report.installed_packages = specs_to_install
+                if report.has_blocking:
+                    logger.warning("RAG deps: post-install — %d deps still missing",
+                                   len(report.missing_required))
+                else:
+                    logger.info("RAG deps: all packages installed successfully")
+                if progress_callback:
+                    if report.has_blocking:
+                        progress_callback("部分依赖安装后仍无法导入，请手动检查。")
+                    else:
+                        progress_callback("所有 Python 依赖已安装成功。")
             else:
-                progress_callback("所有必要依赖已安装成功。")
-    else:
+                report.install_errors.append(msg)
+                if progress_callback:
+                    progress_callback(f"自动安装失败: {msg}")
+
+    # ---- Step 2: Pre-download embedding model ----
+    if report.embedding_model_missing:
         if progress_callback:
-            progress_callback(f"自动安装失败: {msg}")
+            progress_callback(f"嵌入模型未缓存，开始下载 {EMBEDDING_MODEL_LABEL}…")
+        success, msg = _download_embedding_model(progress_callback)
+        if success:
+            report.embedding_model_missing = False
+            installed_anything = True
+        else:
+            report.install_errors.append(f"嵌入模型下载失败: {msg}")
+
+    if installed_anything and progress_callback:
+        progress_callback("依赖检查完成。")
 
     return report
 
@@ -302,14 +529,28 @@ def ensure_dependencies(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _is_importable(module_name: str) -> bool:
-    """Check if a module can be imported without actually importing it globally."""
+    """Check if a module can be imported without importing it globally."""
     try:
         importlib.import_module(module_name)
         return True
     except ImportError:
         return False
     except Exception:
-        # Some packages raise other exceptions on import (e.g., version warnings)
-        # but are still usable. Treat as installed.
+        # Some packages raise non-ImportError on import but are still usable.
         return True
+
+
+def _is_reranker_cached() -> bool:
+    """Check if the BGE reranker model is cached locally."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        key_files = ["pytorch_model.bin", "model.safetensors", "config.json"]
+        for kf in key_files:
+            cached = try_to_load_from_cache(RERANK_MODEL_ID, kf)
+            if cached is not None:
+                return True
+        return False
+    except Exception:
+        return False

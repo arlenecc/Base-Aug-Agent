@@ -46,7 +46,29 @@ class FastEmbedEmbeddingFunction:
             logger.info("  🔧 正在加载嵌入模型: %s (首次加载, 约 130MB)...", self._model_name)
             import time as _time
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
-            self._model = TextEmbedding(model_name=self._model_name)
+            try:
+                self._model = TextEmbedding(model_name=self._model_name)
+            except Exception as e:
+                # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
+                # 下载 ONNX 模型文件（约 130MB），但网络无法访问 huggingface.co。
+                # 给用户提供明确的错误信息和解决方案。
+                msg = (
+                    f"无法加载嵌入模型 '{self._model_name}'：{e}\n\n"
+                    f"可能原因及解决方案：\n"
+                    f"1. 首次使用需从 HuggingFace 下载模型（~130MB），网络无法访问\n"
+                    f"   → 设置镜像站: export HF_ENDPOINT=https://hf-mirror.com\n"
+                    f"2. 新版 huggingface_hub 默认使用 Xet 传输，镜像站可能不支持\n"
+                    f"   → 禁用 Xet: export HF_HUB_DISABLE_XET=1\n"
+                    f"3. 模型缓存目录权限不足\n"
+                    f"   → 检查 ~/.cache/huggingface/ 目录权限\n"
+                    f"4. 也可手动下载模型到本地缓存：\n"
+                    f"   HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \\\n"
+                    f"     python3 -c \"from huggingface_hub import snapshot_download; \\\n"
+                    f"     snapshot_download('nomic-ai/nomic-embed-text-v1.5')\"\n\n"
+                    f"原始错误: {type(e).__name__}: {e}"
+                )
+                logger.error(msg)
+                raise RuntimeError(msg) from e
             logger.info("  ✅ 嵌入模型加载完成: %s", self._model_name)
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 

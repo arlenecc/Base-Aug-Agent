@@ -161,57 +161,132 @@ def _extract_pptx(path: Path) -> str:
 
 
 def _extract_pdf(path: Path) -> str:
-    """Extract text from PDF. Falls back to OCR for image-based pages."""
+    """Extract text from PDF. Auto-detects text vs image-based pages.
+
+    Strategy:
+    1. Text-based pages: extract text directly via PyMuPDF get_text("text").
+    2. Image-based pages (no text layer, has embedded images): OCR via RapidOCR.
+    3. Mixed PDFs: text pages extracted directly, image pages OCR'd.
+
+    If RapidOCR is not installed and the PDF contains image-based pages,
+    a warning is logged and the image pages are skipped — but the text
+    pages are still extracted.
+    """
+    path = Path(path)  # 兼容 str 和 Path 两种入参
     try:
         import fitz  # PyMuPDF
     except ImportError:
         raise ImportError("PyMuPDF is required for PDF files. pip install PyMuPDF")
 
     doc = fitz.open(str(path))
+    total_pages = len(doc)
     parts: List[str] = []
     ocr_engine = None       # lazy-init, 复用同一个引擎实例
     ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
-    ocr_needed = False
 
-    for page_num in range(len(doc)):
+    # 统计各类型页面数量，用于最终日志
+    text_page_count = 0
+    image_page_count = 0
+    ocr_page_count = 0
+    ocr_skipped_count = 0
+    blank_page_count = 0
+
+    for page_num in range(total_pages):
         page = doc[page_num]
         text = page.get_text("text").strip()
+
         if text:
-            # 文字版页面：直接使用提取的文本，不用 OCR
+            # 文字版页面：直接提取文本，不需要 OCR
             parts.append(text)
+            text_page_count += 1
             continue
 
-        # 无文字层 → 可能是图片版页面。检查是否含图片
-        if not page.get_images(full=True):
-            # 既无文字也无图片 → 跳过（可能是空白页）
+        # 无文字层 → 可能是图片版或空白页。检查是否含嵌入图片。
+        images = page.get_images(full=True)
+        if not images:
+            # 既无文字也无图片 → 空白页，跳过
+            blank_page_count += 1
             continue
 
-        # 图片版页面 → 走 OCR（用全局信号量限制并发，避免多 worker 同时跑 OCR 导致 OOM）
-        ocr_needed = True
+        # 图片版页面 → 需要 OCR
+        image_page_count += 1
+
         if ocr_unavailable:
+            ocr_skipped_count += 1
             continue
+
         if ocr_engine is None:
             ocr_engine = _get_ocr_engine()
             if ocr_engine is None:
                 ocr_unavailable = True
+                ocr_skipped_count += 1
                 continue
+
         with _OCR_SEMAPHORE:
-            # 再次检查引擎：可能在等信号量期间其它 worker 已判定不可用
+            # 双重检查：可能在等信号量期间其它 worker 已判定不可用
             if ocr_engine is None:
                 ocr_unavailable = True
+                ocr_skipped_count += 1
                 continue
             pix = page.get_pixmap(dpi=200)
             img_bytes = pix.tobytes("png")
             ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+
         if ocr_text:
             parts.append(ocr_text)
+            ocr_page_count += 1
+        else:
+            # OCR 返回空结果（可能是图片质量太差或引擎异常）
+            ocr_skipped_count += 1
 
     doc.close()
 
+    # 汇总日志：清晰报告各类型页面的处理情况
+    detail_parts = [f"text={text_page_count}"]
+    if image_page_count > 0:
+        detail_parts.append(f"image={image_page_count}(OCR={ocr_page_count})")
+    if ocr_skipped_count > 0:
+        detail_parts.append(f"OCR-skipped={ocr_skipped_count}")
+    if blank_page_count > 0:
+        detail_parts.append(f"blank={blank_page_count}")
+
+    # ---- 全图片版 PDF 且 OCR 不可用 → 抛出明确错误 ----
+    if not parts and image_page_count > 0 and ocr_engine is None:
+        msg = (
+            f"PDF '{path.name}' 是图片版（{total_pages} 页全部为扫描图片），"
+            f"但 RapidOCR 未安装，无法进行 OCR 识别。"
+            f"请安装: pip install rapidocr-onnxruntime"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
     if not parts:
+        logger.warning(
+            "PDF '%s': no text extracted from %d pages "
+            "(text=%d, image=%d, blank=%d)",
+            path.name, total_pages, text_page_count, image_page_count, blank_page_count,
+        )
         return ""
-    if ocr_needed:
-        logger.info("PDF '%s': used OCR on some pages", path.name)
+
+    if ocr_skipped_count > 0 and ocr_engine is None:
+        # 混合 PDF：部分图片页因 OCR 不可用被跳过
+        logger.warning(
+            "PDF '%s': %d/%d pages are image-based but RapidOCR is not installed. "
+            "Image pages were SKIPPED — only text pages were extracted (%d chars). "
+            "Install with: pip install rapidocr-onnxruntime",
+            path.name, ocr_skipped_count, total_pages, sum(len(p) for p in parts),
+        )
+    elif image_page_count > 0:
+        logger.info(
+            "PDF '%s': %d pages processed (%s)",
+            path.name, total_pages, ", ".join(detail_parts),
+        )
+    else:
+        logger.info(
+            "PDF '%s': %d pages, all text-based (%d chars extracted)",
+            path.name, total_pages, sum(len(p) for p in parts),
+        )
+
     return "\n\n".join(parts)
 
 
