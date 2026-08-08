@@ -492,10 +492,12 @@ class RAGEngine:
                         pass
 
             # 把文件列表分片给各 worker（保证负载均衡）
-            chunks_per_worker = (len(files_to_process) + self._parallel_workers - 1) // self._parallel_workers
+            # 动态调整并发数：文件数少于默认 worker 数时，只启动必要数量的线程
+            num_workers = min(self._parallel_workers, len(files_to_process))
+            chunks_per_worker = (len(files_to_process) + num_workers - 1) // num_workers
             file_shards = [
                 files_to_process[i * chunks_per_worker:(i + 1) * chunks_per_worker]
-                for i in range(self._parallel_workers)
+                for i in range(num_workers)
             ]
 
             threads = []
@@ -504,7 +506,7 @@ class RAGEngine:
                 t.start()
                 threads.append(t)
 
-            _flush_logs(f"启动 {len(threads)} 个 Worker")
+            _flush_logs(f"启动 {len(threads)} 个 Worker ({len(files_to_process)} 个文件)")
 
             # Step 4: 主线程消费队列，逐文件增量写入 vector store
             _log("━━━ Step 4/6: 向量化 + 存入向量库 ━━━")
