@@ -5,16 +5,17 @@
 ## 功能特性
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
-- **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计
-- **工具调用** — 内置 14 个工具，支持模型自主决策和工具链式调用
-- **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
+- **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）
+- **工具调用** — 内置 13 个工具（`webexec_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
+- **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
-- **内存管理** — VectorStore/RAGEngine 显式 `close()` 释放 LanceDB 连接 + FastEmbed ONNX 模型（~137MB 量化版）+ BGE reranker（~500MB）；ONNX Runtime InferenceSession 显式 `release()` 立即回收 C++ 堆内存；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
+- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~260 tok（较原来 -65%）；Knowledge base 指令条件注入（无 KB 时省 272 tok/轮）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简；Work memory 注入用 compact JSON；总体每轮节省 ~787 token（-34%）
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
 - **技能系统** — 自动识别用户意图，匹配并激活预定义技能提示词
@@ -116,7 +117,10 @@ python main.py
 | `work_memory` | 短期工作记忆（键值对 scratchpad） | ❌ |
 | `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
 | `memory_search` | 长期记忆语义检索 | ❌ |
-| `rag_search` | 搜索本地知识库 | ❌ |
+| `rag_search` | 搜索本地知识库（仅 RAG 可用时注册） | ❌ |
+| `rag_status` | 查看知识库状态（仅 RAG 可用时注册） | ❌ |
+| `rag_ingest` | 增量索引知识库（仅 RAG 可用时注册） | ❌ |
+| `webexec_js` | 浏览器 JS 执行（仅配置浏览器端点时注册） | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
 | `rag_ingest` | 重新索引知识库 | ❌ |
 
@@ -262,10 +266,11 @@ workspace/.agent/
 
 ### 自动事实抽取
 
-每次 agent 对话结束（无 tool_calls 的最终回复）后，自动调用 LLM 从「用户消息 + 助手回复」中抽取实体、关系和观察，写入知识图谱：
+每次 agent 对话结束（无 tool_calls 的最终回复）后，**异步**调用 LLM 从「用户消息 + 助手回复」中抽取实体、关系和观察，写入知识图谱（daemon 线程，不阻塞用户回复）：
 
 ```
-对话结束 → _maybe_extract_facts()
+对话结束 → _maybe_extract_facts_async()
+  ├─ daemon 线程启动，on_finished() 立即回调
   ├─ 跳过过短对话（< 20 字符）
   ├─ LLM 低温度(0.1)抽取 JSON: {entities: [...], relations: [...]}
   ├─ 写入 GraphMemoryStore（去重 + 向量索引）
@@ -283,17 +288,24 @@ memory_search(query) → GraphMemoryStore.search()
   └─ 向量索引不可用时回退到关键词子串匹配
 ```
 
+### Embedding 模型共享
+
+RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进程级单例 `get_or_create_embedding_function()`），避免加载两份 ~137MB 模型。ONNX Runtime `session.run()` 线程安全，可并发调用。
+
 ### 精简 Prompt 注入
 
 **旧方案**：全量注入所有工作记忆 + 所有长期记忆事实 → 记忆多时 prompt 膨胀，拖慢响应。
 
 **新方案**：
-- **工作记忆**：只注入 key，value 截断到 200 字符
+- **SYSTEM_PROMPT**：精简至 ~260 tok（-65%），合并冗余段落
+- **Knowledge base 指令**：仅当 KB 有数据时注入（无 KB 省 272 tok/轮）
+- **工作记忆**：compact JSON（无缩进），value 截断到 200 字符
 - **长期记忆**：只注入精简 snapshot（最多 10 条最显著事实 + 少量关系），而非全量
+- **总体每轮节省 ~787 token（-34%）**
 
 ```
 # Work memory
-{key: "value[:200]…"}
+{key:"value[:200]…"}
 
 # Long-term memory (snapshot)
 - PostgreSQL (tool): 用 16.3 版本; 连接池 50
