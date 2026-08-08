@@ -252,93 +252,82 @@ def _pdf_has_image_pages(kb_path: str, max_pages_per_pdf: int = 10) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _get_fastembed_cache_dir() -> str:
+    """Return the persistent cache directory for FastEmbed models.
+
+    FastEmbed defaults to a system temp dir (/var/folders/.../T/) which
+    macOS cleans regularly, causing the model to be re-downloaded.  We
+    use ~/.cache/fastembed instead — same as vector_store.py.
+    """
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "fastembed")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
 def _is_embedding_model_cached() -> bool:
     """Check whether the embedding model is already cached locally.
 
-    Checks for the quantized ONNX file (model_quantized.onnx) used by
-    the FastEmbed -Q variant. If any required file is missing, returns False.
+    FastEmbed uses its OWN cache directory (NOT the standard HuggingFace
+    cache).  We check the persistent cache dir (~/.cache/fastembed) that
+    we configure in vector_store.py and _download_embedding_model().
     """
     try:
-        from huggingface_hub import try_to_load_from_cache
-        # Check the quantized model file (the one FastEmbed actually loads)
-        cached = try_to_load_from_cache(EMBEDDING_MODEL_ID, "onnx/model_quantized.onnx")
-        if cached is not None:
-            logger.debug("RAG deps: embedding model found in cache: %s", cached)
-            return True
-        return False
-    except ImportError:
+        from fastembed import TextEmbedding
+        cache_dir = _get_fastembed_cache_dir()
+        # lazy_load=True: don't load ONNX Runtime, just resolve the model path
+        model = TextEmbedding(
+            model_name=FASTEMBED_MODEL_NAME,
+            cache_dir=cache_dir,
+            lazy_load=True,
+        )
+        # Check if the model directory actually has the ONNX file
+        model_dir = getattr(model.model, "_model_dir", None)
+        if model_dir and os.path.isdir(model_dir):
+            # Check for the quantized ONNX file
+            onnx_path = os.path.join(model_dir, "onnx", "model_quantized.onnx")
+            if os.path.isfile(onnx_path):
+                logger.debug("RAG deps: embedding model found in FastEmbed cache: %s", onnx_path)
+                return True
         return False
     except Exception as e:
-        logger.debug("RAG deps: cache check error: %s", e)
+        logger.debug("RAG deps: FastEmbed cache check error: %s", e)
         return False
 
 
 def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
-    """Pre-download only the files FastEmbed actually needs.
+    """Pre-download the embedding model by instantiating FastEmbed.
 
-    Downloads individual files via huggingface_hub.hf_hub_download instead
-    of snapshot_download. This avoids pulling the entire ~1.6GB repo snapshot
-    (which includes FP32, FP16, INT8, Q4, and PyTorch formats). FastEmbed
-    only needs the quantized ONNX model (~137MB) + tokenizer files (~1MB).
+    Previously this used a subprocess to call huggingface_hub.hf_hub_download,
+    but that had two problems:
+    1. It downloaded to the HF cache, but FastEmbed uses its OWN cache —
+       so the model was downloaded but FastEmbed didn't see it.
+    2. In a PyInstaller-frozen .app, sys.executable is the frozen binary
+       and the subprocess can't import huggingface_hub.
+
+    The fix: just instantiate TextEmbedding directly.  FastEmbed handles
+    the download to its own cache directory, which is where it will look
+    for the model at runtime.  This works in both dev and frozen envs.
     """
-    logger.info(
-        "RAG deps: downloading embedding model files (%d files, ~%s)...",
-        len(_EMBEDDING_REQUIRED_FILES),
-        "140MB",
-    )
+    logger.info("RAG deps: downloading embedding model via FastEmbed...")
     if progress_callback:
-        progress_callback(f"正在下载{EMBEDDING_MODEL_LABEL}（仅必需文件）...")
-
-    env = os.environ.copy()
-    env["HF_HUB_DISABLE_XET"] = "1"
-    if "HF_ENDPOINT" not in env:
-        env["HF_ENDPOINT"] = "https://huggingface.co"
-
-    # Build a Python script that downloads individual files via hf_hub_download
-    lines = [
-        "from huggingface_hub import hf_hub_download",
-        f"model_id = '{EMBEDDING_MODEL_ID}'",
-        f"files = {_EMBEDDING_REQUIRED_FILES!r}",
-        "import sys",
-        "for filename in files:",
-        "    print(f'  Downloading {filename}...', file=sys.stderr)",
-        "    local = hf_hub_download(repo_id=model_id, filename=filename)",
-        "    print(f'    -> {local}', file=sys.stderr)",
-        "print('ALL_FILES_DOWNLOADED')",
-    ]
-    script = "\n".join(lines)
+        progress_callback(f"正在下载{EMBEDDING_MODEL_LABEL}（FastEmbed 自动缓存）...")
 
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=600,
-            env=env,
-        )
-        if result.returncode == 0 and "ALL_FILES_DOWNLOADED" in result.stdout:
-            logger.info("RAG deps: embedding model files downloaded (%d files)", len(_EMBEDDING_REQUIRED_FILES))
-            if progress_callback:
-                progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")
-            return True, "下载成功"
-        else:
-            error_tail = result.stderr.strip().split("\n")[-5:] if result.stderr else ["unknown error"]
-            msg = "\n".join(error_tail)
-            logger.error("RAG deps: embedding model download failed: %s", msg)
-            if progress_callback:
-                progress_callback(f"❌ 模型下载失败: {msg}")
-            return False, msg
-    except subprocess.TimeoutExpired:
-        msg = "下载超时（10 分钟），请手动下载"
-        logger.error("RAG deps: embedding model download timed out")
+        from fastembed import TextEmbedding
+        # Instantiating TextEmbedding triggers the download to FastEmbed's
+        # own cache directory.  Use the same persistent cache_dir as
+        # vector_store.py to avoid re-downloads after macOS temp cleanup.
+        cache_dir = _get_fastembed_cache_dir()
+        TextEmbedding(model_name=FASTEMBED_MODEL_NAME, cache_dir=cache_dir)
+        logger.info("RAG deps: embedding model downloaded and cached by FastEmbed")
         if progress_callback:
-            progress_callback(f"❌ {msg}")
-        return False, msg
+            progress_callback(f"✅ {EMBEDDING_MODEL_LABEL} 下载完成")
+        return True, "下载成功"
     except Exception as e:
         msg = str(e)
-        logger.error("RAG deps: embedding model download exception: %s", e)
+        logger.error("RAG deps: embedding model download failed: %s", e)
         if progress_callback:
-            progress_callback(f"❌ 模型下载异常: {msg}")
+            progress_callback(f"❌ 模型下载失败: {msg}")
         return False, msg
 
 

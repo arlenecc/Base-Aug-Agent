@@ -54,7 +54,20 @@ class FastEmbedEmbeddingFunction:
             import time as _time
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
             try:
-                self._model = TextEmbedding(model_name=self._model_name)
+                # Use a persistent cache dir instead of the default system
+                # temp dir (/var/folders/.../T/) which macOS cleans regularly.
+                # This prevents the model from being re-downloaded after
+                # every system cleanup.
+                cache_dir = os.path.join(
+                    os.path.expanduser("~"),
+                    ".cache",
+                    "fastembed",
+                )
+                os.makedirs(cache_dir, exist_ok=True)
+                self._model = TextEmbedding(
+                    model_name=self._model_name,
+                    cache_dir=cache_dir,
+                )
             except Exception as e:
                 # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
                 # 下载 ONNX 模型文件（约 130MB），但网络无法访问 huggingface.co。

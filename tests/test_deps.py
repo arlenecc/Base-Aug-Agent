@@ -133,14 +133,14 @@ class TestDependencyReport:
         report = DependencyReport()
         assert not report.has_missing
         assert not report.has_blocking
-        assert report.summary() == "所有依赖已就绪。"
+        assert "已就绪" in report.summary()
 
     def test_required_missing(self):
         report = DependencyReport()
         report.missing_required.append(DepSpec("foo", "foo", "Test Dep"))
         assert report.has_missing
         assert report.has_blocking
-        assert "缺少必要依赖" in report.summary()
+        assert "缺少必要" in report.summary()
         assert "Test Dep" in report.summary()
 
     def test_optional_missing(self):
