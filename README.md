@@ -6,7 +6,7 @@
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）
-- **工具调用** — 内置 13 个工具（`webexec_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
+- **工具调用** — 内置 15 个工具（12 通用 + 3 RAG；`webexec_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
@@ -18,7 +18,7 @@
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~260 tok（较原来 -65%）；Knowledge base 指令条件注入（无 KB 时省 272 tok/轮）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简；Work memory 注入用 compact JSON；总体每轮节省 ~787 token（-34%）
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
-- **技能系统** — 自动识别用户意图，匹配并激活预定义技能提示词
+- **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，`skill_search` / `skill_load` 按需发现与加载，技能指令不进系统提示词，节省 token
 
 ## 界面布局
 
@@ -112,17 +112,16 @@ python main.py
 | `shell_run` | 执行 Shell 命令 | ✅ |
 | `code_run` | 执行 Python 代码 | ✅ |
 | `web_scan` | 抓取网页内容 | ❌ |
-| `webexec_js` | 浏览器执行 JS | ❌ |
+| `webexec_js` | 浏览器执行 JS（仅配置浏览器端点时注册） | ❌ |
 | `ask_user` | 向用户提问 | ❌ |
 | `work_memory` | 短期工作记忆（键值对 scratchpad） | ❌ |
 | `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
 | `memory_search` | 长期记忆语义检索 | ❌ |
-| `rag_search` | 搜索本地知识库（仅 RAG 可用时注册） | ❌ |
-| `rag_status` | 查看知识库状态（仅 RAG 可用时注册） | ❌ |
-| `rag_ingest` | 增量索引知识库（仅 RAG 可用时注册） | ❌ |
-| `webexec_js` | 浏览器 JS 执行（仅配置浏览器端点时注册） | ❌ |
+| `skill_search` | 搜索/列出技能目录中的技能 | ❌ |
+| `skill_load` | 按路径加载技能完整指令（prompt.md） | ❌ |
+| `rag_search` | 搜索本地知识库 | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
-| `rag_ingest` | 重新索引知识库 | ❌ |
+| `rag_ingest` | 增量索引知识库 | ❌ |
 
 ## 本地知识库 (RAG)
 
@@ -261,7 +260,13 @@ Observation（观察）= 挂在实体上的自由文本事实
 workspace/.agent/
 ├── work_memory.json           # 短期工作记忆（键值对 scratchpad）
 ├── long_memory.graph.json     # 知识图谱 JSON（实体 + 关系）
-└── long_memory.graph.json.vectors/  # LanceDB 观察向量索引
+├── long_memory.graph.json.vectors/  # LanceDB 观察向量索引
+├── skills.json                # SkillManager 数据（扁平技能记录 + 请求计数）
+└── skills/                    # 目录化技能（每个技能一个子目录）
+    ├── _index.json            # SkillIndex 自动生成的索引表
+    └── <skill-name>/
+        ├── skill.json         # 元数据（name/description/keywords/tags/entry）
+        └── prompt.md          # 技能指令全文
 ```
 
 ### 自动事实抽取
@@ -287,6 +292,12 @@ memory_search(query) → GraphMemoryStore.search()
   ├─ 返回 {entity, text, score}
   └─ 向量索引不可用时回退到关键词子串匹配
 ```
+
+索引侧的关键设计：
+
+- **批量嵌入**：`add_observations` / `create_entity` 收集新观察后调用 `embed_documents()` 一次性批量嵌入（单次 ONNX 前向），替代逐条 `embed_query()`（N 条观察从 N×10-50ms 降为一次批量计算）
+- **非对称前缀**：观察作为检索目标用 document 前缀嵌入，查询用 query 前缀嵌入（nomic 模型要求）
+- **注入防护**：删除向量时对实体名单引号做 SQL 转义，防止 filter 表达式被畸形/注入
 
 ### Embedding 模型共享
 
@@ -325,6 +336,31 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 
 旧的 `long_memory.json`（扁平事实列表）在首次加载时自动迁移到知识图谱（作为 "General" 实体的观察），迁移后旧文件清空。
 
+## 技能系统
+
+技能用于把高频任务固化为可复用的指令模板。系统包含两层：
+
+- **SkillManager**（`skills.json`）：按关键词匹配用户意图，命中后把技能 prompt 注入系统提示；同一意图出现 ≥ 2 次时建议固化为技能
+- **SkillIndex**（`.agent/skills/` + `_index.json`）：目录化技能注册表。每个技能一个目录，含 `skill.json`（元数据：name / description / keywords / tags / entry）和 `prompt.md`（指令全文）
+
+工作方式：
+
+```
+用户请求
+  ├─ SkillManager.match() 命中扁平技能 → prompt 注入系统提示
+  │   （目录技能注册的扁平记录引导 agent 调用 skill_load 加载全文）
+  └─ 复杂任务 → agent 主动调用 skill_search(query) 检索技能目录
+                └─ 命中后 skill_load(path) 读取 prompt.md 全文并遵循
+```
+
+关键设计：
+
+- **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_load` 读入，避免技能增多导致 prompt 膨胀
+- **索引防抖**：`_index.json` 在目录 mtime 变化或 300s 间隔后重建，原子写（tmp + rename）
+- **加权检索**：name ×3 / keywords ×2 / tags ×2 / description 子串 ×1
+- **路径安全**：`skill_load` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
+- **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
+
 ## 上下文收缩
 
 Agent 在长对话中会自动管理上下文窗口，避免超出模型 token 限制：
@@ -361,8 +397,9 @@ src/agent/
 ├── config.py             # 配置管理
 ├── llm_client.py         # LLM 流式客户端
 ├── memory.py             # 工作记忆 / 长期记忆（知识图谱，节流写盘）
-├── graph_memory.py       # 知识图谱存储引擎（Entity/Relation/Observation + LanceDB 语义检索）
-├── skills.py             # 技能系统
+├── graph_memory.py       # 知识图谱存储引擎（Entity/Relation/Observation + 批量嵌入 + LanceDB 语义检索）
+├── skills.py             # 技能管理（意图匹配 / 请求固化建议 / 目录技能创建）
+├── skill_index.py        # 技能索引（扫描 .agent/skills/、维护 _index.json、加权检索）
 ├── rag/
 │   ├── engine.py         # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
 │   ├── parsers.py        # 文档解析器（Word/Excel/PPT/PDF/EPUB/MOBI/HTML/文本）
@@ -378,6 +415,7 @@ src/agent/
 │   ├── web.py            # 网页抓取 / JS 执行
 │   ├── interact.py       # 用户交互
 │   ├── memory.py         # 记忆工具（work_memory / memory_graph / memory_search）
+│   ├── skill_search.py   # 技能工具（skill_search / skill_load）
 │   ├── rag_tool.py       # RAG 检索工具
 │   ├── mcp_client.py     # MCP JSON-RPC 客户端
 │   └── mcp_tool.py       # MCP 工具适配
@@ -397,7 +435,7 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统、UI Bridge、内存存储等。当前 100+ 测试用例。
+测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全）、UI Bridge、内存存储等。当前 270+ 测试用例。
 
 ## 部署
 

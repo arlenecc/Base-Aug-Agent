@@ -36,11 +36,24 @@ logger = logging.getLogger(__name__)
 
 # RAG / sync 相关模块的 logger 名称前缀，用于 UI 日志面板过滤
 # 覆盖 RAG 全链路：同步引擎、向量库、解析器、清洗器、切片器、依赖检查、工具调用
+#
+# logger 名取自各模块的 __name__，而包名随运行方式变化：
+#   - python main.py / pip 安装 / PyInstaller 冻结 → "agent.rag.engine"
+#   - 从仓库根目录以 src.agent 导入（如部分测试）   → "src.agent.rag.engine"
+# 这里从本模块的 __name__ 动态推导包根，写死 "src.agent.*" 会导致
+# 生产环境（包名为 agent.*）下过滤器和临时 handler 永远匹配不到任何
+# 日志记录，UI 日志面板静默丢失全部 RAG 日志。
+_PKG_ROOT = __name__.rsplit(".ui", 1)[0]
 _RAG_LOG_PREFIXES = (
-    "src.agent.rag",
-    "src.agent.tools.rag_tool",
-    "src.agent.tools.base",
-    "src.agent.ui.main_window",
+    f"{_PKG_ROOT}.rag",
+    f"{_PKG_ROOT}.tools.rag_tool",
+    f"{_PKG_ROOT}.tools.base",
+    f"{_PKG_ROOT}.ui.main_window",
+)
+# RAG 子模块 logger 全名（同步 worker 临时 handler / 日志桥接 level 设置共用）
+_RAG_SUB_LOGGERS = tuple(
+    f"{_PKG_ROOT}.rag.{m}"
+    for m in ("engine", "vector_store", "chunker", "cleaner", "parsers", "deps")
 )
 
 # QSignalLogHandler 实例引用，保存在模块级别以便 closeEvent 清理。
@@ -97,7 +110,10 @@ class QSignalLogHandler(logging.Handler, QObject):
             ]
         except Exception:
             pass
-        super().close()
+        try:
+            super().close()
+        except RuntimeError:
+            pass
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -123,13 +139,6 @@ class QSignalLogHandler(logging.Handler, QObject):
         """Override flush to prevent RuntimeError during logging.shutdown."""
         try:
             super().flush()
-        except RuntimeError:
-            pass
-
-    def close(self) -> None:
-        """Override close to prevent RuntimeError during logging.shutdown."""
-        try:
-            super().close()
         except RuntimeError:
             pass
 
@@ -336,11 +345,7 @@ class SyncKnowledgeWorker(QThread):
             with self._log_buffer_lock:
                 self._log_buffer.append(msg)
         _tmp_handler.emit = _on_rag_log
-        _rag_loggers = [
-            'src.agent.rag', 'src.agent.rag.engine', 'src.agent.rag.vector_store',
-            'src.agent.rag.chunker', 'src.agent.rag.cleaner',
-            'src.agent.rag.parsers', 'src.agent.rag.deps',
-        ]
+        _rag_loggers = [f"{_PKG_ROOT}.rag", *_RAG_SUB_LOGGERS]
         for _name in _rag_loggers:
             _l = logging.getLogger(_name)
             _l.setLevel(logging.INFO)
@@ -1491,9 +1496,7 @@ class MainWindow(QMainWindow):
             logging.getLogger(prefix).setLevel(logging.DEBUG)
         # 同时设置已知子 logger 的 level，防止子 logger 从 root 继承
         # WARNING(30) 导致 INFO(20) 日志在传播到 handler 前被拦截。
-        for _name in ('src.agent.rag.engine', 'src.agent.rag.vector_store',
-                       'src.agent.rag.chunker', 'src.agent.rag.cleaner',
-                       'src.agent.rag.parsers', 'src.agent.rag.deps'):
+        for _name in _RAG_SUB_LOGGERS:
             logging.getLogger(_name).setLevel(logging.DEBUG)
 
         # 保存到模块级变量，供 closeEvent 清理使用。

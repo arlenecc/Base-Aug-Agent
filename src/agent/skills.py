@@ -2,6 +2,11 @@
 
 A skill records a name, trigger keywords, and a prompt template. When the same
 intent is requested 2+ times, the manager suggests saving it as a skill.
+
+Also supports directory-based skills under .agent/skills/. Each skill
+directory has a skill.json metadata file and a prompt.md entry file.
+The SkillIndex (skill_index.py) scans these directories and maintains
+an _index.json table for fast lookup via the skill_search tool.
 """
 from __future__ import annotations
 
@@ -36,8 +41,9 @@ class Skill:
 class SkillManager:
     SUGGEST_THRESHOLD = 2
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, skills_dir: str = ""):
         self._store = _JsonStore(path)
+        self._skills_dir = skills_dir  # .agent/skills/ directory
         # Defensive: a corrupted store may have null values. Directly modify
         # _data to avoid triggering a debounced _save() which would set
         # _last_save and delay subsequent real writes.
@@ -82,6 +88,69 @@ class SkillManager:
         with self._lock:
             skills = [s for s in (self._store.get("skills") or []) if s["name"] != name]
             self._store.set("skills", skills)
+
+    def create_dir_skill(self, name: str, keywords: List[str], prompt: str,
+                         description: str = "", tags: List[str] = None) -> str:
+        """Create a directory-based skill under .agent/skills/.
+
+        This is the new unified format: each skill gets its own directory
+        with skill.json + prompt.md.  Returns the skill directory path.
+
+        The old flat-skill create_skill() still works for backwards compat,
+        but new skills should use this method.
+        """
+        if not self._skills_dir:
+            raise ValueError("skills_dir not configured")
+
+        # Sanitize name → directory name
+        dir_name = re.sub(r"[^\w\-.]", "-", name.lower().strip()).strip("-")
+        if not dir_name:
+            dir_name = "unnamed-skill"
+        # Ensure uniqueness
+        skill_dir = os.path.join(self._skills_dir, dir_name)
+        counter = 1
+        while os.path.exists(skill_dir):
+            skill_dir = os.path.join(self._skills_dir, f"{dir_name}-{counter}")
+            counter += 1
+
+        os.makedirs(skill_dir, exist_ok=True)
+
+        # Write skill.json
+        meta = {
+            "name": name,
+            "description": description or f"Skill: {name}",
+            "keywords": [k.lower() for k in keywords],
+            "tags": tags or [],
+            "version": "1.0",
+            "entry": "prompt.md",
+        }
+        with open(os.path.join(skill_dir, "skill.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        # Write prompt.md
+        with open(os.path.join(skill_dir, "prompt.md"), "w", encoding="utf-8") as f:
+            f.write(prompt)
+
+        # Also register a flat record so _match_skill() can hit this skill.
+        # The flat record's prompt tells the agent to load the full
+        # instructions via skill_load instead of embedding them in the
+        # system prompt (keeps prompts lean).
+        dir_name = os.path.basename(skill_dir)
+        with self._lock:
+            skills = list(self._store.get("skills") or [])
+            if not any(s["name"] == name for s in skills):
+                skills.append(asdict(Skill(
+                    name=name,
+                    keywords=list(keywords),
+                    prompt=(
+                        f"A saved skill '{name}' matches this task. "
+                        f"Call skill_load with path=\"{dir_name}\" to read its "
+                        f"instructions, then follow them."
+                    ),
+                )))
+                self._store.set("skills", skills)
+
+        return skill_dir
 
     def match(self, text: str) -> Optional[Skill]:
         best: Optional[Skill] = None

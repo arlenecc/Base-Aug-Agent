@@ -609,6 +609,11 @@ def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
 
     Uses hf_hub_download for individual files instead of snapshot_download
     to avoid pulling the entire repo (~1GB+ with unused formats).
+
+    Runs in-process: a ``sys.executable -c`` subprocess would break in a
+    PyInstaller-frozen .app, where sys.executable is the frozen binary and
+    cannot execute Python code (same reason the embedding model download
+    was moved in-process).
     """
     logger.info(
         "RAG deps: downloading reranker model files (%d files)...",
@@ -617,51 +622,30 @@ def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
     if progress_callback:
         progress_callback(f"正在下载{RERANK_MODEL_LABEL}（仅必需文件）...")
 
-    env = os.environ.copy()
-    env["HF_HUB_DISABLE_XET"] = "1"
-    if "HF_ENDPOINT" not in env:
-        env["HF_ENDPOINT"] = "https://huggingface.co"
-
-    lines = [
-        "from huggingface_hub import hf_hub_download",
-        f"model_id = '{RERANK_MODEL_ID}'",
-        f"files = {_RERANKER_REQUIRED_FILES!r}",
-        "import sys",
-        "for filename in files:",
-        "    print(f'  Downloading {filename}...', file=sys.stderr)",
-        "    local = hf_hub_download(repo_id=model_id, filename=filename)",
-        "    print(f'    -> {local}', file=sys.stderr)",
-        "print('ALL_FILES_DOWNLOADED')",
-    ]
-    script = "\n".join(lines)
+    # huggingface_hub reads these at call time; set before downloading.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
 
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=900,  # 15 minutes for ~500MB
-            env=env,
-        )
-        if result.returncode == 0 and "ALL_FILES_DOWNLOADED" in result.stdout:
-            logger.info("RAG deps: reranker model files downloaded")
-            if progress_callback:
-                progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")
-            return True, "下载成功"
-        else:
-            error_tail = result.stderr.strip().split("\n")[-3:] if result.stderr else ["unknown error"]
-            msg = "\n".join(error_tail)
-            logger.warning("RAG deps: reranker download failed: %s", msg)
-            if progress_callback:
-                progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
-            return False, msg
-    except subprocess.TimeoutExpired:
-        msg = "下载超时（15 分钟）"
-        logger.warning("RAG deps: reranker download timed out")
+        from huggingface_hub import hf_hub_download
+
+        for filename in _RERANKER_REQUIRED_FILES:
+            logger.debug("RAG deps: downloading %s ...", filename)
+            hf_hub_download(repo_id=RERANK_MODEL_ID, filename=filename)
+        logger.info("RAG deps: reranker model files downloaded")
         if progress_callback:
-            progress_callback(f"⚠ 重排序模型{msg}（可选，不影响同步）")
+            progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")
+        return True, "下载成功"
+    except ImportError:
+        msg = "huggingface_hub 不可用"
+        logger.warning("RAG deps: reranker download failed: %s", msg)
+        if progress_callback:
+            progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
         return False, msg
     except Exception as e:
-        msg = str(e)
+        # Keep only the last line — HF errors can be multi-page tracebacks.
+        msg = str(e).strip().split("\n")[-1] if str(e).strip() else "unknown error"
         logger.warning("RAG deps: reranker download exception: %s", e)
+        if progress_callback:
+            progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
         return False, msg

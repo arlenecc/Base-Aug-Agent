@@ -172,7 +172,10 @@ class GraphMemoryStore:
         try:
             table = self._ensure_table()
             oid = _hash(entity_name + "|" + observation)
-            vec = self._ef.embed_query(observation)
+            # Observations are documents (retrieval targets), so embed with
+            # the document prefix — matching _semantic_search which embeds
+            # the query with the query prefix.
+            vec = self._ef.embed_documents([observation])[0]
             record = {
                 "id": oid,
                 "entity": entity_name,
@@ -210,9 +213,48 @@ class GraphMemoryStore:
             table = self._ensure_table()
             if table is None:
                 return
-            table.delete(f"entity = '{entity_name}'")
+            # Escape single quotes (SQL literal) — entity names come from
+            # the LLM and may contain them; otherwise the filter expression
+            # would be malformed or injectable.
+            safe = entity_name.replace("'", "''")
+            table.delete(f"entity = '{safe}'")
         except Exception:
             pass
+
+    def _index_observations_batch(self, entity_name: str, observations: List[str]) -> None:
+        """Embed and upsert multiple observations in ONE batch.
+
+        Called OUTSIDE self._lock.  Batching matters: each individual
+        embed_query() costs ~10-50ms of ONNX compute, so adding N facts
+        from a fact-extraction pass would take N× that.  embed_documents()
+        processes the whole list in a single batched ONNX forward pass.
+        """
+        if not self._vec_ready or not observations:
+            return
+        try:
+            vecs = self._ef.embed_documents(observations)
+            records = [
+                {
+                    "id": _hash(entity_name + "|" + obs),
+                    "entity": entity_name,
+                    "text": obs,
+                    "vector": vec,
+                }
+                for obs, vec in zip(observations, vecs)
+            ]
+            with self._vec_lock:
+                table = self._ensure_table()
+                if table is None:
+                    self._table = self._db.create_table("observations", records)
+                    return
+                for rec in records:
+                    try:
+                        table.delete(f"id = '{rec['id']}'")
+                    except Exception:
+                        pass
+                table.add(records)
+        except Exception as e:
+            logger.debug("graph_memory: index_observations_batch failed: %s", e)
 
     # ------------------------------------------------------------------
     # CRUD: entities
@@ -245,9 +287,9 @@ class GraphMemoryStore:
                 to_index = list(e["observations"])
             self._save()
             result = dict(e)
-        # Index outside lock to avoid blocking graph reads during ONNX compute
-        for obs in to_index:
-            self._index_observation(name, obs)
+        # Index outside lock (batched: one ONNX pass for all observations)
+        if to_index:
+            self._index_observations_batch(name, to_index)
         return result
 
     def delete_entity(self, name: str) -> bool:
@@ -304,9 +346,9 @@ class GraphMemoryStore:
                     to_index.append(obs)
             if to_index:
                 self._save()
-        # Index outside lock to avoid blocking graph reads during ONNX compute
-        for obs in to_index:
-            self._index_observation(name, obs)
+        # Index outside lock (batched: one ONNX pass for all observations)
+        if to_index:
+            self._index_observations_batch(name, to_index)
         return len(to_index)
 
     # ------------------------------------------------------------------

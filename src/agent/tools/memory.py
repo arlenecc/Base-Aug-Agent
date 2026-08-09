@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, List
 
 from ..config import AgentConfig
@@ -21,8 +22,31 @@ from ..memory import LongTermMemory, WorkMemory
 from .base import Tool, ToolRegistry, ToolResult
 
 
+# ---------------------------------------------------------------------------
+# Singleton WorkMemory — avoids atexit-handler accumulation.
+#
+# Each WorkMemory wraps a _JsonStore that registers an atexit flush closure
+# on construction.  If we created a new instance on every call, each tool
+# invocation would append one more closure to the atexit registry, growing
+# without bound for the lifetime of the process (memory leak).  The instance
+# is cached per workspace path on the module level so it survives registry
+# rebuilds (work memory data must persist across "应用配置" anyway).
+# ---------------------------------------------------------------------------
+
+_work_memory_by_path: dict = {}
+_work_memory_lock = threading.Lock()
+
+
 def _work_memory(config: AgentConfig) -> WorkMemory:
-    return WorkMemory(path=os.path.join(config.workspace, ".agent", "work_memory.json"))
+    path = os.path.join(config.workspace, ".agent", "work_memory.json")
+    wm = _work_memory_by_path.get(path)
+    if wm is None:
+        with _work_memory_lock:
+            wm = _work_memory_by_path.get(path)
+            if wm is None:
+                wm = WorkMemory(path=path)
+                _work_memory_by_path[path] = wm
+    return wm
 
 
 # ---------------------------------------------------------------------------

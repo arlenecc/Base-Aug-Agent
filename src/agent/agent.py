@@ -52,16 +52,12 @@ Principles:
 2. Prefer the least destructive path. Risky/irreversible actions need user confirmation.
 3. If info is missing, use `ask_user` rather than guessing.
 4. Use `work_memory` for short-term notes. Use `memory_graph` to store entities/relations/observations. Use `memory_search` to recall facts before answering.
-5. When done, reply concisely in plain text (no tool calls). Your `content` field is the visible reply; `reasoning_content` is the thinking trace.
+5. Before complex tasks, use `skill_search` to find relevant skills. If found, use `skill_load` to read the skill's instructions, then follow them.
+6. When done, reply concisely in plain text (no tool calls). Your `content` field is the visible reply; `reasoning_content` is the thinking trace.
 
-Paths are relative to the workspace. Workspace-only ops (file_read/write/modify, work_memory, memory_graph, memory_search, web_scan, ask_user) run without confirmation. `code_run` and `shell_run` need confirmation.
+Paths are relative to the workspace. Workspace-only ops (file_read/write/modify, work_memory, memory_graph, memory_search, skill_search, skill_load, web_scan, ask_user) run without confirmation. `code_run` and `shell_run` need confirmation.
 
 To call a tool, emit a tool_call with name + JSON args. The result returns as a tool message next turn. Chain calls across turns until done."""
-
-# Appended only when a local knowledge base is configured and non-empty.
-_KB_PROMPT = """
-Knowledge base: if the local knowledge base has indexed data, use `rag_search` to retrieve context BEFORE answering questions about the user's documents. Use `rag_status` to check availability. Use `rag_ingest` to index new files (incremental). Prefer knowledge base context over general knowledge for domain-specific questions."""
-
 
 # ---------------------------------------------------------------------------
 # Token estimation: approximate token count from text length.
@@ -120,7 +116,10 @@ class Agent:
         self.config = config
         self.callbacks = callbacks
         self.tools = tool_registry or ToolRegistry(config=config, callbacks=callbacks)
-        self.skills = skills or SkillManager(path=os.path.join(config.workspace, ".agent", "skills.json"))
+        self.skills = skills or SkillManager(
+            path=os.path.join(config.workspace, ".agent", "skills.json"),
+            skills_dir=os.path.join(config.workspace, ".agent", "skills"),
+        )
         self.max_iterations = int(getattr(config, "max_iterations", 15))
         self.max_history = int(getattr(config, "max_history", 50))
         # Context shrink config: shrink proactively when estimated prompt size
@@ -433,38 +432,36 @@ class Agent:
         thread is a daemon so it won't block process exit if the user
         closes the app right after a reply.
         """
+        # Collect the conversation text on the MAIN (agent) thread before
+        # spawning the worker.  The worker must not read self._history —
+        # by the time it runs, the main thread may have already started
+        # the next turn and mutated/shrunk the list.
+        user_text = ""
+        for msg in reversed(self._history):
+            if msg.get("role") == "user" and msg.get("content"):
+                user_text = msg["content"]
+                break
+        if not user_text or len(user_text.strip()) < 20:
+            return
+        if not assistant_reply or len(assistant_reply.strip()) < 20:
+            return
+        conversation = f"User: {user_text}\n\nAssistant: {assistant_reply}"
+
         import threading
         thread = threading.Thread(
             target=self._extract_facts_sync,
-            args=(assistant_reply,),
+            args=(conversation,),
             daemon=True,
             name="fact-extraction",
         )
         thread.start()
 
-    def _extract_facts_sync(self, assistant_reply: str) -> None:
+    def _extract_facts_sync(self, conversation: str) -> None:
         """Best-effort: use the LLM to extract entities/relations/observations
-        from the latest conversation turn and persist them to the knowledge
-        graph.  Non-blocking — any failure is logged and swallowed.
-
-        Only runs when the conversation has meaningful content (skips tiny
-        replies like "done" or "ok").  Uses a low-temperature non-streaming
-        call so it doesn't interfere with the main reasoning loop.
+        from a conversation fragment and persist them to the knowledge
+        graph.  Runs on a daemon thread — any failure is logged and swallowed.
         """
         try:
-            # Gather the last user message + assistant reply
-            user_text = ""
-            for msg in reversed(self._history):
-                if msg.get("role") == "user" and msg.get("content"):
-                    user_text = msg["content"]
-                    break
-            if not user_text or len(user_text.strip()) < 20:
-                # Skip trivial conversations
-                return
-            if not assistant_reply or len(assistant_reply.strip()) < 20:
-                return
-
-            conversation = f"User: {user_text}\n\nAssistant: {assistant_reply}"
             from .graph_memory import extract_facts_via_llm
             data = extract_facts_via_llm(self.llm, conversation)
 
@@ -660,19 +657,16 @@ class Agent:
                 reasoning_tokens = estimated_reasoning_tokens
                 extra_reasoning_tokens = estimated_reasoning_tokens
 
-            # Total tokens for this turn: use the API's total if it's non-zero
-            # and includes reasoning (i.e. api_reasoning_tokens > 0 or no
-            # reasoning text was streamed). Otherwise add our estimate.
+            # Total tokens: use the API's total if it's non-zero and includes
+            # reasoning (i.e. api_reasoning_tokens > 0 or no reasoning text was
+            # streamed). Otherwise add our estimate on top.
             api_total = usage.get("total_tokens", 0)
             if api_total > 0 and (api_reasoning_tokens or not reasoning_text):
                 # API total is trustworthy
                 self._total_tokens += api_total
-                turn_tokens = api_total
             else:
-                # API total is missing or doesn't include reasoning: use
-                # api_total + estimated reasoning tokens
+                # API total is missing or doesn't include reasoning
                 self._total_tokens += api_total + extra_reasoning_tokens
-                turn_tokens = api_total + extra_reasoning_tokens
 
             if usage:
                 self.callbacks.on_usage(usage)
@@ -818,15 +812,6 @@ class Agent:
 
         base = SYSTEM_PROMPT
 
-        # Conditionally append knowledge-base instructions — only when RAG
-        # is actually configured and has data.  Saves ~70 tokens per turn
-        # when no KB is available (the common case for non-RAG workflows).
-        try:
-            if self.tools.is_rag_available():
-                base += _KB_PROMPT
-        except Exception:  # pragma: no cover
-            pass
-
         try:
             from .tools.memory import _work_memory, _get_long_memory
 
@@ -882,24 +867,16 @@ class Agent:
                         os.path.basename(s) for s in sources[:10]
                     ) + ("..." if len(sources) > 10 else "")
                     base += (
-                        f"\n\n# Local knowledge base (ACTIVE)\n"
-                        f"A local knowledge base is available with {chunks} indexed "
-                        f"text chunks from {len(sources)} file(s): {source_list}\n"
-                        f"You have the tools `rag_search`, `rag_status`, and "
-                        f"`rag_ingest` to interact with it.  When the user asks a "
-                        f"question that could be answered from these documents, "
-                        f"MUST call `rag_search` first before answering.\n"
-                        f"知识库已就绪，包含 {chunks} 个文本切片，来自 {len(sources)} 个文件。"
-                        f"回答与用户文档相关的问题时，必须先调用 `rag_search` 检索相关内容。"
+                        f"\n\n# Knowledge base (ACTIVE)\n"
+                        f"{chunks} chunks from {len(sources)} file(s): {source_list}. "
+                        f"For questions answerable from these documents, MUST call "
+                        f"`rag_search` first before answering."
                     )
                 else:
                     base += (
-                        f"\n\n# Local knowledge base (EMPTY)\n"
-                        f"A knowledge base is configured but has no indexed content yet. "
-                        f"Use `rag_ingest` to index documents from the knowledge base "
-                        f"directory, then use `rag_search` to query them.\n"
-                        f"知识库已配置但尚未索引任何文档。可使用 `rag_ingest` 索引文档后，"
-                        f"再用 `rag_search` 进行检索。"
+                        f"\n\n# Knowledge base (EMPTY)\n"
+                        f"Configured but not indexed. Use `rag_ingest` to index, "
+                        f"then `rag_search` to query."
                     )
         except Exception:  # pragma: no cover
             pass

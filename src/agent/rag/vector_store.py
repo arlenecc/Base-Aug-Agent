@@ -115,6 +115,14 @@ class FastEmbedEmbeddingFunction:
         embeddings = list(self._model.embed([prefixed]))
         return embeddings[0].tolist()
 
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of document texts (with document prefix).
+
+        Batched: a single ONNX forward pass for the whole list, much faster
+        than calling embed_query() per text.
+        """
+        return self(texts)
+
     def name(self) -> str:
         return f"fastembed:{self._model_name}"
 

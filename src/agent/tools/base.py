@@ -77,6 +77,7 @@ class ToolRegistry:
         from .web import WebScanTool, WebExecJsTool
         from .interact import AskUserTool
         from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
+        from .skill_search import SkillSearchTool, SkillLoadTool
 
         tools_to_register = [
             FileReadTool(), FileWriteTool(), FileModifyTool(),
@@ -87,6 +88,8 @@ class ToolRegistry:
             WorkMemoryTool(),
             MemoryGraphTool(),
             MemorySearchTool(),
+            SkillSearchTool(),
+            SkillLoadTool(),
         ]
 
         # webexec_js: only register when browser_endpoint is configured.
@@ -253,6 +256,10 @@ class ToolRegistry:
             except Exception as e:
                 logger.warning("⚠ 长期记忆资源释放异常: %s", e)
             setattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
+        # Release the SkillIndex singleton (if any)
+        skill_idx = getattr(self, "_skill_index", None)
+        if skill_idx is not None:
+            setattr(self, "_skill_index", None)
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
@@ -262,27 +269,6 @@ class ToolRegistry:
 
     def schemas(self) -> List[Dict[str, Any]]:
         return [t.schema() for t in self._tools.values()]
-
-    # ------------------------------------------------------------------
-    def is_rag_available(self) -> bool:
-        """Check whether the RAG knowledge base is configured and non-empty.
-
-        Used to conditionally inject KB instructions into the system prompt
-        (saves ~70 tokens when no KB is available) and to decide whether
-        to include RAG tool schemas.
-        """
-        kb_dir = getattr(self.config, "knowledge_base_dir", "") or ""
-        if not kb_dir:
-            return False
-        if not os.path.isdir(kb_dir):
-            return False
-        # Quick check: any files in the KB directory?
-        try:
-            for _ in os.scandir(kb_dir):
-                return True
-            return False
-        except OSError:
-            return False
 
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:
