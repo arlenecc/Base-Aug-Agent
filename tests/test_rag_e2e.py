@@ -458,6 +458,62 @@ class TestVectorStore:
             assert "source" in r
             assert "score" in r
 
+    def test_search_fts_keyword(self, store_dir, vector_store_factory):
+        """BM25 keyword search should find chunks by exact CJK keywords."""
+        store = vector_store_factory(persist_dir=store_dir)
+
+        chunks = [
+            {"source": "a.md", "chunk_index": 0,
+             "text": "机器学习是人工智能的核心分支。深度学习使用神经网络。"},
+            {"source": "b.md", "chunk_index": 0,
+             "text": "Python 是一种流行的编程语言。"},
+            {"source": "c.md", "chunk_index": 0,
+             "text": "气候变化是当今世界的重大挑战。"},
+        ]
+        store.add(chunks)
+
+        # Exact keyword should surface the matching chunk.
+        results = store.search_fts("机器学习 神经网络", top_k=3)
+        assert results, "BM25 should return the matching chunk"
+        assert results[0]["source"] == "a.md"
+
+    def test_search_fts_english_keyword(self, store_dir, vector_store_factory):
+        """BM25 should also work for English keywords."""
+        store = vector_store_factory(persist_dir=store_dir)
+
+        chunks = [
+            {"source": "en.md", "chunk_index": 0,
+             "text": "Machine learning is a branch of artificial intelligence."},
+            {"source": "cn.md", "chunk_index": 0,
+             "text": "深度学习使用多层神经网络。"},
+        ]
+        store.add(chunks)
+
+        results = store.search_fts("machine learning", top_k=2)
+        assert results, "BM25 should find the English chunk"
+        assert results[0]["source"] == "en.md"
+
+    def test_hybrid_retrieval_merges_vector_and_bm25(self, store_dir, vector_store_factory):
+        """search_with_rerank merges vector + BM25 candidates (dedupe)."""
+        store = vector_store_factory(persist_dir=store_dir)
+
+        chunks = [
+            {"source": "a.md", "chunk_index": 0,
+             "text": "机器学习是人工智能的核心分支。"},
+            {"source": "b.md", "chunk_index": 0,
+             "text": "Python 是一种流行的编程语言。"},
+            {"source": "c.md", "chunk_index": 0,
+             "text": "气候变化是当今世界的重大挑战。"},
+        ]
+        store.add(chunks)
+
+        results = store.search_with_rerank("机器学习", top_k=3)
+        # Fallback mode (no reranker) returns up to top_k, no dedupe duplicates.
+        assert 1 <= len(results) <= 3
+        # No duplicate (source, chunk_index) pairs.
+        keys = [(r["source"], r.get("chunk_index", 0)) for r in results]
+        assert len(keys) == len(set(keys))
+
     def test_persistence(self, store_dir, vector_store_factory):
         """Data added to one store should be visible in another instance."""
         store1 = vector_store_factory(persist_dir=store_dir)

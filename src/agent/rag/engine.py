@@ -736,10 +736,12 @@ class RAGEngine:
     # ------------------------------------------------------------------
 
     def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Search the knowledge base with reranking for precise results.
+        """Search the knowledge base with hybrid retrieval + reranking.
 
-        Retrieves top_k * 4 candidates from vector search, then uses BGE
-        reranker to pick the most relevant top_k results.
+        Retrieves top_k * 4 candidates each from vector-similarity search and
+        BM25 keyword search, merges/dedupes, then uses BGE reranker to pick
+        the most relevant results.  Results below the 0.7 similarity threshold
+        are dropped before returning.
         """
         t0 = time.monotonic()
         store = self._get_store()
@@ -751,7 +753,7 @@ class RAGEngine:
             "🔍 知识库检索开始: 查询=%r 目标结果数=%d 向量库总量=%d",
             query[:80], top_k, store_count,
         )
-        logger.info("  ├─ 初检: 从 %d 个向量中检索 top %d 候选", store_count, top_k * 4)
+        logger.info("  ├─ 混合初检: 向量相似度 + BM25 关键词, 各取 top %d 候选", top_k * 4)
         results = store.search_with_rerank(query, top_k=top_k)
         t_total = time.monotonic() - t0
         if results:

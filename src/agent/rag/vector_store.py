@@ -26,6 +26,50 @@ _TABLE_NAME = "knowledge_base"
 _DOC_PREFIX = "search_document: "
 _QUERY_PREFIX = "search_query: "
 
+# BM25 全文检索的预分词列名（jieba 分词后空格连接，供 Tantivy whitespace
+# tokenizer 索引，解决 Tantivy wheel 未编译中文分词器的问题）。
+_FTS_COLUMN = "text_fts"
+
+# jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
+_jieba = None
+_jieba_lock = threading.Lock()
+_jieba_tried = False
+
+
+def _get_jieba():
+    """Lazily import and return jieba, or None if unavailable."""
+    global _jieba, _jieba_tried
+    if _jieba_tried:
+        return _jieba
+    with _jieba_lock:
+        if _jieba_tried:
+            return _jieba
+        _jieba_tried = True
+        try:
+            import jieba
+            _jieba = jieba
+            logger.debug("jieba 分词器已加载（用于 BM25 中文全文检索）")
+        except ImportError:
+            _jieba = None
+            logger.info("jieba 未安装，BM25 中文分词退化为空白切分")
+    return _jieba
+
+
+def _tokenize_for_fts(text: str) -> str:
+    """Tokenize text for the BM25 full-text index.
+
+    Uses jieba for CJK word segmentation, then joins tokens with spaces so
+    Tantivy's ``whitespace`` tokenizer can index each word.  English words are
+    kept intact (jieba segments them on whitespace/punctuation).  When jieba
+    is unavailable, returns the original text (English still works via
+    whitespace; CJK degrades to whole-sentence tokens).
+    """
+    jieba = _get_jieba()
+    if jieba is None or not text:
+        return text or ""
+    tokens = [t.strip() for t in jieba.cut(text) if t.strip()]
+    return " ".join(tokens)
+
 
 # ---------------------------------------------------------------------------
 # FastEmbed-based embedding function (local ONNX Runtime, no API needed)
@@ -184,6 +228,8 @@ class VectorStore:
         self._ef = None  # embedding function
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
+        self._fts_ready = False  # BM25 全文索引是否已就绪
+        self._fts_checked = False  # 是否已尝试创建过 FTS 索引
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -217,10 +263,54 @@ class VectorStore:
         # Open existing table or defer creation until first add
         if _TABLE_NAME in self._db.table_names():
             self._table = self._db.open_table(_TABLE_NAME)
+            self._check_schema_migration()
 
         self._initialized = True
         count = self._table.count_rows() if self._table is not None else 0
         logger.info("  向量库初始化完成: 当前存储 %d 条向量记录", count)
+
+    def _check_schema_migration(self) -> None:
+        """Migrate an existing table to include the ``text_fts`` column.
+
+        The BM25 full-text index lives on a pre-tokenized ``text_fts`` column.
+        Tables created before this feature lack the column; since LanceDB
+        schemas are immutable, we rebuild the table (data survives — it is
+        re-read from the old table and re-written with the new column).
+        """
+        if self._table is None:
+            return
+        try:
+            schema = self._table.schema
+            if _FTS_COLUMN in schema.names:
+                return
+        except Exception:
+            return
+
+        logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", _FTS_COLUMN)
+        try:
+            # Read all existing rows, re-write with the new column.
+            old_rows = self._table.to_pandas()
+            self._db.drop_table(_TABLE_NAME)
+            self._table = None
+            if old_rows is not None and not old_rows.empty:
+                records = []
+                for _, row in old_rows.iterrows():
+                    rec = {
+                        "id": row["id"],
+                        "text": row["text"],
+                        "vector": row["vector"],
+                        "source": row["source"],
+                        "chunk_index": row["chunk_index"],
+                    }
+                    rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                    records.append(rec)
+                self._table = self._db.create_table(_TABLE_NAME, records)
+            self._table_checked = True
+            logger.info("  ⚙ 向量表迁移完成（新增 %s 列）", _FTS_COLUMN)
+        except Exception as e:
+            logger.warning("  ⚠ 向量表迁移失败（BM25 索引将不可用）: %s", e)
+            self._table = None
+            self._table_checked = False
 
     def _ensure_table(self) -> Optional[Any]:
         """Open existing table if it exists, return None if not yet created.
@@ -277,6 +367,7 @@ class VectorStore:
                     "vector": _normalize(vectors[j]),
                     "source": source,
                     "chunk_index": chunk_idx,
+                    _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
                 })
 
         table = self._ensure_table()
@@ -319,6 +410,10 @@ class VectorStore:
                     raise
         if failed_batches > 0:
             logger.warning("VectorStore: %d batch(es) failed during add", failed_batches)
+
+        # 数据写入后刷新 BM25 全文索引，覆盖新增的行。
+        self._fts_ready = False
+        self._ensure_fts_index(self._table)
 
         logger.info("VectorStore: added %d chunks", total)
         return total
@@ -492,6 +587,11 @@ class VectorStore:
                 raise
 
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
+
+        # 数据写入后刷新 BM25 全文索引，覆盖新增的行。
+        self._fts_ready = False
+        self._ensure_fts_index(self._table)
+
         return total
 
     def _embed_chunks(
@@ -529,8 +629,90 @@ class VectorStore:
                 "vector": _normalize(vectors[j]),
                 "source": source,
                 "chunk_index": chunk_idx,
+                _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
             })
         return records
+
+    # ------------------------------------------------------------------
+    # BM25 full-text search (hybrid retrieval)
+    # ------------------------------------------------------------------
+
+    def _ensure_fts_index(self, table) -> bool:
+        """Ensure a BM25 full-text index exists on the ``text_fts`` column.
+
+        Creates the index on first use and after each ingest (the index must
+        be refreshed to cover newly written rows).  The ``text_fts`` column is
+        pre-tokenized with jieba (space-joined), and indexed with Tantivy's
+        ``whitespace`` tokenizer — this sidesteps the fact that the Tantivy
+        wheel ships without the compiled CJK tokenizers (jieba/chinese).
+
+        Returns True if the index is available for querying.
+        """
+        if self._fts_ready:
+            return True
+        try:
+            # Pre-tokenized column + whitespace tokenizer: each space-separated
+            # jieba token becomes one Tantivy token.
+            table.create_fts_index(
+                [_FTS_COLUMN],
+                use_tantivy=True,
+                tokenizer_name="whitespace",
+                replace=True,
+                with_position=True,
+            )
+            self._fts_ready = True
+            self._fts_checked = True
+            logger.info("  ├─ BM25 全文索引已创建 (Tantivy whitespace + jieba 预分词)")
+            return True
+        except Exception as e:
+            logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
+            self._fts_checked = True
+            self._fts_ready = False
+            return False
+
+    def search_fts(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Keyword (BM25) full-text search over the ``text_fts`` column.
+
+        Returns list of {text, source, chunk_index, score, fts_score} dicts,
+        where ``score`` is the BM25 score (higher is better).  Used together
+        with vector search for hybrid retrieval.
+        """
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return []
+
+        if not self._ensure_fts_index(table):
+            return []
+
+        try:
+            # Tokenize the query the same way as the indexed text.
+            tokenized_query = _tokenize_for_fts(query)
+            results = (
+                table.search(tokenized_query, query_type="fts", fts_columns=[_FTS_COLUMN])
+                .limit(top_k)
+                .to_list()
+            )
+        except Exception as e:
+            logger.warning("  ⚠ BM25 全文检索失败: %s", e)
+            return []
+
+        output: List[Dict[str, Any]] = []
+        for r in results:
+            # Tantivy returns BM25 score in `_score` (higher is better).
+            raw = float(r.get("_score", 0.0))
+            output.append({
+                "text": r.get("text", ""),
+                "source": r.get("source", ""),
+                "chunk_index": r.get("chunk_index", 0),
+                "score": raw,
+                "fts_score": raw,
+            })
+        return output
 
     def search(
         self,
@@ -657,12 +839,17 @@ class VectorStore:
         query: str,
         candidates: List[Dict[str, Any]],
         top_k: int = 3,
+        min_similarity: float = 0.7,
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using BGE reranker for precise scoring.
 
         Falls back to distance-based similarity scoring when the reranker
         is unavailable. In both cases scores are normalized to [0, 1]
         (higher is better) and results are returned sorted descending.
+
+        Results whose final score is below ``min_similarity`` are dropped
+        (they are not semantically relevant enough to send to the LLM), so
+        the returned list may be shorter than ``top_k``.
         """
         if not candidates:
             return []
@@ -684,6 +871,8 @@ class VectorStore:
             candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             result = candidates[:top_k]
             logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
+            # 回退模式下分数是余弦距离的近似（非 BGE sigmoid 语义分），
+            # 不做 0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
             return result
 
         # Build pairs for reranker
@@ -713,7 +902,30 @@ class VectorStore:
             for i, r in enumerate(results[:3]):
                 source = os.path.basename(r.get("source", ""))
                 logger.info("  │   [%d] %s (重排序分: %.4f)", i + 1, source, r["score"])
-        return results
+
+        return self._filter_by_similarity(results, min_similarity)
+
+    def _filter_by_similarity(
+        self,
+        results: List[Dict[str, Any]],
+        min_similarity: float,
+    ) -> List[Dict[str, Any]]:
+        """Drop results whose final score is below ``min_similarity``.
+
+        A rerank score (BGE sigmoid, or cosine-similarity fallback) below the
+        threshold means the chunk is not semantically close enough to the
+        query to be worth sending to the LLM.
+        """
+        if not results or min_similarity <= 0:
+            return results
+        kept = [r for r in results if r.get("score", 0.0) >= min_similarity]
+        if len(kept) < len(results):
+            dropped = len(results) - len(kept)
+            logger.info(
+                "  ├─ 相似度过滤: 丢弃 %d 条 < %.2f 的结果, 保留 %d 条",
+                dropped, min_similarity, len(kept),
+            )
+        return kept
 
     def search_with_rerank(
         self,
@@ -721,20 +933,64 @@ class VectorStore:
         top_k: int = 3,
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
+        min_similarity: float = 0.7,
     ) -> List[Dict[str, Any]]:
-        """Search with reranking: retrieve candidates, rerank, return top_k.
+        """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
-        Retrieves top_k * candidate_multiplier results from vector search,
-        then uses BGE reranker to pick the most relevant top_k.
+        Pipeline:
+          1. Vector search: top_k * candidate_multiplier candidates.
+          2. BM25 keyword search: top_k * candidate_multiplier candidates.
+          3. Merge & dedupe by (source, chunk_index).
+          4. BGE rerank the merged candidate set.
+          5. Drop any result whose rerank score < min_similarity (0.7).
+          6. Return up to top_k results.
+
+        Args:
+            query: Search query.
+            top_k: Final number of results to return.
+            candidate_multiplier: Candidates per retrieval channel = top_k × N.
+            where: Optional SQL filter (applied to vector search only).
+            min_similarity: Reject rerank results below this score.
         """
-        candidates = self.search(query, top_k=top_k * candidate_multiplier, where=where)
-        if not candidates:
-            logger.info("VectorStore.search_with_rerank: no candidates from vector search")
-            return []
-        results = self.rerank(query, candidates, top_k=top_k)
+        n_candidates = top_k * candidate_multiplier
+
+        # 1. Vector similarity search.
+        vec_candidates = self.search(query, top_k=n_candidates, where=where)
         logger.info(
-            "VectorStore.search_with_rerank: %d candidates → %d after rerank (top_k=%d)",
-            len(candidates), len(results), top_k,
+            "VectorStore.search_with_rerank: 向量检索 %d 条候选", len(vec_candidates),
+        )
+
+        # 2. BM25 keyword search.
+        fts_candidates = self.search_fts(query, top_k=n_candidates)
+        logger.info(
+            "VectorStore.search_with_rerank: BM25 检索 %d 条候选", len(fts_candidates),
+        )
+
+        # 3. Merge & dedupe by (source, chunk_index), keeping vector candidate
+        #    first (its score is a cosine similarity in [0,1]).
+        merged: List[Dict[str, Any]] = []
+        seen: set = set()
+        for c in vec_candidates + fts_candidates:
+            key = (c.get("source", ""), c.get("chunk_index", 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(c)
+
+        if not merged:
+            logger.info("VectorStore.search_with_rerank: 混合检索无候选")
+            return []
+
+        logger.info(
+            "VectorStore.search_with_rerank: 混合候选 %d 条 (向量 %d + BM25 %d, 去重后 %d)",
+            len(merged), len(vec_candidates), len(fts_candidates), len(merged),
+        )
+
+        # 4. BGE rerank + 5. min_similarity filter.
+        results = self.rerank(query, merged, top_k=top_k, min_similarity=min_similarity)
+        logger.info(
+            "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
+            len(merged), len(results), min_similarity,
         )
         return results
 

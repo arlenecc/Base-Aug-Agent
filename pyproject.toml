@@ -29,6 +29,10 @@ rag = [
     "ebooklib>=0.18",
     "chonkie[semantic]>=1.0.0",
     "docling>=2.0.0",
+    # BM25 hybrid retrieval: Tantivy FTS backend + jieba CJK tokenization
+    "tantivy>=0.22",
+    "pylance>=0.13",
+    "jieba>=0.42",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)
 ocr = ["rapidocr-onnxruntime>=1.0.0"]
