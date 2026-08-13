@@ -36,8 +36,15 @@ _DEFAULT_TIMEOUT = 30
 # Track leaked daemon threads from timed-out code_run calls.
 # We can't kill them, but we can warn the user and track the count.
 # Cleaned up when the process exits (daemon threads).
+#
+# Cap the tracked list: a truly stuck thread (tight C loop / blocking I/O
+# without timeout) lives until process exit and holds a strong reference to
+# its namespace/StringIO via its closure.  Tracking every such thread forever
+# would grow this list without bound across many timeouts.  We only need a
+# bounded sample for the warning, not an exhaustive registry.
 _leaked_threads: List[threading.Thread] = []
 _leaked_threads_lock = threading.Lock()
+_MAX_TRACKED_LEAKED = 10
 
 
 class CodeRunTool(Tool):
@@ -138,15 +145,17 @@ class CodeRunTool(Tool):
             # it next checks `_cancelled()`. Track the leaked thread.
             _cancel_evt.set()
             with _leaked_threads_lock:
-                _leaked_threads.append(t)
-                # Prune completed threads from the leaked list.
+                # Prune completed threads, then append the new one, capped.
                 _leaked_threads[:] = [lt for lt in _leaked_threads if lt.is_alive()]
+                _leaked_threads.append(t)
+                if len(_leaked_threads) > _MAX_TRACKED_LEAKED:
+                    _leaked_threads[:] = _leaked_threads[-_MAX_TRACKED_LEAKED:]
                 leaked_count = len(_leaked_threads)
             if leaked_count > 1:
                 logger.warning(
-                    "code_run: %d daemon threads leaked due to timeout (total leaked: %d). "
-                    "They will be cleaned up on process exit.",
-                    1, leaked_count,
+                    "code_run: daemon thread leaked due to timeout (total tracked: %d). "
+                    "Stuck threads are cleaned up on process exit.",
+                    leaked_count,
                 )
             return ToolResult(
                 False,

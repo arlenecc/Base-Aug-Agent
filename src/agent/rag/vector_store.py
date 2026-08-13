@@ -288,25 +288,29 @@ class VectorStore:
 
         logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", _FTS_COLUMN)
         try:
-            # Read all existing rows, re-write with the new column.
-            old_rows = self._table.to_pandas()
+            # Read all existing rows via PyArrow (无 pandas 依赖)。
+            arrow_table = self._table.to_arrow()
+            records = []
+            for row in arrow_table.to_pylist():
+                rec = {
+                    "id": row["id"],
+                    "text": row["text"],
+                    "vector": row["vector"],
+                    "source": row["source"],
+                    "chunk_index": row["chunk_index"],
+                }
+                rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                records.append(rec)
+
+            # LanceDB OSS 无 rename_table，只能 drop 后重建。数据已在内存
+            # 的 records 中，drop 旧表后 create 失败可再次尝试；即使最终
+            # 失败，RAG 数据也可从源文件重新同步恢复（幂等）。
             self._db.drop_table(_TABLE_NAME)
             self._table = None
-            if old_rows is not None and not old_rows.empty:
-                records = []
-                for _, row in old_rows.iterrows():
-                    rec = {
-                        "id": row["id"],
-                        "text": row["text"],
-                        "vector": row["vector"],
-                        "source": row["source"],
-                        "chunk_index": row["chunk_index"],
-                    }
-                    rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
-                    records.append(rec)
+            if records:
                 self._table = self._db.create_table(_TABLE_NAME, records)
             self._table_checked = True
-            logger.info("  ⚙ 向量表迁移完成（新增 %s 列）", _FTS_COLUMN)
+            logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）", _FTS_COLUMN, len(records))
         except Exception as e:
             logger.warning("  ⚠ 向量表迁移失败（BM25 索引将不可用）: %s", e)
             self._table = None
@@ -411,7 +415,7 @@ class VectorStore:
         if failed_batches > 0:
             logger.warning("VectorStore: %d batch(es) failed during add", failed_batches)
 
-        # 数据写入后刷新 BM25 全文索引，覆盖新增的行。
+        # 数据写入后重建 BM25 全文索引，覆盖新增的行。
         self._fts_ready = False
         self._ensure_fts_index(self._table)
 
@@ -588,7 +592,9 @@ class VectorStore:
 
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
 
-        # 数据写入后刷新 BM25 全文索引，覆盖新增的行。
+        # 数据写入后重建 BM25 全文索引，覆盖新增的行。
+        # 注：LanceDB 的 tantivy FTS 索引不会在 add() 后自动增量更新，
+        # 必须用 replace=True 重建才能检索到新写入的切片。
         self._fts_ready = False
         self._ensure_fts_index(self._table)
 
