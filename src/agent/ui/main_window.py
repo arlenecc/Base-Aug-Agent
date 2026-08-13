@@ -335,6 +335,12 @@ class SyncKnowledgeWorker(QThread):
         # （如 vector_store 的向量化过程日志），写入 _log_buffer。
         # engine.py 的 _log() 则直接通过 log_callback 写 buffer，
         # 不依赖 logging handler。
+        #
+        # IMPORTANT: 临时 handler 只挂在父 logger `agent.rag` 上，利用 logging
+        # 的传播机制捕获所有子模块（engine / vector_store / ...）的日志。
+        # 若同时给父 logger 和每个子 logger 都挂 handler，子 logger 的消息
+        # 会被自己的 handler 捕获一次，再传播到父 logger 的 handler 捕获一次，
+        # 导致每条日志重复输出两遍（叠加 log_callback 即三遍）。
         _tmp_handler = logging.StreamHandler(io.StringIO())
         _tmp_handler.setLevel(logging.INFO)
         _tmp_handler.setFormatter(
@@ -345,7 +351,8 @@ class SyncKnowledgeWorker(QThread):
             with self._log_buffer_lock:
                 self._log_buffer.append(msg)
         _tmp_handler.emit = _on_rag_log
-        _rag_loggers = [f"{_PKG_ROOT}.rag", *_RAG_SUB_LOGGERS]
+        # 只挂父 logger；子 logger 保持 NOTSET（默认传播到父 logger）。
+        _rag_loggers = [f"{_PKG_ROOT}.rag"]
         for _name in _rag_loggers:
             _l = logging.getLogger(_name)
             _l.setLevel(logging.INFO)

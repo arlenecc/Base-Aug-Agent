@@ -94,6 +94,25 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _extract_with_docling(filepath: str) -> tuple:
+    """Extract text, preferring docling (Markdown output).
+
+    Returns ``(text, is_markdown)`` where ``is_markdown`` is True when the
+    text came from docling and is already well-formed Markdown (so the
+    caller can skip clean/normalize).  When docling is unavailable or
+    unsuitable for the format, falls back to the per-format parsers.
+    """
+    try:
+        from .docling_parser import extract_markdown
+
+        markdown = extract_markdown(filepath)
+        if markdown is not None:
+            return markdown, True
+    except Exception:
+        pass
+    return extract_text(filepath), False
+
+
 
 class RAGEngine:
     """Local knowledge base engine.
@@ -112,8 +131,10 @@ class RAGEngine:
         knowledge_base: str = "",
         embedding_model: str = "",
         embedding_function: Any = None,
-        chunk_size: int = 500,
-        chunk_overlap: int = 50,
+        chunk_size: int = 800,
+        chunk_overlap: int = 80,
+        min_chunk_size: int = 100,
+        overlap_percent: float = 0.10,
         rerank_model: str = "BAAI/bge-reranker-base",
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
     ):
@@ -126,6 +147,8 @@ class RAGEngine:
         self._custom_ef = embedding_function  # for testing injection
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
+        self._min_chunk_size = min_chunk_size
+        self._overlap_percent = overlap_percent
         self._rerank_model = rerank_model
         self._parallel_workers = max(1, int(parallel_workers))
         self._store: Optional[VectorStore] = None
@@ -192,13 +215,17 @@ class RAGEngine:
             统计 dict
         """
         self._reset_cancel()
-        # 辅助函数：同时写 logger 和 log_callback（如果提供）
+        # 辅助函数：写入日志。当提供 log_callback（UI 同步场景）时，只走
+        # callback——否则会与临时 logging handler 捕获的 logger.info 重复，
+        # 导致同一条消息在 UI 日志面板出现两遍。无 callback 时（命令行/测试
+        # 直接调用 ingest）走 logger.info 输出到终端。
         def _log(msg: str, *args) -> None:
             if args:
                 msg = msg % args
-            logger.info(msg)
             if log_callback is not None:
                 log_callback(msg)
+            else:
+                logger.info(msg)
 
         if not self._knowledge_base or not os.path.isdir(self._knowledge_base):
             logger.warning("RAG ingest: knowledge base dir not found: %s", self._knowledge_base)
@@ -360,11 +387,14 @@ class RAGEngine:
                         _flush_logs(fname)
                         try:
                             # ---- 1. 解析文件 ----
+                            # 优先用 docling 统一解析（直接输出 Markdown），
+                            # 不可用时回退到按格式的轻量解析器。
                             _log("    ├─ 解析文件: %s", fname)
                             _flush_logs(f"解析: {fname}")
-                            text = extract_text(filepath)
+                            text, is_markdown = _extract_with_docling(filepath)
                             t_extract = time.monotonic() - t0
-                            _log("    ├─ 解析完成: %s (提取 %d 字符, 耗时 %.2fs)", fname, len(text), t_extract)
+                            _log("    ├─ 解析完成: %s (提取 %d 字符, 耗时 %.2fs%s)",
+                                 fname, len(text), t_extract, " [docling]" if is_markdown else "")
                             _flush_logs(f"解析完成: {fname}")
                         except Exception as e:
                             msg = f"{os.path.basename(filepath)}: {e}"
@@ -397,19 +427,26 @@ class RAGEngine:
                                     cleaned = ""
                             if not (not force and os.path.exists(md_path)
                                     and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
-                                # ---- 2. 清洗文本 ----
-                                t_clean = time.monotonic()
-                                _log("    ├─ 清洗文本: %s (原始 %d 字符)", fname, len(text))
-                                _flush_logs(f"清洗: {fname}")
-                                cleaned = clean_text(text)
-                                t_clean_end = time.monotonic()
-                                _log("    ├─ 清洗完成: %s → %d 字符 (耗时 %.2fs)", fname, len(cleaned), t_clean_end - t_clean)
-                                # ---- 3. 转换为 Markdown ----
-                                _log("    ├─ 转换 Markdown: %s", fname)
-                                _flush_logs(f"Markdown: {fname}")
-                                cleaned = normalize_markdown(cleaned)
-                                _log("    ├─ Markdown 完成: %s (%d 字符)", fname, len(cleaned))
-                                _flush_logs(f"Markdown完成: {fname}")
+                                if is_markdown:
+                                    # docling 已输出规范 Markdown，无需再清洗/转换，
+                                    # 直接作为最终文本（省去 clean_text 的 HTML 剥离，
+                                    # 避免误删 Markdown 标题/表格语法）。
+                                    cleaned = text
+                                    _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
+                                else:
+                                    # ---- 2. 清洗文本 ----
+                                    t_clean = time.monotonic()
+                                    _log("    ├─ 清洗文本: %s (原始 %d 字符)", fname, len(text))
+                                    _flush_logs(f"清洗: {fname}")
+                                    cleaned = clean_text(text)
+                                    t_clean_end = time.monotonic()
+                                    _log("    ├─ 清洗完成: %s → %d 字符 (耗时 %.2fs)", fname, len(cleaned), t_clean_end - t_clean)
+                                    # ---- 3. 转换为 Markdown ----
+                                    _log("    ├─ 转换 Markdown: %s", fname)
+                                    _flush_logs(f"Markdown: {fname}")
+                                    cleaned = normalize_markdown(cleaned)
+                                    _log("    ├─ Markdown 完成: %s (%d 字符)", fname, len(cleaned))
+                                    _flush_logs(f"Markdown完成: {fname}")
                                 try:
                                     with open(md_path, "w", encoding="utf-8") as f:
                                         f.write(cleaned)
@@ -431,6 +468,8 @@ class RAGEngine:
                                 [{"source": filepath, "text": cleaned}],
                                 chunk_size=self._chunk_size,
                                 chunk_overlap=self._chunk_overlap,
+                                min_chunk_size=self._min_chunk_size,
+                                overlap_percent=self._overlap_percent,
                             )
                             t_chunk_end = time.monotonic()
                             _log(
@@ -512,7 +551,11 @@ class RAGEngine:
             _log("━━━ Step 4/6: 向量化 + 存入向量库 ━━━")
             def _chunk_iter() -> Iterator[Dict[str, Any]]:
                 sentinels_seen = 0
-                expected_sentinels = self._parallel_workers
+                # 必须等于实际启动的 worker 数（num_workers），而不是
+                # self._parallel_workers：文件数少于默认并发数时，实际启动的
+                # 线程更少，若仍按 _parallel_workers 期待哨兵，会永远等不到
+                # 足够数量，只能靠 15s 空超时兜底退出（白白空等）。
+                expected_sentinels = num_workers
                 empty_streak = 0
                 # 使用较短的 q.get 超时（0.5s），确保取消后最多 0.5s 内能响应。
                 _QGET_TIMEOUT = 0.5

@@ -36,8 +36,8 @@ def _token_count(text: str) -> int:
 
 def chunk_text(
     text: str,
-    chunk_size: int = 500,
-    chunk_overlap: int = 50,
+    chunk_size: int = 800,
+    chunk_overlap: int = 80,
     separators: List[str] | None = None,
 ) -> List[str]:
     """Split text into overlapping chunks using token-based sizing.
@@ -62,18 +62,31 @@ def chunk_text(
 
 def chunk_documents(
     documents: List[Dict[str, Any]],
-    chunk_size: int = 500,
-    chunk_overlap: int = 50,
+    chunk_size: int = 800,
+    chunk_overlap: int = 80,
+    min_chunk_size: int = 100,
+    overlap_percent: float = 0.10,
 ) -> List[Dict[str, Any]]:
     """Chunk multiple documents with metadata.
 
     Args:
         documents: List of dicts with 'source' (filepath) and 'text' keys.
-        chunk_size: Target chunk size in **tokens**.
-        chunk_overlap: Overlap between chunks in **tokens**.
+        chunk_size: Target maximum chunk size in **tokens** (800).
+        chunk_overlap: Overlap between chunks in **tokens** (default 10% of
+            ``chunk_size`` = 80).
+        min_chunk_size: Target minimum chunk size in **tokens** (100) — used by
+            the semantic path to merge undersized chunks.
+        overlap_percent: Fraction of ``chunk_size`` used as overlap between
+            consecutive chunks (0.10 => 80 tokens), preserving continuity —
+            used by the semantic path.
 
     Returns:
         List of dicts with 'source', 'chunk_index', and 'text' keys.
+
+    Chunking strategy: hybrid chunking (document structure + semantic split
+    via chonkie SemanticChunker + shared nomic-embed-text model) when
+    available, falling back to plain semantic chunking, then the recursive
+    chunker.
     """
     all_chunks: List[Dict[str, Any]] = []
     for doc in documents:
@@ -81,7 +94,9 @@ def chunk_documents(
         text = doc.get("text", "")
         total_tokens = estimate_tokens(text)
         logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
-        chunks = chunk_text(text, chunk_size, chunk_overlap)
+        chunks = _chunk_with_hybrid_fallback(
+            text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
+        )
         for i, chunk in enumerate(chunks):
             all_chunks.append({
                 "source": source,
@@ -89,6 +104,57 @@ def chunk_documents(
                 "text": chunk,
             })
     return all_chunks
+
+
+def _chunk_with_hybrid_fallback(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    min_chunk_size: int,
+    overlap_percent: float,
+) -> List[str]:
+    """Hybrid-chunk first (structure + semantic), then semantic, then recursive.
+
+    The fallback chain is deliberately ordered from highest to lowest
+    fidelity:
+      1. hybrid_chunk_text  — Markdown-structure-aware + semantic split
+      2. semantic_chunk_text — pure semantic split (chonkie)
+      3. chunk_text         — recursive character split (no model needed)
+    """
+    # 1. Hybrid (structure + semantic).
+    try:
+        from .hybrid_chunker import hybrid_chunk_text
+
+        hybrid = hybrid_chunk_text(
+            text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_size=min_chunk_size,
+            overlap_percent=overlap_percent,
+        )
+        if hybrid:
+            return hybrid
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("hybrid chunking raised, falling back to semantic", exc_info=True)
+
+    # 2. Semantic (chonkie).
+    try:
+        from .semantic_chunker import semantic_chunk_text
+
+        semantic = semantic_chunk_text(
+            text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_size=min_chunk_size,
+            overlap_percent=overlap_percent,
+        )
+        if semantic is not None:
+            return semantic
+    except Exception:  # pragma: no cover - defensive; semantic_chunk_text already guards
+        logger.warning("semantic chunking raised, falling back to recursive", exc_info=True)
+
+    # 3. Recursive.
+    return chunk_text(text, chunk_size, chunk_overlap)
 
 
 # ---------------------------------------------------------------------------

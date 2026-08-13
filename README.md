@@ -128,7 +128,7 @@ python main.py
 ### 工作流程
 
 ```
-文档目录 → 文本提取 → 清洗 → Markdown 转换 → 切片 (500 tokens / 50 tokens overlap)
+文档目录 → 统一解析 (docling → Markdown) → Hybrid 智能分片 (结构+语义, 100-800 tokens, 10% overlap)
 → 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX) → LanceDB 存储
 检索时: 初检 top_k×4 条 → BGE Reranker 精排 → 返回 top 3
 ```
@@ -156,7 +156,7 @@ python main.py
     ├─ 清洗完成: new_doc.docx → 11800 字符 (耗时 0.02s)
     ├─ 转换 Markdown: new_doc.docx
     ├─ Markdown 完成: new_doc.docx (11800 字符)
-    ├─ 文档切片: new_doc.docx → 24 个切片 (每片约 500 tokens, 重叠 50 tokens, 耗时 0.01s)
+    ├─ 文档切片: new_doc.docx → 24 个切片 (每片 100-800 tokens, 重叠 10%, 耗时 0.01s)
     └─ ✅ 文件处理完成: new_doc.docx (24 切片, 总耗时 0.21s)
 ━━━ Step 4/6: 向量化 + 存入向量库 ━━━
   ├─ 向量化: 首批 24 个切片正在嵌入...
@@ -206,16 +206,35 @@ python main.py
 
 ### 支持的文档格式
 
-| 格式 | 扩展名 | 依赖 |
+**统一解析引擎（docling）**：Word、Excel、PowerPoint、PDF、EPUB 通过 [docling](https://docling-project.github.io/) 统一解析，直接输出结构化 Markdown（含布局、表格、标题、图片 OCR）。docling 未安装时自动回退到按格式的轻量解析器。
+
+| 格式 | 扩展名 | 解析方式 |
 |------|--------|------|
-| Word | `.docx`, `.doc` | `python-docx` |
-| Excel | `.xlsx`, `.xls` | `openpyxl` |
-| PowerPoint | `.pptx`, `.ppt` | `python-pptx` |
-| PDF | `.pdf` | `PyMuPDF`（图片型需 `rapidocr-onnxruntime`） |
-| EPUB | `.epub` | `ebooklib` |
+| Word | `.docx`, `.doc` | docling（回退 `python-docx`） |
+| Excel | `.xlsx`, `.xls` | docling（回退 `openpyxl`） |
+| PowerPoint | `.pptx`, `.ppt` | docling（回退 `python-pptx`） |
+| PDF | `.pdf` | docling（图片型/纯扫描走 `rapidocr-onnxruntime`） |
+| EPUB | `.epub` | docling（回退 `ebooklib`） |
 | MOBI/AZW | `.mobi`, `.azw3` | calibre（可选） |
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
 | HTML | `.html`, `.htm` | `beautifulsoup4` |
+
+### Hybrid 智能分片
+
+分片采用**结构感知 + 语义分块**的混合（Hybrid）策略：
+
+```
+Markdown 文本
+  ├─ 按标题结构（#~######）+ 空行段落边界切分
+  ├─ 超长章节（>800 tokens）→ chonkie SemanticChunker 语义细分
+  │    （复用 nomic-embed-text 嵌入模型，按语义相似度边界切分）
+  ├─ 合并过小块至 ≥100 tokens
+  └─ 相邻块 10% overlap（80 tokens，句子边界对齐，保证跨块上下文连续）
+```
+
+- **大小**：语义块最小 100 tokens、最大 800 tokens、重叠 10%
+- **嵌入模型**：`nomic-embed-text-v1.5-Q`（与向量存储共享同一份 ONNX 模型，不重复加载）
+- **三级回退**：hybrid → 语义分块（chonkie）→ 递归分块（无模型依赖），任何环境都能工作
 
 ### 依赖自动管理
 
@@ -401,12 +420,15 @@ src/agent/
 ├── skills.py             # 技能管理（意图匹配 / 请求固化建议 / 目录技能创建）
 ├── skill_index.py        # 技能索引（扫描 .agent/skills/、维护 _index.json、加权检索）
 ├── rag/
-│   ├── engine.py         # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
-│   ├── parsers.py        # 文档解析器（Word/Excel/PPT/PDF/EPUB/MOBI/HTML/文本）
-│   ├── cleaner.py        # 文本清洗（去标签/URL/控制字符/零宽字符/空白归一化）
-│   ├── chunker.py        # Token 级别切片（基于字符启发的 token 估算）
-│   ├── vector_store.py   # LanceDB 向量存储 + FastEmbed 嵌入 + BGE 重排序
-│   └── deps.py           # 依赖检查与自动安装
+│   ├── engine.py            # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
+│   ├── docling_parser.py    # docling 统一解析器（Word/Excel/PPT/PDF/EPUB → Markdown）
+│   ├── parsers.py           # 按格式的轻量解析器（docling 回退方案 + MOBI/HTML/文本）
+│   ├── cleaner.py           # 文本清洗（去标签/URL/控制字符/零宽字符/空白归一化）
+│   ├── chunker.py           # Token 级别递归切片 + 分片回退链编排
+│   ├── hybrid_chunker.py    # Hybrid 分片（文档结构 + 语义分块）
+│   ├── semantic_chunker.py  # chonkie SemanticChunker 语义分片（复用 nomic-embed-text）
+│   ├── vector_store.py      # LanceDB 向量存储 + FastEmbed 嵌入 + BGE 重排序
+│   └── deps.py              # 依赖检查与自动安装
 ├── tools/
 │   ├── base.py           # 工具注册中心（MCP + RAG 生命周期管理）
 │   ├── file_ops.py       # 文件读写工具

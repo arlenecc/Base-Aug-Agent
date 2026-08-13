@@ -27,6 +27,8 @@ rag = [
     "python-pptx>=0.6.0",
     "PyMuPDF>=1.23.0",
     "ebooklib>=0.18",
+    "chonkie[semantic]>=1.0.0",
+    "docling>=2.0.0",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)
 ocr = ["rapidocr-onnxruntime>=1.0.0"]

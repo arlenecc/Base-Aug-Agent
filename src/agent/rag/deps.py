@@ -391,6 +391,13 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
             if ocr_spec not in report.missing_required:
                 report.missing_required.append(ocr_spec)
 
+    # ---- docling: optional unified parser (falls back to per-format parsers) ----
+    if exts & {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".epub"}:
+        if not _is_importable("docling"):
+            report.missing_optional.append(
+                DepSpec("docling", "docling", "统一文档解析引擎 docling（可选，未安装时回退按格式解析）")
+            )
+
     # ---- Embedding model ----
     if include_core:
         report.embedding_model_missing = not _is_embedding_model_cached()
