@@ -65,8 +65,46 @@ for mod in ['docx', 'openpyxl', 'pptx', 'fitz', 'ebooklib']:
     except Exception:
         pass
 
-# --- MCP (Model Context Protocol client) ---
-hiddenimports += collect_submodules('mcp')
+# --- docling (unified document parser, lazy-loaded) ---
+try:
+    hiddenimports += collect_submodules('docling')
+    datas += collect_data_files('docling')
+except Exception:
+    pass
+
+# --- chonkie (semantic chunking, lazy-loaded) ---
+try:
+    hiddenimports += collect_submodules('chonkie')
+    datas += collect_data_files('chonkie')
+except Exception:
+    pass
+
+# --- jieba (BM25 CJK tokenizer) ---
+try:
+    hiddenimports += collect_submodules('jieba')
+    datas += collect_data_files('jieba')
+except Exception:
+    pass
+
+# --- tantivy (LanceDB BM25 full-text search backend) ---
+try:
+    hiddenimports += collect_submodules('tantivy')
+    datas += collect_data_files('tantivy')
+except Exception:
+    pass
+
+# --- numpy (semantic chunker vector ops) ---
+try:
+    hiddenimports += collect_submodules('numpy')
+except Exception:
+    pass
+
+# --- RapidOCR (optional OCR for scanned PDFs) ---
+try:
+    hiddenimports += collect_submodules('rapidocr_onnxruntime')
+    datas += collect_data_files('rapidocr_onnxruntime')
+except Exception:
+    pass
 
 # --- Package metadata (needed by some libs for version checks) ---
 datas += copy_metadata('PyQt6')
@@ -74,6 +112,8 @@ datas += copy_metadata('httpx')
 datas += copy_metadata('lancedb')
 datas += copy_metadata('fastembed')
 datas += copy_metadata('beautifulsoup4')
+datas += copy_metadata('docling')
+datas += copy_metadata('chonkie')
 
 # -----------------------------------------------------------------------
 # Analysis
