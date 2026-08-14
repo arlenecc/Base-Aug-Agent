@@ -890,6 +890,51 @@ class RAGEngine:
         store = self._get_store()
         return store.list_documents()
 
+    def ensure_digests_for_cached_documents(self) -> int:
+        """为所有已缓存 Markdown 但缺缩略版本的文档补做 digest。
+
+        关键场景：文档在 Meta-context 功能上线前已同步（有 markdown 缓存 + 向量，
+        但从未经过 build_and_store_digest），documents 表里没有它们的记录。此方法
+        扫描 markdown 缓存目录，对每个缺 digest 的缓存文件读内容、构建 fallback
+        摘要并写入 documents 表。
+
+        Returns 本次补做的文档数量。
+        """
+        if not os.path.isdir(self._markdown_dir):
+            return 0
+
+        store = self._get_store()
+        existing = set(store.list_documents())
+        created = 0
+        for fn in sorted(os.listdir(self._markdown_dir)):
+            if not fn.endswith(".md"):
+                continue
+            # 缓存文件名格式：{safe_base}_{md5[:12]}.md → 还原 doc_name。
+            stem = fn[:-3]  # 去掉 .md
+            # 剥离末尾的 _{12位hex}
+            doc_name = stem
+            if len(stem) > 13 and stem[-13] == "_":
+                suffix = stem[-12:]
+                if all(c in "0123456789abcdef" for c in suffix):
+                    doc_name = stem[:-13]
+
+            if doc_name in existing:
+                continue
+
+            md_path = os.path.join(self._markdown_dir, fn)
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    markdown = f.read()
+                if not markdown.strip():
+                    continue
+                self.build_and_store_digest(doc_name, markdown, summarizer=None)
+                existing.add(doc_name)
+                created += 1
+                logger.info("  ├─ 补做缩略版本: %s (%d 字符)", doc_name, len(markdown))
+            except Exception as e:
+                logger.warning("  ⚠ 补做缩略版本失败 %s: %s", fn, e)
+        return created
+
     # ------------------------------------------------------------------
     # management
     # ------------------------------------------------------------------

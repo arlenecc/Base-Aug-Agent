@@ -489,7 +489,14 @@ class OutlineSummarizeWorker(QThread):
         )
         worker = None
         try:
-            # 3. 扫描待摘要文档。
+            # 3. 先为已缓存但缺缩略版本的文档补做 digest（关键：功能上线前
+            #    已同步的文档在 documents 表中无记录，必须从这里补齐）。
+            try:
+                engine.ensure_digests_for_cached_documents()
+            except Exception as e:
+                logger.warning("OutlineSummarizeWorker: ensure_digests failed: %s", e)
+
+            # 4. 扫描待摘要文档。
             store = engine._get_store()
             doc_names = store.list_documents()
             if not doc_names:
