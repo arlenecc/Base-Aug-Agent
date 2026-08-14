@@ -86,13 +86,6 @@ try:
 except Exception:
     pass
 
-# --- tantivy (LanceDB BM25 full-text search backend) ---
-try:
-    hiddenimports += collect_submodules('tantivy')
-    datas += collect_data_files('tantivy')
-except Exception:
-    pass
-
 # --- numpy (semantic chunker vector ops) ---
 try:
     hiddenimports += collect_submodules('numpy')
