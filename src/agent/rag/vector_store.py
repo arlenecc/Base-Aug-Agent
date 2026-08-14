@@ -658,35 +658,48 @@ class VectorStore:
         """
         if self._fts_ready:
             return True
+
+        # 原生 FTS 配置（两种 lancedb 版本共用同一语义）：
+        #  - simple base tokenizer 按空格/标点切分，配合 jieba 预分词列，
+        #    每个空格分隔的 jieba token 即为一个独立 term；
+        #  - ascii_folding=False 保留 CJK 码点；
+        #  - stem=False / remove_stop_words=False 避免破坏中文词形。
+        fts_kwargs = dict(
+            base_tokenizer="simple",
+            lower_case=True,
+            stem=False,
+            remove_stop_words=False,
+            ascii_folding=False,
+            with_position=True,
+        )
+
+        # lancedb >= 0.37：create_index(config=FTS(...))（Tantivy 已移除）。
+        # lancedb 0.25.x：create_fts_index(use_tantivy=False, ...)。
         try:
             from lancedb.index import FTS
-
-            # Pre-tokenized column + native FTS.  The ``simple`` base tokenizer
-            # splits on whitespace/punctuation, which is exactly what we want
-            # for a jieba-space-joined column.  ``ascii_folding=False`` keeps
-            # CJK code points intact (native FTS lowercases/ASCII-folds by
-            # default, which is harmless for CJK but keep it explicit).
             table.create_index(
                 _FTS_COLUMN,
-                config=FTS(
-                    with_position=True,
-                    base_tokenizer="simple",
-                    lower_case=True,
-                    stem=False,
-                    remove_stop_words=False,
-                    ascii_folding=False,
-                ),
+                config=FTS(**fts_kwargs),
                 replace=True,
             )
-            self._fts_ready = True
-            self._fts_checked = True
-            logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
-            return True
+        except TypeError:
+            # 0.25.x 的 create_index 无 config 参数，回退到 create_fts_index。
+            table.create_fts_index(
+                _FTS_COLUMN,
+                use_tantivy=False,
+                replace=True,
+                **fts_kwargs,
+            )
         except Exception as e:
             logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
             self._fts_checked = True
             self._fts_ready = False
             return False
+
+        self._fts_ready = True
+        self._fts_checked = True
+        logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
+        return True
 
     def search_fts(
         self,
