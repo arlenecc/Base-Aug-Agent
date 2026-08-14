@@ -17,7 +17,10 @@ dependencies = [
 test = ["pytest>=8.0"]
 # RAG / knowledge base support: vector store + embedding + reranker + parsers
 rag = [
-    "lancedb>=0.17.0",
+    # lancedb 0.26+ 不再提供 macOS x86_64 (Intel) 的 wheel（仅 ARM64），
+    # 故锁定 <0.26。代码已兼容 0.25 与 0.37 两种 FTS API（见 vector_store.py
+    # _ensure_fts_index），在 ARM64 机器上可放宽至 0.37。
+    "lancedb>=0.17.0,<0.26",
     "pyarrow>=15.0.0",
     "numpy>=1.24.0",
     "fastembed>=0.4.0",
@@ -30,9 +33,7 @@ rag = [
     "ebooklib>=0.18",
     "chonkie[semantic]>=1.0.0",
     "docling>=2.0.0",
-    # BM25 hybrid retrieval: Tantivy FTS backend + jieba CJK tokenization
-    "tantivy>=0.22",
-    "pylance>=0.13",
+    # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)

@@ -26,8 +26,8 @@ _TABLE_NAME = "knowledge_base"
 _DOC_PREFIX = "search_document: "
 _QUERY_PREFIX = "search_query: "
 
-# BM25 全文检索的预分词列名（jieba 分词后空格连接，供 Tantivy whitespace
-# tokenizer 索引，解决 Tantivy wheel 未编译中文分词器的问题）。
+# BM25 全文检索的预分词列名（jieba 分词后空格连接，供原生 FTS 的 simple
+# tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
 _FTS_COLUMN = "text_fts"
 
 # jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
@@ -58,8 +58,8 @@ def _get_jieba():
 def _tokenize_for_fts(text: str) -> str:
     """Tokenize text for the BM25 full-text index.
 
-    Uses jieba for CJK word segmentation, then joins tokens with spaces so
-    Tantivy's ``whitespace`` tokenizer can index each word.  English words are
+    Uses jieba for CJK word segmentation, then joins tokens with spaces so the
+    native FTS ``simple`` tokenizer can index each word.  English words are
     kept intact (jieba segments them on whitespace/punctuation).  When jieba
     is unavailable, returns the original text (English still works via
     whitespace; CJK degrades to whole-sentence tokens).
@@ -593,7 +593,7 @@ class VectorStore:
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
 
         # 数据写入后重建 BM25 全文索引，覆盖新增的行。
-        # 注：LanceDB 的 tantivy FTS 索引不会在 add() 后自动增量更新，
+        # 注：LanceDB 的 FTS 索引不会在 add() 后自动增量更新，
         # 必须用 replace=True 重建才能检索到新写入的切片。
         self._fts_ready = False
         self._ensure_fts_index(self._table)
