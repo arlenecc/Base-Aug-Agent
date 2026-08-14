@@ -83,11 +83,13 @@ class OutlineWorker:
         upsert_document: Callable[..., None],
         max_queue: int = 100,
         idle_sleep: float = 0.5,
+        on_progress: Optional[Callable[[str], None]] = None,
     ):
         self._rag_dir = rag_dir
         self._llm = llm  # object with chat_stream(messages) yielding StreamEvent
         self._get_document = get_document
         self._upsert_document = upsert_document
+        self._on_progress = on_progress  # 进度回调（用于 UI 日志），线程安全由调用方保证
         self._queue: "queue.Queue[str]" = queue.Queue(maxsize=max_queue)
         self._state: Dict[str, Any] = load_state(rag_dir)
         self._state_lock = threading.Lock()
@@ -95,6 +97,14 @@ class OutlineWorker:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._cancel = threading.Event()  # 用于请求提前停止（完成当前章节后）
+
+    def _emit(self, msg: str) -> None:
+        """上报进度（若设置了回调）。"""
+        if self._on_progress is not None:
+            try:
+                self._on_progress(msg)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -173,10 +183,13 @@ class OutlineWorker:
                 continue
             if self._cancel.is_set():
                 break
+            self._emit(f"开始生成摘要: {doc_name}")
             try:
                 self._summarize_document(doc_name)
+                self._emit(f"✓ 摘要完成: {doc_name}")
             except Exception as e:
                 logger.warning("OutlineWorker: summarize %s failed: %s", doc_name, e)
+                self._emit(f"✗ 摘要失败: {doc_name} ({e})")
             finally:
                 self._queue.task_done()
 
@@ -195,6 +208,7 @@ class OutlineWorker:
         def summarizer(title: str, text: str) -> str:
             if self._cancel.is_set():
                 return ""
+            self._emit(f"    章节摘要: {title}")
             snippet = text[:_MAX_CHAPTER_CHARS]
             messages = [{
                 "role": "user",

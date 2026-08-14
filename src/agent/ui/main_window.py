@@ -446,6 +446,7 @@ class OutlineSummarizeWorker(QThread):
     outline_progress = pyqtSignal(int, int, str)
     outline_finished = pyqtSignal()   # 全部完成或无可做任务
     outline_failed = pyqtSignal(str)  # 致命错误
+    log = pyqtSignal(str)             # 关键日志（传到 UI 面板便于诊断）
 
     def __init__(self, workspace: str, knowledge_base: str,
                  embedding_model: str, llm_config: dict):
@@ -470,6 +471,7 @@ class OutlineSummarizeWorker(QThread):
         # 1. 独立的 LLM 客户端（不复用 self._llm，避免与对话争用连接）。
         cfg = self._llm_config
         if not cfg.get("base_url") or not cfg.get("api_key"):
+            self.log.emit("LLM 未配置，跳过章节摘要")
             logger.info("OutlineSummarizeWorker: LLM 未配置，跳过章节摘要")
             self.outline_finished.emit()
             return
@@ -491,14 +493,18 @@ class OutlineSummarizeWorker(QThread):
         try:
             # 3. 先为已缓存但缺缩略版本的文档补做 digest（关键：功能上线前
             #    已同步的文档在 documents 表中无记录，必须从这里补齐）。
+            self.log.emit(f"扫描缓存文档补做缩略版本 (markdown_dir={engine.markdown_dir})")
             try:
-                engine.ensure_digests_for_cached_documents()
+                created = engine.ensure_digests_for_cached_documents()
+                self.log.emit(f"补做缩略版本 {created} 篇")
             except Exception as e:
+                self.log.emit(f"补做缩略版本失败: {e}")
                 logger.warning("OutlineSummarizeWorker: ensure_digests failed: %s", e)
 
             # 4. 扫描待摘要文档。
             store = engine._get_store()
             doc_names = store.list_documents()
+            self.log.emit(f"待摘要文档数: {len(doc_names)}")
             if not doc_names:
                 logger.info("OutlineSummarizeWorker: 无可摘要文档")
                 self.outline_finished.emit()
@@ -512,6 +518,7 @@ class OutlineSummarizeWorker(QThread):
                 llm=llm,
                 get_document=store.get_document_digest,
                 upsert_document=store.upsert_document,
+                on_progress=lambda msg: self.log.emit(msg),
             )
             # 启动后台线程
             worker.start()
@@ -1153,6 +1160,7 @@ class MainWindow(QMainWindow):
                 "timeout": self.config.request_timeout,
                 "max_tokens": self.config.max_tokens,
             }
+            self._append_log(f"[outline] 启动章节摘要 worker (ws={ws}, kb={kb}, model={llm_config['model']})")
             self._outline_worker = OutlineSummarizeWorker(
                 ws, kb,
                 embedding_model=self.config.rag_embedding_model,
@@ -1161,11 +1169,16 @@ class MainWindow(QMainWindow):
             self._outline_worker.outline_progress.connect(self._on_outline_progress)
             self._outline_worker.outline_finished.connect(self._on_outline_finished)
             self._outline_worker.outline_failed.connect(self._on_outline_failed)
+            self._outline_worker.log.connect(self._on_outline_log)
             self._outline_worker.finished.connect(self._outline_worker.deleteLater)
             self._outline_worker.start()
             logger.info("UI: outline summarize worker started (parallel to sync)")
         except Exception as e:
             logger.warning("UI: start outline summarize failed: %s", e)
+            self._append_log(f"[outline] 启动失败: {e}")
+
+    def _on_outline_log(self, msg: str) -> None:
+        self._append_log(f"[outline] {msg}")
 
     def _on_outline_progress(self, done: int, total: int, current: str) -> None:
         self._append_log(f"[outline] 章节摘要进度: {done}/{total}")

@@ -105,8 +105,13 @@ datas += copy_metadata('httpx')
 datas += copy_metadata('lancedb')
 datas += copy_metadata('fastembed')
 datas += copy_metadata('beautifulsoup4')
-datas += copy_metadata('docling')
-datas += copy_metadata('chonkie')
+# docling / chonkie 为可选依赖（未安装时回退到按格式解析/递归分片），
+# 用 try/except 保护，避免打包时因缺少元数据而失败。
+for _pkg in ('docling', 'chonkie'):
+    try:
+        datas += copy_metadata(_pkg)
+    except Exception:
+        pass
 
 # -----------------------------------------------------------------------
 # Analysis
