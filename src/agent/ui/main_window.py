@@ -470,9 +470,13 @@ class OutlineSummarizeWorker(QThread):
     def _run_impl(self) -> None:
         # 1. 独立的 LLM 客户端（不复用 self._llm，避免与对话争用连接）。
         cfg = self._llm_config
-        if not cfg.get("base_url") or not cfg.get("api_key"):
-            self.log.emit("LLM 未配置，跳过章节摘要")
-            logger.info("OutlineSummarizeWorker: LLM 未配置，跳过章节摘要")
+        # 只要求 base_url 非空即可。api_key 允许为空：本地 Ollama/vLLM 等
+        # 服务通常无需鉴权（LLMClient 在 api_key 为空时不会发送 Authorization
+        # 头），而对话功能本身也不校验 api_key。若强行要求 api_key，本地模型
+        # 服务会永远被误判为「未配置」而跳过章节摘要。
+        if not cfg.get("base_url"):
+            self.log.emit("LLM 未配置（缺少 base_url），跳过章节摘要")
+            logger.info("OutlineSummarizeWorker: LLM 未配置（缺少 base_url），跳过章节摘要")
             self.outline_finished.emit()
             return
         llm = LLMClient(
