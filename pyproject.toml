@@ -11,7 +11,6 @@ dependencies = [
     "PyQt6>=6.5",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
-    "mcp>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +18,8 @@ test = ["pytest>=8.0"]
 # RAG / knowledge base support: vector store + embedding + reranker + parsers
 rag = [
     "lancedb>=0.17.0",
+    "pyarrow>=15.0.0",
+    "numpy>=1.24.0",
     "fastembed>=0.4.0",
     "FlagEmbedding>=1.3.0",
     "transformers>=4.40,<5.0",  # FlagEmbedding 不兼容 transformers 5.x
@@ -37,7 +38,7 @@ rag = [
 # PDF OCR (optional, heavy dependency ~500MB)
 ocr = ["rapidocr-onnxruntime>=1.0.0"]
 # All optional features
-all = ["base-agent[test,rag,ocr]"]
+#all = ["base-agent[test,rag,ocr]"]
 
 [project.scripts]
 base-agent = "agent.ui.main_window:run"
