@@ -648,27 +648,39 @@ class VectorStore:
 
         Creates the index on first use and after each ingest (the index must
         be refreshed to cover newly written rows).  The ``text_fts`` column is
-        pre-tokenized with jieba (space-joined), and indexed with Tantivy's
-        ``whitespace`` tokenizer — this sidesteps the fact that the Tantivy
-        wheel ships without the compiled CJK tokenizers (jieba/chinese).
+        pre-tokenized with jieba (space-joined).  We use LanceDB's *native*
+        FTS (Tantivy support was removed in lancedb 0.37); the native ``simple``
+        tokenizer splits on whitespace, so each space-separated jieba token is
+        indexed as its own term — sidestepping the lack of a compiled CJK
+        tokenizer in the native FTS backend.
 
         Returns True if the index is available for querying.
         """
         if self._fts_ready:
             return True
         try:
-            # Pre-tokenized column + whitespace tokenizer: each space-separated
-            # jieba token becomes one Tantivy token.
-            table.create_fts_index(
-                [_FTS_COLUMN],
-                use_tantivy=True,
-                tokenizer_name="whitespace",
+            from lancedb.index import FTS
+
+            # Pre-tokenized column + native FTS.  The ``simple`` base tokenizer
+            # splits on whitespace/punctuation, which is exactly what we want
+            # for a jieba-space-joined column.  ``ascii_folding=False`` keeps
+            # CJK code points intact (native FTS lowercases/ASCII-folds by
+            # default, which is harmless for CJK but keep it explicit).
+            table.create_index(
+                _FTS_COLUMN,
+                config=FTS(
+                    with_position=True,
+                    base_tokenizer="simple",
+                    lower_case=True,
+                    stem=False,
+                    remove_stop_words=False,
+                    ascii_folding=False,
+                ),
                 replace=True,
-                with_position=True,
             )
             self._fts_ready = True
             self._fts_checked = True
-            logger.info("  ├─ BM25 全文索引已创建 (Tantivy whitespace + jieba 预分词)")
+            logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
             return True
         except Exception as e:
             logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
@@ -840,6 +852,33 @@ class VectorStore:
                 self._reranker = None
         return self._reranker
 
+    def _rerank_fallback(
+        self,
+        candidates: List[Dict[str, Any]],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Fall back to vector-distance ranking when BGE reranker is unavailable.
+
+        candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
+        回退模式下分数是余弦距离的近似（非 BGE sigmoid 语义分），因此不做
+        0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
+        """
+        logger.info("  ├─ 重排序: BGE Reranker 不可用, 使用向量距离排序 (回退模式)")
+        for c in candidates:
+            try:
+                s = float(c.get("score", 0.0))
+            except (TypeError, ValueError):
+                c["score"] = 0.0
+                continue
+            if s > 1.0:
+                c["score"] = max(0.0, 1.0 - (s * s) / 2.0)
+            else:
+                c["score"] = s
+        candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        result = candidates[:top_k]
+        logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
+        return result
+
     def rerank(
         self,
         query: str,
@@ -860,32 +899,31 @@ class VectorStore:
         if not candidates:
             return []
 
+        # 使用注入的自定义 embedding（如测试的 FakeEmbeddingFunction）时，
+        # 向量空间与 BGE reranker 的语义空间不一致，rerank 打分无意义，
+        # 直接回退到向量距离排序。
+        if self._custom_ef is not None:
+            return self._rerank_fallback(candidates, top_k)
+
         reranker = self._get_reranker()
         if reranker is None:
-            # Fallback: candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
-            logger.info("  ├─ 重排序: BGE Reranker 不可用, 使用向量距离排序 (回退模式)")
-            for c in candidates:
-                try:
-                    s = float(c.get("score", 0.0))
-                except (TypeError, ValueError):
-                    c["score"] = 0.0
-                    continue
-                if s > 1.0:
-                    c["score"] = max(0.0, 1.0 - (s * s) / 2.0)
-                else:
-                    c["score"] = s
-            candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-            result = candidates[:top_k]
-            logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
-            # 回退模式下分数是余弦距离的近似（非 BGE sigmoid 语义分），
-            # 不做 0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
-            return result
+            return self._rerank_fallback(candidates, top_k)
 
         # Build pairs for reranker
         logger.info("  ├─ BGE Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
         pairs = [[query, c["text"]] for c in candidates]
-        # normalize=True applies sigmoid so scores land in [0, 1].
-        scores = reranker.compute_score(pairs, normalize=True)
+        try:
+            # normalize=True applies sigmoid so scores land in [0, 1].
+            scores = reranker.compute_score(pairs, normalize=True)
+        except Exception as e:
+            # FlagEmbedding 与 transformers 5.x 存在 API 不兼容（如
+            # XLMRobertaTokenizer 缺少 prepare_for_model），打分失败时回退到
+            # 向量距离排序，避免整个检索流程崩溃。
+            logger.warning(
+                "  ⚠ BGE Reranker 打分失败, 回退到向量距离排序: %s", e,
+            )
+            self._reranker = None  # 标记不可用，后续直接走回退分支
+            return self._rerank_fallback(candidates, top_k)
 
         # Normalize to list if single result
         if not isinstance(scores, list):
@@ -998,6 +1036,15 @@ class VectorStore:
             "VectorStore.search_with_rerank: %d 候选 → %d 条 (rerank + 相似度≥%.2f 过滤)",
             len(merged), len(results), min_similarity,
         )
+
+        # 6. 当 rerank 严格过滤后无结果（例如查询词质量差——拼音、口语化、
+        #    噪声词等导致 rerank 语义分普遍低于阈值）时，回退到向量距离排序，
+        #    至少返回 top_k 条候选，避免 LLM 完全拿不到上下文。
+        if not results and merged:
+            logger.info(
+                "VectorStore.search_with_rerank: rerank 过滤后无结果, 回退到向量距离排序",
+            )
+            results = self._rerank_fallback(merged, top_k)
         return results
 
     def clear(self) -> None:
