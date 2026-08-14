@@ -35,7 +35,7 @@ class RagSearchTool(Tool):
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数量，默认 3（经过重排序后的最优结果）",
+                "description": "返回结果数量，默认 3，范围 1-10（经过重排序后的最优结果）",
             },
         },
         "required": ["query"],
@@ -51,6 +51,9 @@ class RagSearchTool(Tool):
     def run(self, query: str = "", top_k: int = 3) -> ToolResult:
         if not query.strip():
             return ToolResult(success=False, error="请提供搜索查询词")
+
+        # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
+        top_k = max(1, min(int(top_k), 10))
 
         logger.info("🔍 RAG 工具调用: rag_search(query=%r, top_k=%d)", query[:80], top_k)
         try:

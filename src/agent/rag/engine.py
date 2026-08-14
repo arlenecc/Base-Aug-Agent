@@ -767,18 +767,41 @@ class RAGEngine:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
 
-    def search_formatted(self, query: str, top_k: int = 3) -> str:
-        """Search and return formatted results as a string."""
+    def search_formatted(
+        self,
+        query: str,
+        top_k: int = 3,
+        max_chars_per_result: int = 1500,
+        max_total_chars: int = 8000,
+    ) -> str:
+        """Search and return formatted results as a string.
+
+        Each result's text is truncated to ``max_chars_per_result`` and the
+        total output is capped at ``max_total_chars`` to avoid blowing up the
+        LLM context window with oversized chunks (some documents produce very
+        long chunks, which previously caused ``exceed_context_size_error``).
+        """
         results = self.search(query, top_k)
         if not results:
             return "（知识库中未找到相关内容）"
 
         lines = [f"从知识库检索到 {len(results)} 条相关内容（已重排序）：\n"]
+        total = 0
         for i, r in enumerate(results, 1):
             source = os.path.basename(r["source"])
-            lines.append(f"### [{i}] 来源: {source} (相关度: {r['score']:.4f})")
-            lines.append(r["text"])
+            header = f"### [{i}] 来源: {source} (相关度: {r['score']:.4f})"
+            text = r.get("text", "") or ""
+            if len(text) > max_chars_per_result:
+                text = text[:max_chars_per_result] + "…"
+            lines.append(header)
+            total += len(header) + 1
+            lines.append(text)
+            total += len(text)
             lines.append("")
+            total += 1
+            if total >= max_total_chars:
+                lines.append("…（结果过长，已截断）")
+                break
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
