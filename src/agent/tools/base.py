@@ -168,7 +168,7 @@ class ToolRegistry:
 
         try:
             from ..rag.engine import RAGEngine
-            from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool
+            from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool, RagOutlineTool
         except ImportError as e:
             logger.warning("RAG module not available: %s", e)
             return
@@ -186,7 +186,8 @@ class ToolRegistry:
         self._rag_engine = engine
 
         registered = []
-        for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine)]:
+        for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine),
+                  RagOutlineTool(engine)]:
             if t.name not in self._tools:
                 t.bind(self.config, self)
                 self._tools[t.name] = t

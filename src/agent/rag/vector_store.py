@@ -22,6 +22,10 @@ DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
 _TABLE_NAME = "knowledge_base"
 
+# 文档元数据表：存储每个文档的缩略版本（目录 + 章节摘要）与完整 Markdown，
+# 用于 Meta-context + Targeted RAG（先返回全文档结构概览，再按需检索细节）。
+_DOCUMENTS_TABLE_NAME = "documents"
+
 # nomic-embed-text-v1.5 requires query/document prefixes for best results
 _DOC_PREFIX = "search_document: "
 _QUERY_PREFIX = "search_query: "
@@ -225,6 +229,8 @@ class VectorStore:
         self._custom_ef = embedding_function  # for testing injection
         self._db = None
         self._table = None
+        self._documents_table = None  # 文档元数据表（缩略版本 + markdown）
+        self._documents_lock = threading.Lock()  # 保护 documents 表懒创建
         self._ef = None  # embedding function
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
@@ -264,6 +270,10 @@ class VectorStore:
         if _TABLE_NAME in self._db.table_names():
             self._table = self._db.open_table(_TABLE_NAME)
             self._check_schema_migration()
+
+        # Open the documents metadata table (if it already exists).
+        if _DOCUMENTS_TABLE_NAME in self._db.table_names():
+            self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
 
         self._initialized = True
         count = self._table.count_rows() if self._table is not None else 0
@@ -705,12 +715,17 @@ class VectorStore:
         self,
         query: str,
         top_k: int = 5,
+        where: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Keyword (BM25) full-text search over the ``text_fts`` column.
 
         Returns list of {text, source, chunk_index, score, fts_score} dicts,
         where ``score`` is the BM25 score (higher is better).  Used together
         with vector search for hybrid retrieval.
+
+        ``where`` is an optional SQL filter (e.g. ``source LIKE '%book.md'``)
+        applied to the FTS search as well, so targeted retrieval restricts both
+        channels consistently.
         """
         self._ensure_initialized()
         table = self._ensure_table()
@@ -723,11 +738,12 @@ class VectorStore:
         try:
             # Tokenize the query the same way as the indexed text.
             tokenized_query = _tokenize_for_fts(query)
-            results = (
+            q = (
                 table.search(tokenized_query, query_type="fts", fts_columns=[_FTS_COLUMN])
-                .limit(top_k)
-                .to_list()
             )
+            if where:
+                q = q.where(where)
+            results = q.limit(top_k).to_list()
         except Exception as e:
             logger.warning("  ⚠ BM25 全文检索失败: %s", e)
             return []
@@ -1017,8 +1033,8 @@ class VectorStore:
             "VectorStore.search_with_rerank: 向量检索 %d 条候选", len(vec_candidates),
         )
 
-        # 2. BM25 keyword search.
-        fts_candidates = self.search_fts(query, top_k=n_candidates)
+        # 2. BM25 keyword search (同样的 where 过滤，保证定向检索一致)。
+        fts_candidates = self.search_fts(query, top_k=n_candidates, where=where)
         logger.info(
             "VectorStore.search_with_rerank: BM25 检索 %d 条候选", len(fts_candidates),
         )
@@ -1073,6 +1089,11 @@ class VectorStore:
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
             logger.info("VectorStore: cleared %d documents", count)
+        # 同步清空文档元数据表。
+        if _DOCUMENTS_TABLE_NAME in self._db.table_names():
+            self._db.drop_table(_DOCUMENTS_TABLE_NAME)
+            self._documents_table = None
+            logger.info("VectorStore: cleared documents metadata table")
 
     def count(self) -> int:
         self._ensure_initialized()
@@ -1176,6 +1197,137 @@ class VectorStore:
                 all_data = table.to_arrow().to_pylist()
             sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
             return sources
+
+    # ------------------------------------------------------------------
+    # documents metadata table (Meta-context + Targeted RAG)
+    # ------------------------------------------------------------------
+
+    def _ensure_documents_table(self):
+        """Open or create the documents metadata table (thread-safe).
+
+        用双重检查锁保护：ingest 的多 worker 并行调用 upsert_document 时，
+        首次创建表会并发竞争——若不加锁，第二个 worker 会在 create_table 时报
+        "Table already exists"。锁内再次检查后，创建或打开由唯一一个线程完成。
+        """
+        if self._documents_table is not None:
+            return self._documents_table
+        with self._documents_lock:
+            if self._documents_table is not None:
+                return self._documents_table
+            self._ensure_initialized()
+            if _DOCUMENTS_TABLE_NAME in self._db.table_names():
+                self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
+            else:
+                # 首次创建：空表（含占位空记录，后续 upsert 时清理）。
+                self._documents_table = self._db.create_table(
+                    _DOCUMENTS_TABLE_NAME,
+                    data=[{
+                        "doc_id": "",
+                        "doc_name": "",
+                        "digest": "",
+                        "markdown": "",
+                        "chapters": "",
+                    }],
+                )
+            return self._documents_table
+
+    def upsert_document(
+        self,
+        doc_name: str,
+        digest: str,
+        markdown: str,
+        chapters: str = "",
+    ) -> None:
+        """Store or update a document's digest (缩略版本) + full markdown.
+
+        ``doc_id`` is a stable md5 of ``doc_name`` so re-ingesting the same
+        document overwrites the previous entry (upsert semantics).
+        """
+        self._ensure_initialized()
+        table = self._ensure_documents_table()
+        doc_id = _hash_source(doc_name)
+
+        # Delete any previous entry (and the placeholder row), then add the new one.
+        try:
+            table.delete(f"doc_id = '{doc_id}'")
+            table.delete("doc_id = ''")
+        except Exception:
+            pass
+        table.add([{
+            "doc_id": doc_id,
+            "doc_name": doc_name,
+            "digest": digest,
+            "markdown": markdown,
+            "chapters": chapters,
+        }])
+        logger.info("  ├─ 文档元数据已写入: %s (digest %d 字符)", doc_name, len(digest))
+
+    def get_document_digest(self, doc_name: str) -> Optional[Dict[str, Any]]:
+        """Return {doc_name, digest, markdown, chapters} for a document by name.
+
+        Matches by exact basename or by substring (so the model can reference
+        a book by a partial title).  Returns None if not found.
+        """
+        self._ensure_initialized()
+        table = self._ensure_documents_table()
+        if table is None:
+            return None
+        try:
+            rows = table.to_arrow().to_pylist()
+        except Exception as e:
+            logger.warning("读取文档元数据失败: %s", e)
+            return None
+        # 过滤占位空记录（doc_name 为空）。
+        rows = [r for r in rows if r.get("doc_name")]
+        if not rows:
+            return None
+
+        # 1. Exact match (case-insensitive) on doc_name or basename.
+        target = doc_name.strip().lower()
+        for r in rows:
+            name = (r.get("doc_name") or "").lower()
+            if name == target or os.path.basename(name) == target:
+                return {
+                    "doc_name": r.get("doc_name", ""),
+                    "digest": r.get("digest", ""),
+                    "markdown": r.get("markdown", ""),
+                    "chapters": r.get("chapters", ""),
+                }
+        # 2. Substring match (partial title).
+        for r in rows:
+            name = (r.get("doc_name") or "").lower()
+            if target and (target in name or name in target):
+                return {
+                    "doc_name": r.get("doc_name", ""),
+                    "digest": r.get("digest", ""),
+                    "markdown": r.get("markdown", ""),
+                    "chapters": r.get("chapters", ""),
+                }
+        return None
+
+    def list_documents(self) -> List[str]:
+        """Return the list of stored document names (for the outline tool)."""
+        self._ensure_initialized()
+        table = self._ensure_documents_table()
+        if table is None:
+            return []
+        try:
+            rows = table.to_arrow().to_pylist()
+        except Exception:
+            return []
+        return sorted({r.get("doc_name", "") for r in rows if r.get("doc_name")})
+
+    def delete_document(self, doc_name: str) -> None:
+        """Remove a document's metadata entry."""
+        self._ensure_initialized()
+        table = self._ensure_documents_table()
+        if table is None:
+            return
+        doc_id = _hash_source(doc_name)
+        try:
+            table.delete(f"doc_id = '{doc_id}'")
+        except Exception as e:
+            logger.warning("删除文档元数据失败: %s", e)
 
 
 # ---------------------------------------------------------------------------

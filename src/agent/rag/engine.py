@@ -94,6 +94,13 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _escape_like(s: str) -> str:
+    """Escape SQL LIKE wildcards so a user/doc keyword is matched literally."""
+    for ch in ("%", "_", "\\"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 def _extract_with_docling(filepath: str) -> tuple:
     """Extract text, preferring docling (Markdown output).
 
@@ -453,6 +460,18 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
+                            # ---- 构建文档缩略版本（目录 + 章节摘要）----
+                            # 使用本地提取式 fallback（无需 LLM），保证文档入库后
+                            # 立即拥有缩略版本；LLM 摘要由异步任务在空闲时补做。
+                            try:
+                                self.build_and_store_digest(
+                                    os.path.basename(filepath),
+                                    cleaned,
+                                    summarizer=None,
+                                )
+                                _log("    ├─ 文档缩略版本已生成: %s", fname)
+                            except Exception as e:
+                                logger.warning("    ├─ ⚠ 缩略版本生成失败: %s: %s", fname, e)
                             del text
 
                             if not cleaned.strip():
@@ -735,13 +754,22 @@ class RAGEngine:
     # retrieval
     # ------------------------------------------------------------------
 
-    def search(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 3,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Search the knowledge base with hybrid retrieval + reranking.
 
         Retrieves top_k * 4 candidates each from vector-similarity search and
         BM25 keyword search, merges/dedupes, then uses BGE reranker to pick
         the most relevant results.  Results below the 0.7 similarity threshold
         are dropped before returning.
+
+        ``source`` 为可选文档名/关键词过滤：定向检索某本书/文档内的切片
+        （配合 rag_outline 实现 Targeted RAG——先掌握全局结构，再按需检索
+        特定文档的细节）。
         """
         t0 = time.monotonic()
         store = self._get_store()
@@ -749,12 +777,17 @@ class RAGEngine:
         if store_count == 0:
             logger.info("🔍 知识库检索: 向量库为空，无结果返回 (查询=%r)", query[:60])
             return []
+        # 构造 SQL 过滤条件：source 字段存完整路径，用 LIKE 匹配文档名。
+        where = None
+        if source:
+            where = f"source LIKE '%{_escape_like(source)}%'"
+            logger.info("  ├─ 定向检索: 限定来源包含 %r", source)
         logger.info(
             "🔍 知识库检索开始: 查询=%r 目标结果数=%d 向量库总量=%d",
             query[:80], top_k, store_count,
         )
         logger.info("  ├─ 混合初检: 向量相似度 + BM25 关键词, 各取 top %d 候选", top_k * 4)
-        results = store.search_with_rerank(query, top_k=top_k)
+        results = store.search_with_rerank(query, top_k=top_k, where=where)
         t_total = time.monotonic() - t0
         if results:
             logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)
@@ -771,6 +804,7 @@ class RAGEngine:
         self,
         query: str,
         top_k: int = 3,
+        source: Optional[str] = None,
         max_chars_per_result: int = 1500,
         max_total_chars: int = 8000,
     ) -> str:
@@ -780,8 +814,10 @@ class RAGEngine:
         total output is capped at ``max_total_chars`` to avoid blowing up the
         LLM context window with oversized chunks (some documents produce very
         long chunks, which previously caused ``exceed_context_size_error``).
+
+        ``source`` 为可选文档名过滤（定向检索某本书）。
         """
-        results = self.search(query, top_k)
+        results = self.search(query, top_k, source=source)
         if not results:
             return "（知识库中未找到相关内容）"
 
@@ -803,6 +839,56 @@ class RAGEngine:
                 lines.append("…（结果过长，已截断）")
                 break
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Meta-context + Targeted RAG (文档缩略版本)
+    # ------------------------------------------------------------------
+
+    def build_and_store_digest(
+        self,
+        doc_name: str,
+        markdown: str,
+        summarizer: Optional[Callable[[str, str], str]] = None,
+        max_summary_chars: int = 50,
+    ) -> str:
+        """Build a document's digest (缩略版本) and store it in the metadata table.
+
+        ``summarizer(title, text) -> str`` is an optional LLM-backed callable.
+        When omitted (e.g. during ingestion), a local extractive fallback is
+        used so the digest is always available immediately; an async job can
+        later regenerate a higher-quality digest with the LLM.
+        """
+        from .document_outline import build_digest
+
+        digest, chapters = build_digest(
+            markdown,
+            summarizer=summarizer,
+            max_summary_chars=max_summary_chars,
+        )
+        # Serialize chapters (title + level + summary) for targeted retrieval.
+        chapters_json = json.dumps(
+            [{"level": c.level, "title": c.title, "summary": c.summary}
+             for c in chapters],
+            ensure_ascii=False,
+        )
+        store = self._get_store()
+        store.upsert_document(
+            doc_name=os.path.basename(doc_name),
+            digest=digest,
+            markdown=markdown,
+            chapters=chapters_json,
+        )
+        return digest
+
+    def get_document_outline(self, doc_name: str) -> Optional[Dict[str, Any]]:
+        """Return a document's stored digest + full markdown by (partial) name."""
+        store = self._get_store()
+        return store.get_document_digest(doc_name)
+
+    def list_documents(self) -> List[str]:
+        """Return stored document names that have a digest."""
+        store = self._get_store()
+        return store.list_documents()
 
     # ------------------------------------------------------------------
     # management
