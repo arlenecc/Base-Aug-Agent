@@ -51,7 +51,7 @@ Principles:
 1. Plan, then call tools to gather info and take actions. After each tool result, decide the next step.
 2. Prefer the least destructive path. Risky/irreversible actions need user confirmation.
 3. If info is missing, use `ask_user` rather than guessing.
-4. Memory: use `memory_graph` to store durable entities/relations/observations; use `memory_search` to recall facts before answering. Use `work_memory` (set/get/list) to persist short-term notes that span multiple steps of the current task — e.g. intermediate results, decisions, or user preferences you must remember across turns. Do NOT store transient state like "greeting received" or anything only relevant to the current turn. Before answering a question about prior context, check `work_memory` (op=list) and `memory_search` first.
+4. Memory: important facts from the conversation are auto-extracted into long-term memory for you — before answering anything about prior context or the user, recall them with `memory_search`. Use `memory_graph` only if you must explicitly add/update an entity. Use `work_memory` (set/get/list) to persist short-term notes that span multiple steps of the current task — e.g. intermediate results, decisions, or user preferences you must remember across turns. Do NOT store transient state like "greeting received" or anything only relevant to the current turn.
 5. Before complex tasks, use `skill_search` to find relevant skills. If found, use `skill_load` to read the skill's instructions, then follow them.
 6. When the user names a specific book/document, first call `rag_outline` to get its full structure (table of contents / chapter titles), then plan which chapters to drill into and use `rag_search` for those details (targeted RAG).
 7. When done, reply concisely in plain text (no tool calls). Your `content` field is the visible reply; `reasoning_content` is the thinking trace.
@@ -452,6 +452,19 @@ class Agent:
         recent.reverse()
         if not recent:
             return
+        # 跳过无实质内容的对话：最新一条 user 消息过短（如「read data.txt」、
+        # 「write and read back」这类单句指令）说明没有可抽取的持久事实，
+        # 抽取只会浪费一次 LLM 调用。这与旧行为保持一致（user/assistant 均
+        # 需 >= 20 字符才抽取）。
+        last_user = ""
+        for msg in reversed(self._history):
+            if msg.get("role") == "user" and msg.get("content"):
+                last_user = msg["content"].strip()
+                break
+        if len(last_user) < 20:
+            return
+        if len((assistant_reply or "").strip()) < 20:
+            return
         # The final reply is already in _history as the last assistant msg;
         # if not (edge case), append it explicitly.
         conversation = "\n\n".join(recent)
@@ -499,6 +512,9 @@ class Agent:
             lm = _get_long_memory(self.tools, self.config)
             g = lm.graph
             added = 0
+            # 收集本次抽取到的所有 observation（实体观察），同时用于
+            # 长期记忆（graph）与短期记忆（当天事实）两份写入。
+            all_observations: List[str] = []
             for ent in entities:
                 name = ent.get("name", "").strip()
                 if not name:
@@ -508,6 +524,7 @@ class Agent:
                 if obs:
                     g.add_observations(name, obs)
                     added += len(obs)
+                    all_observations.extend(obs)
                 elif etype:
                     g.create_entity(name, entity_type=etype)
             for rel in relations:
@@ -518,10 +535,67 @@ class Agent:
                     g.create_relation(src, tgt, lbl)
             if added:
                 self._log(f"[memory] 抽取 {added} 条 observation + {len(relations)} 条 relation 存入长期记忆")
+            # 同时追加到短期记忆（当天桶）：一次抽取，两份写入，避免重复抽取。
+            if all_observations:
+                self._append_daily_facts(all_observations)
         except Exception as e:  # pragma: no cover — best-effort
             self._log(f"[memory] 事实抽取失败: {e}")
         finally:
             lock.release()
+
+    def _append_daily_facts(self, facts: List[str]) -> None:
+        """Append auto-extracted facts to work memory under today's bucket.
+
+        短期记忆只保留当天的自动抽取事实；历史事实已在长期记忆 graph 中
+        持久化（供 memory_search 检索），无需在短期记忆里重复保留。对话时
+        只把当天事实注入上下文（见 _system_prompt），长期记忆则靠检索。
+
+        Key 约定：``__auto_facts__`` → {"date": "YYYY-MM-DD", "facts": [...]}
+        使用保留前缀，避免与模型手动 work_memory set 的 key 冲突。
+        """
+        import datetime
+        from .tools.memory import _work_memory
+        try:
+            today = datetime.date.today().isoformat()
+            wm = _work_memory(self.config)
+            existing = wm.get("__auto_facts__") or ""
+            # 解析现有当天事实（若跨天则视为过期，重置为空）。
+            bucket_date, bucket_facts = self._parse_daily_facts(existing)
+            if bucket_date != today:
+                bucket_facts = []
+            # 去重追加（保持原有顺序，新事实排后）。
+            seen = set(bucket_facts)
+            for f in facts:
+                if f and f not in seen:
+                    bucket_facts.append(f)
+                    seen.add(f)
+            wm.set(
+                "__auto_facts__",
+                json.dumps({"date": today, "facts": bucket_facts}, ensure_ascii=False),
+            )
+        except Exception as e:  # pragma: no cover — best-effort
+            self._log(f"[memory] 短期记忆追加失败: {e}")
+
+    @staticmethod
+    def _parse_daily_facts(raw: str):
+        """Parse the __auto_facts__ work-memory value → (date, [facts]).
+
+        Returns ("", []) on malformed/empty input so callers treat it as
+        "no valid today-bucket" and reset.
+        """
+        if not raw:
+            return "", []
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return "", []
+            date = data.get("date", "")
+            facts = data.get("facts", [])
+            if not isinstance(date, str) or not isinstance(facts, list):
+                return "", []
+            return date, [f for f in facts if isinstance(f, str) and f.strip()]
+        except (json.JSONDecodeError, TypeError):
+            return "", []
 
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
@@ -840,27 +914,34 @@ class Agent:
         base = SYSTEM_PROMPT
 
         try:
-            from .tools.memory import _work_memory, _get_long_memory
+            from .tools.memory import _work_memory
 
-            # Work memory: only inject keys that exist (not the full values
-            # when they're long).  Keeps the prompt compact.
+            # Work memory: inject only the keys the model explicitly set
+            # (its scratchpad), PLUS today's auto-extracted facts.  Long-term
+            # memory is NOT injected here — it is recalled on demand via the
+            # memory_search tool.
             wm = _work_memory(self.config).list()
-            if wm:
-                # Truncate each value to 200 chars to avoid prompt bloat.
-                compact_wm = {}
-                for k, v in wm.items():
-                    s = str(v)
-                    compact_wm[k] = s[:200] + "…" if len(s) > 200 else s
-                # Compact JSON (no indent) to save tokens
-                base += "\n\n# Work memory\n" + json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":"))
-
-            # Long-term memory: inject a compact snapshot (not full dump).
-            # The snapshot caps at ~10 most-salient items, keeping the
-            # prompt lean even with a large knowledge graph.
-            lm = _get_long_memory(self.tools, self.config)
-            snap = lm.snapshot(max_items=10)
-            if snap:
-                base += "\n\n# Long-term memory (snapshot)\n" + snap
+            compact_wm = {}
+            today_facts: List[str] = []
+            for k, v in wm.items():
+                if k == "__auto_facts__":
+                    # 短期记忆里的自动抽取事实：只注入当天桶（历史已在长期
+                    # 记忆 graph 中，靠 memory_search 检索）。
+                    _, facts = self._parse_daily_facts(str(v))
+                    today_facts = facts
+                    continue
+                s = str(v)
+                compact_wm[k] = s[:200] + "…" if len(s) > 200 else s
+            if compact_wm or today_facts:
+                parts = []
+                if today_facts:
+                    # 当天事实用列表形式注入，更易读（而非嵌套 JSON）。
+                    parts.append("# Today's facts (auto-extracted)\n" +
+                                 "\n".join(f"- {f}" for f in today_facts))
+                if compact_wm:
+                    parts.append("# Work memory (scratchpad)\n" +
+                                 json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":")))
+                base += "\n\n" + "\n\n".join(parts)
         except Exception:  # pragma: no cover
             pass
         # inject matched skill prompt

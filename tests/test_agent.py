@@ -1091,3 +1091,76 @@ def test_agent_registers_rag_tools_with_default_knowledge_base(
     assert "rag_ingest" in schema_names
     registry.shutdown()
 
+
+# ---------------------------------------------------------------------------
+# Daily auto-extracted facts (short-term memory) — 短期记忆只保留当天事实
+# ---------------------------------------------------------------------------
+
+def test_parse_daily_facts_valid():
+    """_parse_daily_facts 解析合法的当天桶。"""
+    from agent.agent import Agent
+    raw = '{"date": "2026-08-15", "facts": ["f1", "f2"]}'
+    date, facts = Agent._parse_daily_facts(raw)
+    assert date == "2026-08-15"
+    assert facts == ["f1", "f2"]
+
+
+def test_parse_daily_facts_malformed():
+    """_parse_daily_facts 对空/非法输入返回 ("", [])，视为需重置。"""
+    from agent.agent import Agent
+    assert Agent._parse_daily_facts("") == ("", [])
+    assert Agent._parse_daily_facts("not json") == ("", [])
+    assert Agent._parse_daily_facts('{"date": 123, "facts": "oops"}') == ("", [])
+
+
+def test_parse_daily_facts_filters_non_strings():
+    """facts 里的非字符串项被过滤。"""
+    from agent.agent import Agent
+    raw = '{"date": "2026-08-15", "facts": ["ok", 123, null, "  ", "also"]}'
+    date, facts = Agent._parse_daily_facts(raw)
+    assert date == "2026-08-15"
+    assert facts == ["ok", "also"]
+
+
+def test_append_daily_facts_writes_and_dedups(config, recording_callbacks):
+    """_append_daily_facts 写入当天桶并去重。"""
+    import datetime
+    from agent.agent import Agent
+    from agent.tools.memory import _work_memory
+
+    agent = Agent(llm=MockLLM([[_evt("content", "x"), _evt("done")]]),
+                  config=config, callbacks=recording_callbacks)
+
+    agent._append_daily_facts(["事实A", "事实B"])
+    agent._append_daily_facts(["事实B", "事实C"])  # B 重复，应去重
+
+    wm = _work_memory(config)
+    date, facts = agent._parse_daily_facts(wm.get("__auto_facts__") or "")
+    assert date == datetime.date.today().isoformat()
+    assert facts == ["事实A", "事实B", "事实C"]
+
+
+def test_append_daily_facts_resets_on_new_day(config, recording_callbacks):
+    """跨天后追加，旧当天桶应被清空（历史归长期记忆）。"""
+    import datetime
+    from agent.agent import Agent
+    from agent.tools.memory import _work_memory
+
+    agent = Agent(llm=MockLLM([[_evt("content", "x"), _evt("done")]]),
+                  config=config, callbacks=recording_callbacks)
+
+    # 预置一个「昨天」的桶。
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    _work_memory(config).set(
+        "__auto_facts__",
+        json.dumps({"date": yesterday, "facts": ["旧事实"]}, ensure_ascii=False),
+    )
+
+    # 今天追加新事实 → 旧事实应被丢弃。
+    agent._append_daily_facts(["新事实"])
+
+    wm = _work_memory(config)
+    date, facts = agent._parse_daily_facts(wm.get("__auto_facts__") or "")
+    assert date == datetime.date.today().isoformat()
+    assert facts == ["新事实"], f"跨天应只保留当天事实，got {facts}"
+

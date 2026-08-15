@@ -327,18 +327,22 @@ workspace/.agent/
         └── prompt.md          # 技能指令全文
 ```
 
-### 自动事实抽取
+### 自动事实抽取（一次抽取，双写）
 
-每次 agent 对话结束（无 tool_calls 的最终回复）后，**异步**调用 LLM 从「用户消息 + 助手回复」中抽取实体、关系和观察，写入知识图谱（daemon 线程，不阻塞用户回复）：
+每次 agent 对话结束（无 tool_calls 的最终回复）后，**异步**调用 LLM 从最近几轮对话中抽取实体、关系和观察（daemon 线程，不阻塞用户回复）。**一次抽取，同时写入两份记忆**，避免重复抽取：
 
 ```
 对话结束 → _maybe_extract_facts_async()
   ├─ daemon 线程启动，on_finished() 立即回调
-  ├─ 跳过过短对话（< 20 字符）
+  ├─ 收集最近 6 轮对话窗口（解析代词/项目指代）
   ├─ LLM 低温度(0.1)抽取 JSON: {entities: [...], relations: [...]}
-  ├─ 写入 GraphMemoryStore（去重 + 向量索引）
-  └─ 失败静默跳过（best-effort，不阻塞用户回复）
+  ├─ 写入长期记忆 GraphMemoryStore（去重 + 向量索引）
+  └─ 同步写入短期记忆当天桶 __auto_facts__（只保留当天，跨天重置）
 ```
+
+- **长期记忆**：全部事实持久化到知识图谱，靠 `memory_search` 按需语义检索。
+- **短期记忆**：当天抽取的事实保留在 `work_memory` 的 `__auto_facts__` 键（`{"date": "YYYY-MM-DD", "facts": [...]}`），对话时直接注入上下文；跨天后自动清空（历史已在长期记忆）。
+- **抽取串行化**：`_fact_extract_lock` 非阻塞锁，避免抽取线程与下一轮对话并发争用 LLM 的 `httpx.Client`（非线程安全）。
 
 ### 语义检索
 
@@ -368,8 +372,8 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 **新方案**：
 - **SYSTEM_PROMPT**：精简至 ~260 tok（-65%），合并冗余段落
 - **Knowledge base 指令**：仅当 KB 有数据时注入（无 KB 省 272 tok/轮）
-- **工作记忆**：compact JSON（无缩进），value 截断到 200 字符
-- **长期记忆**：只注入精简 snapshot（最多 10 条最显著事实 + 少量关系），而非全量
+- **工作记忆**：手动 scratchpad（compact JSON，value 截断 200 字符）+ 当天自动抽取事实（列表形式）
+- **长期记忆**：不注入 prompt，靠 `memory_search` 工具按需检索（避免长期记忆膨胀拖慢每轮响应）
 - **总体每轮节省 ~787 token（-34%）**
 
 ```
