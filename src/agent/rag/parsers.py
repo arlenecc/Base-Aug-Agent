@@ -320,6 +320,24 @@ def _get_ocr_engine():
             return None
 
 
+def release_ocr_engine() -> None:
+    """Release the global OCR singleton to reclaim its ~500MB memory.
+
+    The RapidOCR engine holds an ONNX Runtime inference session (~500MB of
+    native heap) that Python GC cannot reclaim promptly.  GUI apps that OCR
+    image-based PDFs would otherwise hold this memory until process exit.
+    Call this from RAGEngine.close() after a sync finishes; the engine is
+    lazily re-created on the next OCR-requiring ingestion.
+    """
+    global _OCR_ENGINE
+    with _OCR_ENGINE_LOCK:
+        if _OCR_ENGINE is not None:
+            # RapidOCR wraps an onnxruntime InferenceSession.  Drop the
+            # reference so the session's C++ heap is freed on GC.
+            _OCR_ENGINE = None
+            logger.info("RapidOCR engine released (memory reclaimed)")
+
+
 def _ocr_image_cached(engine, img_bytes: bytes, page_num: int, filename: str) -> str:
     """Run OCR using a pre-loaded engine instance."""
     try:

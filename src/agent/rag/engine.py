@@ -1024,6 +1024,14 @@ class RAGEngine:
                     except Exception as e:
                         logger.debug("RAG: VectorStore close error: %s", e)
                     self._store = None
+        # Release the global OCR singleton (~500MB) as well.  It is only needed
+        # during ingestion of image-based PDFs; after a sync finishes the
+        # engine can reclaim it.  Lazy re-created on the next OCR-requiring run.
+        try:
+            from .parsers import release_ocr_engine
+            release_ocr_engine()
+        except Exception as e:
+            logger.debug("RAG: release_ocr_engine error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.
