@@ -126,8 +126,9 @@ python main.py
 | `work_memory` | 短期工作记忆（键值对 scratchpad） | ❌ |
 | `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
 | `memory_search` | 长期记忆语义检索 | ❌ |
-| `skill_search` | 搜索/列出技能目录中的技能 | ❌ |
-| `skill_load` | 按路径加载技能完整指令（prompt.md） | ❌ |
+| `skill_search` | 关键词搜索技能目录中的技能 | ❌ |
+| `skill_semantic_search` | 混合检索技能（SKILL.md 向量 + BM25，nomic-embed-text） | ❌ |
+| `skill_load` | 按路径加载技能完整指令（SKILL.md 或支持文件） | ❌ |
 | `rag_search` | 搜索本地知识库（支持按文档名定向检索） | ❌ |
 | `rag_outline` | 获取文档缩略版本（目录结构 + 章节标题） | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
@@ -401,10 +402,11 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 
 ## 技能系统
 
-技能用于把高频任务固化为可复用的指令模板。系统包含两层：
+技能用于把高频任务固化为可复用的指令模板。系统包含三层：
 
 - **SkillManager**（`skills.json`）：按关键词匹配用户意图，命中后把技能 prompt 注入系统提示；同一意图出现 ≥ 2 次时建议固化为技能
 - **SkillIndex**（`.agent/skills/` + `_index.json`）：目录化技能注册表。每个技能一个目录，含 `skill.json`（元数据：name / description / keywords / tags / entry）和 `prompt.md`（指令全文）
+- **SkillRetriever**（`skills/` + LanceDB）：对 **SKILL.md** 的混合语义检索。递归扫描 `workspace/skills` 下的所有 `SKILL.md`，解析 frontmatter（name/tags/description）与正文段落（When to Use / Examples），用 nomic-embed-text 分别对 description 和 examples 计算向量存入独立 LanceDB 表，并对「name+tags+description+examples 拼接文本」建 BM25 全文索引
 
 工作方式：
 
@@ -412,15 +414,18 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 用户请求
   ├─ SkillManager.match() 命中扁平技能 → prompt 注入系统提示
   │   （目录技能注册的扁平记录引导 agent 调用 skill_load 加载全文）
-  └─ 复杂任务 → agent 主动调用 skill_search(query) 检索技能目录
-                └─ 命中后 skill_load(path) 读取 prompt.md 全文并遵循
+  └─ 复杂任务 → agent 主动调用 skill_semantic_search(query) 混合检索
+                │  向量检索（description 0.6 + examples 0.4 融合，取 3 候选）
+                │  + BM25 全文检索（取 3 候选）→ 去重 → 剔除相似度 < 0.5
+                │  返回候选的 name+tags+description，由 agent 判断选用
+                └─ skill_load(dir) 读取 SKILL.md 全文（或 references/ 支持文件）并遵循
 ```
 
 关键设计：
 
 - **按需加载**：技能全文不进系统提示词，仅在需要时通过 `skill_load` 读入，避免技能增多导致 prompt 膨胀
-- **索引防抖**：`_index.json` 在目录 mtime 变化或 300s 间隔后重建，原子写（tmp + rename）
-- **加权检索**：name ×3 / keywords ×2 / tags ×2 / description 子串 ×1
+- **索引防抖**：扫描器在目录 mtime 变化或 300s 间隔后重建，LanceDB 表懒构建
+- **混合检索**：向量相似度（description/examples 0.6:0.4 加权融合）+ BM25 关键词双通道，统一用余弦相似度排序，阈值 0.5 过滤
 - **路径安全**：`skill_load` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
 - **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
 
@@ -463,6 +468,7 @@ src/agent/
 ├── graph_memory.py       # 知识图谱存储引擎（Entity/Relation/Observation + 批量嵌入 + LanceDB 语义检索）
 ├── skills.py             # 技能管理（意图匹配 / 请求固化建议 / 目录技能创建）
 ├── skill_index.py        # 技能索引（扫描 .agent/skills/、维护 _index.json、加权检索）
+├── skill_retriever.py    # SKILL.md 混合检索（扫描 + 解析 + LanceDB 向量/BM25 检索）
 ├── rag/
 │   ├── engine.py            # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
 │   ├── docling_parser.py    # docling 统一解析器（Word/Excel/PPT/PDF/EPUB → Markdown）
@@ -501,7 +507,7 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。当前 311 测试用例。
+测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。当前 322 测试用例。
 
 ## 部署
 

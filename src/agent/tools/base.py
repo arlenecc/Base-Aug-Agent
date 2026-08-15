@@ -77,7 +77,7 @@ class ToolRegistry:
         from .web import WebScanTool, WebExecJsTool
         from .interact import AskUserTool
         from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
-        from .skill_search import SkillSearchTool, SkillLoadTool
+        from .skill_search import SkillSearchTool, SkillLoadTool, SkillSemanticSearchTool
 
         tools_to_register = [
             FileReadTool(), FileWriteTool(), FileModifyTool(),
@@ -90,6 +90,7 @@ class ToolRegistry:
             MemorySearchTool(),
             SkillSearchTool(),
             SkillLoadTool(),
+            SkillSemanticSearchTool(),
         ]
 
         # webexec_js: only register when browser_endpoint is configured.
@@ -206,6 +207,25 @@ class ToolRegistry:
         """Return the RAG engine instance, or None if not configured."""
         return self._rag_engine
 
+    def get_skill_retriever(self):
+        """Return the shared SkillRetriever (hybrid skill search), lazily built.
+
+        The retriever scans ``<workspace>/skills`` for SKILL.md files and builds
+        a LanceDB table (embeddings + BM25).  Building is lazy: the first call
+        triggers scanning + indexing (can be slow for thousands of skills), so
+        it is cached on the registry and rebuilt on subsequent calls only if
+        the skills directory changed.
+        """
+        retriever = getattr(self, "_skill_retriever", None)
+        if retriever is not None:
+            return retriever
+        skills_dir = os.path.join(self.config.workspace, "skills")
+        db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
+        from ..skill_retriever import SkillRetriever
+        retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
+        setattr(self, "_skill_retriever", retriever)
+        return retriever
+
     def reload_rag(self) -> None:
         """Refresh the RAG engine's table handle so new sync data is visible.
 
@@ -261,6 +281,15 @@ class ToolRegistry:
         skill_idx = getattr(self, "_skill_index", None)
         if skill_idx is not None:
             setattr(self, "_skill_index", None)
+        # Release the SkillRetriever (LanceDB connection). Note: it shares the
+        # process-wide embedding function singleton, which we do NOT close here.
+        skill_retriever = getattr(self, "_skill_retriever", None)
+        if skill_retriever is not None:
+            try:
+                skill_retriever.close()
+            except Exception as e:
+                logger.warning("⚠ skill retriever 资源释放异常: %s", e)
+            setattr(self, "_skill_retriever", None)
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)

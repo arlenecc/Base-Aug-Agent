@@ -81,6 +81,64 @@ class SkillSearchTool(Tool):
         return ToolResult(True, output=json.dumps(results, ensure_ascii=False))
 
 
+class SkillSemanticSearchTool(Tool):
+    """Hybrid (vector + BM25) skill search over SKILL.md files.
+
+    Scans ``<workspace>/skills`` recursively for ``SKILL.md`` files, indexes
+    their descriptions + examples (vector) and combined text (BM25), then
+    retrieves candidate skills for a task description.  Optionally hands the
+    candidates to the LLM for a final pick.
+
+    This is the semantic counterpart to ``skill_search`` (keyword-based).
+    """
+    name = "skill_semantic_search"
+    description = (
+        "根据任务描述语义检索最合适的 skill（向量 + BM25 混合检索 SKILL.md）。"
+        "当需要为当前任务寻找可复用的 skill/工作流时使用。"
+        "返回候选 skill 的 name + tags + description；配合 skill_load 读取完整指令。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "任务描述，用于检索匹配的 skill"},
+            "top_k": {"type": "integer", "description": "返回候选数，默认 5"},
+        },
+        "required": ["query"],
+    }
+
+    config: AgentConfig
+    registry: ToolRegistry
+
+    def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
+        self.config = config
+        self.registry = registry
+
+    def run(self, query: str, top_k: int = 5) -> ToolResult:
+        if not query.strip():
+            return ToolResult(False, error="requires 'query'")
+        retriever = self.registry.get_skill_retriever()
+        # 只做混合检索 + 阈值过滤；最终的「选哪个」由 agent（大模型）根据
+        # 返回的 name+tags+description 自行判断，避免工具层再调一次 LLM。
+        result = retriever.retrieve(query, llm=None)
+
+        candidates = result.get("candidates", [])
+        if not candidates:
+            return ToolResult(True, output="找不到匹配的技能。")
+
+        # Compact output: dir + name + tags + description (truncated).
+        items = []
+        for c in candidates[:top_k]:
+            item = {
+                "dir": c["dir"],
+                "name": c["name"],
+                "tags": c.get("tags", ""),
+                "description": (c.get("description", "") or "")[:200],
+                "score": round(c["score"], 4),
+            }
+            items.append(item)
+        return ToolResult(True, output=json.dumps(items, ensure_ascii=False, indent=2))
+
+
 class SkillLoadTool(Tool):
     """Load a skill's full prompt content by its path.
 
@@ -89,14 +147,15 @@ class SkillLoadTool(Tool):
     """
     name = "skill_load"
     description = (
-        "Load a skill's full prompt content. Provide 'path' (from skill_search result). "
-        "Returns the skill's entry file content (e.g. prompt.md)."
+        "读取 skill 的完整指令内容。提供 'path'（来自 skill_search / "
+        "skill_semantic_search 结果的 'dir' 字段），entry 默认 SKILL.md。"
+        "也可读取 skill 目录下的其它支持文件（如 references/xxx.md）。"
     )
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Skill directory name (from skill_search result 'path' field)"},
-            "entry": {"type": "string", "description": "Entry file name (default: prompt.md)"},
+            "path": {"type": "string", "description": "Skill 目录（检索结果的 'dir' 字段）"},
+            "entry": {"type": "string", "description": "文件名，默认 SKILL.md（旧体系默认 prompt.md）"},
         },
         "required": ["path"],
     }
@@ -108,7 +167,21 @@ class SkillLoadTool(Tool):
         self.config = config
         self.registry = registry
 
-    def run(self, path: str, entry: str = "prompt.md") -> ToolResult:
+    def run(self, path: str, entry: str = "SKILL.md") -> ToolResult:
+        # 1) Try the semantic retriever first (SKILL.md directory).
+        retriever = getattr(self.registry, "_skill_retriever", None)
+        if retriever is not None:
+            abs_dir = retriever.read_skill_dir(path)
+            if abs_dir:
+                target = os.path.join(abs_dir, entry)
+                if os.path.isfile(target):
+                    try:
+                        with open(target, "r", encoding="utf-8") as f:
+                            return ToolResult(True, output=f.read())
+                    except (OSError, UnicodeDecodeError) as e:
+                        return ToolResult(False, error=f"read failed: {e}")
+
+        # 2) Fall back to the legacy SkillIndex (skill.json + prompt.md).
         idx = _get_skill_index(self.config, self.registry)
         content = idx.read_skill_content(path, entry)
         if content is None:
