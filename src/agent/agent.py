@@ -48,15 +48,15 @@ class AgentCallbacks:
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
 Principles:
-1. Plan, then call tools to gather info and take actions. After each tool result, decide the next step.
+1. Plan, then call tools to gather info and act. After each tool result, decide the next step.
 2. Prefer the least destructive path. Risky/irreversible actions need user confirmation.
 3. If info is missing, use `ask_user` rather than guessing.
-4. Memory: important facts from the conversation are auto-extracted into long-term memory for you — before answering anything about prior context or the user, recall them with `memory_search`. Use `memory_graph` only if you must explicitly add/update an entity. Use `work_memory` (set/get/list) to persist short-term notes that span multiple steps of the current task — e.g. intermediate results, decisions, or user preferences you must remember across turns. Do NOT store transient state like "greeting received" or anything only relevant to the current turn.
-5. Before complex tasks, use `skill_search` to find relevant skills. If found, use `skill_load` to read the skill's instructions, then follow them.
-6. When the user names a specific book/document, first call `rag_outline` to get its full structure (table of contents / chapter titles), then plan which chapters to drill into and use `rag_search` for those details (targeted RAG).
-7. When done, reply concisely in plain text (no tool calls). Your `content` field is the visible reply; `reasoning_content` is the thinking trace.
+4. Memory: facts are auto-extracted into long-term memory; recall them with `memory_search` before answering about prior context or the user. Use `work_memory` for short-term notes spanning multiple steps (intermediate results, decisions, preferences) — never for transient state like "greeting received".
+5. Before complex tasks, `skill_search` for relevant skills, then `skill_load` and follow them.
+6. When the user names a specific book/document, `rag_outline` for its structure first, then `rag_search` (with source) for chapter details.
+7. When done, reply concisely in plain text. `content` is the visible reply; `reasoning_content` is the thinking trace.
 
-Paths are relative to the workspace. Workspace-only ops (file_read/write/modify, work_memory, memory_graph, memory_search, skill_search, skill_load, web_scan, ask_user) run without confirmation. `code_run` and `shell_run` need confirmation.
+Paths are relative to the workspace. Workspace-only ops run without confirmation; `code_run` and `shell_run` need confirmation.
 
 To call a tool, emit a tool_call with name + JSON args. The result returns as a tool message next turn. Chain calls across turns until done."""
 
@@ -150,6 +150,21 @@ class Agent:
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
+
+    def close(self) -> None:
+        """Release the dedicated fact-extraction LLM client's connection pool.
+
+        ``self.llm`` is owned by the UI (which closes it separately); we only
+        own ``_extract_llm`` (a lazily-built independent LLMClient created to
+        avoid racing the agent's shared httpx.Client from the extraction thread).
+        """
+        ext = getattr(self, "_extract_llm", None)
+        if ext is not None and ext is not self.llm:
+            try:
+                ext.close()
+            except Exception:
+                pass
+            self._extract_llm = None
 
     def history(self) -> List[Dict[str, Any]]:
         return list(self._history)
@@ -483,12 +498,12 @@ class Agent:
         from a conversation fragment and persist them to the knowledge
         graph.  Runs on a daemon thread — any failure is logged and swallowed.
 
-        Serialized under ``_fact_extract_lock``: extraction reuses ``self.llm``
-        whose ``httpx.Client`` is NOT thread-safe.  Without the lock, a fact
-        extraction running concurrently with the next turn's chat would race
-        the shared connection pool and corrupt/fail the request (which is the
-        root cause of extraction silently producing nothing).  The lock is
-        non-blocking for the user — the agent thread never acquires it.
+        Concurrency: extraction uses a *dedicated* LLM client (its own
+        ``httpx.Client``), never the agent's ``self.llm``.  The agent's
+        ``httpx.Client`` is NOT thread-safe — if the daemon thread reused it
+        while the main agent thread streamed the next turn, the shared
+        connection pool would race and fail the request.  A ``_fact_extract_lock``
+        further prevents multiple extractions from piling up.
         """
         lock = getattr(self, "_fact_extract_lock", None)
         if lock is None:
@@ -500,7 +515,8 @@ class Agent:
             return
         try:
             from .graph_memory import extract_facts_via_llm
-            data = extract_facts_via_llm(self.llm, conversation)
+            extract_llm = self._get_extract_llm()
+            data = extract_facts_via_llm(extract_llm, conversation)
 
             entities = data.get("entities", [])
             relations = data.get("relations", [])
@@ -542,6 +558,42 @@ class Agent:
             self._log(f"[memory] 事实抽取失败: {e}")
         finally:
             lock.release()
+
+    def _get_extract_llm(self):
+        """Return a dedicated LLM client for fact extraction.
+
+        Fact extraction runs on a daemon thread concurrently with the agent's
+        next turn.  ``LLMClient`` wraps a single ``httpx.Client`` that is NOT
+        thread-safe, so extraction must not reuse ``self.llm``.  We lazily
+        build one independent ``LLMClient`` (its own connection pool) and
+        cache it on the instance.
+
+        For non-``LLMClient`` llm objects (test mocks, scripted LLMs) we return
+        ``self.llm`` unchanged — those have no shared socket state.
+        """
+        cached = getattr(self, "_extract_llm", None)
+        if cached is not None:
+            return cached
+        try:
+            from .llm_client import LLMClient
+            if isinstance(self.llm, LLMClient):
+                self._extract_llm = LLMClient(
+                    base_url=self.llm.base_url,
+                    api_key=self.llm.api_key,
+                    model=self.llm.model,
+                    timeout=self.llm.timeout,
+                    max_tokens=self.llm.max_tokens,
+                    top_p=self.llm.top_p,
+                    min_p=self.llm.min_p,
+                    top_k=self.llm.top_k,
+                    repetition_penalty=self.llm.repetition_penalty,
+                )
+                return self._extract_llm
+        except Exception:  # pragma: no cover — best-effort
+            pass
+        # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
+        # socket state to race).
+        return self.llm
 
     def _append_daily_facts(self, facts: List[str]) -> None:
         """Append auto-extracted facts to work memory under today's bucket.
@@ -971,20 +1023,21 @@ class Agent:
                 chunks = status.get("chunks_stored", 0)
                 sources = status.get("sources", [])
                 if chunks > 0:
+                    # 仅注入文档名（不含路径），最多 8 个，超出省略。
                     source_list = ", ".join(
-                        os.path.basename(s) for s in sources[:10]
-                    ) + ("..." if len(sources) > 10 else "")
+                        os.path.basename(s) for s in sources[:8]
+                    )
+                    if len(sources) > 8:
+                        source_list += f" (and {len(sources) - 8} more)"
                     base += (
-                        f"\n\n# Knowledge base (ACTIVE)\n"
-                        f"{chunks} chunks from {len(sources)} file(s): {source_list}. "
-                        f"For questions answerable from these documents, MUST call "
-                        f"`rag_search` first before answering."
+                        f"\n\n# Knowledge base\n"
+                        f"{chunks} chunks in {len(sources)} file(s): {source_list}. "
+                        f"Answer from these via `rag_search`."
                     )
                 else:
                     base += (
-                        f"\n\n# Knowledge base (EMPTY)\n"
-                        f"Configured but not indexed. Use `rag_ingest` to index, "
-                        f"then `rag_search` to query."
+                        f"\n\n# Knowledge base\n"
+                        f"Configured but empty. Use `rag_ingest` to index."
                     )
         except Exception:  # pragma: no cover
             pass

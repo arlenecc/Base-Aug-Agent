@@ -9,7 +9,7 @@ import pytest
 
 from agent.agent import Agent
 from agent.config import AgentConfig
-from agent.llm_client import StreamEvent
+from agent.llm_client import LLMClient, StreamEvent
 
 
 def _evt(t, content="", tool_calls=None, usage=None):
@@ -1163,4 +1163,44 @@ def test_append_daily_facts_resets_on_new_day(config, recording_callbacks):
     date, facts = agent._parse_daily_facts(wm.get("__auto_facts__") or "")
     assert date == datetime.date.today().isoformat()
     assert facts == ["新事实"], f"跨天应只保留当天事实，got {facts}"
+
+
+# ---------------------------------------------------------------------------
+# 独立抽取 LLM 客户端（避免与对话线程争用 httpx.Client）
+# ---------------------------------------------------------------------------
+
+def test_get_extract_llm_returns_dedicated_client(config, recording_callbacks):
+    """self.llm 是 LLMClient 时，抽取应使用独立实例（不同连接池）。"""
+    llm = LLMClient(base_url="http://localhost:1/v1", api_key="", model="m")
+    agent = Agent(llm=llm, config=config, callbacks=recording_callbacks)
+    try:
+        ext = agent._get_extract_llm()
+        assert ext is not llm            # 独立实例
+        assert isinstance(ext, LLMClient)
+        assert ext is agent._get_extract_llm()  # 缓存复用
+    finally:
+        agent.close()
+        llm.close()
+
+
+def test_get_extract_llm_falls_back_to_mock(config, recording_callbacks):
+    """self.llm 是 mock（非 LLMClient）时，直接复用 self.llm（无共享 socket）。"""
+    mock = MockLLM([[_evt("content", "x"), _evt("done")]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    assert agent._get_extract_llm() is mock
+    # close() 不应关闭 mock（不拥有它）。
+    agent.close()
+
+
+def test_agent_close_releases_extract_client(config, recording_callbacks):
+    """close() 释放独立抽取客户端，且不关闭 self.llm。"""
+    llm = LLMClient(base_url="http://localhost:1/v1", api_key="", model="m")
+    agent = Agent(llm=llm, config=config, callbacks=recording_callbacks)
+    ext = agent._get_extract_llm()
+    assert ext is not llm
+    agent.close()
+    # 独立客户端已释放，再次获取会重新创建（或用 self.llm）。
+    assert getattr(agent, "_extract_llm", None) is None
+    # self.llm 未被关闭（仍可复用）。
+    llm.close()
 

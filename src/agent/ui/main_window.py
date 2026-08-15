@@ -856,6 +856,10 @@ class MainWindow(QMainWindow):
         old_agent = getattr(self, "_agent", None)
         if old_agent is not None:
             try:
+                old_agent.close()
+            except Exception:
+                pass
+            try:
                 old_agent.tools.shutdown()
             except Exception:
                 pass
