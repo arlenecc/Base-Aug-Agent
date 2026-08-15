@@ -15,19 +15,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# RAG 依赖（FlagEmbedding/torch/transformers/docling/chonkie 等）安装在
+# Python 3.12 环境（macOS Intel 上 torch 仅 3.12 有 wheel）。默认的 `python3`
+# 可能指向 3.13/3.14，缺少这些依赖。这里优先使用 3.12 的解释器，保证打包
+# 出的 .app 包含完整的 RAG 能力（BGE Reranker 等）。
+PY312="/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"
+if [[ -x "$PY312" ]]; then
+    PYTHON_BIN="$PY312"
+    PIP_BIN="${PY312%/python3}/pip3"
+else
+    PYTHON_BIN="$(command -v python3)"
+    PIP_BIN="$(command -v pip3)"
+fi
+echo "🔧 使用 Python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+
 if [[ "${1:-}" == "clean" ]]; then
     echo "🧹 Cleaning previous build artifacts..."
     rm -rf build/ dist/
 fi
 
 # Ensure PyInstaller is installed
-if ! python3 -c "import PyInstaller" 2>/dev/null; then
+if ! "$PYTHON_BIN" -c "import PyInstaller" 2>/dev/null; then
     echo "📦 Installing PyInstaller..."
-    pip3 install pyinstaller
+    "$PIP_BIN" install pyinstaller
 fi
 
 echo "🔨 Building BaseAgent.app..."
-PYTHONPATH=src python3 -m PyInstaller base-agent.spec --noconfirm
+PYTHONPATH=src "$PYTHON_BIN" -m PyInstaller base-agent.spec --noconfirm
 
 echo ""
 echo "✅ Build complete!"
