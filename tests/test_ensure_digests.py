@@ -77,3 +77,53 @@ def test_ensure_digests_skips_empty_markdown(engine):
 def test_ensure_digests_no_cache_dir(engine):
     """无 markdown 缓存目录时返回 0。"""
     assert engine.ensure_digests_for_cached_documents() == 0
+
+
+def test_ensure_digests_refresh_stale_digest(engine):
+    """refresh_stale=True 时，旧格式（含「章节摘要」段）的 digest 应被重刷。"""
+    # 写入缓存 markdown，并先手动生成一个旧格式（含章节摘要段）的 digest。
+    doc_name = "旧格式.pdf"
+    _write_cached_markdown(engine, doc_name, "# 第一章\n\n内容。")
+    engine.build_and_store_digest(doc_name, "# 第一章\n\n内容。")
+    # 人为把 digest 改成旧格式（含废弃的「章节摘要」段）。
+    store = engine._get_store()
+    doc = store.get_document_digest(doc_name)
+    assert doc is not None
+    store.upsert_document(
+        doc_name=doc_name,
+        digest="# 目录\n\n\n\n# 章节摘要\n",
+        markdown=doc["markdown"],
+        chapters=doc["chapters"],
+    )
+
+    # 默认 refresh_stale=False：不重刷，返回 0。
+    assert engine.ensure_digests_for_cached_documents() == 0
+
+    # refresh_stale=True：重刷为纯目录结构。
+    assert engine.ensure_digests_for_cached_documents(refresh_stale=True) == 1
+    refreshed = engine.get_document_outline(doc_name)
+    assert "# 章节摘要" not in refreshed["digest"]
+    assert "# 目录" in refreshed["digest"]
+    assert "第一章" in refreshed["digest"]
+
+
+def test_ensure_digests_refresh_empty_toc(engine):
+    """refresh_stale=True 时，目录为空的旧 digest 也应被重刷（或用文档名兜底）。"""
+    doc_name = "无标题.pdf"
+    # 纯文本、无 Markdown 标题的 markdown。
+    _write_cached_markdown(engine, doc_name, "这是没有标题的纯文本内容。")
+    engine.build_and_store_digest(doc_name, "这是没有标题的纯文本内容。")
+    # 人为写入一个目录为空的旧 digest。
+    store = engine._get_store()
+    doc = store.get_document_digest(doc_name)
+    store.upsert_document(
+        doc_name=doc_name,
+        digest="# 目录\n",
+        markdown=doc["markdown"],
+        chapters=doc["chapters"],
+    )
+
+    assert engine.ensure_digests_for_cached_documents(refresh_stale=True) == 1
+    refreshed = engine.get_document_outline(doc_name)
+    # 无标题文档：digest 兜底为文档名，不再只有空目录。
+    assert doc_name in refreshed["digest"]

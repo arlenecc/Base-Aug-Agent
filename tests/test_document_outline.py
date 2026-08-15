@@ -5,8 +5,8 @@ from agent.rag.document_outline import (
     build_digest,
     build_toc,
     extract_chapters,
+    extract_chapters_plain,
     find_chapters_by_title,
-    summarize_chapters,
 )
 
 
@@ -58,32 +58,15 @@ def test_build_toc():
     assert "1.1 背景" in toc
 
 
-def test_summarize_fallback_truncates():
-    chapters = extract_chapters(MARKDOWN)
-    summarize_chapters(chapters, summarizer=None, max_summary_chars=50)
-    for c in chapters:
-        if c.text:
-            assert c.summary  # 非空
-            assert len(c.summary) <= 51  # 50 + 省略号
-
-
-def test_summarize_with_llm():
-    chapters = extract_chapters(MARKDOWN)
-
-    def fake_summarizer(title, text):
-        return f"摘要:{title}"
-
-    summarize_chapters(chapters, summarizer=fake_summarizer, max_summary_chars=50)
-    for c in chapters:
-        if c.text:
-            assert c.summary.startswith("摘要:")
-
-
-def test_build_digest_structure():
-    digest, chapters = build_digest(MARKDOWN, summarizer=None, max_summary_chars=50)
+def test_build_digest_is_toc_only():
+    """digest 只含目录结构（标题层级），不再生成逐章摘要。"""
+    digest, chapters = build_digest(MARKDOWN)
     assert "# 目录" in digest
-    assert "# 章节摘要" in digest
     assert "第一章 引言" in digest
+    assert "1.1 背景" in digest
+    # 不再包含「章节摘要」段
+    assert "# 章节摘要" not in digest
+    assert "（无内容）" not in digest
 
 
 def test_find_chapters_by_title():
@@ -96,5 +79,88 @@ def test_find_chapters_by_title():
 
 def test_empty_markdown():
     assert extract_chapters("") == []
-    digest, chapters = build_digest("", summarizer=None)
+    digest, chapters = build_digest("")
     assert chapters == []
+
+
+# ---------------------------------------------------------------------------
+# 纯文本（无 Markdown 标题）目录提取
+# ---------------------------------------------------------------------------
+
+PLAIN_TOC_PDF = """人生的活法
+（日）本多静六著
+
+目 录
+本多静六语录
+作者简介
+自序
+1卷 我的财产告白
+我的财产告白
+征讨贫困和本多式储蓄法
+2卷 我的人生活法
+我的健康长寿法
+如何健康长寿
+3卷 我的人生计划
+如何制定人生计划
+人生为什么需要计划？
+
+他，设计了明治神宫的森林和日比谷公园，被
+称为“日本的公园之父”。
+"""
+
+
+def test_plain_toc_block_extraction():
+    """纯文本「目录」块应提取出标题列表。"""
+    chapters = extract_chapters_plain(PLAIN_TOC_PDF)
+    titles = {c.title for c in chapters}
+    assert "1卷 我的财产告白" in titles
+    assert "2卷 我的人生活法" in titles
+    assert "3卷 我的人生计划" in titles
+    assert "自序" in titles
+    # 目录块应在正文（以句号结尾的句子）处终止，不混入正文。
+    assert not any("明治神宫" in t for t in titles)
+
+
+def test_plain_cn_chapter_headings():
+    """无「目录」标记、但正文含「第X章」标题的纯文本，应被识别。"""
+    text = """内容提要
+这是一段前言介绍。
+
+第一章 人际关系的构成
+假若黄金周这样度过，是不是很美妙。
+
+第二章 研究方法
+本章介绍研究亲密关系的方法。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "第一章 人际关系的构成" in titles
+    assert "第二章 研究方法" in titles
+
+
+def test_plain_epub_link_toc():
+    """EPUB 的 [TITLE](#anchor) 目录格式应被清理为纯标题。"""
+    text = """TABLE OF CONTENTS
+
+[INTRODUCTION TO GENERATIVE AI](#aid_45)
+
+[HOW GENERATIVE AI WORKS](#aid_33)
+
+INTRODUCTION TO GENERATIVE AI
+
+Generative AI is a revolutionary technique.
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "INTRODUCTION TO GENERATIVE AI" in titles
+    assert "HOW GENERATIVE AI WORKS" in titles
+    # 不应残留 (#anchor) 后缀。
+    assert not any("(#" in t for t in titles)
+
+
+def test_build_digest_falls_back_to_plain():
+    """build_digest 在无 Markdown 标题时应回退到纯文本提取。"""
+    digest, chapters = build_digest(PLAIN_TOC_PDF)
+    assert "1卷 我的财产告白" in digest
+    assert "# 目录" in digest
+    assert len(chapters) > 0

@@ -80,15 +80,15 @@ class RagSearchTool(Tool):
 
 
 class RagOutlineTool(Tool):
-    """Return a document's condensed outline (目录 + 章节摘要) for Meta-context RAG.
+    """Return a document's condensed outline (目录结构) for Meta-context RAG.
 
-    当用户提到具体书名/文档名时，先调用本工具获取该文档的完整目录结构与各章节
-    摘要（缩略版本），让模型先掌握全文结构，再规划需要深入检索哪些章节的细节。
+    当用户提到具体书名/文档名时，先调用本工具获取该文档的完整目录结构
+    （标题层级），让模型先掌握全文结构，再规划需要深入检索哪些章节的细节。
     """
 
     name = "rag_outline"
     description = (
-        "获取知识库中某本文档/书籍的缩略版本（完整目录结构 + 各章节摘要）。"
+        "获取知识库中某本文档/书籍的缩略版本（完整目录结构与章节标题）。"
         "当用户明确提到具体书名、文档名，或需要从某本具体的书/文档中系统性地"
         "回答问题时，先调用本工具了解全文档结构，再决定用 rag_search 检索哪些"
         "章节的细节。参数 book_name 为书名或文档名的关键词。"

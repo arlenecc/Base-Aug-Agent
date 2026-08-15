@@ -14,9 +14,27 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, normalize_markdown
 from .chunker import chunk_documents
+from .document_outline import build_digest
 from .vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def _is_stale_digest(old_digest: str, new_digest: str) -> bool:
+    """判断 documents 表中已存的 digest 是否为旧格式、需要重刷。
+
+    旧格式特征（任一即判定为 stale）：
+      * 含「# 章节摘要」段 —— 历史版本会生成逐章摘要，已废弃；
+      * 含「# 目录」但后面只有空白（目录为空）—— 说明标题提取失败。
+    """
+    if "# 章节摘要" in old_digest:
+        return True
+    # 目录为空的旧记录：`# 目录\n` 后紧跟空白，无任何标题行。
+    if "# 目录" in old_digest:
+        body = old_digest.split("# 目录", 1)[1].strip()
+        if not body:
+            return True
+    return False
 
 # Default number of worker threads for parallel ingestion. Tuned for typical
 # local-disk + CPU-bound parsing workloads (PDF OCR, docx parsing, etc.).
@@ -460,14 +478,12 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
-                            # ---- 构建文档缩略版本（目录 + 章节摘要）----
-                            # 使用本地提取式 fallback（无需 LLM），保证文档入库后
-                            # 立即拥有缩略版本；LLM 摘要由异步任务在空闲时补做。
+                            # ---- 构建文档缩略版本（目录结构 + 标题）----
+                            # 只存目录结构（标题层级），不做逐章摘要。
                             try:
                                 self.build_and_store_digest(
                                     os.path.basename(filepath),
                                     cleaned,
-                                    summarizer=None,
                                 )
                                 _log("    ├─ 文档缩略版本已生成: %s", fname)
                             except Exception as e:
@@ -691,6 +707,17 @@ class RAGEngine:
         except OSError as e:
             logger.warning("  同步记录保存失败: %s", e)
 
+        # Step 7: 补做/重刷文档目录结构（缩略版本）。
+        # 这一步不依赖「文件是否修改」——即使所有文件都被增量跳过（未修改），
+        # 也要扫描 markdown 缓存，为缺记录或旧格式（含废弃的「章节摘要」段、
+        # 空目录）的文档重刷为纯目录结构，确保 rag_outline 始终返回正确结果。
+        try:
+            refreshed = self.ensure_digests_for_cached_documents(refresh_stale=True)
+            if refreshed:
+                _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
+        except Exception as e:
+            logger.warning("  目录结构补做/重刷失败: %s", e)
+
         if cancelled:
             t_total = time.monotonic() - t_start
             _log("══════════════════════════════════════════")
@@ -848,26 +875,21 @@ class RAGEngine:
         self,
         doc_name: str,
         markdown: str,
-        summarizer: Optional[Callable[[str, str], str]] = None,
-        max_summary_chars: int = 50,
     ) -> str:
         """Build a document's digest (缩略版本) and store it in the metadata table.
 
-        ``summarizer(title, text) -> str`` is an optional LLM-backed callable.
-        When omitted (e.g. during ingestion), a local extractive fallback is
-        used so the digest is always available immediately; an async job can
-        later regenerate a higher-quality digest with the LLM.
+        The digest is the document's 目录结构（标题层级），不含逐章摘要——避免
+        对每章调用 LLM 带来的慢速与空结果问题。标题层级已足以作为 Targeted RAG
+        的全局结构元信息。
         """
-        from .document_outline import build_digest
-
-        digest, chapters = build_digest(
-            markdown,
-            summarizer=summarizer,
-            max_summary_chars=max_summary_chars,
-        )
-        # Serialize chapters (title + level + summary) for targeted retrieval.
+        digest, chapters = build_digest(markdown)
+        # 兜底：纯文本解析结果（如 PDF OCR）通常没有 Markdown 标题，提取不到
+        # 任何章节。此时用文档名作为最小缩略版本，避免 rag_outline 返回空目录。
+        if not chapters:
+            digest = f"# 目录\n\n{os.path.basename(doc_name)}"
+        # Serialize chapters (title + level) for targeted retrieval.
         chapters_json = json.dumps(
-            [{"level": c.level, "title": c.title, "summary": c.summary}
+            [{"level": c.level, "title": c.title}
              for c in chapters],
             ensure_ascii=False,
         )
@@ -890,21 +912,25 @@ class RAGEngine:
         store = self._get_store()
         return store.list_documents()
 
-    def ensure_digests_for_cached_documents(self) -> int:
-        """为所有已缓存 Markdown 但缺缩略版本的文档补做 digest。
+    def ensure_digests_for_cached_documents(self, refresh_stale: bool = False) -> int:
+        """为已缓存 Markdown 的文档补做/重刷 digest（目录结构）。
 
-        关键场景：文档在 Meta-context 功能上线前已同步（有 markdown 缓存 + 向量，
-        但从未经过 build_and_store_digest），documents 表里没有它们的记录。此方法
-        扫描 markdown 缓存目录，对每个缺 digest 的缓存文件读内容、构建 fallback
-        摘要并写入 documents 表。
+        扫描 ``markdown_dir`` 缓存目录，对每个 .md 缓存文件：
+          * documents 表中缺记录的 → 补做 digest（关键场景：功能上线前已同步
+            的文档，有 markdown 缓存 + 向量，但无 metadata 记录）；
+          * ``refresh_stale=True`` 时，对已存在但 digest 为旧格式（含「章节摘要」
+            段）或目录为空的记录 → 用当前目录结构重刷。
 
-        Returns 本次补做的文档数量。
+        旧格式判定：历史版本曾生成「# 章节摘要」段（逐章 LLM/提取式摘要），
+        该功能已废弃，残留数据需重刷为纯目录结构。
+
+        Returns 本次补做/重刷的文档数量。
         """
         if not os.path.isdir(self._markdown_dir):
             return 0
 
         store = self._get_store()
-        existing = set(store.list_documents())
+        # 缓存目录下所有 .md 文件对应的 doc_name，以及当前 documents 表已有记录。
         created = 0
         for fn in sorted(os.listdir(self._markdown_dir)):
             if not fn.endswith(".md"):
@@ -918,19 +944,25 @@ class RAGEngine:
                 if all(c in "0123456789abcdef" for c in suffix):
                     doc_name = stem[:-13]
 
-            if doc_name in existing:
-                continue
-
             md_path = os.path.join(self._markdown_dir, fn)
             try:
                 with open(md_path, "r", encoding="utf-8") as f:
                     markdown = f.read()
                 if not markdown.strip():
                     continue
-                self.build_and_store_digest(doc_name, markdown, summarizer=None)
-                existing.add(doc_name)
+                digest, _ = build_digest(markdown)
+                # 判断是否需要写入：缺记录 或 旧格式需重刷。
+                existing = store.get_document_digest(doc_name)
+                need_write = existing is None
+                if existing is not None and refresh_stale:
+                    old_digest = existing.get("digest", "")
+                    if _is_stale_digest(old_digest, digest):
+                        need_write = True
+                if not need_write:
+                    continue
+                self.build_and_store_digest(doc_name, markdown)
                 created += 1
-                logger.info("  ├─ 补做缩略版本: %s (%d 字符)", doc_name, len(markdown))
+                logger.info("  ├─ 补做/重刷缩略版本: %s (%d 字符)", doc_name, len(markdown))
             except Exception as e:
                 logger.warning("  ⚠ 补做缩略版本失败 %s: %s", fn, e)
         return created

@@ -435,145 +435,6 @@ class SyncKnowledgeWorker(QThread):
         self.sync_progress.emit(done, total, current)
 
 
-class OutlineSummarizeWorker(QThread):
-    """独立的后台 worker：为知识库文档生成 LLM 章节摘要（缩略版本补强）。
-
-    与 Agent / 对话完全隔离：拥有自己的 LLMClient 和 RAGEngine，在「同步知识」
-    时并行启动。断点续传——每次触发都扫描尚未完成 LLM 摘要的文档继续补做，
-    直到全部完成。不影响现有任何功能。
-    """
-    # 进度信号：(已完成数, 总数, 当前文档名)
-    outline_progress = pyqtSignal(int, int, str)
-    outline_finished = pyqtSignal()   # 全部完成或无可做任务
-    outline_failed = pyqtSignal(str)  # 致命错误
-    log = pyqtSignal(str)             # 关键日志（传到 UI 面板便于诊断）
-
-    def __init__(self, workspace: str, knowledge_base: str,
-                 embedding_model: str, llm_config: dict):
-        super().__init__()
-        self._workspace = workspace
-        self._knowledge_base = knowledge_base
-        self._embedding_model = embedding_model
-        self._llm_config = llm_config  # {base_url, api_key, model, timeout, max_tokens}
-        self._cancelled = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancelled.set()
-
-    def run(self) -> None:  # type: ignore[override]
-        try:
-            self._run_impl()
-        except Exception as e:
-            logger.error("OutlineSummarizeWorker fatal: %s", e, exc_info=True)
-            self.outline_failed.emit(f"{type(e).__name__}: {e}")
-
-    def _run_impl(self) -> None:
-        # 1. 独立的 LLM 客户端（不复用 self._llm，避免与对话争用连接）。
-        cfg = self._llm_config
-        # 只要求 base_url 非空即可。api_key 允许为空：本地 Ollama/vLLM 等
-        # 服务通常无需鉴权（LLMClient 在 api_key 为空时不会发送 Authorization
-        # 头），而对话功能本身也不校验 api_key。若强行要求 api_key，本地模型
-        # 服务会永远被误判为「未配置」而跳过章节摘要。
-        if not cfg.get("base_url"):
-            self.log.emit("LLM 未配置（缺少 base_url），跳过章节摘要")
-            logger.info("OutlineSummarizeWorker: LLM 未配置（缺少 base_url），跳过章节摘要")
-            self.outline_finished.emit()
-            return
-        llm = LLMClient(
-            base_url=cfg["base_url"],
-            api_key=cfg["api_key"],
-            model=cfg.get("model", ""),
-            timeout=cfg.get("timeout", 120.0),
-            max_tokens=cfg.get("max_tokens", 32768),
-        )
-
-        # 2. 独立的 RAGEngine（复用 workspace/kb，加载独立的 store 句柄）。
-        engine = RAGEngine(
-            workspace=self._workspace,
-            knowledge_base=self._knowledge_base,
-            embedding_model=self._embedding_model,
-        )
-        worker = None
-        try:
-            # 3. 先为已缓存但缺缩略版本的文档补做 digest（关键：功能上线前
-            #    已同步的文档在 documents 表中无记录，必须从这里补齐）。
-            self.log.emit(f"扫描缓存文档补做缩略版本 (markdown_dir={engine.markdown_dir})")
-            try:
-                created = engine.ensure_digests_for_cached_documents()
-                self.log.emit(f"补做缩略版本 {created} 篇")
-            except Exception as e:
-                self.log.emit(f"补做缩略版本失败: {e}")
-                logger.warning("OutlineSummarizeWorker: ensure_digests failed: %s", e)
-
-            # 4. 扫描待摘要文档。
-            store = engine._get_store()
-            doc_names = store.list_documents()
-            self.log.emit(f"待摘要文档数: {len(doc_names)}")
-            if not doc_names:
-                logger.info("OutlineSummarizeWorker: 无可摘要文档")
-                self.outline_finished.emit()
-                return
-
-            # 4. 构建 OutlineWorker 并续做未完成章节摘要。
-            from ..rag.outline_worker import OutlineWorker
-
-            worker = OutlineWorker(
-                rag_dir=engine.rag_dir,
-                llm=llm,
-                get_document=store.get_document_digest,
-                upsert_document=store.upsert_document,
-                on_progress=lambda msg: self.log.emit(msg),
-            )
-            # 启动后台线程
-            worker.start()
-            # 提交所有文档（内部会跳过已完成的）
-            enqueued = worker.enqueue_pending(doc_names)
-            logger.info("OutlineSummarizeWorker: %d 篇文档待摘要（共 %d 篇）",
-                        enqueued, len(doc_names))
-            if enqueued == 0:
-                self.outline_finished.emit()
-                return
-
-            # 5. 轮询进度，直到完成或取消。
-            total = len(doc_names)
-            done_prev = 0
-            while not self._cancelled.is_set():
-                # 已完成数 = 已标记摘要的文档数
-                done = sum(1 for d in doc_names if worker._state.get(d))
-                if done != done_prev:
-                    self.outline_progress.emit(done, total, "")
-                    done_prev = done
-                # 队列已空且线程退出 -> 全部完成
-                if worker.wait_until_done(timeout=0.5):
-                    break
-            # 收尾：上报最终进度
-            final_done = sum(1 for d in doc_names if worker._state.get(d))
-            if final_done != done_prev:
-                self.outline_progress.emit(final_done, total, "")
-            if self._cancelled.is_set():
-                logger.info("OutlineSummarizeWorker: 用户取消章节摘要")
-            else:
-                logger.info("OutlineSummarizeWorker: 章节摘要全部完成")
-            self.outline_finished.emit()
-        finally:
-            # 先停止并等待 worker 线程真正退出，再关闭 engine/llm，
-            # 避免 daemon 线程还在使用已关闭的连接/存储（时序竞态）。
-            if worker is not None:
-                try:
-                    worker.stop()
-                    worker.wait_until_done(timeout=5.0)
-                except Exception as e:
-                    logger.warning("OutlineSummarizeWorker: worker stop failed: %s", e)
-            try:
-                engine.close()
-            except Exception as e:
-                logger.warning("OutlineSummarizeWorker: engine close failed: %s", e)
-            try:
-                llm.close()
-            except Exception:
-                pass
-
-
 class InstallDepsWorker(QThread):
     """Background worker for checking and installing missing RAG dependencies."""
     progress = pyqtSignal(str)
@@ -646,7 +507,6 @@ class MainWindow(QMainWindow):
         self._worker: Optional[AgentWorker] = None
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
-        self._outline_worker: Optional[OutlineSummarizeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
@@ -1142,58 +1002,8 @@ class MainWindow(QMainWindow):
         self._sync_worker.finished.connect(self._on_sync_thread_finished)
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
-        # 并行启动章节摘要 worker（独立于同步任务与对话，断点续传）。
-        self._start_outline_summarize(ws, kb)
         # 启动日志轮询定时器：每 100ms 消费 _log_buffer，实时显示同步日志
         self._log_poll_timer.start()
-
-    def _start_outline_summarize(self, ws: str, kb: str) -> None:
-        """并行启动独立的章节摘要 worker（LLM 补强缩略版本）。
-
-        与知识同步、Agent 对话完全隔离：拥有自己的 LLMClient + RAGEngine，
-        断点续传未完成的章节摘要。若已有 worker 在运行则跳过（避免重复）。
-        """
-        if self._outline_worker is not None and self._outline_worker.isRunning():
-            logger.info("Outline summarize already running, skip duplicate start")
-            return
-        try:
-            llm_config = {
-                "base_url": self.config.base_url,
-                "api_key": self.config.api_key,
-                "model": self.config.model,
-                "timeout": self.config.request_timeout,
-                "max_tokens": self.config.max_tokens,
-            }
-            self._append_log(f"[outline] 启动章节摘要 worker (ws={ws}, kb={kb}, model={llm_config['model']})")
-            self._outline_worker = OutlineSummarizeWorker(
-                ws, kb,
-                embedding_model=self.config.rag_embedding_model,
-                llm_config=llm_config,
-            )
-            self._outline_worker.outline_progress.connect(self._on_outline_progress)
-            self._outline_worker.outline_finished.connect(self._on_outline_finished)
-            self._outline_worker.outline_failed.connect(self._on_outline_failed)
-            self._outline_worker.log.connect(self._on_outline_log)
-            self._outline_worker.finished.connect(self._outline_worker.deleteLater)
-            self._outline_worker.start()
-            logger.info("UI: outline summarize worker started (parallel to sync)")
-        except Exception as e:
-            logger.warning("UI: start outline summarize failed: %s", e)
-            self._append_log(f"[outline] 启动失败: {e}")
-
-    def _on_outline_log(self, msg: str) -> None:
-        self._append_log(f"[outline] {msg}")
-
-    def _on_outline_progress(self, done: int, total: int, current: str) -> None:
-        self._append_log(f"[outline] 章节摘要进度: {done}/{total}")
-
-    def _on_outline_finished(self) -> None:
-        self._append_log("[outline] 章节摘要任务结束")
-        self._outline_worker = None
-
-    def _on_outline_failed(self, error: str) -> None:
-        self._append_log(f"[outline] 章节摘要失败: {error}")
-        self._outline_worker = None
 
     def _on_sync_finished(self, stats: dict) -> None:
         logger.info("UI: _on_sync_finished called")
@@ -1813,20 +1623,6 @@ class MainWindow(QMainWindow):
                     self._sync_worker.terminate()
                     self._sync_worker.wait(2000)
             self._sync_worker = None
-        # --- OutlineSummarizeWorker: cooperative cancel (finishes current chapter).
-        if self._outline_worker is not None:
-            try:
-                self._outline_worker.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            if self._outline_worker.isRunning():
-                self._outline_worker.cancel()
-                self._outline_worker.wait(3000)
-                if self._outline_worker.isRunning():
-                    logger.warning("UI: outline worker did not finish in 3s, terminating")
-                    self._outline_worker.terminate()
-                    self._outline_worker.wait(2000)
-            self._outline_worker = None
         # --- InstallDepsWorker: no cancel mechanism, just wait.
         if self._deps_worker is not None:
             try:

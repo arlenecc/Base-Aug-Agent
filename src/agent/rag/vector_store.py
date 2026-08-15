@@ -22,7 +22,7 @@ DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
 _TABLE_NAME = "knowledge_base"
 
-# 文档元数据表：存储每个文档的缩略版本（目录 + 章节摘要）与完整 Markdown，
+# 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
 # 用于 Meta-context + Targeted RAG（先返回全文档结构概览，再按需检索细节）。
 _DOCUMENTS_TABLE_NAME = "documents"
 
