@@ -526,8 +526,14 @@ Return ONLY a JSON object with this schema:
 }
 
 Rules:
-- Extract only concrete, reusable facts — not chitchat or transient state.
-- Each observation is a short self-contained sentence.
+- Extract ONLY concrete, durable facts about the USER, their projects, preferences,
+  decisions, technical stack, and important domain knowledge — NOT chitchat,
+  transient state, or meta-information about the assistant's own tools/capabilities.
+- Do NOT create entities for tools (e.g. "rag_search", "skills", "memory_graph")
+  or for the assistant itself.  Ignore any text that merely describes what a tool
+  does or what the system can do.
+- Each observation is a short self-contained sentence that would still be true
+  and useful weeks later (e.g. "user's project is a RAG system built with LanceDB").
 - Entity names should be canonical (e.g. "PostgreSQL" not "postgres db").
 - Relations are directional: source --[label]--> target.
 - If nothing worth persisting, return {"entities": [], "relations": []}.

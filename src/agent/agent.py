@@ -432,21 +432,29 @@ class Agent:
         on_finished() — the user should get their reply immediately.  The
         thread is a daemon so it won't block process exit if the user
         closes the app right after a reply.
+
+        We capture the *recent conversation window* on the main thread before
+        spawning the worker (the worker must not read self._history — by the
+        time it runs, the main thread may have already started the next turn
+        and mutated/shrunk the list).  A multi-turn window (instead of just
+        the last exchange) lets the extractor resolve pronouns and project
+        references ("这个项目用 X 吗") that a single isolated turn cannot.
         """
-        # Collect the conversation text on the MAIN (agent) thread before
-        # spawning the worker.  The worker must not read self._history —
-        # by the time it runs, the main thread may have already started
-        # the next turn and mutated/shrunk the list.
-        user_text = ""
+        # Collect the last few user/assistant exchanges for context.
+        recent: List[str] = []
         for msg in reversed(self._history):
-            if msg.get("role") == "user" and msg.get("content"):
-                user_text = msg["content"]
-                break
-        if not user_text or len(user_text.strip()) < 20:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                recent.append(f"{'User' if role == 'user' else 'Assistant'}: {content}")
+                if len(recent) >= 6:
+                    break
+        recent.reverse()
+        if not recent:
             return
-        if not assistant_reply or len(assistant_reply.strip()) < 20:
-            return
-        conversation = f"User: {user_text}\n\nAssistant: {assistant_reply}"
+        # The final reply is already in _history as the last assistant msg;
+        # if not (edge case), append it explicitly.
+        conversation = "\n\n".join(recent)
 
         import threading
         thread = threading.Thread(
@@ -461,7 +469,22 @@ class Agent:
         """Best-effort: use the LLM to extract entities/relations/observations
         from a conversation fragment and persist them to the knowledge
         graph.  Runs on a daemon thread — any failure is logged and swallowed.
+
+        Serialized under ``_fact_extract_lock``: extraction reuses ``self.llm``
+        whose ``httpx.Client`` is NOT thread-safe.  Without the lock, a fact
+        extraction running concurrently with the next turn's chat would race
+        the shared connection pool and corrupt/fail the request (which is the
+        root cause of extraction silently producing nothing).  The lock is
+        non-blocking for the user — the agent thread never acquires it.
         """
+        lock = getattr(self, "_fact_extract_lock", None)
+        if lock is None:
+            import threading as _th
+            lock = _th.Lock()
+            self._fact_extract_lock = lock
+        if not lock.acquire(blocking=False):
+            # A previous extraction is still running; skip to avoid piling up.
+            return
         try:
             from .graph_memory import extract_facts_via_llm
             data = extract_facts_via_llm(self.llm, conversation)
@@ -469,6 +492,7 @@ class Agent:
             entities = data.get("entities", [])
             relations = data.get("relations", [])
             if not entities and not relations:
+                self._log("[memory] 本轮无可持久化事实（抽取为空或 LLM 返回空图）")
                 return
 
             from .tools.memory import _get_long_memory
@@ -493,9 +517,11 @@ class Agent:
                 if src and tgt and lbl:
                     g.create_relation(src, tgt, lbl)
             if added:
-                self._log(f"[memory] extracted {added} observations + {len(relations)} relations into graph")
+                self._log(f"[memory] 抽取 {added} 条 observation + {len(relations)} 条 relation 存入长期记忆")
         except Exception as e:  # pragma: no cover — best-effort
-            self._log(f"[memory] fact extraction skipped: {e}")
+            self._log(f"[memory] 事实抽取失败: {e}")
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
