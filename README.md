@@ -120,7 +120,7 @@ python main.py
 | `skill_search` | 搜索/列出技能目录中的技能 | ❌ |
 | `skill_load` | 按路径加载技能完整指令（prompt.md） | ❌ |
 | `rag_search` | 搜索本地知识库（支持按文档名定向检索） | ❌ |
-| `rag_outline` | 获取文档缩略版本（目录 + 章节摘要） | ❌ |
+| `rag_outline` | 获取文档缩略版本（目录结构 + 章节标题） | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
 | `rag_ingest` | 增量索引知识库 | ❌ |
 
@@ -209,22 +209,21 @@ python main.py
 
 ```
 文档解析 (docling → Markdown)
-  └─ 提取完整目录结构（#~###### 章节树）+ 逐章生成 ≤50 字摘要
-       （保留关键数据与实体）→ 形成「缩略版本」
+  └─ 提取目录结构（章节树 + 标题层级）→ 形成「缩略版本」
   └─ 存入 LanceDB documents 表（文档名 / 缩略版本 / 完整 Markdown）
 
 用户提问「某本书里 XXX 是怎么说的？」
-  ├─ ① rag_outline("书名") → 返回全书目录 + 各章节摘要（掌握全局）
+  ├─ ① rag_outline("书名") → 返回全书目录结构（掌握全局）
   ├─ ② 大模型规划需要哪些章节的细节
   ├─ ③ rag_search(query, source="书名") → 定向检索该书内的原文片段
   ├─ ④ 细节追加到 context，滚动累加
   └─ ⑤ 综合全局结构 + 按需细节 → 最终答案
 ```
 
-- **缩略版本**：`rag_outline` 返回完整目录 + 每章摘要，让大模型对全书有全局视野。
+- **缩略版本**：`rag_outline` 返回完整目录结构（标题层级），让大模型对全书有全局视野。**不生成逐章摘要**——逐章 LLM 摘要慢、费 token、且对本地模型易产生空结果，标题层级已足以支撑定向检索。
+- **纯文本目录提取**：除标准 Markdown 标题（`#`~`######`）外，还支持从纯文本（无标题语法的 PDF/EPUB 解析结果）启发式提取目录：识别「目录/Contents」标记块、中文章节标题（`第X章`/`第X节`/`X卷`）、编号标题（`1.1`）、EPUB 链接（`[TITLE](#anchor)`）、全大写短行。
 - **定向检索**：`rag_search` 支持 `source` 参数（文档名关键词），限定在某本书内检索，避免混入其它文档。
-- **章节摘要生成独立于对话**：同步知识时，`OutlineSummarizeWorker` 在后台并行生成 LLM 章节摘要（独立 QThread + 独立 LLM 客户端 + 独立 RAGEngine），不影响对话与其它功能；断点续传——每次点击「同步知识」继续补做未完成的章节摘要，直至全部完成。
-- **两级摘要**：入库时先用本地提取式 fallback 摘要（文档立即可用 `rag_outline`），后台再用 LLM 生成更准确的摘要覆盖。
+- **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
 - **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
@@ -232,6 +231,8 @@ python main.py
 - **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`（表内含完整 Markdown，反复全量扫描既慢又占内存）；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
+- **Reranker 加载去重**：BGE reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
 
 ### 支持的文档格式
 
@@ -486,7 +487,7 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全）、UI Bridge、内存存储等。当前 270+ 测试用例。
+测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。当前 311 测试用例。
 
 ## 部署
 

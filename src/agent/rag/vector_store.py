@@ -230,7 +230,11 @@ class VectorStore:
         self._db = None
         self._table = None
         self._documents_table = None  # 文档元数据表（缩略版本 + markdown）
-        self._documents_lock = threading.Lock()  # 保护 documents 表懒创建
+        self._documents_lock = threading.Lock()  # 保护 documents 表懒创建 + 写操作
+        # documents 表内容缓存：避免 get_document_digest / list_documents 每次
+        # 都全表 to_pylist()（表内含完整 markdown，反复全量扫描既慢又占内存）。
+        # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
+        self._documents_cache: Optional[List[Dict[str, Any]]] = None
         self._ef = None  # embedding function
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
@@ -828,57 +832,72 @@ class VectorStore:
         Returns the reranker instance, or None if loading fails (network
         timeout, missing dependency, etc.). Callers must handle None by
         falling back to distance-based ranking.
+
+        Uses ``_reranker_state`` to track loading state so concurrent callers
+        don't each spawn their own load thread (which would leak ~500MB of
+        PyTorch weights per extra thread).  On timeout, the background thread
+        is NOT abandoned — when it eventually finishes it stores the result
+        (or error) on ``self`` so a later call can pick it up without reloading.
         """
-        if not hasattr(self, "_reranker"):
+        state = getattr(self, "_reranker_state", "idle")
+        if state == "done":
+            return self._reranker
+        if state == "failed":
+            return None
+        if state == "loading":
+            # Another caller already started the load. Don't spawn a duplicate;
+            # return None so this call falls back to distance ranking, and the
+            # result will be available on a later call.
+            return None
+
+        try:
+            from FlagEmbedding import FlagReranker
+        except ImportError:
+            logger.warning(
+                "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
+            )
+            self._reranker = None
+            self._reranker_state = "failed"
+            return None
+
+        logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
+        import time as _time
+        _time.sleep(0.01)  # 释放 GIL 让 UI 更新
+
+        # Mark loading before spawning so concurrent callers see it.
+        self._reranker_state = "loading"
+
+        def _load():
             try:
-                from FlagEmbedding import FlagReranker
-            except ImportError:
-                logger.warning(
-                    "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
+                self._reranker = FlagReranker(
+                    self._rerank_model,
+                    use_fp16=False,
                 )
-                self._reranker = None
-                return self._reranker
-
-            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
-            import time as _time
-            _time.sleep(0.01)  # 释放 GIL 让 UI 更新
-
-            try:
-                # 模型加载可能在首次下载时卡住（网络问题）。
-                # 用 thread + join(timeout) 做超时保护，避免永久阻塞。
-                import threading
-                result = [None]
-                error = [None]
-
-                def _load():
-                    try:
-                        result[0] = FlagReranker(
-                            self._rerank_model,
-                            use_fp16=False,
-                        )
-                    except Exception as e:
-                        error[0] = e
-
-                t = threading.Thread(target=_load, daemon=True)
-                t.start()
-                t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
-
-                if t.is_alive():
-                    logger.warning(
-                        "  ⚠ BGE Reranker 加载超时 (2 分钟) — 可能正在下载模型但网络较慢。"
-                        " 重排序将回退到向量距离排序。"
-                        " 下次同步时依赖检查会自动预下载 reranker 模型。"
-                    )
-                    self._reranker = None
-                elif error[0] is not None:
-                    logger.warning("  ⚠ BGE Reranker 加载失败: %s", error[0])
-                    self._reranker = None
-                else:
-                    self._reranker = result[0]
-                    logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
+                self._reranker_state = "done"
+                logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
             except Exception as e:
                 logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
                 self._reranker = None
+                self._reranker_state = "failed"
+
+        try:
+            import threading
+            t = threading.Thread(target=_load, daemon=True)
+            t.start()
+            t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
+
+            if t.is_alive():
+                # 加载仍在后台进行（网络慢）。不丢弃结果——后台线程完成时会
+                # 写入 self._reranker/_reranker_state，后续调用直接复用。
+                logger.warning(
+                    "  ⚠ BGE Reranker 加载超时 (2 分钟) — 仍在后台下载中。"
+                    " 本次重排序回退到向量距离排序；加载完成后自动启用。"
+                )
+        except Exception as e:
+            logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
+            self._reranker = None
+            self._reranker_state = "failed"
+
         return self._reranker
 
     def _rerank_fallback(
@@ -1093,6 +1112,7 @@ class VectorStore:
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
             self._db.drop_table(_DOCUMENTS_TABLE_NAME)
             self._documents_table = None
+            self._documents_cache = None
             logger.info("VectorStore: cleared documents metadata table")
 
     def count(self) -> int:
@@ -1125,6 +1145,7 @@ class VectorStore:
         # back to simply dropping the Python reference.
         self._table = None
         self._db = None
+        self._documents_cache = None
         if self._ef is not None:
             # Only release the ONNX session if this VectorStore owns a
             # private (non-shared) embedding function.  When using the
@@ -1157,6 +1178,7 @@ class VectorStore:
             except Exception:
                 pass
             self._reranker = None
+        self._reranker_state = "idle"
         self._initialized = False
         self._table_checked = False
         logger.info("VectorStore: resources released")
@@ -1242,25 +1264,55 @@ class VectorStore:
 
         ``doc_id`` is a stable md5 of ``doc_name`` so re-ingesting the same
         document overwrites the previous entry (upsert semantics).
+
+        The delete+add pair is serialized under ``_documents_lock`` because
+        ingest workers call this concurrently (one per file). LanceDB table
+        writes are not thread-safe, and interleaving delete/add from multiple
+        threads could corrupt rows or raise "Table already exists"-style races.
         """
         self._ensure_initialized()
-        table = self._ensure_documents_table()
-        doc_id = _hash_source(doc_name)
+        with self._documents_lock:
+            table = self._ensure_documents_table()
+            doc_id = _hash_source(doc_name)
 
-        # Delete any previous entry (and the placeholder row), then add the new one.
+            # Delete any previous entry (and the placeholder row), then add the new one.
+            try:
+                table.delete(f"doc_id = '{doc_id}'")
+                table.delete("doc_id = ''")
+            except Exception:
+                pass
+            table.add([{
+                "doc_id": doc_id,
+                "doc_name": doc_name,
+                "digest": digest,
+                "markdown": markdown,
+                "chapters": chapters,
+            }])
+            logger.info("  ├─ 文档元数据已写入: %s (digest %d 字符)", doc_name, len(digest))
+            # 写入后失效缓存，下次读取时重新加载。
+            self._documents_cache = None
+
+    def _load_documents(self) -> List[Dict[str, Any]]:
+        """Load (and cache) all non-placeholder document rows.
+
+        Returns a list of dicts, filtered to drop the placeholder row
+        (``doc_name`` empty).  Cached in ``_documents_cache``; callers should
+        hold ``_documents_lock`` when the cache could be invalidated
+        concurrently (or accept a benign re-read on a cache miss).
+        """
+        if self._documents_cache is not None:
+            return self._documents_cache
+        table = self._ensure_documents_table()
+        if table is None:
+            return []
         try:
-            table.delete(f"doc_id = '{doc_id}'")
-            table.delete("doc_id = ''")
-        except Exception:
-            pass
-        table.add([{
-            "doc_id": doc_id,
-            "doc_name": doc_name,
-            "digest": digest,
-            "markdown": markdown,
-            "chapters": chapters,
-        }])
-        logger.info("  ├─ 文档元数据已写入: %s (digest %d 字符)", doc_name, len(digest))
+            rows = table.to_arrow().to_pylist()
+        except Exception as e:
+            logger.warning("读取文档元数据失败: %s", e)
+            return []
+        rows = [r for r in rows if r.get("doc_name")]
+        self._documents_cache = rows
+        return rows
 
     def get_document_digest(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """Return {doc_name, digest, markdown, chapters} for a document by name.
@@ -1269,16 +1321,7 @@ class VectorStore:
         a book by a partial title).  Returns None if not found.
         """
         self._ensure_initialized()
-        table = self._ensure_documents_table()
-        if table is None:
-            return None
-        try:
-            rows = table.to_arrow().to_pylist()
-        except Exception as e:
-            logger.warning("读取文档元数据失败: %s", e)
-            return None
-        # 过滤占位空记录（doc_name 为空）。
-        rows = [r for r in rows if r.get("doc_name")]
+        rows = self._load_documents()
         if not rows:
             return None
 
@@ -1308,26 +1351,22 @@ class VectorStore:
     def list_documents(self) -> List[str]:
         """Return the list of stored document names (for the outline tool)."""
         self._ensure_initialized()
-        table = self._ensure_documents_table()
-        if table is None:
-            return []
-        try:
-            rows = table.to_arrow().to_pylist()
-        except Exception:
-            return []
+        rows = self._load_documents()
         return sorted({r.get("doc_name", "") for r in rows if r.get("doc_name")})
 
     def delete_document(self, doc_name: str) -> None:
         """Remove a document's metadata entry."""
         self._ensure_initialized()
-        table = self._ensure_documents_table()
-        if table is None:
-            return
-        doc_id = _hash_source(doc_name)
-        try:
-            table.delete(f"doc_id = '{doc_id}'")
-        except Exception as e:
-            logger.warning("删除文档元数据失败: %s", e)
+        with self._documents_lock:
+            table = self._ensure_documents_table()
+            if table is None:
+                return
+            doc_id = _hash_source(doc_name)
+            try:
+                table.delete(f"doc_id = '{doc_id}'")
+            except Exception as e:
+                logger.warning("删除文档元数据失败: %s", e)
+            self._documents_cache = None
 
 
 # ---------------------------------------------------------------------------

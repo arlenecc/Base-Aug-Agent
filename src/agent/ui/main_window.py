@@ -720,6 +720,8 @@ class MainWindow(QMainWindow):
         font = QFont("Menlo")
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.think_view.setFont(font)
+        # 防止单次超长流式推理导致内存无限增长（每轮运行前会 clear()）。
+        self.think_view.setMaximumBlockCount(10000)
         llay.addWidget(self.think_view, 2)
 
         hsplit.addWidget(left)
