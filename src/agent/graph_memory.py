@@ -512,32 +512,20 @@ class GraphMemoryStore:
 # ---------------------------------------------------------------------------
 
 _EXTRACT_SYSTEM = """\
-You are an information extraction engine.  Given a piece of conversation,
-extract salient facts as a knowledge graph.
-
-Return ONLY a JSON object with this schema:
+Extract durable facts from the conversation as a knowledge graph. Return ONLY JSON:
 {
-  "entities": [
-    {"name": "<entity name>", "type": "<person|project|concept|tool|place|other>", "observations": ["<fact 1>", "<fact 2>"]}
-  ],
-  "relations": [
-    {"source": "<entity name>", "target": "<entity name>", "label": "<relation verb phrase>"}
-  ]
+  "entities": [{"name": "name", "type": "person|project|concept|tool|place|other", "observations": ["fact"]}],
+  "relations": [{"source": "name", "target": "name", "label": "verb phrase"}]
 }
 
 Rules:
-- Extract ONLY concrete, durable facts about the USER, their projects, preferences,
-  decisions, technical stack, and important domain knowledge — NOT chitchat,
-  transient state, or meta-information about the assistant's own tools/capabilities.
-- Do NOT create entities for tools (e.g. "rag_search", "skills", "memory_graph")
-  or for the assistant itself.  Ignore any text that merely describes what a tool
-  does or what the system can do.
-- Each observation is a short self-contained sentence that would still be true
-  and useful weeks later (e.g. "user's project is a RAG system built with LanceDB").
-- Entity names should be canonical (e.g. "PostgreSQL" not "postgres db").
-- Relations are directional: source --[label]--> target.
-- If nothing worth persisting, return {"entities": [], "relations": []}.
-- Output must be valid JSON, no markdown fences, no commentary.\
+- Only concrete, durable facts about the user, their projects, preferences,
+  decisions, or domain knowledge. Skip chitchat and transient state.
+- Skip the assistant's own tools/capabilities (no entities for "rag_search", etc.).
+- Observations are short self-contained sentences still useful weeks later.
+- Canonical entity names ("PostgreSQL", not "postgres db").
+- If nothing to persist, return {"entities": [], "relations": []}.
+- Valid JSON only, no markdown fences or commentary.\
 """
 
 _EXTRACT_USER = """\

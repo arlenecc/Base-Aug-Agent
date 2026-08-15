@@ -15,7 +15,7 @@
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
-- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~260 tok（较原来 -65%）；Knowledge base 指令条件注入（无 KB 时省 272 tok/轮）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简；Work memory 注入用 compact JSON；总体每轮节省 ~787 token（-34%）
+- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
 - **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，`skill_search` / `skill_load` 按需发现与加载，技能指令不进系统提示词，节省 token
@@ -342,7 +342,7 @@ workspace/.agent/
 
 - **长期记忆**：全部事实持久化到知识图谱，靠 `memory_search` 按需语义检索。
 - **短期记忆**：当天抽取的事实保留在 `work_memory` 的 `__auto_facts__` 键（`{"date": "YYYY-MM-DD", "facts": [...]}`），对话时直接注入上下文；跨天后自动清空（历史已在长期记忆）。
-- **抽取串行化**：`_fact_extract_lock` 非阻塞锁，避免抽取线程与下一轮对话并发争用 LLM 的 `httpx.Client`（非线程安全）。
+- **独立抽取客户端**：抽取线程使用独立的 `LLMClient` 实例（`_get_extract_llm()` 惰性创建，独立的 `httpx.Client` 连接池），避免与对话线程并发争用同一个非线程安全的 `httpx.Client`；`_fact_extract_lock` 非阻塞锁进一步防止多个抽取堆积。`Agent.close()` 显式释放该独立客户端。
 
 ### 语义检索
 
@@ -370,11 +370,12 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 **旧方案**：全量注入所有工作记忆 + 所有长期记忆事实 → 记忆多时 prompt 膨胀，拖慢响应。
 
 **新方案**：
-- **SYSTEM_PROMPT**：精简至 ~260 tok（-65%），合并冗余段落
-- **Knowledge base 指令**：仅当 KB 有数据时注入（无 KB 省 272 tok/轮）
+- **SYSTEM_PROMPT**：精简至 ~200 tok，操作原则/确认策略/工具约定/记忆/技能/RAG 引导各一条、无冗余
+- **Knowledge base 状态**：仅当 RAG 可用时注入（无 KB 时不注入），仅含文档名列表（不含路径），最多 8 个
 - **工作记忆**：手动 scratchpad（compact JSON，value 截断 200 字符）+ 当天自动抽取事实（列表形式）
 - **长期记忆**：不注入 prompt，靠 `memory_search` 工具按需检索（避免长期记忆膨胀拖慢每轮响应）
-- **总体每轮节省 ~787 token（-34%）**
+- **Tool descriptions**：精简（`rag_search` 的 query 描述从 ~150 字压到一句话，`rag_outline` 去除重复的「定向检索」解释）
+- **记忆抽取 prompt**：`_EXTRACT_SYSTEM` 规则压缩去重
 
 ```
 # Work memory

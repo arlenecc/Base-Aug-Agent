@@ -17,34 +17,21 @@ class RagSearchTool(Tool):
     """Search the local knowledge base for relevant information."""
 
     name = "rag_search"
-    description = (
-        "搜索本地知识库获取相关信息。当需要查找文档、参考资料或专业知识时使用此工具。"
-        "适合查询知识库中的文档内容，如技术文档、书籍、论文等。"
-        "当需要限定在某本书/文档内检索时，用 source 参数传入书名或文档名关键词。"
-    )
+    description = "搜索本地知识库。查询文档内容、参考资料时使用；可用 source 限定在某本书/文档内检索。"
     parameters = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": (
-                    "搜索查询词。必须使用用户原始语言的关键词/短语，"
-                    "例如用户问中文就用中文关键词（如「回归神 主旨 思想」），"
-                    "用户问英文就用英文。严禁把中文音译成拼音或罗马化，"
-                    "也不要翻译成其他语言。直接提取用户问题中的核心名词/概念即可。"
-                ),
+                "description": "检索关键词/短语。用用户原始语言，提取问题核心概念，勿翻译或音译。",
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数量，默认 3，范围 1-10（经过重排序后的最优结果）",
+                "description": "返回结果数，默认 3，范围 1-10。",
             },
             "source": {
                 "type": "string",
-                "description": (
-                    "可选。限定检索的文档名/书名关键词（如「亲密关系」「人生的活法」）。"
-                    "当 rag_outline 已返回某本书的结构、需要定向检索该书内某章节细节时，"
-                    "传入该书名，只在该书内检索，避免混入其它文档。"
-                ),
+                "description": "可选。限定检索的书名/文档名关键词。",
             },
         },
         "required": ["query"],
@@ -88,20 +75,18 @@ class RagOutlineTool(Tool):
 
     name = "rag_outline"
     description = (
-        "获取知识库中某本文档/书籍的缩略版本（完整目录结构与章节标题）。"
-        "当用户明确提到具体书名、文档名，或需要从某本具体的书/文档中系统性地"
-        "回答问题时，先调用本工具了解全文档结构，再决定用 rag_search 检索哪些"
-        "章节的细节。参数 book_name 为书名或文档名的关键词。"
+        "获取某文档/书籍的目录结构（章节标题）。用户提到具体书名时先调用，"
+        "了解全文结构后再用 rag_search 检索章节细节。不带 book_name 时列出所有文档。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "book_name": {
                 "type": "string",
-                "description": "书名或文档名的关键词（支持部分标题匹配）",
+                "description": "书名/文档名关键词（支持部分匹配）",
             },
         },
-        "required": ["book_name"],
+        "required": [],
     }
     destructive = False
 
