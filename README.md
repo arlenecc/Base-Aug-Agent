@@ -17,7 +17,7 @@
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
-- **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认
+- **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认；确认弹窗只显示**用途说明**（LLM 生成 ≤20 字中文用途，失败回退注释/docstring/命令名启发式），不贴代码全文，避免超长文本把按钮顶出屏幕
 - **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，`skill_search` / `skill_load` 按需发现与加载，技能指令不进系统提示词，节省 token
 
 ## 界面布局
