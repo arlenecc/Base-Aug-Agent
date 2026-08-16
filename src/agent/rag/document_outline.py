@@ -62,6 +62,37 @@ _NOISE_TITLES = {
     "references", "references and citations", "img",
 }
 
+# 「目录」标记本身（含带空格的变体），无论在哪个阶段都应跳过。
+_TOC_TITLE_NOISE = {"目录", "目 录", "目錄", "目 錄"}
+
+# PDF 页眉模式：「章节名 + 分隔符 + 纯数字页码」，如「第二章 → 23」、
+# 「第十章 ／ 147」、「第六章 ～65」。这是书籍左/右页页眉（章节名+页码），
+# 不是真正的标题，应整体丢弃。
+_PDF_HEADER_PAGENO_RE = re.compile(
+    r"^(.{2,40}?)\s*[→／/～~|—\-]\s*\d{1,4}$"
+)
+
+# 页眉变体 2：「章节名 + 空格 + 纯数字页码」（无分隔符），如「第二章 29」、
+# 「第五章 753」「第九章 85」。书名/章节名后紧跟页码。
+_PDF_HEADER_CHAPTER_PAGENO_RE = re.compile(
+    r"^(第[%s0-9一二三四五六七八九十百]+[章卷篇部节]|[A-Za-z][A-Za-z0-9 .,&'()/:-]{2,40}?)\s+\d{1,4}$" % _CJK_NUM
+)
+
+# 页眉变体 3：「页码 + 分隔符 + 章节名」（页码在前），如「128 ／ 薄伽梵歌」。
+_PDF_HEADER_PAGENO_CHAPTER_RE = re.compile(
+    r"^\d{1,4}\s*[→／/～~|—\-]\s*\S.{0,38}$"
+)
+
+# 被截断的章节名（缺「第」字，如「三章」「一章」「二章」）——通常是页眉
+# 「第三章」的「第」字与数字被拆到上一行所致，单独成行时是噪声。
+_TRUNCATED_CN_CHAPTER_RE = re.compile(
+    r"^[%s]{1,3}[章卷篇部]$" % _CJK_NUM
+)
+
+# 年份开头的正文行：如「1947）。《薄伽梵歌》是…」「2007 年12月」。
+# 标题不会以 4 位年份开头（除非恰是年份书名，罕见），视为正文噪声。
+_YEAR_PREFIX_RE = re.compile(r"^(?:19|20)\d{2}\s*[年）).、]")
+
 
 class Chapter:
     """A single heading + its body text."""
@@ -125,6 +156,23 @@ def _looks_like_title(line: str) -> bool:
         return False
     # 明显噪声。
     if line.lower() in _NOISE_TITLES:
+        return False
+    # 「目录」标记本身（含带空格变体）不是标题。
+    if line in _TOC_TITLE_NOISE:
+        return False
+    # 年份开头的正文行（如「1947）。《薄伽梵歌》…」「2007 年12月」）。
+    if _YEAR_PREFIX_RE.match(line):
+        return False
+    # PDF 页眉（「第二章 → 23」「第十章 ／ 147」）不是标题。
+    if _PDF_HEADER_PAGENO_RE.match(line):
+        return False
+    # 页眉变体：「章节名 + 页码」（「第二章 29」）和「页码 + 章节名」（「128 ／ 薄伽梵歌」）。
+    if _PDF_HEADER_CHAPTER_PAGENO_RE.match(line):
+        return False
+    if _PDF_HEADER_PAGENO_CHAPTER_RE.match(line):
+        return False
+    # 被截断的章节名（「三章」「一章」）不是标题。
+    if _TRUNCATED_CN_CHAPTER_RE.match(line):
         return False
     return True
 

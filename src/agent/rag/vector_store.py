@@ -850,24 +850,31 @@ class VectorStore:
             # result will be available on a later call.
             return None
 
-        # numpy 版本探测：FlagEmbedding 依赖 torch，而 macOS Intel 上 torch
-        # 最高只能到 2.2.2（需要 numpy 1.x）。numpy 2.x 下 torch 的
+        # torch/numpy 兼容性探测：FlagEmbedding 依赖 torch，而某些旧版 torch
+        # （如 macOS Intel 上最高可装的 2.2.2）与 numpy 2.x 不兼容，调用
         # ``tensor.numpy()`` 会抛 ``Numpy is not available``，导致重排序崩溃。
-        # 与其在模型加载时崩溃，不如提前降级为向量距离排序并给出清晰提示。
+        # 这里不凭 numpy 版本号猜测，而是真正执行一次 tensor→numpy 转换来
+        # 验证 torch 与 numpy 是否兼容，避免误伤 numpy 2.x + 新版 torch 的
+        # 正常组合（如 arm64 上的 torch 2.13 + numpy 2.5 是完全兼容的）。
         try:
-            import numpy as _np
-            if int(_np.__version__.split(".")[0]) >= 2:
+            import torch as _torch
+            try:
+                _torch.tensor([1.0, 2.0]).numpy()
+            except Exception as _e:
+                import numpy as _np
                 logger.warning(
-                    "  ⚠ BGE Reranker 不可用: numpy %s 与 torch 2.2.2 (macOS Intel) "
-                    "不兼容（torch 需要 numpy 1.x）。重排序回退到向量距离排序。"
-                    "如需启用，请降级 numpy 到 1.26.x 并同步降级 chonkie/scipy/opencv。",
-                    _np.__version__,
+                    "  ⚠ BGE Reranker 不可用: torch %s 与 numpy %s 不兼容 "
+                    "（tensor.numpy() 失败: %s）。重排序回退到向量距离排序。"
+                    "如需启用，请升级 torch 或降级 numpy 到 1.26.x。",
+                    getattr(_torch, "__version__", "?"),
+                    getattr(_np, "__version__", "?"),
+                    _e,
                 )
                 self._reranker = None
                 self._reranker_state = "failed"
                 return None
         except ImportError:
-            pass  # numpy 缺失时交由后续 import FlagEmbedding 报错处理
+            pass  # torch 缺失时交由后续 import FlagEmbedding 报错处理
 
         try:
             from FlagEmbedding import FlagReranker

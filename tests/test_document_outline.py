@@ -164,3 +164,80 @@ def test_build_digest_falls_back_to_plain():
     assert "1卷 我的财产告白" in digest
     assert "# 目录" in digest
     assert len(chapters) > 0
+
+
+# ---------------------------------------------------------------------------
+# PDF 页眉 / 页码噪声过滤
+# ---------------------------------------------------------------------------
+
+def test_plain_pdf_header_pageno_noise():
+    """PDF 页眉「章节名 + 分隔符 + 页码」应被过滤，不当作标题。"""
+    text = """第一章 引言
+正文内容。
+
+第二章 → 23
+本章正文。
+
+第三章 ／ 45
+第三章正文。
+
+第四章
+第四章正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "第一章 引言" in titles
+    assert "第四章" in titles
+    # 页眉噪声应被丢弃
+    assert "第二章 → 23" not in titles
+    assert "第三章 ／ 45" not in titles
+
+
+def test_plain_pdf_header_chapter_pageno_noise():
+    """PDF 页眉「章节名 + 空格 + 页码」（无分隔符）应被过滤。"""
+    text = """第五章
+正文。
+
+第六章 767
+正文。
+
+第七章
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "第五章" in titles
+    assert "第七章" in titles
+    assert "第六章 767" not in titles
+
+
+def test_plain_year_prefix_noise():
+    """年份开头的正文行（如「1947）。…」「2007 年12月」）不应是标题。"""
+    text = """第一章 引言
+正文。
+
+1947）。《薄伽梵歌》是其中的第二十三至第四十章。
+2007 年12月
+第二章 正文
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "第一章 引言" in titles
+    assert not any(t.startswith("1947") for t in titles)
+    assert not any(t.startswith("2007") for t in titles)
+
+
+def test_plain_toc_marker_not_title():
+    """「目 录」目录标记本身不应出现在标题列表里。"""
+    text = """《神之所欲》
+翻 译 者 序
+目 录
+~1~ 不可置信之书
+~2~ 史上最重要的问题
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "~1~ 不可置信之书" in titles
+    assert "~2~ 史上最重要的问题" in titles
+    assert "目 录" not in titles
