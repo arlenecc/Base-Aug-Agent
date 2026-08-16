@@ -211,3 +211,60 @@ def test_retriever_read_skill_dir(tmp_path):
     # 路径穿越应被拒绝
     assert retriever.read_skill_dir("../../etc") is None
     retriever.close()
+
+
+def test_ensure_indexed_is_idempotent(tmp_path):
+    """已建表后，重复 ensure_indexed 不应触发重新 build（不重复 embed）。"""
+    skills_dir = str(tmp_path / "skills")
+    _make_skill_dir(skills_dir, "finance/invoice", "invoice-organizer")
+    _make_skill_dir(skills_dir, "science/networkx", "networkx")
+
+    db_path = str(tmp_path / "retriever.lancedb")
+    retriever = SkillRetriever(
+        skills_dir=skills_dir, db_path=db_path, embedding_function=FakeEF()
+    )
+    # 记录 build 调用次数
+    build_calls = []
+    original_build = retriever._store.build
+    def _counting_build(skills, batch_size=8):
+        build_calls.append(len(skills))
+        return original_build(skills, batch_size)
+    retriever._store.build = _counting_build
+
+    # 第一次：表不存在 → build
+    retriever.ensure_indexed()
+    assert len(build_calls) == 1
+
+    # 第二次：表已存在 + 目录未变化 → 不 build
+    retriever.ensure_indexed()
+    assert len(build_calls) == 1, "目录未变化时不应重建索引"
+
+    retriever.close()
+
+
+def test_ensure_indexed_rebuilds_on_dir_change(tmp_path):
+    """skills 目录变化（新增 SKILL.md）后应触发重建。"""
+    skills_dir = str(tmp_path / "skills")
+    _make_skill_dir(skills_dir, "finance/invoice", "invoice-organizer")
+
+    db_path = str(tmp_path / "retriever.lancedb")
+    retriever = SkillRetriever(
+        skills_dir=skills_dir, db_path=db_path, embedding_function=FakeEF()
+    )
+    build_calls = []
+    original_build = retriever._store.build
+    def _counting_build(skills, batch_size=8):
+        build_calls.append(len(skills))
+        return original_build(skills, batch_size)
+    retriever._store.build = _counting_build
+
+    retriever.ensure_indexed()
+    assert len(build_calls) == 1
+
+    # 新增一个 skill 目录（改变 mtime），强制扫描器感知变化
+    _make_skill_dir(skills_dir, "science/networkx", "networkx")
+    retriever._scanner._last_mtime = 0.0  # 强制认为目录已变
+    retriever.ensure_indexed()
+    assert len(build_calls) == 2, "目录变化后应重建索引"
+
+    retriever.close()

@@ -591,10 +591,23 @@ class SkillRetriever:
         self._skills_dir = skills_dir
 
     def ensure_indexed(self) -> None:
-        """(Re)build the vector table if the skills dir changed or table is empty."""
-        skills = self._scanner.scan()
+        """(Re)build the vector table if the skills dir changed or table is empty.
+
+        Idempotent: if the LanceDB table already exists AND the skills
+        directory has not changed since the last scan, this is a no-op (the
+        table is just opened, never rebuilt).  It only (re)builds when:
+          1. the table does not exist yet (first run), or
+          2. the skills directory mtime changed (new/edited SKILL.md).
+        """
         table = self._store._get_table()
         if table is None:
+            # First run: table missing → build.
+            skills = self._scanner.scan(force=True)
+            self._store.build(skills)
+            return
+        # Table exists: rebuild only if the directory changed.
+        if self._scanner._should_scan():
+            skills = self._scanner.scan(force=True)
             self._store.build(skills)
 
     def retrieve(self, query: str, llm=None) -> Dict[str, Any]:
