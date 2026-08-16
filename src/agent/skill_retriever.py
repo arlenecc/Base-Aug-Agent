@@ -378,14 +378,15 @@ class SkillVectorStore:
         ef = self._get_ef()
         return ef.embed_documents(texts)
 
-    def build(self, skills: List[SkillMetadata], batch_size: int = 100) -> int:
+    def build(self, skills: List[SkillMetadata], batch_size: int = 8) -> int:
         """Build/rebuild the skills table from the given skill list.
 
-        Drops and recreates the table, then processes skills in **batches**:
-        embed ``batch_size`` texts per forward pass and write each batch to
-        LanceDB immediately.  This keeps peak memory at O(batch_size) instead
-        of O(total) — critical for thousands of skills (the previous
-        whole-list approach ballooned memory to tens of GB and froze the OS).
+        Drops and recreates the table, then processes skills in **small
+        batches** (default 8): embed ``batch_size`` texts per forward pass and
+        write each batch to LanceDB immediately.  This keeps peak memory at
+        O(batch_size) instead of O(total) — critical for thousands of skills
+        (the previous whole-list approach ballooned memory to tens of GB and
+        froze the OS).
         """
         from .rag.vector_store import _tokenize_for_fts
 
