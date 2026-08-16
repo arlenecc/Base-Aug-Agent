@@ -1055,12 +1055,61 @@ class Agent:
             "content": content,
         }
 
+    @staticmethod
+    def _summarize_code(code: str) -> str:
+        """Return a one-line summary of a code snippet (never the full code)."""
+        code = code.strip()
+        if not code:
+            return "（空代码）"
+        lines = code.splitlines()
+        n = len(lines)
+        first = lines[0].strip()
+        # 推断语言/特征
+        if first.startswith("#") and "!" in first:
+            hint = "（shell 脚本）"
+        elif first.startswith("import ") or first.startswith("from "):
+            hint = "（Python）"
+        elif first.startswith("def ") or first.startswith("class "):
+            hint = "（Python 函数/类）"
+        elif first.startswith("pip ") or first.startswith("npm ") or first.startswith("brew "):
+            hint = "（包安装命令）"
+        else:
+            hint = ""
+        head = first if len(first) <= 60 else first[:60] + "…"
+        return f"{head} {hint}，共 {n} 行".strip()
+
     def _confirm_message(self, name: str, args: Dict[str, Any]) -> str:
+        """Build a concise confirmation message (no full code dump).
+
+        ``code_run`` / ``shell_run`` carry full code/commands — dumping them
+        into the dialog makes it unreadably long and pushes the Yes/No buttons
+        off-screen.  For these we show a short operation summary instead.
+        """
+        if name == "code_run":
+            code = str(args.get("code", "")).strip()
+            timeout = args.get("timeout")
+            summary = self._summarize_code(code)
+            msg = f"即将执行 Python 代码：\n{summary}"
+            if timeout is not None:
+                msg += f"\n超时：{timeout}s"
+            return msg + "\n\n是否继续？"
+        if name == "shell_run":
+            cmd = str(args.get("command", "")).strip()
+            timeout = args.get("timeout")
+            preview = cmd if len(cmd) <= 200 else cmd[:200] + "…"
+            msg = f"即将执行 Shell 命令：\n{preview}"
+            if timeout is not None:
+                msg += f"\n超时：{timeout}s"
+            return msg + "\n\n是否继续？"
+
+        # Other tools: show a compact argument summary (truncated).
         try:
             pretty = json.dumps(args, ensure_ascii=False)
         except Exception:
             pretty = str(args)
-        return f"Tool `{name}` is about to run with arguments:\n{pretty}\n\nProceed?"
+        if len(pretty) > 500:
+            pretty = pretty[:500] + "…"
+        return f"即将调用工具 `{name}`：\n{pretty}\n\n是否继续？"
 
     def _log(self, line: str) -> None:
         self.callbacks.on_log(line)

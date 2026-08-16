@@ -1440,6 +1440,9 @@ class MainWindow(QMainWindow):
     # blocking dialogs (run in UI thread, unblock worker)
     # ------------------------------------------------------------------
     def _on_confirm_request(self, message: str) -> None:
+        # 兜底保护：确认消息过长会把 Yes/No 按钮顶出屏幕，这里截断到合理长度。
+        if len(message) > 800:
+            message = message[:800] + "…\n\n（内容过长已截断）"
         reply = QMessageBox.question(self, "确认操作", message,
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
