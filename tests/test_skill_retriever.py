@@ -214,7 +214,7 @@ def test_retriever_read_skill_dir(tmp_path):
 
 
 def test_ensure_indexed_is_idempotent(tmp_path):
-    """已建表后，重复 ensure_indexed 不应触发重新 build（不重复 embed）。"""
+    """已建表后，重复 ensure_indexed 不应触发重建（不重复 embed）。"""
     skills_dir = str(tmp_path / "skills")
     _make_skill_dir(skills_dir, "finance/invoice", "invoice-organizer")
     _make_skill_dir(skills_dir, "science/networkx", "networkx")
@@ -223,27 +223,83 @@ def test_ensure_indexed_is_idempotent(tmp_path):
     retriever = SkillRetriever(
         skills_dir=skills_dir, db_path=db_path, embedding_function=FakeEF()
     )
-    # 记录 build 调用次数
+    # 记录 build/sync 调用次数
     build_calls = []
     original_build = retriever._store.build
     def _counting_build(skills, batch_size=8):
-        build_calls.append(len(skills))
+        build_calls.append(("build", len(skills)))
         return original_build(skills, batch_size)
     retriever._store.build = _counting_build
+    sync_calls = []
+    original_sync = retriever._store.sync
+    def _counting_sync(skills, batch_size=8):
+        sync_calls.append(len(skills))
+        return original_sync(skills, batch_size)
+    retriever._store.sync = _counting_sync
 
     # 第一次：表不存在 → build
     retriever.ensure_indexed()
     assert len(build_calls) == 1
 
-    # 第二次：表已存在 + 目录未变化 → 不 build
+    # 第二次：表已存在 + 目录未变化 → 不 build 也不 sync
     retriever.ensure_indexed()
-    assert len(build_calls) == 1, "目录未变化时不应重建索引"
+    assert len(build_calls) == 1, "目录未变化时不应重建"
+    assert len(sync_calls) == 0, "目录未变化时不应 sync"
 
     retriever.close()
 
 
-def test_ensure_indexed_rebuilds_on_dir_change(tmp_path):
-    """skills 目录变化（新增 SKILL.md）后应触发重建。"""
+def test_sync_adds_updates_removes(tmp_path):
+    """增量 sync：新增/修改/删除 skill，只操作对应项，不触发全量重建。"""
+    skills_dir = str(tmp_path / "skills")
+    _make_skill_dir(skills_dir, "finance/invoice", "invoice-organizer")
+    _make_skill_dir(skills_dir, "science/networkx", "networkx")
+
+    db_path = str(tmp_path / "retriever.lancedb")
+    retriever = SkillRetriever(
+        skills_dir=skills_dir, db_path=db_path, embedding_function=FakeEF()
+    )
+    retriever.ensure_indexed()  # 首次全量 build
+
+    # 记录后续 sync 时 embed 的 dir 集合（验证只 embed 增量项）
+    embedded_dirs = []
+    original_embed_batch = retriever._store._embed_batch
+    def _tracking_embed_batch(batch):
+        embedded_dirs.extend(s.dir for s in batch)
+        return original_embed_batch(batch)
+    retriever._store._embed_batch = _tracking_embed_batch
+
+    # 变更 1：删除 networkx + 新增 budget + 修改 invoice（改 description）
+    import shutil
+    shutil.rmtree(os.path.join(skills_dir, "science", "networkx"))
+    _make_skill_dir(skills_dir, "finance/budget", "budget-planner")
+    # 修改 invoice 的 SKILL.md 内容（改变 fingerprint）
+    invoice_md = os.path.join(skills_dir, "finance", "invoice", "SKILL.md")
+    with open(invoice_md, "w", encoding="utf-8") as f:
+        f.write("---\nname: invoice-organizer\ndescription: EDITED description\n---\n")
+
+    retriever._scanner._last_mtime = 0.0  # 强制感知变化
+    result = retriever._store.sync(retriever._scanner.scan(force=True))
+
+    assert result["removed"] == 1, f"应删除 networkx, got {result}"
+    assert result["added"] == 1, f"应新增 budget, got {result}"
+    assert result["updated"] == 1, f"应更新 invoice, got {result}"
+
+    # 只 embed 了新增 + 更新的项（budget + invoice），没有 embed 未变的项
+    assert set(embedded_dirs) == {"finance/budget", "finance/invoice"}, \
+        f"只应 embed 增/改项, got {embedded_dirs}"
+
+    # 验证表中最终状态
+    from agent.skill_retriever import SkillScanner
+    scanner = SkillScanner(skills_dir)
+    remaining = {s.dir for s in scanner.scan(force=True)}
+    assert remaining == {"finance/invoice", "finance/budget"}
+
+    retriever.close()
+
+
+def test_sync_first_run_falls_back_to_build(tmp_path):
+    """表不存在时 sync 回退到全量 build。"""
     skills_dir = str(tmp_path / "skills")
     _make_skill_dir(skills_dir, "finance/invoice", "invoice-organizer")
 
@@ -251,20 +307,9 @@ def test_ensure_indexed_rebuilds_on_dir_change(tmp_path):
     retriever = SkillRetriever(
         skills_dir=skills_dir, db_path=db_path, embedding_function=FakeEF()
     )
-    build_calls = []
-    original_build = retriever._store.build
-    def _counting_build(skills, batch_size=8):
-        build_calls.append(len(skills))
-        return original_build(skills, batch_size)
-    retriever._store.build = _counting_build
-
-    retriever.ensure_indexed()
-    assert len(build_calls) == 1
-
-    # 新增一个 skill 目录（改变 mtime），强制扫描器感知变化
-    _make_skill_dir(skills_dir, "science/networkx", "networkx")
-    retriever._scanner._last_mtime = 0.0  # 强制认为目录已变
-    retriever.ensure_indexed()
-    assert len(build_calls) == 2, "目录变化后应重建索引"
-
+    skills = SkillScanner(skills_dir).scan(force=True)
+    result = retriever._store.sync(skills)
+    assert result["added"] == 1
+    assert result["updated"] == 0
+    assert result["removed"] == 0
     retriever.close()

@@ -183,10 +183,11 @@ class SkillMetadata:
     """Parsed metadata for a single SKILL.md."""
 
     __slots__ = ("name", "description", "tags", "dir", "when_to_use",
-                 "when_not_to_use", "examples", "combined_text")
+                 "when_not_to_use", "examples", "combined_text", "fingerprint")
 
     def __init__(self, name: str, description: str, tags: List[str], dir: str,
-                 when_to_use: str, when_not_to_use: str, examples: str):
+                 when_to_use: str, when_not_to_use: str, examples: str,
+                 fingerprint: str = ""):
         self.name = name
         self.description = description
         self.tags = tags
@@ -194,6 +195,7 @@ class SkillMetadata:
         self.when_to_use = when_to_use
         self.when_not_to_use = when_not_to_use
         self.examples = examples
+        self.fingerprint = fingerprint
         self.combined_text = self._build_combined()
 
     def _build_combined(self) -> str:
@@ -234,6 +236,10 @@ def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
     when_not_to_use = _extract_section(text, _WHEN_NOT_TO_USE_HEADINGS)
     examples = _extract_section(text, _EXAMPLES_HEADINGS)
 
+    # Content fingerprint for incremental sync (dir unchanged but content edited).
+    import hashlib
+    fingerprint = hashlib.md5(text.encode("utf-8")).hexdigest()
+
     return SkillMetadata(
         name=name,
         description=description,
@@ -242,6 +248,7 @@ def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
         when_to_use=when_to_use,
         when_not_to_use=when_not_to_use,
         examples=examples,
+        fingerprint=fingerprint,
     )
 
 
@@ -408,42 +415,13 @@ class SkillVectorStore:
 
             import pyarrow as pa
             vec_type = pa.list_(pa.float32(), dim)
-            schema = pa.schema([
-                pa.field("dir", pa.string()),
-                pa.field("name", pa.string()),
-                pa.field("tags", pa.string()),
-                pa.field("description", pa.string()),
-                pa.field("desc_vec", vec_type),
-                pa.field("examples_vec", vec_type),
-                pa.field("combined", pa.string()),
-                pa.field("combined_fts", pa.string()),
-            ])
+            schema = self._table_schema(vec_type)
 
             table = db.create_table(_SKILL_TABLE_NAME, [], schema=schema)
             total = 0
             for i in range(0, len(skills), batch_size):
                 batch = skills[i:i + batch_size]
-                # 截断后再 embedding，避免超长 SKILL.md 导致内存/耗时爆炸。
-                descriptions = [_truncate(s.description or s.name, _MAX_DESC_CHARS) for s in batch]
-                examples = [
-                    _truncate(s.examples or s.when_to_use or s.description or s.name, _MAX_EXAMPLES_CHARS)
-                    for s in batch
-                ]
-                desc_vecs = self._embed(descriptions)
-                examples_vecs = self._embed(examples)
-
-                rows = []
-                for s, dv, ev in zip(batch, desc_vecs, examples_vecs):
-                    rows.append({
-                        "dir": s.dir,
-                        "name": s.name,
-                        "tags": ", ".join(s.tags),
-                        "description": s.description,
-                        "desc_vec": _normalize_vec(dv),
-                        "examples_vec": _normalize_vec(ev),
-                        "combined": s.combined_text,
-                        "combined_fts": _tokenize_for_fts(s.combined_text),
-                    })
+                rows = self._embed_batch(batch)
                 table.add(rows)
                 total += len(rows)
                 logger.info(
@@ -455,6 +433,117 @@ class SkillVectorStore:
             self._ensure_fts_index(self._table)
             logger.info("skill_retriever: built skills table with %d rows", total)
             return total
+
+    @staticmethod
+    def _table_schema(vec_type):
+        import pyarrow as pa
+        return pa.schema([
+            pa.field("dir", pa.string()),
+            pa.field("name", pa.string()),
+            pa.field("tags", pa.string()),
+            pa.field("description", pa.string()),
+            pa.field("desc_vec", vec_type),
+            pa.field("examples_vec", vec_type),
+            pa.field("combined", pa.string()),
+            pa.field("combined_fts", pa.string()),
+            pa.field("fingerprint", pa.string()),
+        ])
+
+    def _embed_batch(self, batch: List[SkillMetadata]) -> List[Dict[str, Any]]:
+        """Embed one batch of skills and build their table rows."""
+        from .rag.vector_store import _tokenize_for_fts
+
+        # 截断后再 embedding，避免超长 SKILL.md 导致内存/耗时爆炸。
+        descriptions = [_truncate(s.description or s.name, _MAX_DESC_CHARS) for s in batch]
+        examples = [
+            _truncate(s.examples or s.when_to_use or s.description or s.name, _MAX_EXAMPLES_CHARS)
+            for s in batch
+        ]
+        desc_vecs = self._embed(descriptions)
+        examples_vecs = self._embed(examples)
+
+        rows = []
+        for s, dv, ev in zip(batch, desc_vecs, examples_vecs):
+            rows.append({
+                "dir": s.dir,
+                "name": s.name,
+                "tags": ", ".join(s.tags),
+                "description": s.description,
+                "desc_vec": _normalize_vec(dv),
+                "examples_vec": _normalize_vec(ev),
+                "combined": s.combined_text,
+                "combined_fts": _tokenize_for_fts(s.combined_text),
+                "fingerprint": s.fingerprint,
+            })
+        return rows
+
+    def sync(self, skills: List[SkillMetadata], batch_size: int = 8) -> Dict[str, int]:
+        """Incrementally sync the table against the scanned skill list.
+
+        Only touches changed items — NO full rebuild:
+          * ``added``    — dirs not yet in the table → embed + add.
+          * ``updated``  — dirs present but fingerprint changed → delete + re-add.
+          * ``removed``  — dirs in the table but absent from scan → delete.
+
+        Returns ``{"added": n, "updated": n, "removed": n}``.
+        """
+        table = self._get_table()
+        if table is None:
+            # No table yet — fall back to a full build.
+            self.build(skills, batch_size=batch_size)
+            return {"added": len(skills), "updated": 0, "removed": 0}
+
+        # Current table contents: dir -> fingerprint.
+        try:
+            existing_rows = table.to_arrow().to_pylist()
+        except Exception as e:
+            logger.warning("skill_retriever: sync failed to read table: %s", e)
+            self.build(skills, batch_size=batch_size)
+            return {"added": len(skills), "updated": 0, "removed": 0}
+
+        existing: Dict[str, str] = {}
+        for r in existing_rows:
+            d = r.get("dir", "")
+            if d:
+                existing[d] = r.get("fingerprint", "")
+
+        scanned: Dict[str, SkillMetadata] = {s.dir: s for s in skills}
+
+        added_dirs = [d for d in scanned if d not in existing]
+        updated_dirs = [d for d in scanned if d in existing and existing[d] != scanned[d].fingerprint]
+        removed_dirs = [d for d in existing if d not in scanned]
+
+        with self._lock:
+            # Remove deleted skills.
+            for d in removed_dirs:
+                try:
+                    table.delete(f"dir = '{d}'")
+                except Exception as e:
+                    logger.warning("skill_retriever: delete %s failed: %s", d, e)
+
+            # Re-add updated skills (delete then add, since vectors changed).
+            for d in updated_dirs:
+                try:
+                    table.delete(f"dir = '{d}'")
+                except Exception:
+                    pass
+
+            # Embed + add new and updated skills in small batches.
+            to_add = [scanned[d] for d in (added_dirs + updated_dirs)]
+            for i in range(0, len(to_add), batch_size):
+                batch = to_add[i:i + batch_size]
+                rows = self._embed_batch(batch)
+                table.add(rows)
+
+            # 数据增删后重建 FTS（BM25）索引，确保新增/删除项参与全文检索。
+            if added_dirs or updated_dirs or removed_dirs:
+                self._ensure_fts_index(table)
+
+        logger.info(
+            "skill_retriever: synced +%d ~%d -%d (total %d)",
+            len(added_dirs), len(updated_dirs), len(removed_dirs), len(scanned),
+        )
+        return {"added": len(added_dirs), "updated": len(updated_dirs), "removed": len(removed_dirs)}
 
     def _ensure_fts_index(self, table) -> None:
         """Create a BM25 full-text index on the ``combined_fts`` column."""
@@ -591,13 +680,14 @@ class SkillRetriever:
         self._skills_dir = skills_dir
 
     def ensure_indexed(self) -> None:
-        """(Re)build the vector table if the skills dir changed or table is empty.
+        """Sync the vector table against the skills directory (incremental).
 
-        Idempotent: if the LanceDB table already exists AND the skills
-        directory has not changed since the last scan, this is a no-op (the
-        table is just opened, never rebuilt).  It only (re)builds when:
-          1. the table does not exist yet (first run), or
-          2. the skills directory mtime changed (new/edited SKILL.md).
+        Idempotent + incremental:
+          * table missing (first run) → full build;
+          * table exists + directory unchanged → no-op (open table only);
+          * directory changed → ``sync()``: only add new skills, update
+            edited skills (fingerprint differs), and remove deleted skills —
+            never a full rebuild.
         """
         table = self._store._get_table()
         if table is None:
@@ -605,10 +695,10 @@ class SkillRetriever:
             skills = self._scanner.scan(force=True)
             self._store.build(skills)
             return
-        # Table exists: rebuild only if the directory changed.
+        # Table exists: sync only if the directory changed.
         if self._scanner._should_scan():
             skills = self._scanner.scan(force=True)
-            self._store.build(skills)
+            self._store.sync(skills)
 
     def retrieve(self, query: str, llm=None) -> Dict[str, Any]:
         """Hybrid retrieve for a query.
