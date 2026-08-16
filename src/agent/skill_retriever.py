@@ -46,6 +46,13 @@ _MIN_SIMILARITY = 0.5
 # Number of candidates from each channel (vector / BM25).
 _VECTOR_TOP_K = 3
 _BM25_TOP_K = 3
+# Max chars of description/examples kept for embedding and combined text.
+# SKILL.md body sections (especially "Examples") can be tens of KB; embedding
+# them whole is wasteful (the model truncates at ~2k tokens anyway) and makes
+# jieba tokenization + LanceDB storage balloon. Cap to keep memory O(1) per skill.
+_MAX_DESC_CHARS = 2000
+_MAX_EXAMPLES_CHARS = 3000
+_MAX_COMBINED_CHARS = 6000
 
 # Directories to skip while scanning (tests, caches, etc.).
 _SKIP_DIR_NAMES = {"tests", "test", "__pycache__", ".git", ".DS_Store", "node_modules"}
@@ -114,6 +121,13 @@ def _parse_frontmatter(text: str) -> Dict[str, Any]:
     if tags:
         result["tags"] = tags
     return result
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Truncate text to ``max_chars`` (no-op if shorter)."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
 
 
 def _normalize_vec(vec: List[float]) -> List[float]:
@@ -187,12 +201,12 @@ class SkillMetadata:
         if self.tags:
             parts.append(" ".join(self.tags))
         if self.description:
-            parts.append(self.description)
+            parts.append(_truncate(self.description, _MAX_DESC_CHARS))
         if self.when_to_use:
-            parts.append(self.when_to_use)
+            parts.append(_truncate(self.when_to_use, _MAX_EXAMPLES_CHARS))
         if self.examples:
-            parts.append(self.examples)
-        return "\n".join(parts)
+            parts.append(_truncate(self.examples, _MAX_EXAMPLES_CHARS))
+        return _truncate("\n".join(parts), _MAX_COMBINED_CHARS)
 
     def summary_text(self) -> str:
         """Short text (name + tags + description) handed to the LLM for final pick."""
@@ -364,12 +378,14 @@ class SkillVectorStore:
         ef = self._get_ef()
         return ef.embed_documents(texts)
 
-    def build(self, skills: List[SkillMetadata]) -> int:
+    def build(self, skills: List[SkillMetadata], batch_size: int = 100) -> int:
         """Build/rebuild the skills table from the given skill list.
 
-        Drops and recreates the table (skills are few enough that full rebuild
-        is simpler than incremental upsert; embeddings are recomputed on
-        changed content only in a future optimization).  Returns row count.
+        Drops and recreates the table, then processes skills in **batches**:
+        embed ``batch_size`` texts per forward pass and write each batch to
+        LanceDB immediately.  This keeps peak memory at O(batch_size) instead
+        of O(total) — critical for thousands of skills (the previous
+        whole-list approach ballooned memory to tens of GB and froze the OS).
         """
         from .rag.vector_store import _tokenize_for_fts
 
@@ -381,17 +397,11 @@ class SkillVectorStore:
             # Drop old table if present.
             if _SKILL_TABLE_NAME in db.table_names():
                 db.drop_table(_SKILL_TABLE_NAME)
+            self._table = None
 
-            # Embed descriptions and examples in batch (two forward passes).
-            descriptions = [s.description or s.name for s in skills]
-            examples = [s.examples or s.when_to_use or s.description or s.name for s in skills]
-            desc_vecs = self._embed(descriptions)
-            examples_vecs = self._embed(examples)
-
-            # 显式用 pyarrow schema 声明向量列（FixedSizeList），否则 LanceDB
-            # 可能把 list[float] 推断成标量 Float64，导致向量检索报错
-            # "Data type is not a vector"。
-            dim = len(desc_vecs[0]) if desc_vecs else 0
+            # Probe the embedding dimension with a single text first.
+            probe = self._embed([skills[0].description or skills[0].name])
+            dim = len(probe[0]) if probe else 0
             if dim <= 0:
                 return 0
 
@@ -408,23 +418,42 @@ class SkillVectorStore:
                 pa.field("combined_fts", pa.string()),
             ])
 
-            rows = []
-            for s, dv, ev in zip(skills, desc_vecs, examples_vecs):
-                rows.append({
-                    "dir": s.dir,
-                    "name": s.name,
-                    "tags": ", ".join(s.tags),
-                    "description": s.description,
-                    "desc_vec": _normalize_vec(dv),
-                    "examples_vec": _normalize_vec(ev),
-                    "combined": s.combined_text,
-                    "combined_fts": _tokenize_for_fts(s.combined_text),
-                })
+            table = db.create_table(_SKILL_TABLE_NAME, [], schema=schema)
+            total = 0
+            for i in range(0, len(skills), batch_size):
+                batch = skills[i:i + batch_size]
+                # 截断后再 embedding，避免超长 SKILL.md 导致内存/耗时爆炸。
+                descriptions = [_truncate(s.description or s.name, _MAX_DESC_CHARS) for s in batch]
+                examples = [
+                    _truncate(s.examples or s.when_to_use or s.description or s.name, _MAX_EXAMPLES_CHARS)
+                    for s in batch
+                ]
+                desc_vecs = self._embed(descriptions)
+                examples_vecs = self._embed(examples)
 
-            self._table = db.create_table(_SKILL_TABLE_NAME, rows, schema=schema)
+                rows = []
+                for s, dv, ev in zip(batch, desc_vecs, examples_vecs):
+                    rows.append({
+                        "dir": s.dir,
+                        "name": s.name,
+                        "tags": ", ".join(s.tags),
+                        "description": s.description,
+                        "desc_vec": _normalize_vec(dv),
+                        "examples_vec": _normalize_vec(ev),
+                        "combined": s.combined_text,
+                        "combined_fts": _tokenize_for_fts(s.combined_text),
+                    })
+                table.add(rows)
+                total += len(rows)
+                logger.info(
+                    "skill_retriever: built %d/%d skills",
+                    total, len(skills),
+                )
+
+            self._table = table
             self._ensure_fts_index(self._table)
-            logger.info("skill_retriever: built skills table with %d rows", len(rows))
-            return len(rows)
+            logger.info("skill_retriever: built skills table with %d rows", total)
+            return total
 
     def _ensure_fts_index(self, table) -> None:
         """Create a BM25 full-text index on the ``combined_fts`` column."""
