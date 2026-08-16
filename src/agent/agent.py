@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol
@@ -1057,47 +1058,171 @@ class Agent:
 
     @staticmethod
     def _summarize_code(code: str) -> str:
-        """Return a one-line summary of a code snippet (never the full code)."""
+        """Heuristic fallback: infer the purpose of a code snippet.
+
+        Tries comments/docstrings first (models usually emit a purpose comment),
+        then the first non-import statement.  Returns a short "做什么" phrase
+        WITHOUT dumping the code.  Used only when LLM summarization is
+        unavailable.
+        """
         code = code.strip()
         if not code:
             return "（空代码）"
-        lines = code.splitlines()
-        n = len(lines)
-        first = lines[0].strip()
-        # 推断语言/特征
-        if first.startswith("#") and "!" in first:
-            hint = "（shell 脚本）"
-        elif first.startswith("import ") or first.startswith("from "):
-            hint = "（Python）"
-        elif first.startswith("def ") or first.startswith("class "):
-            hint = "（Python 函数/类）"
-        elif first.startswith("pip ") or first.startswith("npm ") or first.startswith("brew "):
-            hint = "（包安装命令）"
-        else:
-            hint = ""
-        head = first if len(first) <= 60 else first[:60] + "…"
-        return f"{head} {hint}，共 {n} 行".strip()
+        lines = [ln.rstrip() for ln in code.splitlines()]
+
+        # 1) Extract a purpose comment / docstring near the top.
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                continue
+            # Module docstring or inline comment describing intent.
+            if s.startswith('"""') or s.startswith("'''"):
+                doc = s.strip('"\'').strip()
+                if doc and not doc.startswith(("import", "from", "#!")):
+                    return doc[:80]
+            if s.startswith("#"):
+                comment = s.lstrip("#").strip()
+                # Skip shebang and import markers.
+                if comment and not comment.startswith(("!", "encoding", "coding")):
+                    return comment[:80]
+            # Stop at the first real statement (imports come before purpose comments
+            # in many generated snippets, so scan past leading imports).
+            if s.startswith(("import ", "from ")):
+                continue
+            break
+
+        # 2) Infer from the first executable statement.
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith(("#", "import ", "from ")):
+                continue
+            if s.startswith("def "):
+                m = re.match(r"def\s+(\w+)", s)
+                return f"定义函数 {m.group(1)}" if m else "定义函数"
+            if s.startswith("class "):
+                m = re.match(r"class\s+(\w+)", s)
+                return f"定义类 {m.group(1)}" if m else "定义类"
+            if s.startswith("pip install"):
+                return "安装 Python 包：" + s[len("pip install"):].strip()[:60]
+            if s.startswith("npm install"):
+                return "安装 Node 包：" + s[len("npm install"):].strip()[:60]
+            return "执行代码片段：" + s[:60]
+        return "执行一段代码"
+
+    @staticmethod
+    def _summarize_command(cmd: str) -> str:
+        """Infer the purpose of a shell command (no full command dump)."""
+        cmd = cmd.strip()
+        if not cmd:
+            return "（空命令）"
+        # Map common commands to a human-readable purpose.
+        parts = cmd.split()
+        prog = parts[0] if parts else ""
+        known = {
+            "pip": "安装/管理 Python 包",
+            "npm": "安装/管理 Node 包",
+            "brew": "安装/管理 macOS 软件",
+            "apt": "安装/管理系统软件包",
+            "apt-get": "安装/管理系统软件包",
+            "yum": "安装/管理系统软件包",
+            "git": "Git 版本控制操作",
+            "cd": "切换目录",
+            "ls": "列出目录内容",
+            "cat": "查看文件内容",
+            "mkdir": "创建目录",
+            "touch": "创建文件",
+            "rm": "删除文件/目录",
+            "mv": "移动/重命名文件",
+            "cp": "复制文件",
+            "curl": "发起网络请求",
+            "wget": "下载文件",
+            "python": "运行 Python 脚本",
+            "python3": "运行 Python 脚本",
+            "node": "运行 Node 脚本",
+            "grep": "搜索文本内容",
+            "find": "查找文件",
+            "chmod": "修改文件权限",
+            "echo": "输出文本",
+            "tar": "打包/解压归档",
+            "unzip": "解压 zip 文件",
+            "ssh": "SSH 远程连接",
+            "docker": "Docker 容器操作",
+            "kubectl": "Kubernetes 集群操作",
+        }
+        if prog in known:
+            return known[prog]
+        # Generic: show the program name only.
+        return f"执行命令 {prog}"
+
+    def _describe_code_purpose(self, code: str) -> str:
+        """Return a one-line purpose description for code/command.
+
+        Tries the LLM first (accurate semantic understanding), falling back to
+        a local heuristic if the LLM is unavailable or fails.  Never returns
+        the full code.
+        """
+        try:
+            llm = self._get_extract_llm()
+            if llm is not None and llm is not self.llm:
+                # Only use the LLM when we have a real (dedicated) client; a
+                # plain mock/scripted llm would not understand code anyway.
+                prompt = (
+                    "用一句简短的中文说明以下代码/命令的用途（做什么事情），"
+                    "不要贴代码，不要输出多余解释，20 字以内：\n\n"
+                    + code[:2000]
+                )
+                events = list(llm.chat_stream([{"role": "user", "content": prompt}]))
+                answer = "".join(
+                    ev.get("content", "") for ev in events if ev.get("type") == "content"
+                ).strip()
+                if answer:
+                    return answer[:80]
+        except Exception:
+            pass
+        # Fallback: heuristic. For commands use the command-name mapping;
+        # for code use the comment/docstring heuristic.
+        if self._looks_like_command(code):
+            return self._summarize_command(code)
+        return self._summarize_code(code)
+
+    @staticmethod
+    def _looks_like_command(text: str) -> bool:
+        """True if text looks like a shell command rather than code."""
+        s = text.strip()
+        if not s:
+            return False
+        # Commands are usually a single line starting with a known program,
+        # without Python keywords.
+        if "\n" in s:
+            return False
+        first = s.split()[0] if s.split() else ""
+        return first in {
+            "pip", "npm", "brew", "apt", "apt-get", "yum", "git", "cd", "ls",
+            "cat", "mkdir", "touch", "rm", "mv", "cp", "curl", "wget", "python",
+            "python3", "node", "grep", "find", "chmod", "echo", "tar", "unzip",
+            "ssh", "docker", "kubectl",
+        }
 
     def _confirm_message(self, name: str, args: Dict[str, Any]) -> str:
-        """Build a concise confirmation message (no full code dump).
+        """Build a concise confirmation message (purpose description, no code).
 
         ``code_run`` / ``shell_run`` carry full code/commands — dumping them
         into the dialog makes it unreadably long and pushes the Yes/No buttons
-        off-screen.  For these we show a short operation summary instead.
+        off-screen.  We show a short *purpose* description instead.
         """
         if name == "code_run":
             code = str(args.get("code", "")).strip()
             timeout = args.get("timeout")
-            summary = self._summarize_code(code)
-            msg = f"即将执行 Python 代码：\n{summary}"
+            purpose = self._describe_code_purpose(code)
+            msg = f"即将执行代码：{purpose}"
             if timeout is not None:
                 msg += f"\n超时：{timeout}s"
             return msg + "\n\n是否继续？"
         if name == "shell_run":
             cmd = str(args.get("command", "")).strip()
             timeout = args.get("timeout")
-            preview = cmd if len(cmd) <= 200 else cmd[:200] + "…"
-            msg = f"即将执行 Shell 命令：\n{preview}"
+            purpose = self._describe_code_purpose(cmd)
+            msg = f"即将执行命令：{purpose}"
             if timeout is not None:
                 msg += f"\n超时：{timeout}s"
             return msg + "\n\n是否继续？"
