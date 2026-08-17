@@ -756,6 +756,14 @@ class Agent:
                         last_speed_emit = now
             except Exception as e:
                 err_str = str(e)
+                # Friendly message for streaming read timeouts (the most common
+                # cause of "reply stops halfway and never resumes").
+                if not err_str:
+                    import httpx
+                    if isinstance(e, httpx.ReadTimeout):
+                        err_str = "模型响应超时（读取中断），请重试"
+                    elif isinstance(e, httpx.TimeoutException):
+                        err_str = "模型请求超时，请重试"
                 # --- Reactive context shrink: if the LLM rejected the prompt
                 # for being too long, shrink and retry the same iteration
                 # instead of failing the whole turn.

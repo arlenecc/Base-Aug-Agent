@@ -55,7 +55,22 @@ class LLMClient:
         self.min_p = min_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
-        self._http: httpx.Client = httpx.Client(timeout=timeout)
+        # Use a structured timeout so that streaming reads have a per-chunk
+        # deadline.  A plain `timeout=float` applies only to the *whole*
+        # request (and, for streaming, once the first byte arrives, an idle
+        # server that stalls mid-generation would block `iter_lines()`
+        # FOREVER — the "reply stops halfway and never resumes" symptom).
+        # `read` here is the max gap between chunks; local models can take
+        # tens of seconds on a hard reasoning step, so we use a generous but
+        # finite bound to fail fast instead of hanging the UI.
+        if isinstance(timeout, httpx.Timeout):
+            self._http: httpx.Client = httpx.Client(timeout=timeout)
+        else:
+            read_timeout = max(timeout, 60.0)
+            self._http: httpx.Client = httpx.Client(
+                timeout=httpx.Timeout(connect=timeout, read=read_timeout,
+                                      write=timeout, pool=timeout)
+            )
 
     # ------------------------------------------------------------------
     # set http (used by tests; also lets the UI inject a configured client)
