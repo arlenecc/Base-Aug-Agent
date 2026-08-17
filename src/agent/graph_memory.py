@@ -49,6 +49,24 @@ def _norm_name(name: str) -> str:
     return name.strip()
 
 
+def _normalize_vector(vec: List[float]) -> List[float]:
+    """Normalize a vector to unit length.
+
+    LanceDB's default L2 distance only maps to cosine similarity
+    (``1 - d²/2``) when vectors are unit-normalized.  FastEmbed outputs are
+    NOT normalized, so raw L2 distances are huge (~300+), making the
+    ``1 - d²/2`` similarity collapse to 0 for every pair.  Normalize both on
+    write and on query.
+    """
+    norm = 0.0
+    for x in vec:
+        norm += x * x
+    norm = norm ** 0.5
+    if norm == 0:
+        return list(vec)
+    return [x / norm for x in vec]
+
+
 def _hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
 
@@ -82,6 +100,7 @@ class GraphMemoryStore:
         self._table = None
         self._ef = None
         self._vec_ready = False
+        self._backfilled = False
         self._load()
 
     # ------------------------------------------------------------------
@@ -130,6 +149,10 @@ class GraphMemoryStore:
         Uses a separate _vec_lock with double-checked locking so that
         concurrent callers (e.g. agent thread + tool thread) don't
         race into loading the ONNX model twice.
+
+        On first successful init, backfills any observations already present
+        in the JSON graph but missing from the vector table (so facts stored
+        before the vector index existed become searchable too).
         """
         if self._vec_ready:
             return
@@ -151,6 +174,69 @@ class GraphMemoryStore:
                 # Non-fatal: semantic search just falls back to keyword.
                 logger.debug("graph_memory: vector index unavailable: %s", e)
                 self._vec_ready = False
+        # Backfill outside the lock (embedding is slow). Only once per instance.
+        if self._vec_ready and not getattr(self, "_backfilled", False):
+            self._backfilled = True
+            try:
+                self._backfill_vectors()
+            except Exception as e:
+                logger.debug("graph_memory: backfill failed: %s", e)
+
+    def _backfill_vectors(self) -> None:
+        """Index any observations present in the graph JSON but missing from
+        the vector table (e.g. facts stored before the vector index existed)."""
+        # Snapshot entities under lock.
+        with self._lock:
+            pairs = [
+                (e["name"], obs)
+                for e in self._entities.values()
+                for obs in e.get("observations", [])
+            ]
+        if not pairs:
+            return
+        table = self._ensure_table()
+        # Determine which ids are already indexed.
+        existing_ids: set = set()
+        if table is not None:
+            try:
+                for r in table.to_arrow().to_pylist():
+                    existing_ids.add(r.get("id", ""))
+            except Exception:
+                existing_ids = set()
+        # Collect missing (entity, observation) pairs.
+        missing = [
+            (name, obs)
+            for name, obs in pairs
+            if _hash(name + "|" + obs) not in existing_ids
+        ]
+        if not missing:
+            return
+        # Embed + insert missing observations in batches of 100.
+        texts = [obs for _, obs in missing]
+        for i in range(0, len(missing), 100):
+            batch = missing[i:i + 100]
+            batch_texts = [obs for _, obs in batch]
+            try:
+                vecs = self._ef.embed_documents(batch_texts)
+            except Exception as e:
+                logger.warning("graph_memory: backfill embed failed: %s", e)
+                return
+            records = [
+                {
+                    "id": _hash(name + "|" + obs),
+                    "entity": name,
+                    "text": obs,
+                    "vector": _normalize_vector(vec),
+                }
+                for (name, obs), vec in zip(batch, vecs)
+            ]
+            with self._vec_lock:
+                if table is None:
+                    self._table = self._db.create_table("observations", records)
+                    table = self._table
+                else:
+                    table.add(records)
+        logger.info("graph_memory: backfilled %d observations into vector index", len(missing))
 
     def _ensure_table(self):
         if self._table is not None:
@@ -167,6 +253,7 @@ class GraphMemoryStore:
         that time would block all JSON reads (snapshot, search fallback, etc.)
         and freeze the UI if this runs on the agent thread.
         """
+        self._ensure_vectors()
         if not self._vec_ready:
             return
         try:
@@ -175,7 +262,7 @@ class GraphMemoryStore:
             # Observations are documents (retrieval targets), so embed with
             # the document prefix — matching _semantic_search which embeds
             # the query with the query prefix.
-            vec = self._ef.embed_documents([observation])[0]
+            vec = _normalize_vector(self._ef.embed_documents([observation])[0])
             record = {
                 "id": oid,
                 "entity": entity_name,
@@ -228,8 +315,16 @@ class GraphMemoryStore:
         embed_query() costs ~10-50ms of ONNX compute, so adding N facts
         from a fact-extraction pass would take N× that.  embed_documents()
         processes the whole list in a single batched ONNX forward pass.
+
+        Lazily initialises the vector index on first use (``_ensure_vectors``)
+        — previously it bailed out if the index wasn't already ready, which
+        meant the very first ``add_observations`` (before any ``search``)
+        silently skipped indexing and the vector table was never built.
         """
-        if not self._vec_ready or not observations:
+        if not observations:
+            return
+        self._ensure_vectors()
+        if not self._vec_ready:
             return
         try:
             vecs = self._ef.embed_documents(observations)
@@ -238,7 +333,7 @@ class GraphMemoryStore:
                     "id": _hash(entity_name + "|" + obs),
                     "entity": entity_name,
                     "text": obs,
-                    "vector": vec,
+                    "vector": _normalize_vector(vec),
                 }
                 for obs, vec in zip(observations, vecs)
             ]
@@ -414,12 +509,16 @@ class GraphMemoryStore:
             table = self._ensure_table()
             if table is None:
                 return self._keyword_search(query)
-            qvec = self._ef.embed_query(query)
+            qvec = _normalize_vector(self._ef.embed_query(query))
             results = table.search(qvec).limit(top_k).to_list()
             out = []
             for r in results:
                 dist = float(r.get("_distance", 1.0))
                 score = max(0.0, 1.0 - (dist * dist) / 2.0)
+                # 相似度阈值：过滤语义上不相关的结果（否则无关查询也会
+                # 返回低分命中，破坏"无匹配返回空"的语义）。
+                if score < 0.5:
+                    continue
                 out.append({
                     "entity": r.get("entity", ""),
                     "text": r.get("text", ""),
