@@ -1157,15 +1157,31 @@ class Agent:
     def _describe_code_purpose(self, code: str) -> str:
         """Return a one-line purpose description for code/command.
 
-        Tries the LLM first (accurate semantic understanding), falling back to
-        a local heuristic if the LLM is unavailable or fails.  Never returns
-        the full code.
+        Strategy: heuristic FIRST (zero latency — most generated code carries
+        a purpose comment/docstring, and known commands map to a fixed phrase).
+        Only when the heuristic yields a generic/empty description do we fall
+        back to the LLM (a slow 1-3s call that would otherwise delay the
+        confirmation dialog on every run).
         """
+        is_cmd = self._looks_like_command(code)
+        if is_cmd:
+            heuristic = self._summarize_command(code)
+            # Command mapping is authoritative for known programs; only fall
+            # back to LLM for unknown programs.
+            if not heuristic.startswith("执行命令 "):
+                return heuristic
+        else:
+            heuristic = self._summarize_code(code)
+            # A useful heuristic is a real purpose phrase (comment/docstring/
+            # function name), not the generic "执行代码片段：<first line>" or
+            # "执行一段代码" fallback.
+            if not heuristic.startswith(("执行代码片段", "执行一段代码")):
+                return heuristic
+
+        # Fallback: ask the LLM (dedicated client, with a short timeout).
         try:
             llm = self._get_extract_llm()
             if llm is not None and llm is not self.llm:
-                # Only use the LLM when we have a real (dedicated) client; a
-                # plain mock/scripted llm would not understand code anyway.
                 prompt = (
                     "用一句简短的中文说明以下代码/命令的用途（做什么事情），"
                     "不要贴代码，不要输出多余解释，20 字以内：\n\n"
@@ -1179,11 +1195,7 @@ class Agent:
                     return answer[:80]
         except Exception:
             pass
-        # Fallback: heuristic. For commands use the command-name mapping;
-        # for code use the comment/docstring heuristic.
-        if self._looks_like_command(code):
-            return self._summarize_command(code)
-        return self._summarize_code(code)
+        return heuristic
 
     @staticmethod
     def _looks_like_command(text: str) -> bool:
