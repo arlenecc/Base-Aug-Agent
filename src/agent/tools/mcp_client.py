@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 # 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
 _TOOL_CALL_TIMEOUT = 300.0
 
+# 单次 MCP 工具返回保留的最大字符数。MCP 工具是外部代码，输出体积不受我们
+# 控制（例如让它 dump 一个大文件/数据库表），而这段文本会原样进入模型上下文
+# ——不设上限一次调用就能把窗口撑爆。与 file_read / shell_run 的 200K 策略
+# 保持一致，保留头部并明确标注截断。
+_MAX_TOOL_OUTPUT_CHARS = 200_000
+
 # ------------------------------------------------------------------
 # MCP JSON-RPC wire types
 # ------------------------------------------------------------------
@@ -186,7 +192,16 @@ class MCPClient:
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 except Exception:
                     process.kill()
-                process.wait()
+                # SIGKILL 后仍设超时：进程处于不可中断状态（D，常见于 NFS/
+                # FUSE I/O）时 wait() 会永久挂起，进而卡死 shutdown/重建。
+                # 这种情况下只能放弃等待，让 init 在进程退出后收尸。
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "MCP server '%s': pid %d unkillable (D state?), giving up wait",
+                        self.name, process.pid,
+                    )
             except Exception:
                 pass
         # Clear pending requests under the lock.
@@ -242,8 +257,8 @@ class MCPClient:
                         texts.append(json.dumps(block, ensure_ascii=False))
                 else:
                     texts.append(str(block))
-            return "\n".join(texts)
-        return json.dumps(result, ensure_ascii=False)
+            return _cap_output("\n".join(texts))
+        return _cap_output(json.dumps(result, ensure_ascii=False))
 
     # ------------------------------------------------------------------
     # JSON-RPC internals
@@ -301,14 +316,19 @@ class MCPClient:
 
         Guarded by _write_lock so concurrent _call() invocations cannot
         interleave bytes on the pipe (writes >PIPE_BUF are not atomic).
+
+        进程引用在锁内读取：stop() 会在锁内置 ``_process = None``，旧实现
+        在锁外判空、锁内解引用，与 stop() 竞态时抛 AttributeError 而不是
+        清晰的 MCPError。
         """
-        if not self._process or not self._process.stdin:
-            raise MCPError(f"MCP server '{self.name}': not running")
         with self._write_lock:
+            process = self._process
+            if not process or not process.stdin:
+                raise MCPError(f"MCP server '{self.name}': not running")
             try:
-                self._process.stdin.write(line + "\n")
-                self._process.stdin.flush()
-            except (BrokenPipeError, OSError) as e:
+                process.stdin.write(line + "\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as e:
                 raise MCPError(f"MCP server '{self.name}': write failed: {e}")
 
     def _drain_stderr(self) -> None:
@@ -372,6 +392,25 @@ class MCPClient:
                             error={"message": "MCP server connection closed", "code": -1},
                         )
                     ev.set()
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+
+def _cap_output(text: str) -> str:
+    """把 MCP 工具输出钳制到 _MAX_TOOL_OUTPUT_CHARS，超长部分截断并标注。
+
+    截断标记必须让模型知道「结果被裁了」，否则它会把半截输出当成完整结果
+    继续推理。
+    """
+    if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
+        return text
+    return (
+        text[:_MAX_TOOL_OUTPUT_CHARS]
+        + f"\n… [MCP 工具输出共 {len(text)} 字符，已截断到 {_MAX_TOOL_OUTPUT_CHARS}]"
+    )
 
 
 # ------------------------------------------------------------------

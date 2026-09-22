@@ -222,11 +222,17 @@ class MemoryGraphTool(Tool):
             return ToolResult(True, output="created" if ok else "duplicate or invalid")
         if op == "list_entities":
             entities = g.list_entities()
-            # Compact: name + type + observation count
+            # Compact: name + type + observation count.
+            # 图谱可能积累数百实体，全量塞进上下文会挤掉真正要处理的内容；
+            # 截断并提示用 get_entity 精确查询。
+            _MAX_LIST = 200
             summary = [
                 f"{e['name']} ({e.get('type','?')}) [{len(e.get('observations',[]))} obs]"
-                for e in entities
+                for e in entities[:_MAX_LIST]
             ]
+            if len(entities) > _MAX_LIST:
+                summary.append(f"… (共 {len(entities)} 个实体，仅显示前 {_MAX_LIST} 个；"
+                               f"用 get_entity 查询具体实体)")
             return ToolResult(True, output=json.dumps(summary, ensure_ascii=False))
         if op == "get_entity":
             if not name:
@@ -268,6 +274,16 @@ class MemorySearchTool(Tool):
         self.registry = registry
 
     def run(self, query: str, top_k: int = 5) -> ToolResult:
+        # 模型可能传 null 或超大 top_k：None 会让 embed 失败，大 top_k 会把
+        # 全部观察灌进上下文。归一化 + 钳制（与 rag_search 一致）。
+        query = (query or "").strip()
+        if not query:
+            return ToolResult(False, error="请提供要回忆的内容（query）")
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 5
+        top_k = max(1, min(top_k, 20))
         lm = _get_long_memory(self.registry, self.config)
         results = lm.graph.search(query, top_k=top_k)
         return ToolResult(True, output=json.dumps(results, ensure_ascii=False))

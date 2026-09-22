@@ -164,9 +164,15 @@ class RagStatusTool(Tool):
                 f"  已索引文件数: {len(status['sources'])}",
             ]
             if status["sources"]:
-                lines.append("  已索引文件:")
-                for s in status["sources"]:
+                sources = status["sources"]
+                # 大知识库可能索引了成百上千个文件，全量列出既挤占上下文也
+                # 没有决策价值——截断并提示总数。
+                _MAX_SOURCES = 50
+                lines.append(f"  已索引文件: 共 {len(sources)} 个")
+                for s in sources[:_MAX_SOURCES]:
                     lines.append(f"    - {os.path.basename(s)}")
+                if len(sources) > _MAX_SOURCES:
+                    lines.append(f"    … （其余 {len(sources) - _MAX_SOURCES} 个省略）")
             return ToolResult(success=True, output="\n".join(lines))
         except Exception as e:
             return ToolResult(success=False, error=f"获取知识库状态失败: {e}")

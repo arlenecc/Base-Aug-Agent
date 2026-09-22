@@ -556,6 +556,12 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 33 | `graph_memory` 批量嵌入 `zip` 截断 | 图谱与向量库永久不一致 | 数量校验，整批失败 |
 | 34 | `deps` 把 `config.json` 当重排序缓存命中 | 中断下载后跳过预下载 | 只认权重文件 |
 | 35 | `skill_load` 读过期 retriever 属性 | 切 workspace 后校验发生在旧目录 | 走按目录缓存的 `get_skill_retriever()` |
+| 36 | `file_modify` 无界读 + 二进制裸异常 | 大文件 OOM；二进制报难懂错误 | 10MB 上限 + 显式捕获，指引改用 file_write |
+| 37 | `_atomic_write` 保留 mkstemp 的 0600 | 每次写文件悄悄变成「仅属主可读」 | 恢复原权限 / 按 umask 取 0644 |
+| 38 | `mcp` 工具输出无上限 | 一次调用撑爆模型上下文 | 200K 截断 + 标注原始长度 |
+| 39 | `mcp.stop()` 最终 `wait()` 无超时 | D 状态进程卡死 shutdown | 5s 超时放弃等待 |
+| 40 | `memory_search` 无 top_k 钳制 / `list_entities` 全量 | 全部观察/实体灌进上下文 | top_k ≤ 20；列表截断到 200 |
+| 41 | `rag_status` 文件列表全量 | 数百文件挤占上下文 | 截断到 50 并标注总数 |
 
 ## 部署
 

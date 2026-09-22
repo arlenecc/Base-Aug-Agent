@@ -1,7 +1,7 @@
 """MCP tool adapter – wraps an MCP server tool as a base-agent Tool."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry
 
@@ -39,20 +39,3 @@ class MCPTool(Tool):
             return ToolResult(success=True, output=output)
         except Exception as e:
             return ToolResult(success=False, error=str(e))
-
-
-def mcp_schema_to_tool_schema(tool_def: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert an MCP tool definition to OpenAI function-calling schema."""
-    input_schema = tool_def.get("inputSchema", {})
-    return {
-        "type": "function",
-        "function": {
-            "name": tool_def.get("name", ""),
-            "description": tool_def.get("description", ""),
-            "parameters": {
-                "type": input_schema.get("type", "object"),
-                "properties": input_schema.get("properties", {}),
-                "required": input_schema.get("required", []),
-            },
-        },
-    }

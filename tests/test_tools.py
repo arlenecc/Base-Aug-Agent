@@ -522,3 +522,104 @@ def test_web_scan_rejects_non_http_schemes(config):
     assert not res.success
     assert "http" in res.error.lower()
     reg.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# file_ops robustness (round 3 review)
+# ---------------------------------------------------------------------------
+
+def test_file_modify_binary_file_returns_clear_error(config):
+    """二进制文件替换文本应报「不是 UTF-8」，而不是裸 UnicodeDecodeError。"""
+    p = os.path.join(config.workspace, "img.bin")
+    with open(p, "wb") as f:
+        f.write(bytes(range(256)) * 64)  # 无效 UTF-8
+    reg = _reg(config)
+    res = reg.execute("file_modify", {"path": "img.bin", "old": "x", "new": "y"})
+    assert not res.success
+    assert "utf-8" in res.error.lower()
+    reg.shutdown()
+
+
+def test_file_modify_huge_file_is_rejected(config):
+    """超大文件全量读入内存做替换会被拒绝（给出指引而不是 OOM）。"""
+    from agent.tools import file_ops as fo
+
+    p = os.path.join(config.workspace, "big.log")
+    # 用 monkeypatch 把阈值压小，避免真的写 10MB。
+    import unittest.mock as mock
+    reg = _reg(config)
+    with open(p, "w") as f:
+        f.write("hello world\n" * 100)
+    with mock.patch.object(fo, "_MAX_MODIFY_BYTES", 100):
+        res = reg.execute("file_modify", {"path": "big.log", "old": "hello", "new": "bye"})
+    assert not res.success
+    assert "too large" in res.error.lower()
+    assert "file_write" in res.error or "sed" in res.error
+    reg.shutdown()
+
+
+def test_file_write_preserves_mode_and_default_0644(config):
+    """mkstemp 是 0600——file_write 不应悄悄把目标文件变成仅属主可读。"""
+    p1 = os.path.join(config.workspace, "mode_new.txt")
+    p2 = os.path.join(config.workspace, "mode_exist.txt")
+    with open(p2, "w") as f:
+        f.write("old")
+    os.chmod(p2, 0o640)
+
+    reg = _reg(config)
+    assert reg.execute("file_write", {"path": "mode_new.txt", "content": "x"}).success
+    assert reg.execute("file_write", {"path": "mode_exist.txt", "content": "y"}).success
+    reg.shutdown()
+
+    # 新文件按 umask 得到常规权限（非 0600）；已有文件继承原权限。
+    new_mode = os.stat(p1).st_mode & 0o777
+    assert new_mode != 0o600, f"new file got mkstemp's 0600: {oct(new_mode)}"
+    assert os.stat(p2).st_mode & 0o777 == 0o640
+
+
+def test_memory_search_clamps_top_k(config):
+    """top_k=100000 不能把全部观察灌进上下文。"""
+    reg = _reg(config)
+    reg.execute("memory_graph", {"op": "create_entity",
+                                 "name": "E", "observations": ["fact1", "fact2"]})
+    res = reg.execute("memory_search", {"query": "fact", "top_k": 100000})
+    assert res.success
+    # 钳制到 20：JSON 里最多 20 条结果。
+    import json as _json
+    results = _json.loads(res.output)
+    assert len(results) <= 20
+    reg.shutdown()
+
+
+def test_memory_search_rejects_blank_query(config):
+    reg = _reg(config)
+    res = reg.execute("memory_search", {"query": "   "})
+    assert not res.success
+    reg.shutdown()
+
+
+def test_mcp_client_caps_tool_output():
+    """MCP 工具输出无上限会撑爆模型上下文，必须钳制并标注。"""
+    from agent.tools.mcp_client import _cap_output, _MAX_TOOL_OUTPUT_CHARS
+
+    assert _cap_output("short") == "short"
+    big = "x" * (_MAX_TOOL_OUTPUT_CHARS + 1234)
+    capped = _cap_output(big)
+    assert len(capped) < _MAX_TOOL_OUTPUT_CHARS + 200
+    assert "截断" in capped
+    assert "1234" in capped  # 标注里写明原始长度
+
+
+def test_mcp_client_send_after_stop_raises_clean_error():
+    """stop() 之后 _send 必须抛 MCPError，而不是与 stop() 竞态抛 AttributeError。"""
+    from agent.tools.mcp_client import MCPClient, MCPError
+
+    c = MCPClient(name="t", command="true")
+    try:
+        c._send("{}")
+        raised = None
+    except MCPError:
+        raised = "mcp"
+    except AttributeError:
+        raised = "attr"
+    assert raised == "mcp"

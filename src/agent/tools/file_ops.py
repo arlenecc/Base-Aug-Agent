@@ -12,6 +12,11 @@ from .base import Tool, ToolRegistry, ToolResult
 # (200K)、web (8MB) 的上限策略保持一致。
 _MAX_READ_CHARS = 200_000
 
+# file_modify 全文读入内存做替换，超过这个大小直接拒绝——既避免把整个大文件
+# 拽进内存（读 + 替换副本是 2~3 倍文件体积），也因为对超大文件的「替换第一处」
+# 本来就不可靠，模型应改用 file_write 重写或 shell 处理。
+_MAX_MODIFY_BYTES = 10 * 1024 * 1024
+
 
 def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
     """Temp + os.replace 原子写。
@@ -19,13 +24,34 @@ def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
     临时文件名必须唯一：固定 ``full + ".tmp"`` 在两个线程并发写同一目标时会
     互相覆盖、落盘混合内容；写失败时固定名还会把 .tmp 残留在 workspace 里被
     后续读取当成数据。用 mkstemp 生成唯一名，finally 里清理。
+
+    mkstemp 出于安全考虑以 0600 建文件——直接 replace 会让目标文件的权限从
+    常规的 0644 变成「仅属主可读」。这里在 replace 前把权限恢复为「目标文件
+    原有权限，不存在则 0644 & ~umask」，避免每次 file_write 都悄悄改变文件
+    可见性（例如另一个用户/服务读不了 agent 写的文件）。
     """
     dir_name = os.path.dirname(full) or "."
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=dir_name)
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as f:
-            f.write(content)
-        os.replace(tmp, full)
+        try:
+            # 目标已存在 → 继承其权限；否则按 umask 得到常规 0644。
+            try:
+                mode = os.stat(full).st_mode & 0o7777
+            except OSError:
+                mask = os.umask(0)
+                os.umask(mask)
+                mode = 0o666 & ~mask
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w", encoding=encoding) as f:
+                f.write(content)
+            fd = -1  # fdopen 已接管， finally 不再重复 close
+            os.replace(tmp, full)
+        finally:
+            if fd >= 0:  # fchmod/fdopen 抛异常时避免 fd 泄漏
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     finally:
         # os.replace 成功后 tmp 已不存在；失败时清理掉半成品。
         try:
@@ -90,6 +116,11 @@ class FileReadTool(_FileTool):
                 # 大二进制文件就能把内存和模型上下文一起撑爆。
                 raw = f.read(_MAX_READ_CHARS // 2)
             return ToolResult(True, output="(binary) " + base64.b64encode(raw).decode())
+        except FileNotFoundError:
+            # isfile 与 open 之间存在竞态（文件被删/符号链接失效）。
+            return ToolResult(False, error=f"File does not exist: {path}")
+        except OSError as e:
+            return ToolResult(False, error=f"Read failed: {e}")
 
 
 class FileWriteTool(_FileTool):
@@ -111,8 +142,10 @@ class FileWriteTool(_FileTool):
             full = self._resolve(path)
         except PermissionError as e:
             return ToolResult(False, error=str(e))
-        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
         try:
+            # makedirs 也放进 try：磁盘满/只读目录/权限不足都表现为 OSError，
+            # 应作为工具失败返回而不是让 registry 兜底成裸异常。
+            os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
             _atomic_write(full, content)
         except OSError as e:
             return ToolResult(False, error=f"Write failed: {e}")
@@ -142,8 +175,25 @@ class FileModifyTool(_FileTool):
             return ToolResult(False, error=str(e))
         if not os.path.isfile(full):
             return ToolResult(False, error=f"File does not exist: {path}")
-        with open(full, "r", encoding="utf-8") as f:
-            text = f.read()
+        # 全文读入内存做替换，必须设上限：读 + 替换副本 ≈ 2~3 倍文件体积，
+        # 一个几百 MB 的日志就能把内存打满。超限时给出明确指引而不是 OOM。
+        size = os.path.getsize(full)
+        if size > _MAX_MODIFY_BYTES:
+            return ToolResult(
+                False,
+                error=f"File too large for file_modify ({size} bytes > "
+                      f"{_MAX_MODIFY_BYTES}); use file_write to rewrite it "
+                      f"or shell_run (sed/python) instead",
+            )
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            # 二进制文件替换文本没有意义，且旧实现在这里抛未捕获的
+            # UnicodeDecodeError，被 registry 兜底成难懂的裸异常。
+            return ToolResult(False, error=f"File is not UTF-8 text: {path}")
+        except OSError as e:
+            return ToolResult(False, error=f"Read failed: {e}")
         if old not in text:
             return ToolResult(False, error=f"'old' string not found in {path}")
         if replace_all:

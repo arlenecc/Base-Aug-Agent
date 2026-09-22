@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import List
+from typing import List, Optional
 
 from ..config import AgentConfig
 from .base import Tool, ToolRegistry, ToolResult
@@ -78,7 +78,7 @@ class CodeRunTool(Tool):
         self.config = config
         self.registry = registry
 
-    def run(self, code: str, timeout: float = None) -> ToolResult:
+    def run(self, code: str, timeout: Optional[float] = None) -> ToolResult:
         import builtins as _b
 
         # Tolerate non-string `code` (some models emit a number or a list).
@@ -195,6 +195,11 @@ class CodeRunTool(Tool):
             # Signal cooperative cancellation so the worker can exit when
             # it next checks `_cancelled()`. Track the leaked thread.
             _cancel_evt.set()
+            # 已知限制：泄漏线程最终退出时，它的 finally 会把 sys.stdout 恢复
+            # 成「它启动时的值」。若此期间又有一次 code_run 正在执行并已换成
+            # 自己的 StringIO，后者的输出会被这次恢复吞掉。窗口极小（要求
+            # 前一次超时泄漏 + 后一次恰好并发执行），根治需要线程级 stdout
+            # （contextvars + 自定义 print），收益不抵复杂度。
             with _leaked_threads_lock:
                 # Prune completed threads, then append the new one, capped.
                 _leaked_threads[:] = [lt for lt in _leaked_threads if lt.is_alive()]
