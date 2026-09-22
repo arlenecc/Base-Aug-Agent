@@ -146,27 +146,26 @@ class CodeRunTool(Tool):
         result: dict = {"exc": None, "done": False}
 
         def _worker():
-            cwd = os.getcwd()
             try:
                 # os.chdir / sys.stdout 替换是**进程级**全局状态，不是线程级的：
                 # 执行期间其它线程的相对路径与 print 都会受影响。这里接受这段
-                # 时间的短暂影响（相对路径语义是工具契约的一部分），但恢复动作
-                # 必须由主线程在 join 之后完成——旧实现放在 worker 的 finally，
-                # 超时泄漏的线程会在未来任意时刻把整个进程 cwd 拽回来，并且
-                # 只要它不结束，sys.stdout 就一直被劫持到 StringIO，agent 的
-                # 所有 print 输出从此全部丢失。
+                # 时间的短暂影响（相对路径语义是工具契约的一部分）。
+                #
+                # 恢复动作**全部**由主线程在 join 之后完成（见下方注释），
+                # worker 自己绝不恢复——尤其不能碰 sys.stdout：超时泄漏的线程
+                # 会在未来任意时刻退出，若它在 finally 里把 stdout 恢复成
+                # 「自己启动时的值」，就可能覆盖掉下一次 code_run 刚换上的
+                # StringIO，把那次执行的输出整个吞掉。
                 os.chdir(ws)
                 # Inject cancellation checker into the sandbox namespace so
                 # user code can call `_cancelled()` to poll and exit early.
                 namespace["__builtins__"] = {**vars(_b), "open": _guard_open}
                 namespace["_cancelled"] = _cancel_evt.is_set
-                _saved_stdout, _saved_stderr = sys.stdout, sys.stderr
+                sys.stdout, sys.stderr = out, err
                 try:
-                    sys.stdout, sys.stderr = out, err
                     exec(compile(code, "<code_run>", "exec"), namespace)
                 finally:
                     result["done"] = True
-                    sys.stdout, sys.stderr = _saved_stdout, _saved_stderr
             except PermissionError as e:
                 result["exc"] = e
             except SystemExit as e:
@@ -183,7 +182,9 @@ class CodeRunTool(Tool):
         t.start()
         t.join(timeout=timeout)
 
-        # 无论是否超时都由主线程恢复进程级全局状态（见 _worker 注释）。
+        # 无论是否超时都由主线程统一恢复进程级全局状态。恢复权**只**属于
+        # 主线程：worker 不做任何恢复（见 _worker 注释），因此超时泄漏的
+        # 线程无论何时退出都不会再污染 cwd / sys.stdout。
         try:
             os.chdir(_prev_cwd)
             sys.stdout, sys.stderr = _prev_stdout, _prev_stderr
@@ -195,11 +196,8 @@ class CodeRunTool(Tool):
             # Signal cooperative cancellation so the worker can exit when
             # it next checks `_cancelled()`. Track the leaked thread.
             _cancel_evt.set()
-            # 已知限制：泄漏线程最终退出时，它的 finally 会把 sys.stdout 恢复
-            # 成「它启动时的值」。若此期间又有一次 code_run 正在执行并已换成
-            # 自己的 StringIO，后者的输出会被这次恢复吞掉。窗口极小（要求
-            # 前一次超时泄漏 + 后一次恰好并发执行），根治需要线程级 stdout
-            # （contextvars + 自定义 print），收益不抵复杂度。
+            # 泄漏线程此后只会继续往自己的 StringIO 写（不会再碰全局
+            # stdout/cwd），因此并发执行下一次 code_run 是安全的。
             with _leaked_threads_lock:
                 # Prune completed threads, then append the new one, capped.
                 _leaked_threads[:] = [lt for lt in _leaked_threads if lt.is_alive()]

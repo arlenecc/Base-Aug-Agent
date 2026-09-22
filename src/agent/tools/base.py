@@ -1,6 +1,7 @@
 """Tool base class, registry, and exports."""
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -328,10 +329,34 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(success=False, error=f"Unknown tool: {name}")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            return ToolResult(
+                success=False,
+                error=f"Invalid arguments for {name}: expected a JSON object, "
+                      f"got {type(args).__name__}",
+            )
+
+        # 签名级预检：把「模型传错参数」和「工具内部抛 TypeError」区分开。
+        # 旧实现靠捕获 run() 抛出的 TypeError 一律报 "Invalid arguments"——
+        # 工具内部代码出 bug（比如对 None 调 .strip()）时模型会收到"参数
+        # 无效"，于是反复重试同样的调用而不是上报问题。
+        try:
+            inspect.signature(tool.run).bind(**args)
+        except TypeError as e:
+            return ToolResult(success=False, error=f"Invalid arguments for {name}: {e}")
+
         try:
             return tool.run(**args)
         except TypeError as e:
-            return ToolResult(success=False, error=f"Invalid arguments for {name}: {e}")
+            # 签名已通过 → 这里的 TypeError 是工具内部缺陷，如实报告。
+            logger.exception("tool %s raised TypeError internally (args=%r)", name, args)
+            return ToolResult(
+                success=False,
+                error=f"{name} failed internally (not an argument problem): "
+                      f"{type(e).__name__}: {e}",
+            )
         except Exception as e:  # pragma: no cover - defensive
             return ToolResult(success=False, error=f"{type(e).__name__}: {e}")
 

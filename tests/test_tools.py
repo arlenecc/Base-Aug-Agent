@@ -623,3 +623,110 @@ def test_mcp_client_send_after_stop_raises_clean_error():
     except AttributeError:
         raised = "attr"
     assert raised == "mcp"
+
+
+# ---------------------------------------------------------------------------
+# execute() argument validation vs internal errors (round 4)
+# ---------------------------------------------------------------------------
+
+def test_execute_reports_bad_args_as_invalid_arguments(config):
+    """模型漏传/多传参数 → "Invalid arguments"（模型可据此修正调用）。"""
+    reg = _reg(config)
+
+    # 缺 required 参数。
+    res = reg.execute("file_read", {})
+    assert not res.success
+    assert "Invalid arguments" in res.error
+    assert "path" in res.error
+
+    # 传了签名里不存在的参数。
+    res = reg.execute("file_read", {"path": "a.txt", "bogus": 1})
+    assert not res.success
+    assert "Invalid arguments" in res.error
+
+    # args 不是 dict。
+    res = reg.execute("file_read", ["not", "a", "dict"])
+    assert not res.success
+    assert "Invalid arguments" in res.error
+    reg.shutdown()
+
+
+def test_execute_distinguishes_internal_typeerror(config):
+    """工具内部抛 TypeError 不能再被误报成 "Invalid arguments"。
+
+    旧实现一律捕 TypeError 报参数错误，模型会反复重试同样的调用而不是
+    意识到工具本身坏了。
+    """
+    from agent.tools.base import Tool
+
+    class BuggyTool(Tool):
+        name = "buggy_tool"
+        description = "raises TypeError internally"
+        parameters = {"type": "object", "properties": {"x": {"type": "string"}},
+                      "required": ["x"]}
+
+        def run(self, x: str) -> ToolResult:
+            # 与参数无关的内部 TypeError（len() 不接受 int）。
+            len(42)
+            return ToolResult(True, output="never")
+
+    reg = _reg(config)
+    reg._tools["buggy_tool"] = BuggyTool()
+    res = reg.execute("buggy_tool", {"x": "hello"})
+    assert not res.success
+    assert "Invalid arguments" not in res.error
+    assert "internally" in res.error
+    assert "object of type 'int' has no len()" in res.error
+    reg.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# code_run stdout restore ownership (round 4)
+# ---------------------------------------------------------------------------
+
+def test_code_run_leaked_thread_does_not_hijack_stdout(config):
+    """超时泄漏的线程退出后不得污染进程级 sys.stdout。
+
+    旧实现 worker 在 finally 里恢复 stdout——泄漏线程在未来的任意时刻退出时，
+    若期间又有一次 code_run 在执行（已换上自己的 StringIO），那次执行的输出
+    会被这次恢复吞掉。
+    """
+    import sys as _sys
+    import time as _time
+
+    reg = _reg(config)
+    # 第一次调用：启动一个后台线程持续向 stdout 写，然后主脚本超时。
+    # 该泄漏线程的 finally（旧实现）会在它退出时恢复 stdout。
+    res1 = reg.execute("code_run", {
+        "code": (
+            "import threading, time, sys\n"
+            "def spin():\n"
+            "    while not _cancelled():\n"
+            "        try:\n"
+            "            print('x')\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        time.sleep(0.01)\n"
+            "threading.Thread(target=spin, daemon=True).start()\n"
+            "time.sleep(30)\n"
+        ),
+        "timeout": 1,
+    })
+    assert not res1.success and "timed out" in res1.error.lower()
+
+    real_stdout = _sys.stdout
+    try:
+        # 第二次调用：验证其输出完整进入自己的 StringIO（未被泄漏线程吞掉）。
+        res2 = reg.execute("code_run", {
+            "code": "print('second-run-ok')",
+            "timeout": 10,
+        })
+        assert res2.success
+        assert "second-run-ok" in res2.output
+        # 全局 stdout 始终是真 stdout（未被任何 StringIO 劫持）。
+        assert _sys.stdout is real_stdout
+    finally:
+        # 唤醒泄漏线程，让它尽快退出，避免污染后续测试。
+        reg.execute("code_run", {"code": "_cancelled()", "timeout": 5})
+        _time.sleep(0.05)
+    reg.shutdown()

@@ -562,6 +562,8 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 39 | `mcp.stop()` 最终 `wait()` 无超时 | D 状态进程卡死 shutdown | 5s 超时放弃等待 |
 | 40 | `memory_search` 无 top_k 钳制 / `list_entities` 全量 | 全部观察/实体灌进上下文 | top_k ≤ 20；列表截断到 200 |
 | 41 | `rag_status` 文件列表全量 | 数百文件挤占上下文 | 截断到 50 并标注总数 |
+| 42 | `execute()` 把工具内部 TypeError 误报为参数错误 | 工具出 bug 时模型反复重试而不是上报 | `inspect.signature` 预检区分两类错误 |
+| 43 | `code_run` 泄漏线程可吞掉后续执行的 stdout | 并发执行时输出丢失 | 恢复权全部移交主线程，worker 不再碰全局状态 |
 
 ## 部署
 
