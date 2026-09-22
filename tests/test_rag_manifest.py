@@ -123,6 +123,7 @@ class _FakeStore:
     def __init__(self):
         self.records = []
         self.deleted_sources = []
+        self.deleted_documents = []
         self._count = 0
 
     def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
@@ -138,6 +139,9 @@ class _FakeStore:
     def delete_by_source(self, source):
         self.deleted_sources.append(source)
         return 1
+
+    def delete_document(self, doc_name):
+        self.deleted_documents.append(doc_name)
 
     def count(self):
         return self._count
@@ -265,6 +269,8 @@ def test_deleted_file_is_cleaned_up(tmp_path):
     stats = engine.ingest(force=False)
     assert stats["files_deleted"] == 1, "deleted file must be cleaned up"
     assert deleted_source in store.deleted_sources, "vectors must be deleted"
+    # 目录概要（documents 元数据表）也必须同步清理（用 basename 作为 doc_id）。
+    assert "a.txt" in store.deleted_documents, "document digest must be deleted"
 
     # Manifest must no longer contain the deleted file
     manifest = _load_manifest(engine._rag_dir)

@@ -233,9 +233,6 @@ class VectorStore:
         # 保护 documents 表懒创建 + 写操作。用 RLock：upsert_document /
         # delete_document 会「持锁后再调用 _ensure_documents_table()」，普通
         # Lock 会在此自锁死（见 _ensure_documents_table 的注释）。
-        # 保护 documents 表懒创建 + 写操作。用 RLock：upsert_document /
-        # delete_document 会「持锁后再调用 _ensure_documents_table()」，普通
-        # Lock 会在此自锁死（见 _ensure_documents_table 的注释）。
         self._documents_lock = threading.RLock()
         # 保护整个 store 的懒初始化（连接/建表/schema 迁移只允许一次）。
         self._init_lock = threading.RLock()

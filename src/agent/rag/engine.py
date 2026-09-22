@@ -823,10 +823,14 @@ class RAGEngine:
         removed = [fp for fp in old_manifest if fp not in current_set]
         if not removed:
             return
-        logger.info("  发现 %d 个已删除文件，清理对应向量...", len(removed))
+        logger.info("  发现 %d 个已删除文件，清理对应向量与目录概要...", len(removed))
         store = self._get_store()
         for source in removed:
             store.delete_by_source(source)
+            # 同步清理 documents 元数据表里的目录概要（digest）/markdown 记录。
+            # 注意：documents 表的 doc_id 用 basename 生成（见 upsert_document），
+            # 而向量表用完整路径，故此处需取 basename。
+            store.delete_document(os.path.basename(source))
             new_manifest.pop(source, None)
             with stats_lock:
                 stats["files_deleted"] += 1
