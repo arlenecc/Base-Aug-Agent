@@ -83,8 +83,16 @@ class _JsonStore:
 
         Used after an external write (e.g. another thread / process saved the
         same store file) so this instance picks up the latest data.
+
+        必须先把未落盘的脏数据强制写回：防抖策略（_FLUSH_INTERVAL=0.5s）下，
+        刚 set() 的内容可能还只在内存里。旧实现直接 _load() 用磁盘内容整体
+        覆盖 _data——「set 后 0.5s 内 reload」会把那次 set 静默丢弃。实际触发
+        场景：UI 在 create_skill() 后立刻 reload()（main_window），若距上一轮
+        record_request 的写入不足 0.5s，用户刚固化的技能直接丢失。
         """
         with self._lock:
+            if self._dirty:
+                self._save()
             self._load()
 
     def _save(self) -> None:

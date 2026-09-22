@@ -79,3 +79,33 @@ def test_longterm_memory_add_many_handles_corrupted_store(tmp_path):
     mem = LongTermMemory(path=p)
     mem.add_many(["a", "b", "c"])
     assert mem.all() == ["a", "b", "c"]
+
+
+# ---------------------------------------------------------------------------
+# _JsonStore: reload must not discard unsaved (debounced) writes
+# ---------------------------------------------------------------------------
+
+def test_json_store_reload_flushes_pending_writes(tmp_path):
+    """reload() 不得丢弃防抖窗口内尚未落盘的 set()。
+
+    实际触发场景：UI 在 create_skill() 后立刻 reload()——若距上一轮
+    record_request 的写入不足 0.5s（防抖窗口），刚固化的技能会被磁盘上的
+    旧内容覆盖，静默丢失。
+    """
+    from agent.memory import _JsonStore
+
+    p = str(tmp_path / "store.json")
+    store = _JsonStore(p)
+
+    store.set("a", 1)          # 落盘（首写总是立即）
+    store.set("b", 2)          # 防抖窗口内 → 只在内存
+    store.reload()             # 旧实现：直接用磁盘旧内容覆盖内存 → "b" 丢失
+
+    assert store.get("a") == 1
+    assert store.get("b") == 2, "reload() discarded a debounced write"
+
+    # 磁盘上也要真的有。
+    import json as _json
+    with open(p, "r", encoding="utf-8") as f:
+        on_disk = _json.load(f)
+    assert on_disk.get("b") == 2
