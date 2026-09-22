@@ -93,12 +93,18 @@ class SkillIndex:
         try:
             with open(self._index_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self._index = data.get("skills", [])
-            self._last_scan = data.get("updated_at_ts", 0)
+            if not isinstance(data, dict):
+                raise ValueError("index root is not an object")
+            skills = data.get("skills", [])
+            self._index = skills if isinstance(skills, list) else []
+            ts = data.get("updated_at_ts", 0)
+            self._last_scan = ts if isinstance(ts, (int, float)) else 0
             # Sync _last_dir_mtime so _should_scan() doesn't immediately
             # trigger a rescan right after loading a fresh index.
             self._last_dir_mtime = self._dir_mtime()
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, json.JSONDecodeError, ValueError, TypeError, AttributeError) as e:
+            # 手工写坏 / 版本不兼容的 _index.json 不能让技能检索整体失效：
+            # 记日志后按空索引处理，下次 scan() 会重建。
             logger.warning("skill_index: failed to load %s: %s", self._index_path, e)
             self._index = []
 
@@ -141,18 +147,36 @@ class SkillIndex:
         return False
 
     def _dir_mtime(self) -> float:
-        """Get the most recent mtime among all skill subdirectories."""
+        """Get the most recent mtime among skill subdirectories *and* their
+        ``skill.json`` metadata files.
+
+        Stat-ing only the subdirectories (the old behaviour) misses the common
+        edit case: rewriting ``skill.json``/``prompt.md`` does not change the
+        parent directory's mtime, so the index stayed stale for up to
+        ``_SCAN_INTERVAL`` seconds after a skill was edited.
+        """
         max_mtime = 0.0
         if not os.path.isdir(self._dir):
             return 0.0
+        try:
+            mtime = os.stat(self._dir).st_mtime
+            if mtime > max_mtime:
+                max_mtime = mtime
+        except OSError:
+            pass
         for entry in os.scandir(self._dir):
-            if entry.is_dir() and not entry.name.startswith("_"):
-                try:
-                    mtime = entry.stat(follow_symlinks=False).st_mtime
-                    if mtime > max_mtime:
-                        max_mtime = mtime
-                except OSError:
-                    pass
+            if not entry.is_dir() or entry.name.startswith("_"):
+                continue
+            try:
+                mtime = entry.stat(follow_symlinks=False).st_mtime
+                if mtime > max_mtime:
+                    max_mtime = mtime
+                meta = os.path.join(entry.path, _SKILL_META_FILENAME)
+                mtime = os.stat(meta).st_mtime
+                if mtime > max_mtime:
+                    max_mtime = mtime
+            except OSError:
+                pass
         return max_mtime
 
     def scan(self, force: bool = False) -> int:
@@ -165,8 +189,13 @@ class SkillIndex:
                 return len(self._index)
 
             if not os.path.isdir(self._dir):
+                # 目录不存在时同样要更新 _last_scan/_last_dir_mtime，否则
+                # _should_scan() 永远为真：每次 search() 都会 makedirs +
+                # 重写一遍 _index.json（无谓的磁盘写入，且目录被外部创建后
+                # 也感知不到）。
                 self._index = []
-                self._save()
+                self._last_scan = time.time()
+                self._last_dir_mtime = 0.0
                 return 0
 
             new_index: List[Dict[str, Any]] = []
@@ -240,7 +269,12 @@ class SkillIndex:
         # Ensure index is fresh
         self.scan()
 
-        if not self._index or not query.strip():
+        # 在锁内取快照：scan() 结束后另一个线程可能立刻再次扫描并替换
+        # self._index，直接遍历会在迭代过程中被改写。
+        with self._lock:
+            index = list(self._index)
+
+        if not index or not query.strip():
             return []
 
         query_tokens = set(_tokenize(query.lower()))
@@ -248,7 +282,7 @@ class SkillIndex:
             return []
 
         scored = []
-        for skill in self._index:
+        for skill in index:
             score = 0
             # Match against name
             name_tokens = set(_tokenize(skill.get("name", "").lower()))

@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+from agent.config import AgentConfig
 from agent.skill_index import SkillIndex
 from agent.skills import SkillManager
 from agent.tools.base import ToolRegistry
@@ -256,6 +257,40 @@ def test_skill_load_tool(registry, config):
     # Traversal -> error
     res = tool.run(path="..", entry="secret.txt")
     assert not res.success
+
+
+def test_skill_load_rejects_absolute_entry(registry, config):
+    """`entry` is model-supplied. os.path.join drops the base when entry is
+    absolute, so an unvalidated entry let the tool read any file on disk."""
+    skills_dir = os.path.join(config.workspace, ".agent", "skills")
+    _make_skill(skills_dir, "web-scrape", "Web Scrape", prompt="# Scrape")
+
+    tool = registry.get("skill_load")
+
+    # Absolute path escapes the skill directory entirely.
+    res = tool.run(path="web-scrape", entry="/etc/passwd")
+    assert not res.success
+    assert "passwd" not in (res.output or "")
+
+    # Parent traversal is rejected too.
+    res = tool.run(path="web-scrape", entry="../../../../etc/passwd")
+    assert not res.success
+    assert "root:" not in (res.output or "")
+
+
+def test_skill_search_tracks_workspace_change(config, recording_callbacks):
+    """Switching the workspace must not keep serving the previous one's index."""
+    from agent.tools.skill_search import _get_skill_index
+
+    reg = ToolRegistry(config=config, callbacks=recording_callbacks)
+    idx_a = _get_skill_index(config, reg)
+
+    other = AgentConfig(workspace=os.path.join(str(config.workspace) + "_other"))
+    other.ensure_workspace()
+    idx_b = _get_skill_index(other, reg)
+
+    assert idx_a is not idx_b
+    assert idx_a._dir != idx_b._dir
 
 
 def test_skill_tools_registered_by_default(registry):

@@ -68,3 +68,42 @@ def test_documents_table_survives_reopen(tmp_path, fake_ef):
     s2 = VectorStore(persist_dir=str(tmp_path), embedding_function=fake_ef)
     assert s2.get_document_digest("a.pdf") is not None
     s2.close()
+
+
+def test_first_upsert_on_fresh_db_does_not_deadlock(tmp_path, fake_ef):
+    """Regression: upsert_document() held `_documents_lock` and then called
+    `_ensure_documents_table()`, which tried to acquire the same non-reentrant
+    Lock. On a brand-new database (`_documents_table` still None) this
+    self-deadlocked — the ingest worker froze and the whole sync hung forever.
+    """
+    import threading
+
+    store = VectorStore(persist_dir=str(tmp_path), embedding_function=fake_ef)
+    done = threading.Event()
+
+    def _upsert():
+        store.upsert_document("fresh.pdf", digest="d", markdown="m", chapters="[]")
+        done.set()
+
+    t = threading.Thread(target=_upsert, daemon=True)
+    t.start()
+    assert done.wait(timeout=10), "first upsert deadlocked on a fresh database"
+    t.join(timeout=5)
+    assert store.get_document_digest("fresh.pdf") is not None
+    store.close()
+
+
+def test_delete_document_on_fresh_db_does_not_deadlock(tmp_path, fake_ef):
+    """Same nested-lock hazard in delete_document()."""
+    import threading
+
+    store = VectorStore(persist_dir=str(tmp_path), embedding_function=fake_ef)
+    done = threading.Event()
+    t = threading.Thread(
+        target=lambda: (store.delete_document("nope.pdf"), done.set()),
+        daemon=True,
+    )
+    t.start()
+    assert done.wait(timeout=10), "delete_document deadlocked on a fresh database"
+    t.join(timeout=5)
+    store.close()

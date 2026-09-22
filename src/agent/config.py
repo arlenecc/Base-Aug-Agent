@@ -1,8 +1,11 @@
 """Configuration for the agent."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,18 +55,69 @@ class AgentConfig:
     #   [{"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
     mcp_servers: list = field(default_factory=list)
 
+    # 数值字段的类型，用于把 config.json 里的字符串/浮点值强制转换回正确类型。
+    # 手工编辑过的 config.json 常出现 "32768"（字符串）或 32768.0（浮点），
+    # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
+    _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
+                   "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap")
+    _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
+                     "request_timeout", "context_shrink_ratio")
+    _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
+                   "rag_embedding_model", "rag_rerank_model", "browser_endpoint")
+    _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
+
+    @classmethod
+    def _coerce(cls, name: str, value):
+        """Force a raw JSON value into the declared field type.
+
+        Returns ``None`` when the value cannot be coerced, so the caller can
+        fall back to the dataclass default instead of storing a wrong type.
+        """
+        try:
+            if name in cls._INT_FIELDS:
+                return int(value)
+            if name in cls._FLOAT_FIELDS:
+                return float(value)
+            if name in cls._STR_FIELDS:
+                return str(value)
+            if name in cls._BOOL_FIELDS:
+                return bool(value)
+        except (TypeError, ValueError):
+            return None
+        return value
+
     @classmethod
     def load(cls, path: str) -> "AgentConfig":
         import json
 
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            return cls()
+        try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            known = {k for k in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-            cfg = cls(**{k: v for k, v in data.items() if k in known})
-            cfg._migrate()
-            return cfg
-        return cls()
+            if not isinstance(data, dict):
+                raise ValueError("config root is not an object")
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            # 配置文件损坏（写一半崩溃 / 手工编辑出错）时不能让程序起不来：
+            # 备份坏文件后用默认配置启动，用户重新「应用配置」即可恢复。
+            logger.warning("config: %s 无法解析 (%s)，备份后使用默认配置", path, e)
+            try:
+                os.replace(path, path + ".corrupt")
+            except OSError:
+                pass
+            return cls()
+
+        known = {k for k in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        kwargs = {}
+        for k, v in data.items():
+            if k not in known:
+                continue
+            coerced = cls._coerce(k, v)
+            if coerced is not None:
+                kwargs[k] = coerced
+        cfg = cls(**kwargs)
+        cfg._migrate()
+        return cfg
 
     def _migrate(self) -> None:
         """Normalize obsolete config values from older versions.
@@ -88,10 +142,11 @@ class AgentConfig:
         # Same 768-dim embeddings, 4x smaller download, same quality.
         elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
-        # Older configs saved max_tokens=4096 (the old LLMClient default).
-        # Bump any sub-8192 value to the current default (32768) so users
-        # upgrading don't keep hitting the tiny old budget.
-        if self.max_tokens < 8192:
+        # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
+        # value when it is still that legacy default — an explicitly chosen
+        # small budget (e.g. 4096 for a local 4K model) must survive; silently
+        # bumping every sub-8192 value would fight the user on every start.
+        if self.max_tokens == 4096:
             self.max_tokens = 32768
         # max_context_tokens was introduced at 32000; older configs that
         # saved a stale small value should also be bumped. Track max_tokens
@@ -103,8 +158,15 @@ class AgentConfig:
         import json
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        # 原子写：先写临时文件再 os.replace。旧实现直接 open(path, "w")，
+        # 写一半崩溃（断电/强杀）会留下截断的 JSON，下次启动 load() 直接抛
+        # JSONDecodeError 导致程序无法启动。
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def ensure_workspace(self) -> str:
         os.makedirs(self.workspace, exist_ok=True)

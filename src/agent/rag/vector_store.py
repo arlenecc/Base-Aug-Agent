@@ -230,7 +230,10 @@ class VectorStore:
         self._db = None
         self._table = None
         self._documents_table = None  # 文档元数据表（缩略版本 + markdown）
-        self._documents_lock = threading.Lock()  # 保护 documents 表懒创建 + 写操作
+        # 保护 documents 表懒创建 + 写操作。用 RLock：upsert_document /
+        # delete_document 会「持锁后再调用 _ensure_documents_table()」，普通
+        # Lock 会在此自锁死（见 _ensure_documents_table 的注释）。
+        self._documents_lock = threading.RLock()
         # documents 表内容缓存：避免 get_document_digest / list_documents 每次
         # 都全表 to_pylist()（表内含完整 markdown，反复全量扫描既慢又占内存）。
         # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
@@ -1207,6 +1210,11 @@ class VectorStore:
         self._reranker_state = "idle"
         self._initialized = False
         self._table_checked = False
+        # 表句柄已丢弃，重连后打开的是「另一张」表（可能被 clear()/迁移重建
+        # 过）。不重置 FTS 标记的话，_ensure_fts_index() 会直接返回 True，
+        # 于是 BM25 检索静默失效（新表上没有索引）。
+        self._fts_ready = False
+        self._fts_checked = False
         logger.info("VectorStore: resources released")
 
     def reload(self) -> None:
@@ -1256,28 +1264,38 @@ class VectorStore:
         用双重检查锁保护：ingest 的多 worker 并行调用 upsert_document 时，
         首次创建表会并发竞争——若不加锁，第二个 worker 会在 create_table 时报
         "Table already exists"。锁内再次检查后，创建或打开由唯一一个线程完成。
+
+        注意：调用方（upsert_document / delete_document）通常已经持有
+        ``_documents_lock``。锁现在是 RLock，所以这里再次 acquire 是安全的；
+        但真正的首次建表路径过去是 **死锁**：upsert_document 持锁 →
+        调用本函数 → 再次 acquire 同一个非可重入 Lock → 永久阻塞。第一次同步
+        （documents 表尚不存在）会卡死整个 ingest，UI 一直停在「同步中」。
         """
         if self._documents_table is not None:
             return self._documents_table
         with self._documents_lock:
-            if self._documents_table is not None:
-                return self._documents_table
-            self._ensure_initialized()
-            if _DOCUMENTS_TABLE_NAME in self._db.table_names():
-                self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
-            else:
-                # 首次创建：空表（含占位空记录，后续 upsert 时清理）。
-                self._documents_table = self._db.create_table(
-                    _DOCUMENTS_TABLE_NAME,
-                    data=[{
-                        "doc_id": "",
-                        "doc_name": "",
-                        "digest": "",
-                        "markdown": "",
-                        "chapters": "",
-                    }],
-                )
+            return self._ensure_documents_table_locked()
+
+    def _ensure_documents_table_locked(self):
+        """``_ensure_documents_table`` 的实现，调用方必须已持有 _documents_lock。"""
+        if self._documents_table is not None:
             return self._documents_table
+        self._ensure_initialized()
+        if _DOCUMENTS_TABLE_NAME in self._db.table_names():
+            self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
+        else:
+            # 首次创建：空表（含占位空记录，后续 upsert 时清理）。
+            self._documents_table = self._db.create_table(
+                _DOCUMENTS_TABLE_NAME,
+                data=[{
+                    "doc_id": "",
+                    "doc_name": "",
+                    "digest": "",
+                    "markdown": "",
+                    "chapters": "",
+                }],
+            )
+        return self._documents_table
 
     def upsert_document(
         self,
@@ -1298,7 +1316,8 @@ class VectorStore:
         """
         self._ensure_initialized()
         with self._documents_lock:
-            table = self._ensure_documents_table()
+            # 已在锁内 → 用不重复加锁的版本，避免嵌套 acquire。
+            table = self._ensure_documents_table_locked()
             doc_id = _hash_source(doc_name)
 
             # Delete any previous entry (and the placeholder row), then add the new one.
@@ -1384,7 +1403,7 @@ class VectorStore:
         """Remove a document's metadata entry."""
         self._ensure_initialized()
         with self._documents_lock:
-            table = self._ensure_documents_table()
+            table = self._ensure_documents_table_locked()
             if table is None:
                 return
             doc_id = _hash_source(doc_name)

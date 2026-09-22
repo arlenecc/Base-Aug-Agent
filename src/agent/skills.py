@@ -21,6 +21,19 @@ from .memory import _JsonStore
 
 _TOKEN_RE = re.compile(r"\w+")
 
+# 停用词表提到模块级：_request_key() 每轮对话都会调用，旧实现在函数体内重建
+# 这个集合，白白重复分配。
+_STOPWORDS = frozenset({
+    "a", "an", "the", "to", "of", "in", "on", "at", "for",
+    "and", "or", "is", "are", "was", "were", "be", "been",
+    "do", "does", "did", "with", "from", "by", "as", "it",
+    "this", "that", "these", "those", "i", "we", "you",
+    "please", "me", "my", "our",
+})
+
+# 「请求计数」表的条目上限（见 SkillManager.record_request）。
+_MAX_TRACKED_REQUESTS = 500
+
 
 def _keywords_of(text: str) -> List[str]:
     return [w.lower() for w in _TOKEN_RE.findall(text)]
@@ -71,23 +84,48 @@ class SkillManager:
             if not isinstance(self._store.get("requests"), dict):
                 self._store.set("requests", {})
 
+    def _load_skills(self) -> List[Skill]:
+        """Read persisted skill records, tolerating corrupted entries.
+
+        A single malformed record (hand-edited skills.json, an aborted write,
+        a record from an older schema) used to raise TypeError/KeyError inside
+        ``Skill(**s)`` — which propagated out of ``match()`` and broke every
+        turn's skill lookup, not just the bad record.  Skip bad entries instead.
+        """
+        raw = self._store.get("skills") or []
+        if not isinstance(raw, list):
+            return []
+        out: List[Skill] = []
+        for s in raw:
+            if not isinstance(s, dict):
+                continue
+            try:
+                out.append(Skill(
+                    name=str(s.get("name", "")),
+                    keywords=list(s.get("keywords") or []),
+                    prompt=str(s.get("prompt", "")),
+                    count=int(s.get("count", 0) or 0),
+                ))
+            except (TypeError, ValueError):
+                continue
+        return [s for s in out if s.name]
+
     def list(self) -> List[Skill]:
         with self._lock:
-            return [Skill(**s) for s in (self._store.get("skills") or [])]
+            return self._load_skills()
 
     def create_skill(self, name: str, keywords: List[str], prompt: str) -> Skill:
         skill = Skill(name=name, keywords=[k.lower() for k in keywords], prompt=prompt)
         with self._lock:
-            skills = list(self._store.get("skills") or [])
-            skills = [s for s in skills if s["name"] != name]
-            skills.append(asdict(skill))
-            self._store.set("skills", skills)
+            skills = [s for s in self._load_skills() if s.name != name]
+            skills.append(skill)
+            self._store.set("skills", [asdict(s) for s in skills])
         return skill
 
     def delete(self, name: str) -> None:
         with self._lock:
-            skills = [s for s in (self._store.get("skills") or []) if s["name"] != name]
-            self._store.set("skills", skills)
+            skills = [s for s in self._load_skills() if s.name != name]
+            self._store.set("skills", [asdict(s) for s in skills])
 
     def create_dir_skill(self, name: str, keywords: List[str], prompt: str,
                          description: str = "", tags: List[str] = None) -> str:
@@ -137,9 +175,9 @@ class SkillManager:
         # system prompt (keeps prompts lean).
         dir_name = os.path.basename(skill_dir)
         with self._lock:
-            skills = list(self._store.get("skills") or [])
-            if not any(s["name"] == name for s in skills):
-                skills.append(asdict(Skill(
+            skills = self._load_skills()
+            if not any(s.name == name for s in skills):
+                skills.append(Skill(
                     name=name,
                     keywords=list(keywords),
                     prompt=(
@@ -147,8 +185,8 @@ class SkillManager:
                         f"Call skill_load with path=\"{dir_name}\" to read its "
                         f"instructions, then follow them."
                     ),
-                )))
-                self._store.set("skills", skills)
+                ))
+                self._store.set("skills", [asdict(s) for s in skills])
 
         return skill_dir
 
@@ -175,14 +213,7 @@ class SkillManager:
         dropping or adding a single word produced a different key and the
         counter never reached the suggestion threshold.
         """
-        STOPWORDS = {
-            "a", "an", "the", "to", "of", "in", "on", "at", "for",
-            "and", "or", "is", "are", "was", "were", "be", "been",
-            "do", "does", "did", "with", "from", "by", "as", "it",
-            "this", "that", "these", "those", "i", "we", "you",
-            "please", "me", "my", "our",
-        }
-        kws = sorted({w for w in _keywords_of(text) if w not in STOPWORDS})
+        kws = sorted({w for w in _keywords_of(text) if w not in _STOPWORDS})
         return " ".join(kws)[:80]
 
     def record_request(self, text: str) -> Optional[Skill]:
@@ -194,8 +225,15 @@ class SkillManager:
         if not key:
             return None
         with self._lock:
-            requests = dict(self._store.get("requests") or {})
+            raw = self._store.get("requests")
+            requests = dict(raw) if isinstance(raw, dict) else {}
             requests[key] = requests.get(key, 0) + 1
+            # 请求计数表只增不删：长期使用的 skills.json 会无界膨胀（既占内存
+            # 也让每次 set() 的 JSON 序列化越来越大）。超过上限时淘汰最旧的
+            # 一半条目（dict 保持插入顺序）。
+            if len(requests) > _MAX_TRACKED_REQUESTS:
+                for k in list(requests)[:_MAX_TRACKED_REQUESTS // 2]:
+                    requests.pop(k, None)
             self._store.set("requests", requests)
             count = requests[key]
 

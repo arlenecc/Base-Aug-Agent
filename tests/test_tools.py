@@ -420,3 +420,57 @@ def test_rag_tools_registered_with_knowledge_base(config, tmp_path):
     # unit test to avoid model download. Just verify the engine exists.
 
     reg.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# shell_run: timeout must not leave orphaned processes behind
+# ---------------------------------------------------------------------------
+
+def test_shell_run_timeout_kills_the_process_group(config):
+    """A timed-out command must not leave its children running.
+
+    `shell=True` spawns `sh -c …`; killing only that PID used to orphan
+    grandchildren (a `sleep`, a dev server, a pip subprocess) that then lived
+    until logout.
+    """
+    import subprocess
+    import time
+
+    reg = _reg(config)
+    marker = os.path.join(config.workspace, "orphan.marker")
+    # `sh -c 'sleep 30 & ...'` — the sleep is a grandchild of the shell.
+    res = reg.execute("shell_run", {
+        "command": f"sleep 30; echo done > {marker}",
+        "timeout": 1,
+    })
+    assert not res.success
+    assert "timed out" in res.error.lower()
+
+    time.sleep(1.5)
+    assert not os.path.exists(marker), "orphaned grandchild was still running"
+    # No `sleep 30` should survive the timeout.
+    out = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
+    assert not out.stdout.strip(), f"orphan process survived: {out.stdout!r}"
+    reg.shutdown()
+
+
+def test_shell_run_caps_huge_output(config):
+    """A command that floods stdout must not dump it all into the reply."""
+    reg = _reg(config)
+    res = reg.execute("shell_run", {
+        "command": "python3 -c \"print('x' * 1000)\" ; "
+                   "python3 -c \"import sys; sys.stdout.write('y' * 500000)\"",
+        "timeout": 60,
+    })
+    assert res.success
+    assert len(res.output) < 300_000, f"output not capped: {len(res.output)} chars"
+    reg.shutdown()
+
+
+def test_web_scan_rejects_non_http_schemes(config):
+    """`url` comes from the model — file:// and friends must be refused."""
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "file:///etc/passwd"})
+    assert not res.success
+    assert "http" in res.error.lower()
+    reg.shutdown()

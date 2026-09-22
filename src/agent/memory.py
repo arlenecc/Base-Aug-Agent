@@ -12,6 +12,39 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 进程级 atexit 刷新注册表
+#
+# 旧实现里每个 _JsonStore 实例在 __init__ 中调用 atexit.register(...)，但从不
+# unregister。atexit 内部持有回调的强引用，因此每创建一个 store（LongTermMemory
+# 重建、workspace 切换…）都会永久新增一条回调及其闭包引用，进程生命周期内单调
+# 增长 —— 典型的缓慢内存泄漏。
+#
+# 现在改为：只注册一个全局 atexit 回调，遍历 WeakSet 中仍存活的 store。store
+# 被 GC 后自动从 WeakSet 消失，回调数量恒为 1，且不会阻止 store 被回收。
+# ---------------------------------------------------------------------------
+
+_LIVE_STORES: "weakref.WeakSet[_JsonStore]" = weakref.WeakSet()
+_LIVE_STORES_LOCK = threading.Lock()
+_ATEXIT_REGISTERED = False
+
+
+def _flush_all_stores() -> None:
+    for store in list(_LIVE_STORES):
+        try:
+            store.flush(force=True)
+        except Exception:  # pragma: no cover - 退出路径，尽力而为
+            pass
+
+
+def _register_atexit_flush(store: "_JsonStore") -> None:
+    global _ATEXIT_REGISTERED
+    with _LIVE_STORES_LOCK:
+        _LIVE_STORES.add(store)
+        if not _ATEXIT_REGISTERED:
+            atexit.register(_flush_all_stores)
+            _ATEXIT_REGISTERED = True
+
 
 class _JsonStore:
     """A tiny thread-safe JSON key/value file store.
@@ -32,17 +65,10 @@ class _JsonStore:
         self._dirty = False
         self._last_save = 0.0
         self._load()
-        # Register atexit to flush dirty data on process exit so debounced
-        # writes don't get lost. Use weakref so the store can still be GC'd
-        # (atexit holds a strong ref to the callback, weakref breaks the cycle).
-        _store_ref = weakref.ref(self)
-
-        def _atexit_flush():
-            store = _store_ref()
-            if store is not None:
-                store.flush(force=True)
-
-        atexit.register(_atexit_flush)
+        # Register for the process-level atexit flush (one global callback for
+        # all stores — see _register_atexit_flush for why we don't call
+        # atexit.register() per instance).
+        _register_atexit_flush(self)
 
     def _load(self) -> None:
         if os.path.exists(self.path):

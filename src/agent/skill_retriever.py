@@ -130,6 +130,16 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars]
 
 
+def _sql_quote(value: str) -> str:
+    """Escape a value for use inside a single-quoted SQL/LanceDB literal.
+
+    Skill directory names come from the filesystem (and, indirectly, from LLM
+    output), so they may contain a single quote.  Interpolating them raw makes
+    the filter expression malformed — and injectable.
+    """
+    return str(value).replace("'", "''")
+
+
 def _normalize_vec(vec: List[float]) -> List[float]:
     """Normalize a vector to unit length (for cosine similarity via L2 distance)."""
     norm = math.sqrt(sum(x * x for x in vec))
@@ -272,15 +282,28 @@ class SkillScanner:
         self._last_mtime = 0.0
 
     def _dir_mtime(self) -> float:
+        """Most recent mtime of any SKILL.md (plus its parent dirs).
+
+        We deliberately stat only directories and ``SKILL.md`` files: walking
+        and stat-ing *every* file (the old behaviour) is O(files) syscalls, and
+        ``_should_scan()`` + ``scan()`` each called it — two full tree walks per
+        query on a skills tree that can hold thousands of directories.
+        """
         max_mtime = 0.0
         if not os.path.isdir(self._dir):
             return 0.0
         try:
             for root, dirs, files in os.walk(self._dir):
                 dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
-                for fn in files:
+                try:
+                    mtime = os.stat(root).st_mtime
+                    if mtime > max_mtime:
+                        max_mtime = mtime
+                except OSError:
+                    pass
+                if _SKILL_FILENAME in files:
                     try:
-                        mtime = os.stat(os.path.join(root, fn)).st_mtime
+                        mtime = os.stat(os.path.join(root, _SKILL_FILENAME)).st_mtime
                         if mtime > max_mtime:
                             max_mtime = mtime
                     except OSError:
@@ -401,17 +424,24 @@ class SkillVectorStore:
             return 0
 
         db = self._get_db()
+
+        # Probe the embedding dimension BEFORE dropping anything.
+        # 旧实现先 drop 表再探测维度：一旦 embedding 失败（模型未下载、
+        # 网络故障），已有的可用索引已经被删掉了，功能直接归零。
+        try:
+            probe = self._embed([skills[0].description or skills[0].name])
+        except Exception as e:
+            logger.warning("skill_retriever: embedding probe failed, keeping existing index: %s", e)
+            return 0
+        dim = len(probe[0]) if probe else 0
+        if dim <= 0:
+            return 0
+
         with self._lock:
             # Drop old table if present.
             if _SKILL_TABLE_NAME in db.table_names():
                 db.drop_table(_SKILL_TABLE_NAME)
             self._table = None
-
-            # Probe the embedding dimension with a single text first.
-            probe = self._embed([skills[0].description or skills[0].name])
-            dim = len(probe[0]) if probe else 0
-            if dim <= 0:
-                return 0
 
             import pyarrow as pa
             vec_type = pa.list_(pa.float32(), dim)
@@ -494,8 +524,13 @@ class SkillVectorStore:
             return {"added": len(skills), "updated": 0, "removed": 0}
 
         # Current table contents: dir -> fingerprint.
+        # 只取需要的两列——表内还有两条 768 维向量列，整表 to_pylist() 会把
+        # 全部向量转成 Python float 列表（数千技能 ≈ 百万级对象、数百 MB），
+        # 直接抵消了 build() 分批嵌入防内存爆炸的设计。
         try:
-            existing_rows = table.to_arrow().to_pylist()
+            existing_rows = (
+                table.to_arrow().select(["dir", "fingerprint"]).to_pylist()
+            )
         except Exception as e:
             logger.warning("skill_retriever: sync failed to read table: %s", e)
             self.build(skills, batch_size=batch_size)
@@ -515,16 +550,18 @@ class SkillVectorStore:
 
         with self._lock:
             # Remove deleted skills.
+            # 目录名来自文件系统/LLM，可能含单引号——直接拼进 SQL 字面量会
+            # 产生语法错误甚至注入。转义 '' 后再拼接。
             for d in removed_dirs:
                 try:
-                    table.delete(f"dir = '{d}'")
+                    table.delete(f"dir = '{_sql_quote(d)}'")
                 except Exception as e:
                     logger.warning("skill_retriever: delete %s failed: %s", d, e)
 
             # Re-add updated skills (delete then add, since vectors changed).
             for d in updated_dirs:
                 try:
-                    table.delete(f"dir = '{d}'")
+                    table.delete(f"dir = '{_sql_quote(d)}'")
                 except Exception:
                     pass
 
@@ -651,16 +688,22 @@ class SkillVectorStore:
         return out
 
     def close(self) -> None:
-        if self._table is not None:
+        """Drop the table handle and close the LanceDB connection.
+
+        旧实现只把引用置 None，从不调用 ``db.close()``。LanceDB 的连接对象
+        持有底层文件句柄与对象存储缓存，反复「应用配置」重建 retriever 会让
+        这些资源一直堆积到进程退出。
+        """
+        self._table = None
+        db = self._db
+        self._db = None
+        if db is not None:
             try:
-                self._table = None
-            except Exception:
-                pass
-        if self._db is not None:
-            try:
-                self._db = None
-            except Exception:
-                pass
+                close_fn = getattr(db, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception as e:
+                logger.debug("skill_retriever: db close failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -734,11 +777,16 @@ class SkillRetriever:
         # unified ``score``. If the skill already matched in the vector channel,
         # reuse that score; otherwise look it up via a vector search.
         bm25_by_dir = {r.get("dir", ""): r for r in bm25_results if r.get("dir")}
+        # 只为「仅 BM25 命中」的候选准备查询向量，并复用之——每个候选各跑
+        # 一次 embed_query 会重复做相同的 ONNX 前向（最多 3 次）。
+        query_vec = None
         for d, bm in bm25_by_dir.items():
             if d in merged:
                 merged[d]["bm25_score"] = bm["bm25_score"]
             else:
-                sim = self._lookup_similarity(query, d)
+                if query_vec is None:
+                    query_vec = self._embed_query_vector(query)
+                sim = self._lookup_similarity(query, d, qv=query_vec)
                 merged[d] = dict(bm)
                 merged[d]["bm25_score"] = bm["bm25_score"]
                 merged[d]["score"] = sim
@@ -759,24 +807,42 @@ class SkillRetriever:
 
         return {"candidates": candidates, "picked": picked, "reason": reason}
 
-    def _lookup_similarity(self, query: str, dir: str) -> float:
+    def _embed_query_vector(self, query: str):
+        """Embed + L2-normalize a query, or None if embedding is unavailable."""
+        try:
+            ef = self._store._get_ef()
+            qv = ef.embed_query(query)
+        except Exception as e:
+            logger.debug("skill_retriever: query embedding failed: %s", e)
+            return None
+        norm = math.sqrt(sum(x * x for x in qv))
+        if norm > 0:
+            qv = [x / norm for x in qv]
+        return qv
+
+    def _lookup_similarity(self, query: str, dir: str, qv=None) -> float:
         """Return the cosine similarity of ``query`` against skill ``dir``.
 
         Used to give BM25-only matches a comparable vector score.  Falls back
         to 0.0 if the skill can't be located or embedding fails.
+
+        ``qv`` is an optional pre-normalized query vector.  The caller scores
+        every BM25-only candidate through this method, so passing the vector in
+        avoids re-running the ONNX query embedding once per candidate.
         """
         table = self._store._get_table()
         if table is None:
             return 0.0
-        ef = self._store._get_ef()
         try:
-            qv = ef.embed_query(query)
-            norm = math.sqrt(sum(x * x for x in qv))
-            if norm > 0:
-                qv = [x / norm for x in qv]
+            if qv is None:
+                ef = self._store._get_ef()
+                qv = ef.embed_query(query)
+                norm = math.sqrt(sum(x * x for x in qv))
+                if norm > 0:
+                    qv = [x / norm for x in qv]
             res = (
                 table.search(qv, vector_column_name="desc_vec")
-                .where(f"dir = '{dir}'")
+                .where(f"dir = '{_sql_quote(dir)}'")
                 .limit(1)
                 .to_list()
             )

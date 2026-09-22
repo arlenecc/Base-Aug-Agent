@@ -17,6 +17,7 @@ Design:
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -29,9 +30,26 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # Converter singleton: docling models are heavy, so share one instance across
 # all workers (access is guarded by a lock — DocumentConverter is not
 # documented as thread-safe).
+#
+# 锁必须在模块导入时就创建好。旧实现在 _get_converter() 里「if _converter_lock
+# is None: _converter_lock = threading.Lock()」，这在并发首次调用时是典型的
+# check-then-act 竞态：两个线程各自新建一把锁，于是各自持自己的锁去创建
+# DocumentConverter —— 同时加载两份数百 MB 的模型。
 _converter = None
-_converter_lock = None
+_converter_lock = threading.Lock()
 _converter_unavailable = False
+
+
+def release_converter() -> None:
+    """Drop the shared docling converter so its models can be freed.
+
+    Mirrors ``parsers.release_ocr_engine()``: ingestion runs in short bursts
+    (a sync job), after which the converter's models would otherwise stay
+    resident for the whole process lifetime.
+    """
+    global _converter
+    with _converter_lock:
+        _converter = None
 
 
 def is_docling_available() -> bool:
@@ -53,14 +71,11 @@ def is_supported(ext: str) -> bool:
 
 def _get_converter():
     """Lazily build and cache the docling DocumentConverter singleton."""
-    global _converter, _converter_lock, _converter_unavailable
+    global _converter, _converter_unavailable
     if _converter is not None:
         return _converter
     if _converter_unavailable:
         return None
-    if _converter_lock is None:
-        import threading
-        _converter_lock = threading.Lock()
     with _converter_lock:
         if _converter is not None:
             return _converter
@@ -108,9 +123,15 @@ def extract_markdown(filepath: str) -> Optional[str]:
         return None
 
     try:
-        result = converter.convert(str(path))
-        doc = result.document
-        markdown = doc.export_to_markdown()
+        # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
+        # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
+        # 并发转换会互相踩踏（状态污染/崩溃）。这里用同一把锁串行化转换。
+        with _converter_lock:
+            result = converter.convert(str(path))
+            doc = result.document
+            markdown = doc.export_to_markdown()
+        # 及时释放大对象引用，避免整棵文档树在切片前一直常驻。
+        del result, doc
         if not markdown or not markdown.strip():
             logger.warning("docling extracted empty markdown from %s", path.name)
             return None

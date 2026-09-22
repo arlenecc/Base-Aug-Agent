@@ -158,3 +158,57 @@ def test_ensure_workspace_creates_dir(tmp_path):
     cfg = AgentConfig(workspace=str(tmp_path / "ws"))
     cfg.ensure_workspace()
     assert os.path.isdir(str(tmp_path / "ws"))
+
+
+# ---------------------------------------------------------------------------
+# Robustness: corrupted config files and user-chosen small budgets
+# ---------------------------------------------------------------------------
+
+def test_load_recovers_from_corrupted_config(tmp_path):
+    """A config.json truncated by a crash (or hand-edited badly) must not make
+    the app unreadable: back it up and start from defaults."""
+    p = tmp_path / "c.json"
+    p.write_text('{"base_url": "http://x", "api_key":')
+    cfg = AgentConfig.load(str(p))
+    assert cfg.base_url == AgentConfig().base_url
+    # The bad file is kept for inspection instead of being silently lost.
+    assert os.path.exists(str(p) + ".corrupt")
+
+
+def test_load_rejects_non_object_root(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(["not", "an", "object"]))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.base_url == AgentConfig().base_url
+
+
+def test_load_coerces_string_typed_numbers(tmp_path):
+    """Hand-edited configs often quote numbers. They must be coerced back to
+    int/float so later arithmetic and comparisons don't blow up."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"max_tokens": "8192", "temperature": "0.3"}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.max_tokens == 8192
+    assert isinstance(cfg.max_tokens, int)
+    assert cfg.temperature == 0.3
+    assert isinstance(cfg.temperature, float)
+
+
+def test_save_is_atomic(tmp_path):
+    """save() must write via temp + rename so a crash can never leave a
+    half-written config.json behind."""
+    p = tmp_path / "c.json"
+    cfg = AgentConfig(base_url="http://x")
+    cfg.save(str(p))
+    assert os.path.exists(str(p))
+    assert not os.path.exists(str(p) + ".tmp")
+
+
+def test_migrate_keeps_explicitly_small_budget(tmp_path):
+    """A deliberately small context budget (e.g. a local 4K model) must survive
+    a restart — migration should only rewrite the legacy 4096 default."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"max_tokens": 2048, "max_context_tokens": 2048}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.max_tokens == 2048
+    assert cfg.max_context_tokens == 2048

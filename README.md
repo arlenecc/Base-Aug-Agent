@@ -14,7 +14,8 @@
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎全局单例；窗口关闭时统一清理 QThread worker 和 logger handler
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
+- **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认；确认弹窗只显示**用途说明**（启发式优先：注释/docstring/命令名映射，零延迟；无注释时才用 LLM 兜底生成 ≤20 字用途），不贴代码全文，避免超长文本把按钮顶出屏幕
@@ -69,10 +70,10 @@ pip install -e ".[all]"
 
 | 分组 | 安装命令 | 包含内容 |
 |------|---------|---------|
-| 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4, mcp |
-| RAG | `pip install -e ".[rag]"` | lancedb, fastembed, FlagEmbedding, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib |
+| 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
+| RAG | `pip install -e ".[rag]"` | lancedb, fastembed, FlagEmbedding, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
 | OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别） |
-| 测试 | `pip install -e ".[test]"` | pytest, pytest-qt, pytest-cov, ruff |
+| 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
 | 全部 | `pip install -e ".[all]"` | 以上所有 |
 
 RAG 子系统依赖也可在首次同步知识库时通过界面自动检测并安装。
@@ -508,7 +509,38 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。当前 322 测试用例。
+测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
+
+近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置。当前共 366 个用例。
+
+> UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
+
+## 近期修复（全量代码复查）
+
+按影响面排序，详见 [软件设计文档 §11](docs/软件设计文档.md)：
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 1 | `upsert_document` 持 `_documents_lock` 后再取同一把非可重入锁 | **全新知识库首次同步永久卡死** | 锁改 `RLock` + 拆分 `_ensure_documents_table_locked()` |
+| 2 | `InstallDepsWorker.finished` 遮盖 `QThread.finished` | `deleteLater` 在 `run()` 内销毁运行中的线程 | 改名 `deps_finished`，`deleteLater` 挂内置信号 |
+| 3 | 确认弹窗 `wait()` 返回值被忽略 + 初值 `True` | 超时后 `shell_run`/`code_run` 被自动放行 | 初值 `False` + 检查 `wait()` 结果 + `reset()` |
+| 4 | `skill_load` 未校验 `entry` | 绝对路径 / `..` 可读磁盘任意文件 | 显式拒绝 + `realpath` 前缀校验 |
+| 5 | 语义切片无视注入的 embedding function | 离线环境卡在模型下载 | 全链路透传 `embedding_function` |
+| 6 | 切片拼接凭空造字符 | chunk 文本不是原文子串，模型看到不存在的内容 | 取源码真实间隔 / 句末边界直接切片 |
+| 7 | docling 锁惰性创建竞态 + `convert()` 无锁 | 并发加载两份模型、状态污染 | 模块级锁 + 串行化转换 + `release_converter()` |
+| 8 | `shell_run` 只杀顶层 `sh` + 输出无上限 | 孤儿进程、大输出打满内存 | 独立进程组 `killpg` + 200KB 截断 |
+| 9 | MCP `stop()` 以 `_running` 为条件提前 return | 僵尸进程永不回收 | 以 `_process` 为条件 + `killpg` + 关闭管道 |
+| 10 | 配置损坏即无法启动、迁移改写用户设置、非原子写 | 启动崩溃 / 设置被反复改回 | 备份回退 + 仅迁移旧默认值 + 原子写 |
+| 11 | 技能索引目录缺失时每次查询写盘、mtime 失效 | 无谓磁盘 I/O、索引最长 300s 陈旧 | 补更新时间戳 + 同时 stat `skill.json` |
+| 12 | `skill_retriever.build()` 先删表后探测维度 | embedding 失败即丢失已有索引 | 先探测再重建 |
+| 13 | `skills.json` 损坏记录拖垮 `match()`、请求表无界 | 整轮技能检索失败、文件膨胀 | 逐条校验跳过 + 淘汰上限 |
+| 14 | `_JsonStore` 每实例注册 atexit 回调且从不注销 | 缓慢内存泄漏 | 单一全局回调 + WeakSet |
+| 15 | `_describe_code_purpose` 用 `ev.get()` 访问 `StreamEvent` | LLM 兜底是死代码 | 按属性访问 |
+| 16 | PDF/OCR 异常分支漏 `doc.close()`、加密 PDF 整份失败 | 句柄与解码缓存泄漏 | `try/finally` + 空密码解锁 |
+| 17 | `VectorStore.close()` 未重置 `_fts_ready` | 重连后 BM25 静默失效 | 一并重置 |
+| 18 | `web_scan` 无协议白名单、响应体全量入内存 | `file://` 读本地文件、OOM | http/https 白名单 + 8MB 截断 |
+| 19 | 技能缓存未按 workspace 区分 | 切换工作区后读到旧技能 | 按目录路径缓存 |
+| 20 | `chat_view` 无 `setMaximumBlockCount` | 长会话文档无限增长 | 限 5000 段 |
 
 ## 部署
 

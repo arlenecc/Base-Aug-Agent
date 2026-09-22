@@ -129,7 +129,7 @@ def test_chunk_documents_falls_back_when_chonkie_missing(monkeypatch, topic_ef):
     # Force both hybrid and semantic chunking to be unavailable -> recursive.
     monkeypatch.setattr(
         ch, "_chunk_with_hybrid_fallback",
-        lambda text, cs, co, mn, op: ch.chunk_text(text, cs, co),
+        lambda text, cs, co, mn, op, embedding_function=None: ch.chunk_text(text, cs, co),
     )
     docs = [{"source": "doc.md", "text": "这是测试内容。" * 200}]
     chunks = chunk_documents(docs, chunk_size=800, chunk_overlap=50)

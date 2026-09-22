@@ -80,10 +80,11 @@ def hybrid_chunk_text(
             chunks.extend(sub if sub else _split_by_paragraph(section, chunk_size))
 
     # 3. Merge undersized chunks to reach min_chunk_size.
-    merged = _merge_to_target_size(chunks, chunk_size, min_chunk_size)
+    merged = _merge_to_target_size(chunks, chunk_size, min_chunk_size, source=text)
 
     # 4. Apply overlap for cross-boundary continuity.
-    return _apply_overlap(merged, chunk_size, chunk_overlap, overlap_percent)
+    return _apply_overlap(merged, chunk_size, chunk_overlap, overlap_percent,
+                          source=text)
 
 
 # ---------------------------------------------------------------------------
@@ -96,22 +97,48 @@ def _split_by_structure(text: str) -> List[str]:
     Blank-line paragraph groups are kept together.  A section is: a heading
     line plus everything up to (but not including) the next heading of the
     same or higher level.
+
+    Fenced code blocks (```` ``` ```` / ``~~``) are skipped: shell and Python
+    comments inside them start with ``#`` and would otherwise be mistaken for
+    Markdown headings, cutting code samples in half.
     """
-    # Find heading positions.
-    heading_matches = list(_HEADING_RE.finditer(text))
-    if not heading_matches:
+    # Find heading positions, ignoring anything inside a fenced code block.
+    # 记录的是「相对于整篇 text 的绝对偏移」，供下面切片使用。
+    heading_starts: List[int] = []
+    in_fence = False
+    fence_marker = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = True
+                fence_marker = stripped[:3]
+                offset += len(line)
+                continue
+        else:
+            # 只有同一种围栏才能闭合（``` 不能被 ~~~ 闭合，反之亦然）。
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            offset += len(line)
+            continue
+        if _HEADING_RE.match(line):
+            heading_starts.append(offset)
+        offset += len(line)
+
+    if not heading_starts:
         # No headings: fall back to blank-line paragraph groups.
         return _split_by_paragraph(text, max_tokens=None)
 
     sections: List[str] = []
-    for i, m in enumerate(heading_matches):
-        start = m.start()
-        end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(text)
+    for i, start in enumerate(heading_starts):
+        end = heading_starts[i + 1] if i + 1 < len(heading_starts) else len(text)
         sections.append(text[start:end].strip())
 
     # Prepend any text before the first heading as its own section.
-    if heading_matches and heading_matches[0].start() > 0:
-        prefix = text[:heading_matches[0].start()].strip()
+    if heading_starts and heading_starts[0] > 0:
+        prefix = text[:heading_starts[0]].strip()
         if prefix:
             sections.insert(0, prefix)
 
@@ -129,14 +156,21 @@ def _split_by_paragraph(text: str, max_tokens: Optional[int]) -> List[str]:
 
     groups: List[str] = []
     current = ""
+    # 增量维护当前组的 token 数：旧写法在每次追加时重新估算整个 current，
+    # 组越长扫描越长 → 整段文本是 O(n²)，大章节下明显卡顿。
+    current_tokens = 0
     for p in paragraphs:
+        p_tokens = estimate_tokens(p)
         if not current:
             current = p
-        elif estimate_tokens(current) + estimate_tokens(p) <= max_tokens:
+            current_tokens = p_tokens
+        elif current_tokens + p_tokens <= max_tokens:
             current = current + "\n\n" + p
+            current_tokens += p_tokens
         else:
             groups.append(current)
             current = p
+            current_tokens = p_tokens
     if current:
         groups.append(current)
     return groups
@@ -167,9 +201,10 @@ def _semantic_split(section: str, chunk_size: int, embedding_function) -> Option
 # merge + overlap (reuse the semantic_chunker helpers for consistency)
 # ---------------------------------------------------------------------------
 
-def _merge_to_target_size(chunks: List[str], chunk_size: int, min_chunk_size: int) -> List[str]:
+def _merge_to_target_size(chunks: List[str], chunk_size: int, min_chunk_size: int,
+                          source: Optional[str] = None) -> List[str]:
     from .semantic_chunker import _merge_to_target_size as _m
-    return _m(chunks, chunk_size, min_chunk_size)
+    return _m(chunks, chunk_size, min_chunk_size, source=source)
 
 
 def _apply_overlap(
@@ -177,6 +212,7 @@ def _apply_overlap(
     chunk_size: int,
     chunk_overlap: int,
     overlap_percent: float,
+    source: Optional[str] = None,
 ) -> List[str]:
     from .semantic_chunker import _apply_overlap as _o
-    return _o(chunks, chunk_size, chunk_overlap, overlap_percent)
+    return _o(chunks, chunk_size, chunk_overlap, overlap_percent, source=source)

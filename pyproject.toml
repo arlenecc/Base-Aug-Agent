@@ -14,7 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+# pytest-qt 提供 `qapp` / `qtbot` fixture —— tests/test_bridge.py 与
+# tests/test_integration.py 依赖它构造 MainWindow；缺了这两个文件的用例
+# 会全部在 setup 阶段报 "fixture 'qapp' not found"。
+test = ["pytest>=8.0", "pytest-qt>=4.0"]
 # RAG / knowledge base support: vector store + embedding + reranker + parsers
 rag = [
     # lancedb 0.26+ 不再提供 macOS x86_64 (Intel) 的 wheel（仅 ARM64），

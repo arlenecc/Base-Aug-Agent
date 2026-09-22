@@ -220,14 +220,18 @@ def _pdf_has_image_pages(kb_path: str, max_pages_per_pdf: int = 10) -> bool:
         return False
 
     root = Path(kb_path)
-    pdf_files = list(root.rglob("*.pdf")) + list(root.rglob("*.PDF"))
+    # 单遍遍历 + 小写后缀判断：旧实现 rglob 两遍（"*.pdf" 和 "*.PDF"），
+    # 在大知识库上等于把整棵目录树扫两次。
+    pdf_files = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() == ".pdf" and not p.name.startswith(".")
+    ]
     if not pdf_files:
         return False
 
     logger.info("RAG deps: checking %d PDF(s) for image-based pages...", len(pdf_files))
     for pdf_path in pdf_files:
-        if pdf_path.name.startswith("."):
-            continue
+        doc = None
         try:
             doc = fitz.open(str(pdf_path))
             pages_to_check = min(len(doc), max_pages_per_pdf)
@@ -235,15 +239,21 @@ def _pdf_has_image_pages(kb_path: str, max_pages_per_pdf: int = 10) -> bool:
                 page = doc[i]
                 text = page.get_text("text").strip()
                 if not text and page.get_images(full=True):
-                    doc.close()
                     logger.info(
                         "RAG deps: found image-based page in '%s' (page %d)",
                         pdf_path.name, i + 1,
                     )
                     return True
-            doc.close()
         except Exception as e:
             logger.debug("RAG deps: failed to check PDF '%s': %s", pdf_path.name, e)
+        finally:
+            # 旧实现在异常分支直接漏掉 doc.close()，损坏/加密 PDF 会持续
+            # 泄漏文件句柄与解码缓存。
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     return False
 
@@ -386,9 +396,16 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
         # Check if OCR is installed
         report.ocr_installed = _is_importable("rapidocr_onnxruntime")
         if has_images and not report.ocr_installed:
-            # Move OCR from optional to required
+            # Move OCR from optional to required.
+            # 必须同时从 missing_optional 里移除：否则同一个 pip_spec 会同时
+            # 出现在「缺失必需」和「缺失可选」里 → pip 装两遍、summary 里
+            # 重复列出同一项。按 pip_spec 去重（DepSpec 是 dataclass，值相等
+            # 即可比较，但这里显式按 pip_spec 匹配更稳）。
             ocr_spec = DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别")
-            if ocr_spec not in report.missing_required:
+            report.missing_optional = [
+                d for d in report.missing_optional if d.pip_spec != ocr_spec.pip_spec
+            ]
+            if all(d.pip_spec != ocr_spec.pip_spec for d in report.missing_required):
                 report.missing_required.append(ocr_spec)
 
     # ---- docling: optional unified parser (falls back to per-format parsers) ----
@@ -598,17 +615,27 @@ def _is_importable(module_name: str) -> bool:
 
 
 def _is_reranker_cached() -> bool:
-    """Check if the BGE reranker model is cached locally."""
+    """Check if the BGE reranker model is cached locally.
+
+    ``try_to_load_from_cache`` does NOT return ``None`` for a known-missing
+    file in recent huggingface_hub versions — it returns the
+    ``_CACHED_NO_EXISTENT`` sentinel object.  Treating any non-None return as
+    "cached" therefore reported the model as present when it wasn't, so the
+    pre-download step never ran.  Only a real path means cached.
+    """
     try:
         from huggingface_hub import try_to_load_from_cache
-        key_files = ["pytorch_model.bin", "model.safetensors", "config.json"]
-        for kf in key_files:
-            cached = try_to_load_from_cache(RERANK_MODEL_ID, kf)
-            if cached is not None:
-                return True
-        return False
     except Exception:
         return False
+    key_files = ["pytorch_model.bin", "model.safetensors", "config.json"]
+    for kf in key_files:
+        try:
+            cached = try_to_load_from_cache(RERANK_MODEL_ID, kf)
+        except Exception:
+            continue
+        if isinstance(cached, (str, os.PathLike)):
+            return True
+    return False
 
 
 def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:

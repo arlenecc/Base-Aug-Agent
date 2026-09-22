@@ -16,12 +16,18 @@ logger = logging.getLogger(__name__)
 # token estimation
 # ---------------------------------------------------------------------------
 
+# 预编译正则 + 用 finditer 计数：estimate_tokens() 在切片热路径上被调用
+# 非常频繁，re.findall 会把所有匹配物化成一个列表（整篇文档几万个中文字符
+# = 几万个临时单字符串对象），纯属浪费。
+_CJK_RE = re.compile(r'[\u4e00-\u9fff]')
+
+
 def estimate_tokens(text: str) -> int:
     """Roughly estimate token count.
 
     Chinese: ~2 chars per token.  English: ~3 chars per token.
     """
-    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+    chinese_chars = sum(1 for _ in _CJK_RE.finditer(text))
     other_chars = len(text) - chinese_chars
     return chinese_chars // 2 + other_chars // 3
 
@@ -66,8 +72,14 @@ def chunk_documents(
     chunk_overlap: int = 80,
     min_chunk_size: int = 100,
     overlap_percent: float = 0.10,
+    embedding_function=None,
 ) -> List[Dict[str, Any]]:
     """Chunk multiple documents with metadata.
+
+    ``embedding_function`` 会一路透传给 hybrid/semantic 切分器。RAGEngine 注入
+    的自定义 EF（测试的 fake_ef、未来可替换的远端 embedding）必须能被语义
+    切片用到——否则语义切片仍会去加载共享的本地 ONNX 模型，既浪费内存，
+    在离线环境还会卡在模型下载上。
 
     Args:
         documents: List of dicts with 'source' (filepath) and 'text' keys.
@@ -96,6 +108,7 @@ def chunk_documents(
         logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
         chunks = _chunk_with_hybrid_fallback(
             text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
+            embedding_function,
         )
         for i, chunk in enumerate(chunks):
             all_chunks.append({
@@ -112,6 +125,7 @@ def _chunk_with_hybrid_fallback(
     chunk_overlap: int,
     min_chunk_size: int,
     overlap_percent: float,
+    embedding_function=None,
 ) -> List[str]:
     """Hybrid-chunk first (structure + semantic), then semantic, then recursive.
 
@@ -131,6 +145,7 @@ def _chunk_with_hybrid_fallback(
             chunk_overlap=chunk_overlap,
             min_chunk_size=min_chunk_size,
             overlap_percent=overlap_percent,
+            embedding_function=embedding_function,
         )
         if hybrid:
             return hybrid
@@ -147,6 +162,7 @@ def _chunk_with_hybrid_fallback(
             chunk_overlap=chunk_overlap,
             min_chunk_size=min_chunk_size,
             overlap_percent=overlap_percent,
+            embedding_function=embedding_function,
         )
         if semantic is not None:
             return semantic
@@ -261,7 +277,9 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     but without rescanning the substring on every step.
     """
     chunks: List[str] = []
-    seen: set = set()  # O(1) dedup instead of O(n) `in chunks`
+    # O(1) dedup instead of O(n) `in chunks`. 存哈希而非 chunk 全文：切片
+    # 本身已经是文档全文的副本，再去重集合里各存一份会让峰值内存翻倍。
+    seen: set = set()
     pos = 0  # character position
     text_len = len(text)
 
@@ -291,9 +309,11 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
                     break
 
         chunk = text[pos:end].strip()
-        if chunk and chunk not in seen:
-            seen.add(chunk)
-            chunks.append(chunk)
+        if chunk:
+            digest = hash(chunk)
+            if digest not in seen:
+                seen.add(digest)
+                chunks.append(chunk)
 
         if end >= text_len:
             break
@@ -328,7 +348,10 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
 
     merged: List[str] = [chunks[0]]
     for i in range(1, len(chunks)):
-        prev = merged[-1]
+        # 取「原始前一段」的尾部，而不是 merged[-1] 的尾部。merged[-1]
+        # 已经带上了一段重叠文本，若某段比 overlap 还短，向后回退会越界取
+        # 到上一段的重叠部分，导致重叠逐段复合、chunk 无限膨胀。
+        prev = chunks[i - 1]
         curr = chunks[i]
 
         # Take last N tokens from prev as overlap.

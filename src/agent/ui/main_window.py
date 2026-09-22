@@ -187,7 +187,10 @@ class BridgeCallbacks(AgentCallbacks):
         self._confirm_event = threading.Event()
         self._ask_event = threading.Event()
         self._lock = threading.Lock()
-        self._confirm_result: bool = True
+        # 默认「拒绝」而不是「同意」：确认弹窗用于 shell_run / code_run 等
+        # 高风险操作，若对话框因任何原因没有回话（超时、事件循环被卡住、
+        # 信号丢失），安全的一侧是拒绝执行，而不是默默放行。
+        self._confirm_result: bool = False
         self._ask_result: Optional[str] = None
         self._cancelled = False
 
@@ -214,12 +217,20 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.finished.emit()
 
     # blocking dialogs (called from worker thread)
+    # 等待用户回话的最长时间（秒）。超过则视为未获授权 → 拒绝 / 无回答。
+    _DIALOG_TIMEOUT = 600.0
+
     def confirm(self, message: str) -> bool:
         if self._cancelled:
             return False
         self._confirm_event.clear()
+        with self._lock:
+            self._confirm_result = False
         self.bridge.confirm_request.emit(message)
-        self._confirm_event.wait(timeout=600.0)
+        # Event.wait() 返回 False 表示超时——此时绝不能沿用默认/上一次结果，
+        # 否则高风险操作会在用户没点确认的情况下被执行。
+        if not self._confirm_event.wait(timeout=self._DIALOG_TIMEOUT):
+            return False
         with self._lock:
             return self._confirm_result
 
@@ -227,8 +238,11 @@ class BridgeCallbacks(AgentCallbacks):
         if self._cancelled:
             return None
         self._ask_event.clear()
+        with self._lock:
+            self._ask_result = None
         self.bridge.ask_request.emit(prompt)
-        self._ask_event.wait(timeout=600.0)
+        if not self._ask_event.wait(timeout=self._DIALOG_TIMEOUT):
+            return None
         with self._lock:
             return self._ask_result
 
@@ -242,6 +256,20 @@ class BridgeCallbacks(AgentCallbacks):
         with self._lock:
             self._ask_result = val
         self._ask_event.set()
+
+    def reset(self) -> None:
+        """Clear per-run state so the next turn starts from a clean slate.
+
+        Without this, ``_cancelled`` stays True after 「终止对话」 and every
+        later confirm/ask would be auto-declined; the stale ``_ask_result``
+        would also be returned again for the next question.
+        """
+        self._cancelled = False
+        with self._lock:
+            self._confirm_result = False
+            self._ask_result = None
+        self._confirm_event.clear()
+        self._ask_event.clear()
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -436,9 +464,17 @@ class SyncKnowledgeWorker(QThread):
 
 
 class InstallDepsWorker(QThread):
-    """Background worker for checking and installing missing RAG dependencies."""
+    """Background worker for checking and installing missing RAG dependencies.
+
+    IMPORTANT: the completion signal is named ``deps_finished``, NOT
+    ``finished``.  ``QThread`` already defines a built-in ``finished`` signal
+    that is emitted *after* ``run()`` returns; declaring a custom signal with
+    the same name shadows it, so anything connected to it (e.g.
+    ``deleteLater``) fires from inside ``run()`` — deleting the QThread while
+    it is still running.  See the same note on SyncKnowledgeWorker.
+    """
     progress = pyqtSignal(str)
-    finished = pyqtSignal(object)  # DependencyReport
+    deps_finished = pyqtSignal(object)  # DependencyReport
 
     def __init__(self, kb_path: str):
         super().__init__()
@@ -453,7 +489,7 @@ class InstallDepsWorker(QThread):
         try:
             if self._cancelled.is_set():
                 self.progress.emit("依赖检查已取消")
-                self.finished.emit(None)
+                self.deps_finished.emit(None)
                 return
             from ..rag.deps import ensure_dependencies
             report = ensure_dependencies(
@@ -464,12 +500,12 @@ class InstallDepsWorker(QThread):
             )
             if self._cancelled.is_set():
                 self.progress.emit("依赖检查已取消")
-                self.finished.emit(None)
+                self.deps_finished.emit(None)
                 return
-            self.finished.emit(report)
+            self.deps_finished.emit(report)
         except Exception as e:
             self.progress.emit(f"依赖检查异常: {e}")
-            self.finished.emit(None)
+            self.deps_finished.emit(None)
 
 
 # ===========================================================================
@@ -684,6 +720,9 @@ class MainWindow(QMainWindow):
         # chat view
         self.chat_view = QTextEdit()
         self.chat_view.setReadOnly(True)
+        # 限制对话区保留的段落数。长会话（多轮工具调用 + 大段输出）会让
+        # QTextDocument 无限增长，最终吃光内存并让滚动/重排越来越卡。
+        self.chat_view.document().setMaximumBlockCount(5000)
         self.chat_view.document().setDefaultStyleSheet(
             ".u{color:#2563eb}.a{color:#059669}.t{color:#7c3aed}.sys{color:#9ca3af}"
         )
@@ -913,11 +952,27 @@ class MainWindow(QMainWindow):
         if d:
             self.knowledge_base_edit.setText(d)
 
+    @staticmethod
+    def _is_worker_running(worker) -> bool:
+        """``worker.isRunning()`` that tolerates an already-deleted QThread.
+
+        Workers are cleaned up with ``deleteLater``, so a stale reference can
+        point at a QThread whose C++ object is gone — calling ``isRunning()``
+        on it raises ``RuntimeError: wrapped C/C++ object has been deleted``
+        and would take down the click handler.
+        """
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
     def _on_sync_knowledge(self, force: bool = False) -> None:
-        if self._sync_worker is not None and self._sync_worker.isRunning():
+        if self._is_worker_running(self._sync_worker):
             logger.warning("Sync already running, ignoring duplicate request")
             return
-        if self._deps_worker is not None and self._deps_worker.isRunning():
+        if self._is_worker_running(self._deps_worker):
             logger.warning("Deps check already running, ignoring duplicate request")
             return
         kb = self.knowledge_base_edit.text().strip()
@@ -941,7 +996,9 @@ class MainWindow(QMainWindow):
         self._append_log("[rag] ────────── 开始知识库同步 ──────────")
         self._deps_worker = InstallDepsWorker(kb)
         self._deps_worker.progress.connect(self._on_deps_progress)
-        self._deps_worker.finished.connect(self._on_deps_finished)
+        self._deps_worker.deps_finished.connect(self._on_deps_finished)
+        # deleteLater 必须挂到 QThread 内建的 finished（run() 返回后触发），
+        # 挂在自定义信号上会在 run() 执行途中销毁线程对象。
         self._deps_worker.finished.connect(self._deps_worker.deleteLater)
         self._deps_worker.start()
 
@@ -1209,7 +1266,7 @@ class MainWindow(QMainWindow):
         self._set_controls_busy(True)
         self.think_view.clear()
         self.speed_label.setText("0.0 tok/s")
-        self._callbacks._cancelled = False
+        self._callbacks.reset()
         self._worker = AgentWorker(self._agent, self._callbacks)
         self._worker.set_input(text)
         # Let Qt clean up the QThread asynchronously once run() returns, instead
@@ -1650,6 +1707,13 @@ class MainWindow(QMainWindow):
                 self._agent.tools.shutdown()
             except Exception as e:
                 logger.warning("UI: shutdown error: %s", e)
+            # agent.close() 释放 fact-extraction 专用的 LLMClient（独立
+            # httpx 连接池）。_rebuild_agent() 会做，但窗口直接关闭时不会走
+            # 那条路径，连接池会随进程残留。
+            try:
+                self._agent.close()
+            except Exception as e:
+                logger.warning("UI: agent close error: %s", e)
         if self._llm is not None:
             try:
                 self._llm.close()

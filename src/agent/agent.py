@@ -68,6 +68,17 @@ To call a tool, emit a tool_call with name + JSON args. The result returns as a 
 # omits reasoning tokens entirely.
 # ---------------------------------------------------------------------------
 
+# CJK 码点 → None 的删除表，供 str.translate 一次性统计 CJK 字符数（C 层实现）。
+# 覆盖统一表意文字、扩展 A、CJK 符号/日文假名、全角字符。
+_CJK_DELETE_TABLE = {
+    cp: None
+    for cp in list(range(0x4E00, 0xA000))      # CJK 统一表意文字
+    + list(range(0x3400, 0x4DC0))              # CJK 扩展 A
+    + list(range(0x3000, 0x3100))              # CJK 符号 + 日文假名
+    + list(range(0xFF00, 0xFFF0))              # 全角字符
+}
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token-count estimate from text.
 
@@ -86,15 +97,11 @@ def _estimate_tokens(text: str) -> int:
 
     # Mixed/CJK text: count CJK characters via str.translate for speed.
     # Building the translation table is O(1) and translate is O(n) in C,
-    # much faster than a Python-level per-character loop for long text.
-    cjk = 0
-    for ch in text:
-        cp = ord(ch)
-        if (0x4E00 <= cp <= 0x9FFF or  # CJK Unified Ideographs
-                0x3400 <= cp <= 0x4DBF or  # CJK Extension A
-                0x3000 <= cp <= 0x30FF or  # CJK symbols + Japanese kana
-                0xFF00 <= cp <= 0xFFEF):  # Fullwidth forms
-            cjk += 1
+    # much faster than a Python-level per-character loop for long text
+    # (旧实现是纯 Python 逐字符循环，长文本下明显偏慢，与上面的注释不符)。
+    # translate() 删除的是 CJK 字符，所以剩下的是非 CJK —— 用总长度相减
+    # 得到 CJK 数量（比逐字符 Python 循环快一个数量级）。
+    cjk = len(text) - len(text.translate(_CJK_DELETE_TABLE))
     other = len(text) - cjk
     # CJK: ~1.5 chars/token; ASCII/other: ~4 chars/token
     return max(1, int(cjk / 1.5 + other / 4.0))
@@ -1195,10 +1202,16 @@ class Agent:
                     "不要贴代码，不要输出多余解释，20 字以内：\n\n"
                     + code[:2000]
                 )
-                events = list(llm.chat_stream([{"role": "user", "content": prompt}]))
-                answer = "".join(
-                    ev.get("content", "") for ev in events if ev.get("type") == "content"
-                ).strip()
+                # chat_stream 产出的是 StreamEvent 数据类，不是 dict。旧代码写
+                # `ev.get(...)` 会抛 AttributeError 并被下面的 except 吞掉，
+                # 导致 LLM 兜底永远是死代码、只能退回通用描述。这里按属性访问。
+                answer_parts = []
+                for ev in llm.chat_stream([{"role": "user", "content": prompt}]):
+                    if ev.type == "content":
+                        answer_parts.append(ev.content)
+                    elif ev.type == "done":
+                        break
+                answer = "".join(answer_parts).strip()
                 if answer:
                     return answer[:80]
         except Exception:

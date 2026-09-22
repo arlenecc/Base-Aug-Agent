@@ -505,6 +505,9 @@ class RAGEngine:
                                 chunk_overlap=self._chunk_overlap,
                                 min_chunk_size=self._min_chunk_size,
                                 overlap_percent=self._overlap_percent,
+                                # 把引擎的 EF（可能是注入的自定义 EF）透传给
+                                # 语义切片，避免它另起一份本地 ONNX 模型。
+                                embedding_function=self._custom_ef,
                             )
                             t_chunk_end = time.monotonic()
                             _log(
@@ -1032,6 +1035,12 @@ class RAGEngine:
             release_ocr_engine()
         except Exception as e:
             logger.debug("RAG: release_ocr_engine error: %s", e)
+        # 同样释放 docling 的共享 DocumentConverter（重量级模型常驻）。
+        try:
+            from .docling_parser import release_converter
+            release_converter()
+        except Exception as e:
+            logger.debug("RAG: release_converter error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.

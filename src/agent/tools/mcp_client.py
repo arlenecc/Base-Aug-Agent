@@ -96,6 +96,11 @@ class MCPClient:
                 env=env,
                 text=True,
                 bufsize=1,
+                # 独立进程组：很多 MCP server 由 `npx` 启动，npx 会再 fork 出
+                # 真正的 node server。不建新会话的话 terminate() 只杀掉 npx，
+                # 真正的 server 会变成孤儿进程一直存活到关机。有了独立进程组，
+                # stop() 可以 killpg 一次性回收整棵树。
+                start_new_session=True,
             )
         except FileNotFoundError:
             raise MCPError(f"MCP server '{self.name}': command not found: {self.command}")
@@ -134,32 +139,52 @@ class MCPClient:
             raise
 
     def stop(self) -> None:
-        """Terminate the MCP server subprocess and wait for threads."""
+        """Terminate the MCP server subprocess and wait for threads.
+
+        Cleanup is driven by ``self._process``, NOT by ``self._running``.
+        The reader thread sets ``_running = False`` in its ``finally`` block
+        whenever the server dies on its own (crash, stdout closed).  If we
+        bailed out on ``not self._running``, that path would skip
+        terminate()/wait() entirely and leave a zombie child forever — and a
+        still-alive server (only its stdout closed) would become an orphan.
+        """
         # Signal the reader thread to stop first. We set _running=False under
         # the lock so the reader sees it on its next loop iteration.
         with self._lock:
-            if not self._running:
-                # Already stopped — avoid double-cleanup.
-                return
             self._running = False
+            process = self._process
+            self._process = None
         # Close stdin / terminate the process OUTSIDE the lock so the reader
         # thread (which may be in its finally block trying to acquire the lock)
         # doesn't deadlock waiting for us to release it.
-        process = self._process
         if process:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except Exception:
+                    pass
             try:
-                process.stdin.close()
-            except Exception:
-                pass
-            try:
-                process.terminate()
+                # 整棵进程组一起收：npx 之类的包装进程会把真正的 server 挂成
+                # 孙进程，只 terminate 顶层 PID 会留下孤儿。
+                try:
+                    import os
+                    import signal
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except Exception:
+                    process.terminate()
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                try:
+                    import os
+                    import signal
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except Exception:
+                    process.kill()
                 process.wait()
             except Exception:
                 pass
-        # Clear the process reference under the lock.
+        # Clear pending requests under the lock.
         with self._lock:
             self._process = None
             # Wake up any waiters
@@ -302,10 +327,14 @@ class MCPClient:
                     error=obj.get("error"),
                 )
                 with self._lock:
-                    self._results[resp.id] = resp
                     ev = self._pending.get(resp.id)
-                if ev:
-                    ev.set()
+                    if ev is None:
+                        # 迟到的响应：对应的 _call() 已超时/被取消，没人会再来
+                        # pop 它。旧实现无条件写入 _results，这些条目会永久
+                        # 驻留（内存泄漏）。直接丢弃。
+                        continue
+                    self._results[resp.id] = resp
+                ev.set()
         except Exception as e:
             logger.debug("MCP server '%s' reader exited: %s", self.name, e)
         finally:

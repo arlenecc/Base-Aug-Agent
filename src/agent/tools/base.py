@@ -216,13 +216,20 @@ class ToolRegistry:
         it is cached on the registry and rebuilt on subsequent calls only if
         the skills directory changed.
         """
-        retriever = getattr(self, "_skill_retriever", None)
+        # 缓存按 skills_dir 区分：「应用配置」切换 workspace 后，复用旧目录的
+        # retriever 会检索到错误工作区的技能。
+        skills_dir = os.path.join(self.config.workspace, "skills")
+        cache = getattr(self, "_skill_retriever_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, "_skill_retriever_cache", cache)
+        retriever = cache.get(skills_dir)
         if retriever is not None:
             return retriever
-        skills_dir = os.path.join(self.config.workspace, "skills")
         db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
         from ..skill_retriever import SkillRetriever
         retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
+        cache[skills_dir] = retriever
         setattr(self, "_skill_retriever", retriever)
         return retriever
 
@@ -277,19 +284,23 @@ class ToolRegistry:
             except Exception as e:
                 logger.warning("⚠ 长期记忆资源释放异常: %s", e)
             setattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
-        # Release the SkillIndex singleton (if any)
-        skill_idx = getattr(self, "_skill_index", None)
-        if skill_idx is not None:
-            setattr(self, "_skill_index", None)
+        # Release the SkillIndex singleton(s) (if any)
+        setattr(self, "_skill_index", None)
+        setattr(self, "_skill_index_cache", None)
         # Release the SkillRetriever (LanceDB connection). Note: it shares the
         # process-wide embedding function singleton, which we do NOT close here.
-        skill_retriever = getattr(self, "_skill_retriever", None)
-        if skill_retriever is not None:
+        cache = getattr(self, "_skill_retriever_cache", None)
+        retrievers = list(cache.values()) if isinstance(cache, dict) else []
+        legacy = getattr(self, "_skill_retriever", None)
+        if legacy is not None and legacy not in retrievers:
+            retrievers.append(legacy)
+        for skill_retriever in retrievers:
             try:
                 skill_retriever.close()
             except Exception as e:
                 logger.warning("⚠ skill retriever 资源释放异常: %s", e)
-            setattr(self, "_skill_retriever", None)
+        setattr(self, "_skill_retriever", None)
+        setattr(self, "_skill_retriever_cache", None)
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)

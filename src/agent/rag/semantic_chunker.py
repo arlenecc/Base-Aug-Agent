@@ -15,6 +15,8 @@ so callers fall back to the existing recursive chunker.
 from __future__ import annotations
 
 import logging
+import re
+import threading
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -101,8 +103,12 @@ def semantic_chunk_text(
         )
         chunks = chunker.chunk(text)
         result = [c.text.strip() for c in chunks if c.text.strip()]
-        merged = _merge_to_target_size(result, chunk_size, min_chunk_size)
-        return _apply_overlap(merged, chunk_size, chunk_overlap, overlap_percent)
+        # 传入原文 text，合并/重叠时用「源码里真实的间隔」拼接，保证产出的
+        # chunk 一定是原文的连续子串（见 _gap_between）。
+        merged = _merge_to_target_size(result, chunk_size, min_chunk_size, source=text)
+        return _apply_overlap(
+            merged, chunk_size, chunk_overlap, overlap_percent, source=text,
+        )
     except Exception as e:
         # Never let a chunking failure abort ingestion — the caller falls back
         # to the recursive chunker.
@@ -111,10 +117,34 @@ def semantic_chunk_text(
         return None
 
 
+def _gap_between(source: Optional[str], left: str, right: str) -> str:
+    """Return the exact text that separates ``left`` and ``right`` in ``source``.
+
+    Merging/overlapping chunks used to hardcode ``"\\n\\n"`` as the joiner.
+    When the two chunks were adjacent in the source with different whitespace
+    (a single ``\\n``, a space, or nothing at all), the joined chunk contained
+    characters the source never had — so chunk text was not a substring of the
+    document, and the model saw text that doesn't exist in the file.
+
+    Falls back to ``"\\n\\n"`` when the pieces can't be located in ``source``
+    (no source supplied, or the chunker re-wrote whitespace).
+    """
+    if not source or not left or not right:
+        return "\n\n"
+    i = source.find(left)
+    if i < 0:
+        return "\n\n"
+    j = source.find(right, i + len(left))
+    if j < 0:
+        return "\n\n"
+    return source[i + len(left):j]
+
+
 def _merge_to_target_size(
     chunks: List[str],
     chunk_size: int,
     min_chunk_size: int,
+    source: Optional[str] = None,
 ) -> List[str]:
     """Greedily merge adjacent chunks toward the [min, max] token target.
 
@@ -136,7 +166,7 @@ def _merge_to_target_size(
     for nxt in chunks[1:]:
         if estimate_tokens(current) < min_chunk_size and \
                 estimate_tokens(current) + estimate_tokens(nxt) <= chunk_size:
-            current = current + "\n\n" + nxt
+            current = current + _gap_between(source, current, nxt) + nxt
         else:
             merged.append(current)
             current = nxt
@@ -149,6 +179,7 @@ def _apply_overlap(
     chunk_size: int,
     chunk_overlap: int,
     overlap_percent: float,
+    source: Optional[str] = None,
 ) -> List[str]:
     """Add token-level overlap between consecutive chunks.
 
@@ -176,34 +207,41 @@ def _apply_overlap(
         # overlap-padded one), so overlap never compounds across boundaries.
         tail = _tail_by_tokens(chunks[i - 1], overlap)
         if tail:
-            result.append(tail + "\n\n" + chunks[i])
+            # 用源码里真实的间隔拼接，保证结果仍是原文的连续子串。
+            result.append(tail + _gap_between(source, tail, chunks[i]) + chunks[i])
         else:
             result.append(chunks[i])
     return result
 
 
+_TAIL_BOUNDARY_RE = re.compile(r"(?<=[。！？!?\.])[ \t]*\n?|\n")
+
+
 def _tail_by_tokens(text: str, max_tokens: int) -> str:
     """Return the trailing portion of ``text`` up to ``max_tokens`` tokens,
-    aligned to a sentence boundary (never splitting a sentence)."""
+    aligned to a sentence boundary (never splitting a sentence).
+
+    切片必须取自原文 —— 旧实现先用 ``re.split`` 拆句（分隔符中的 ``\\s*``
+    被丢弃）再用 ``"".join`` 拼回来，句间的换行/空格因此凭空消失，产出的
+    重叠文本在原文里根本不存在（模型会看到源文件没有的内容）。这里改为直接
+    在原文里找句末边界并切片，保证结果恒为原文子串。
+    """
     from .chunker import estimate_tokens
 
     if not text or max_tokens <= 0:
         return ""
 
-    # Split into sentences keeping delimiters attached, so we can re-join.
-    import re
-    parts = re.split(r"(?<=[。！？!?\.])\s*|\n", text)
-    parts = [p for p in parts if p.strip()]
+    # 所有可作为起点的句末边界（0 = 整段文本）。
+    bounds = [0] + [m.end() for m in _TAIL_BOUNDARY_RE.finditer(text)]
+    bounds = [b for b in bounds if b < len(text)]
 
-    tail: List[str] = []
-    total = 0
-    for p in reversed(parts):
-        tk = estimate_tokens(p)
-        if total + tk > max_tokens and tail:
+    # 从最靠近末尾的边界往回找，取能满足 token 预算的最长后缀。
+    start = len(text)
+    for b in reversed(bounds):
+        if estimate_tokens(text[b:]) > max_tokens:
             break
-        tail.insert(0, p)
-        total += tk
-    return "".join(tail).strip()
+        start = b
+    return text[start:].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -214,22 +252,34 @@ _shared_ef = None
 _shared_ef_resolved = False
 
 
+_shared_ef_lock = threading.Lock()
+
+
 def _shared_embedding_function():
     """Return the process-wide nomic-embed-text embedding function, if available.
 
     Imported lazily to avoid a hard dependency on fastembed/vector_store for
     callers that never enable RAG.
+
+    失败结果不再永久缓存：旧实现先把 ``_shared_ef_resolved = True`` 置位再加载，
+    一旦首次加载失败（模型未下载、网络不通），本进程内语义切片就永久降级到递归
+    切片，即使后来网络恢复/模型下载完成也不会再试。同时加载过程加锁，避免多个
+    worker 线程并发触发多次模型加载。
     """
     global _shared_ef, _shared_ef_resolved
     if _shared_ef_resolved:
         return _shared_ef
-    _shared_ef_resolved = True
-    try:
-        from .vector_store import get_or_create_embedding_function
-        _shared_ef = get_or_create_embedding_function()
-    except Exception as e:
-        logger.debug("shared embedding function unavailable: %s", e)
-        _shared_ef = None
+    with _shared_ef_lock:
+        if _shared_ef_resolved:
+            return _shared_ef
+        try:
+            from .vector_store import get_or_create_embedding_function
+            _shared_ef = get_or_create_embedding_function()
+            # 只在成功时置位，失败时留给下次重试。
+            _shared_ef_resolved = _shared_ef is not None
+        except Exception as e:
+            logger.debug("shared embedding function unavailable: %s", e)
+            _shared_ef = None
     return _shared_ef
 
 

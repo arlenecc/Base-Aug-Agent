@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Optional
 
 from ..config import AgentConfig
 from ..skill_index import SkillIndex
@@ -19,14 +19,39 @@ from .base import Tool, ToolRegistry, ToolResult
 
 
 def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
-    """Get or create the singleton SkillIndex, cached on the registry."""
-    idx = getattr(registry, "_skill_index", None)
-    if idx is not None:
-        return idx
+    """Get or create the singleton SkillIndex, cached on the registry.
+
+    The cache key includes the skills directory: 「应用配置」 can switch the
+    workspace mid-session, and returning the previous workspace's index would
+    silently show (and load) skills from the wrong place.
+    """
     skills_dir = os.path.join(config.workspace, ".agent", "skills")
+    cache = getattr(registry, "_skill_index_cache", None)
+    if isinstance(cache, dict):
+        idx = cache.get(skills_dir)
+        if idx is not None:
+            return idx
+    else:
+        cache = {}
+        setattr(registry, "_skill_index_cache", cache)
     idx = SkillIndex(skills_dir)
+    cache[skills_dir] = idx
+    # Keep the legacy attribute in sync so shutdown()/other callers still see it.
     setattr(registry, "_skill_index", idx)
     return idx
+
+
+def _resolve_within(base_dir: str, *parts: str) -> Optional[str]:
+    """Join ``parts`` under ``base_dir`` and verify the result stays inside it.
+
+    Returns ``None`` for traversal attempts (``..``), absolute paths, and
+    anything else that escapes ``base_dir``.
+    """
+    base = os.path.realpath(base_dir)
+    resolved = os.path.realpath(os.path.join(base, *parts))
+    if resolved == base or not resolved.startswith(base + os.sep):
+        return None
+    return resolved
 
 
 class SkillSearchTool(Tool):
@@ -168,12 +193,37 @@ class SkillLoadTool(Tool):
         self.registry = registry
 
     def run(self, path: str, entry: str = "SKILL.md") -> ToolResult:
+        # 入口名由模型提供，先做显式校验：绝对路径会被 os.path.join 直接当作
+        # 结果（丢掉技能目录），".." 又能逃出目录 —— 两者都会让 skill_load
+        # 变成任意文件读取。校验失败必须直接报错，不能「回退到别的文件」
+        # 从而把非法请求伪装成一次成功读取。
+        entry = (entry or "SKILL.md").strip()
+        if os.path.isabs(entry) or ".." in entry.replace("\\", "/").split("/"):
+            return ToolResult(
+                False,
+                error=f"refusing unsafe entry outside the skill directory: {entry!r}",
+            )
+
         # 1) Try the semantic retriever first (SKILL.md directory).
         retriever = getattr(self.registry, "_skill_retriever", None)
         if retriever is not None:
             abs_dir = retriever.read_skill_dir(path)
             if abs_dir:
-                target = os.path.join(abs_dir, entry)
+                # `entry` 由模型提供，必须校验：os.path.join 在 entry 为绝对
+                # 路径时会直接丢弃 abs_dir，而 "../" 又能逃出技能目录——
+                # 两者合起来等于允许读取磁盘上的任意文件。
+                target = _resolve_within(abs_dir, entry)
+                if target is None:
+                    return ToolResult(
+                        False,
+                        error=f"refusing entry outside the skill directory: {entry!r}",
+                    )
+                # 旧体系（SkillIndex）的技能入口是 prompt.md，SKILL.md 缺失时
+                # 回退一次，否则这些技能永远读不出来。
+                if not os.path.isfile(target) and entry == "SKILL.md":
+                    legacy = _resolve_within(abs_dir, "prompt.md")
+                    if legacy is not None and os.path.isfile(legacy):
+                        target = legacy
                 if os.path.isfile(target):
                     try:
                         with open(target, "r", encoding="utf-8") as f:
@@ -185,5 +235,27 @@ class SkillLoadTool(Tool):
         idx = _get_skill_index(self.config, self.registry)
         content = idx.read_skill_content(path, entry)
         if content is None:
+            # 目录技能在 skill.json 里声明自己的入口文件（老技能是
+            # prompt.md）。工具默认 entry 是 SKILL.md，老技能因此永远读不到
+            # —— 回退到索引里记录的 entry，再回退到 prompt.md。
+            declared = self._declared_entry(idx, path)
+            for fallback in (declared, "prompt.md"):
+                if not fallback or fallback == entry:
+                    continue
+                content = idx.read_skill_content(path, fallback)
+                if content is not None:
+                    return ToolResult(True, output=content)
+        if content is None:
             return ToolResult(False, error=f"skill not found or entry file missing: {path}/{entry}")
         return ToolResult(True, output=content)
+
+    @staticmethod
+    def _declared_entry(idx: SkillIndex, path: str) -> Optional[str]:
+        """Return the entry file declared by the skill's own skill.json."""
+        try:
+            for record in idx.list_all():
+                if record.get("path") == path:
+                    return record.get("entry") or None
+        except Exception:
+            return None
+        return None

@@ -179,67 +179,82 @@ def _extract_pdf(path: Path) -> str:
         raise ImportError("PyMuPDF is required for PDF files. pip install PyMuPDF")
 
     doc = fitz.open(str(path))
-    total_pages = len(doc)
-    parts: List[str] = []
-    ocr_engine = None       # lazy-init, 复用同一个引擎实例
-    ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
+    try:
+        # 加密 PDF：没有密码就取不到任何文本，旧行为是整份文件静默产出空
+        # 内容并计入「提取失败」。用空密码尝试解锁，能解就继续正常解析。
+        if doc.needs_pass:
+            if not doc.authenticate(""):
+                raise ValueError("PDF 已加密且无法用空密码解锁")
 
-    # 统计各类型页面数量，用于最终日志
-    text_page_count = 0
-    image_page_count = 0
-    ocr_page_count = 0
-    ocr_skipped_count = 0
-    blank_page_count = 0
+        total_pages = len(doc)
+        parts: List[str] = []
+        ocr_engine = None       # lazy-init, 复用同一个引擎实例
+        ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
 
-    for page_num in range(total_pages):
-        page = doc[page_num]
-        text = page.get_text("text").strip()
+        # 统计各类型页面数量，用于最终日志
+        text_page_count = 0
+        image_page_count = 0
+        ocr_page_count = 0
+        ocr_skipped_count = 0
+        blank_page_count = 0
 
-        if text:
-            # 文字版页面：直接提取文本，不需要 OCR
-            parts.append(text)
-            text_page_count += 1
-            continue
+        for page_num in range(total_pages):
+            page = doc[page_num]
+            text = page.get_text("text").strip()
 
-        # 无文字层 → 可能是图片版或空白页。检查是否含嵌入图片。
-        images = page.get_images(full=True)
-        if not images:
-            # 既无文字也无图片 → 空白页，跳过
-            blank_page_count += 1
-            continue
+            if text:
+                # 文字版页面：直接提取文本，不需要 OCR
+                parts.append(text)
+                text_page_count += 1
+                continue
 
-        # 图片版页面 → 需要 OCR
-        image_page_count += 1
+            # 无文字层 → 可能是图片版或空白页。检查是否含嵌入图片。
+            images = page.get_images(full=True)
+            if not images:
+                # 既无文字也无图片 → 空白页，跳过
+                blank_page_count += 1
+                continue
 
-        if ocr_unavailable:
-            ocr_skipped_count += 1
-            continue
+            # 图片版页面 → 需要 OCR
+            image_page_count += 1
 
-        if ocr_engine is None:
-            ocr_engine = _get_ocr_engine()
-            if ocr_engine is None:
-                ocr_unavailable = True
+            if ocr_unavailable:
                 ocr_skipped_count += 1
                 continue
 
-        with _OCR_SEMAPHORE:
-            # 双重检查：可能在等信号量期间其它 worker 已判定不可用
             if ocr_engine is None:
-                ocr_unavailable = True
+                ocr_engine = _get_ocr_engine()
+                if ocr_engine is None:
+                    ocr_unavailable = True
+                    ocr_skipped_count += 1
+                    continue
+
+            with _OCR_SEMAPHORE:
+                # 双重检查：可能在等信号量期间其它 worker 已判定不可用
+                if ocr_engine is None:
+                    ocr_unavailable = True
+                    ocr_skipped_count += 1
+                    continue
+                pix = page.get_pixmap(dpi=200)
+                try:
+                    img_bytes = pix.tobytes("png")
+                finally:
+                    # Pixmap 持有整页 200dpi 位图（数 MB），显式释放避免
+                    # 多页循环时峰值内存持续累积。
+                    pix = None
+
+                ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+
+            if ocr_text:
+                parts.append(ocr_text)
+                ocr_page_count += 1
+            else:
+                # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
-                continue
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
-            ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
-
-        if ocr_text:
-            parts.append(ocr_text)
-            ocr_page_count += 1
-        else:
-            # OCR 返回空结果（可能是图片质量太差或引擎异常）
-            ocr_skipped_count += 1
-
-    doc.close()
+    finally:
+        # 必须放在 finally：中途抛异常（加密 PDF、损坏文件、OCR 崩溃）时
+        # 旧实现直接跳过 doc.close()，泄漏文件句柄与整份文档的解码缓存。
+        doc.close()
 
     # 汇总日志：清晰报告各类型页面的处理情况
     detail_parts = [f"text={text_page_count}"]
