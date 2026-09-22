@@ -16,7 +16,7 @@
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
-- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简
+- **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认；确认弹窗只显示**用途说明**（启发式优先：注释/docstring/命令名映射，零延迟；无注释时才用 LLM 兜底生成 ≤20 字用途），不贴代码全文，避免超长文本把按钮顶出屏幕
 - **技能系统** — 自动识别用户意图匹配技能；支持目录化技能（`.agent/skills/` 下每个技能一个目录，含 `skill.json` 元数据 + `prompt.md` 指令），`SkillIndex` 维护 `_index.json` 索引，`skill_search` / `skill_load` 按需发现与加载，技能指令不进系统提示词，节省 token
@@ -221,7 +221,7 @@ python main.py
 ```
 文档解析 (docling → Markdown)
   └─ 提取目录结构（章节树 + 标题层级）→ 形成「缩略版本」
-  └─ 存入 LanceDB documents 表（文档名 / 缩略版本 / 完整 Markdown）
+  └─ 存入 LanceDB documents 表（文档名 / 缩略版本 / 章节列表 / md 缓存路径）
 
 用户提问「某本书里 XXX 是怎么说的？」
   ├─ ① rag_outline("书名") → 返回全书目录结构（掌握全局）
@@ -242,7 +242,10 @@ python main.py
 - **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
-- **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`（表内含完整 Markdown，反复全量扫描既慢又占内存）；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
+- **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
+- **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
+- **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
+- **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
 - **Reranker 加载去重**：BGE reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
 
 ### 支持的文档格式
@@ -435,7 +438,8 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 
 Agent 在长对话中会自动管理上下文窗口，避免超出模型 token 限制：
 
-- **主动收缩**：当估计的 prompt 大小达到 `max_context_tokens × 90%` 时，自动摘要旧消息，保留最近 6 条消息（当前任务上下文）verbatim，旧消息压缩为单条摘要标记。Token 估算采用增量计数（O(1) 而非 O(N) 每次全量扫描），高频场景下性能更优。
+- **主动收缩**：当估计的 prompt 大小达到 `max_context_tokens × 90%` 时，自动摘要旧消息，保留最近 6 条消息（当前任务上下文）verbatim，旧消息压缩为单条摘要标记。Token 估算采用增量计数（O(1) 而非 O(N) 每次全量扫描），高频场景下性能更优。估算包含 **系统提示 + 历史 + tools schema**（工具多时 schema 可达数千 token，漏算会让主动收缩几乎不触发）。
+- **注入上限**：系统提示的动态注入段（当天事实、命中技能 prompt）**不在收缩范围内**，因此各自设上限（事实 ≤20 条/2000 字符，技能 prompt ≤1500 字符），否则长会话下系统提示会单调膨胀且无自愈路径。
 - **被动收缩**：遇到 LLM API 返回 `context_length_exceeded` 类错误时，自动收缩并重试同一轮（不消耗迭代次数），最多重试 3 次
 - **持久化**：摘要写入 `workspace/memory.md`（带时间戳和触发原因），支持长期/跨会话回溯
 - **摘要策略**：调用 LLM 生成要点摘要（用户需求、决策、已完成步骤、未完成子任务、关键路径/URL/数值）；LLM 不可用时回退到结构化摘要（用户请求 + 工具调用列表）
@@ -565,6 +569,27 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 42 | `execute()` 把工具内部 TypeError 误报为参数错误 | 工具出 bug 时模型反复重试而不是上报 | `inspect.signature` 预检区分两类错误 |
 | 43 | `code_run` 泄漏线程可吞掉后续执行的 stdout | 并发执行时输出丢失 | 恢复权全部移交主线程，worker 不再碰全局状态 |
 | 44 | `_JsonStore.reload()` 丢弃防抖窗口内的未落盘写入 | **0.5s 内 set 后 reload，刚固化的技能静默丢失** | reload 前先把脏数据强制写回 |
+| 45 | `add_streaming` 单批写完提前 return，跳过 FTS 重建 | **小知识库同步后 BM25 静默失效**（混合检索退化成纯向量，无报错） | 提前出口同样重建索引 |
+| 46 | `delete_by_source` 删向量后不失效 FTS | 已删除文档的内容仍被关键词检索召回并返回给 LLM | 删除后置 `_fts_ready = False` |
+| 47 | `reload()` 只刷向量表句柄 | 同步后 `rag_outline` 读到旧 digest、BM25 看不到新切片 | 一并重置 documents 表/缓存/FTS 标志 |
+| 48 | documents 元数据表存每篇文档**完整 markdown** 且全量进缓存 | 语料在磁盘存 3 份；进程常驻内存 ≈ 整个知识库；该字段**零消费者** | 不入库，改存 `md_path`（缓存按列读取，绝不加载 markdown） |
+| 49 | 删除源文件只清向量与 manifest，不删文档元数据 | `rag_outline` 列出已无向量的文档 | `_cleanup_deleted_files` 同步 `delete_document` |
+| 50 | `_fetch_worker` 成功后从不置 None | **获取模型后关闭窗口必崩**（`isRunning()` 抛 RuntimeError → PyQt abort） | 两个槽都清空引用；`closeEvent` 全部改用 `_is_worker_running()` |
+| 51 | `_on_stop_sync` / `closeEvent` 直接调 `isRunning()` | 同上，`deleteLater` 后点击「停止同步」崩溃 | 统一走带 RuntimeError 保护的守卫 |
+| 52 | `usage` 字段为 `null` 时 `None > 0` | 部分网关返回 null → **整轮 run() 崩溃，回复丢失** | `usage.get(x) or 0` 归一 |
+| 53 | 事实抽取 prompt 无条数/语言约束 + 当天事实桶无上限 | 长会话系统提示单调膨胀（且系统提示**不在上下文收缩范围内**） | 抽取限 5 实体 × 3 观察；桶限 200 条；注入限 20 条/2000 字符 |
+| 54 | 命中技能 prompt、当天事实注入零截断 | 同上，膨胀无自愈路径 | skill prompt ≤1500 字符并提示 `skill_load` |
+| 55 | `_estimate_history_tokens` 不计 `tools` schema | 工具多时系统性低估 → 主动收缩几乎不触发，只剩被动收缩 | 计入 tools schema（带缓存） |
+| 56 | `_get_extract_llm()` 阻塞等 `_fact_extract_lock` | **确认弹窗被抽取线程阻塞最长一个 LLM 请求（~120s）**，与「不延迟弹窗」意图相反 | 非阻塞取锁，取不到直接复用 `self.llm` |
+| 57 | `memory_search` 关键词兜底路径完全忽略 `top_k` | 未装 rag 依赖时（默认路径）一次查询灌入全部观察 | `_keyword_search` 接收并生效 top_k |
+| 58 | 技能分词用 `\w+` 对中文失效 | `"提取pdf表格"` 成单 token，中文关键词**永远匹配不上** | 补 CJK 整串 + bigram |
+| 59 | `GraphMemoryStore.close()` 只置 None 从不 close | 每次「应用配置」泄漏一个 LanceDB 连接 | 显式 close + 重置 `_vec_tried` |
+| 60 | 工具层 RAG 引擎初始化在 try 之外 | 知识库不可用时**所有工具（文件/shell/web）一起失效** | 整段包 try，失败仅跳过 RAG 工具 |
+| 61 | `shell_run` 的 `timeout` 无上下限钳制 | 传 99999 → 阻塞 27h 且无法取消；传 0 → 立刻 kill | 钳制到 [1s, 600s] |
+| 62 | `web_scan` 流式失败 `except Exception` 静默重试 | 真实超时后重复请求（最坏 2×30s）、已读内容丢弃 | 仅 `AttributeError`（无 stream 实现）才回退 |
+| 63 | `_reranker_state` 打分失败后停在 `"done"` 而模型为 None | 状态机失真 | 同步置 `"failed"` |
+| 64 | 每 chunk 重复计算 `_hash_source` | 写入侧纯浪费（同批同源） | 批次内缓存 source→hash |
+| 65 | SYSTEM_PROMPT 含模型已知的协议说明与冗余反例 | 每轮浪费 ~100 tok | 精简；补充「语义检索 query 语言」与「工具报错重试」两条关键约束 |
 
 ## 部署
 

@@ -92,8 +92,8 @@ def test_ensure_digests_refresh_stale_digest(engine):
     store.upsert_document(
         doc_name=doc_name,
         digest="# 目录\n\n\n\n# 章节摘要\n",
-        markdown=doc["markdown"],
         chapters=doc["chapters"],
+        md_path=doc.get("md_path", ""),
     )
 
     # 默认 refresh_stale=False：不重刷，返回 0。
@@ -119,8 +119,8 @@ def test_ensure_digests_refresh_empty_toc(engine):
     store.upsert_document(
         doc_name=doc_name,
         digest="# 目录\n",
-        markdown=doc["markdown"],
         chapters=doc["chapters"],
+        md_path=doc.get("md_path", ""),
     )
 
     assert engine.ensure_digests_for_cached_documents(refresh_stale=True) == 1

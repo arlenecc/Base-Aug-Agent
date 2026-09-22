@@ -1269,6 +1269,10 @@ class MainWindow(QMainWindow):
         self._fetch_worker.start()
 
     def _on_models_fetched(self, models: list) -> None:
+        # 必须清空引用：worker 已挂 deleteLater，C++ 对象随后被销毁，继续持有
+        # 会让 closeEvent 里的 isRunning() 抛 RuntimeError（PyQt 默认 qFatal
+        # → 进程 abort）。典型触发：获取模型成功后关闭窗口。
+        self._fetch_worker = None
         self.fetch_btn.setEnabled(True)
         self.progress.setRange(0, 1)
         current = self.model_combo.currentText().strip()
@@ -1281,6 +1285,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"获取到 {len(models)} 个模型")
 
     def _on_fetch_failed(self, msg: str) -> None:
+        self._fetch_worker = None
         self.fetch_btn.setEnabled(True)
         self.progress.setRange(0, 1)
         self.status_label.setText("获取模型失败")
@@ -1327,7 +1332,9 @@ class MainWindow(QMainWindow):
         sync_worker.cancel() 设置 RAGEngine 内部的取消标志，
         ingest 循环在处理完当前文件后检查该标志并退出。
         """
-        if self._sync_worker is not None and self._sync_worker.isRunning():
+        # 用 _is_worker_running() 而非直接 isRunning()：worker 挂了
+        # deleteLater，C++ 对象可能已销毁，直接调用会抛 RuntimeError。
+        if self._is_worker_running(self._sync_worker):
             logger.info("User requested sync cancellation")
             self._sync_worker.cancel()
             self.stop_sync_btn.setEnabled(False)  # 防止重复点击
@@ -1335,7 +1342,7 @@ class MainWindow(QMainWindow):
             self._append_log("[rag] 用户请求停止同步")
             return
         # deps 检查阶段：记录取消意图，deps 完成后不启动同步。
-        if self._deps_worker is not None and self._deps_worker.isRunning():
+        if self._is_worker_running(self._deps_worker):
             logger.info("User requested stop during deps check — will abort after deps")
             self._deps_worker.cancel()
             self._deps_cancelled = True
@@ -1697,9 +1704,9 @@ class MainWindow(QMainWindow):
                 self._callbacks.cancel()
             except Exception:
                 pass
-            if self._worker.isRunning():
+            if self._is_worker_running(self._worker):
                 self._worker.wait(3000)
-                if self._worker.isRunning():
+                if self._is_worker_running(self._worker):
                     logger.warning("UI: agent worker did not finish in 3s, terminating")
                     self._worker.terminate()
                     self._worker.wait(2000)
@@ -1710,9 +1717,9 @@ class MainWindow(QMainWindow):
                 self._fetch_worker.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            if self._fetch_worker.isRunning():
+            if self._is_worker_running(self._fetch_worker):
                 self._fetch_worker.wait(2000)
-                if self._fetch_worker.isRunning():
+                if self._is_worker_running(self._fetch_worker):
                     self._fetch_worker.terminate()
                     self._fetch_worker.wait(1000)
             self._fetch_worker = None
@@ -1722,10 +1729,10 @@ class MainWindow(QMainWindow):
                 self._sync_worker.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            if self._sync_worker.isRunning():
+            if self._is_worker_running(self._sync_worker):
                 self._sync_worker.cancel()
                 self._sync_worker.wait(3000)
-                if self._sync_worker.isRunning():
+                if self._is_worker_running(self._sync_worker):
                     logger.warning("UI: sync worker did not finish in 3s, terminating")
                     self._sync_worker.terminate()
                     self._sync_worker.wait(2000)
@@ -1736,9 +1743,9 @@ class MainWindow(QMainWindow):
                 self._deps_worker.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            if self._deps_worker.isRunning():
+            if self._is_worker_running(self._deps_worker):
                 self._deps_worker.wait(2000)
-                if self._deps_worker.isRunning():
+                if self._is_worker_running(self._deps_worker):
                     self._deps_worker.terminate()
                     self._deps_worker.wait(1000)
             self._deps_worker = None

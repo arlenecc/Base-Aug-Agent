@@ -169,37 +169,43 @@ class ToolRegistry:
                 "RAG: knowledge_base not configured, defaulting to %s", kb
             )
 
-        # Create the directory if it doesn't exist so that RAGEngine
-        # initialization doesn't fail on a missing path.
-        os.makedirs(kb, exist_ok=True)
-
+        # RAG 是可选能力：整段初始化（建目录 + 构造引擎 + 注册工具）都必须
+        # 包在 try 里。否则知识库路径不可创建/引擎构造失败时，异常会冒泡到
+        # ToolRegistry.__init__ → Agent 构造失败 → 文件读写、shell、web 等
+        # **所有**工具一起失效。
         try:
+            # Create the directory if it doesn't exist so that RAGEngine
+            # initialization doesn't fail on a missing path.
+            os.makedirs(kb, exist_ok=True)
+
             from ..rag.engine import RAGEngine
             from .rag_tool import RagSearchTool, RagStatusTool, RagIngestTool, RagOutlineTool
-        except ImportError as e:
-            logger.warning("RAG module not available: %s", e)
+
+            logger.info(
+                "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
+                self.config.workspace, kb,
+                getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+            )
+            engine = RAGEngine(
+                workspace=self.config.workspace,
+                knowledge_base=kb,
+                embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+            )
+            self._rag_engine = engine
+
+            registered = []
+            for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine),
+                      RagOutlineTool(engine)]:
+                if t.name not in self._tools:
+                    t.bind(self.config, self)
+                    self._tools[t.name] = t
+                    registered.append(t.name)
+            logger.info("RAG: tools registered: %s", ", ".join(registered))
+        except Exception as e:
+            logger.warning(
+                "RAG 工具不可用（其余工具不受影响）: %s: %s", type(e).__name__, e
+            )
             return
-
-        logger.info(
-            "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
-            self.config.workspace, kb,
-            getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
-        )
-        engine = RAGEngine(
-            workspace=self.config.workspace,
-            knowledge_base=kb,
-            embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
-        )
-        self._rag_engine = engine
-
-        registered = []
-        for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine),
-                  RagOutlineTool(engine)]:
-            if t.name not in self._tools:
-                t.bind(self.config, self)
-                self._tools[t.name] = t
-                registered.append(t.name)
-        logger.info("RAG: tools registered: %s", ", ".join(registered))
 
         # NOTE: auto-ingest is intentionally NOT performed here.
         # _register_rag_tools() runs in ToolRegistry.__init__, which is called

@@ -58,18 +58,18 @@ class AgentCallbacks:
 
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
-Principles:
-1. Plan, then call tools to gather info and act. After each tool result, decide the next step.
-2. Prefer the least destructive path. Risky/irreversible actions need user confirmation.
-3. If info is missing, use `ask_user` rather than guessing.
-4. Memory: facts are auto-extracted into long-term memory; recall them with `memory_search` before answering about prior context or the user. Use `work_memory` for short-term notes spanning multiple steps (intermediate results, decisions, preferences) — never for transient state like "greeting received".
-5. Before complex tasks, `skill_semantic_search` to find a relevant skill (or `skill_search`), then `skill_load` its SKILL.md and follow it. If no skill matches, proceed without one.
-6. When the user names a specific book/document, `rag_outline` for its structure first, then `rag_search` (with source) for chapter details.
-7. When done, reply concisely in plain text. `content` is the visible reply; `reasoning_content` is the thinking trace.
+Rules:
+1. Plan, then call tools. After each result, decide the next step.
+2. Prefer the least destructive path. Risky/irreversible actions need confirmation.
+3. Missing info → `ask_user`, never guess.
+4. Recall prior context with `memory_search` before answering about the user or past work. Use `work_memory` only for multi-step notes (intermediate results, decisions, preferences).
+5. Complex task → `skill_semantic_search` first; if it finds nothing, try `skill_search` (they index different directories). Then `skill_load` and follow it. No match → proceed.
+6. User names a book/document → `rag_outline` for structure, then `rag_search` (with source) for details.
+7. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
+8. On tool ERROR: fix the arguments and retry. Two identical failures in a row → change approach or `ask_user`. Never loop on the same failing call.
+9. Reply concisely in plain text when done.
 
-Paths are relative to the workspace. Workspace-only ops run without confirmation; `code_run` and `shell_run` need confirmation.
-
-To call a tool, emit a tool_call with name + JSON args. The result returns as a tool message next turn. Chain calls across turns until done."""
+Paths are relative to the workspace. Only `code_run`, `shell_run` and external MCP tools require confirmation."""
 
 # ---------------------------------------------------------------------------
 # Token estimation: approximate token count from text length.
@@ -117,6 +117,16 @@ def _estimate_tokens(text: str) -> int:
     return max(1, int(cjk / 1.5 + other / 4.0))
 
 
+# 系统提示动态注入段的上限。
+# 这些段不在上下文收缩（_shrink_context 只压 _history）的作用范围内，
+# 若不加限制会随会话时长单调膨胀，最终挤爆上下文窗口。
+_MAX_INJECTED_FACTS = 20        # 当天事实最多注入条数
+_MAX_FACTS_CHARS = 2000         # 事实段总字符上限
+_MAX_FACT_CHARS = 120           # 单条事实字符上限
+_MAX_SKILL_PROMPT_CHARS = 1500  # 命中技能 prompt 的字符上限
+_MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -159,6 +169,9 @@ class Agent:
         self._cached_prompt = ""
         self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
+        # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
+        self._tool_schema_tokens_cache: Optional[int] = None
+        self._tool_schema_tokens_turn = -1
 
         # 事实抽取的防堆叠锁。必须用 RLock：_extract_facts_sync 持锁期间会调
         # _get_extract_llm()，后者也要 acquire 同一把锁（普通 Lock 会自锁死，
@@ -229,16 +242,40 @@ class Agent:
         return count
 
     def _estimate_history_tokens(self) -> int:
-        """Estimate the token count of the full prompt (system + history).
+        """Estimate the token count of the full prompt (system + history + tools).
 
         Always does a full O(n) scan of _history. The history list is
         typically short (<= max_history messages), so the cost is negligible
         compared to the complexity of maintaining an incremental counter
         that can get out of sync when _history is modified directly.
+
+        Tools must be counted: every request actually sends
+        ``tools=self.tools.schemas()``, and with many MCP tools the schema
+        alone can be several thousand tokens. Excluding it systematically
+        underestimates the prompt, so proactive shrink never triggers and the
+        only protection left is the (capped) reactive shrink after the API
+        already rejected the request.
         """
         system_tokens = _estimate_tokens(self._system_prompt())
         history_tokens = sum(self._msg_token_count(msg) for msg in self._history)
-        return system_tokens + history_tokens
+        tools_tokens = self._tool_schema_tokens()
+        return system_tokens + history_tokens + tools_tokens
+
+    def _tool_schema_tokens(self) -> int:
+        """Cached token estimate of the tools schema (JSON sent every request)."""
+        n = len(self._history)
+        cached = getattr(self, "_tool_schema_tokens_cache", None)
+        if cached is not None and self._tool_schema_tokens_turn == n:
+            return cached
+        try:
+            schemas = self.tools.schemas() if self.tools else []
+            text = json.dumps(schemas, ensure_ascii=False) if schemas else ""
+            est = _estimate_tokens(text) if text else 0
+        except Exception:
+            est = 0
+        self._tool_schema_tokens_cache = est
+        self._tool_schema_tokens_turn = n
+        return est
 
     def _should_shrink_context(self) -> bool:
         """Return True if the estimated context size exceeds the shrink
@@ -303,15 +340,15 @@ class Agent:
 
         transcript = self._format_messages_for_summary(old_messages)
         summary_prompt = (
-            "请把下面的对话历史压缩成一份精炼的摘要，只保留关键信息：\n"
-            "1. 用户的核心需求和当前任务目标\n"
-            "2. 已经做出的重要决定与原因\n"
-            "3. 已经完成的步骤及其结果（含工具调用的关键输出）\n"
-            "4. 尚未完成的子任务和下一步计划\n"
-            "5. 关键的文件路径、配置值、用户偏好、URL 等具体信息\n"
-            "6. 任何错误、警告或需要后续注意的事项\n\n"
-            "要求：用要点列出，不要复述整段对话；保留所有具体的路径、数值、"
-            "标识符；不要编造未出现过的信息。若某条信息不重要可省略。\n\n"
+            "把下面的对话压缩成要点摘要，只保留：\n"
+            "1. 用户的核心需求与当前目标\n"
+            "2. 已做的决定及原因\n"
+            "3. 已完成的步骤与结果（含工具关键输出）\n"
+            "4. 未完成的子任务与下一步\n"
+            "5. 具体路径、数值、标识符、配置值、偏好、URL\n"
+            "6. 错误/警告等需注意的事项\n\n"
+            "要求：只输出要点列表，不要前言或解释；不要复述对话；不要编造。"
+            "不重要的信息直接省略。\n\n"
             f"对话历史:\n{transcript}"
         )
 
@@ -425,7 +462,7 @@ class Agent:
         Uses a low temperature for determinism. Reuses chat_stream so the
         same client/transport is used."""
         messages = [
-            {"role": "system", "content": "You are a precise conversation summarizer. 输出中文要点。"},
+            {"role": "system", "content": "你是精确的对话摘要器，用中文输出要点列表，不加前言和解释。"},
             {"role": "user", "content": prompt},
         ]
         out: List[str] = []
@@ -595,33 +632,45 @@ class Agent:
         cached = getattr(self, "_extract_llm", None)
         if cached is not None:
             return cached
+
+        from .llm_client import LLMClient
+        if not isinstance(self.llm, LLMClient):
+            # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
+            # socket state to race).
+            return self.llm
+
         # 懒初始化会被两个线程并发触发：confirm 弹窗的
         # _describe_code_purpose（worker 线程）与抽取守护线程。不加锁会各自
         # 建一个 LLMClient，后写者覆盖 _extract_llm，被覆盖一方的 httpx 连接
         # 池永不关闭（close() 只关属性里最后一个）。
-        with self._fact_extract_lock:
+        #
+        # 但这里绝不能阻塞等锁：抽取线程会**在整个 LLM 调用期间**持有这把锁
+        # （见 _extract_facts_sync），阻塞等待会让 agent 线程卡住一个完整
+        # 请求（最长 read timeout）才发出确认弹窗——与「不延迟弹窗」的意图
+        # 正好相反。因此取不到锁就直接复用 self.llm 走本次调用。
+        if not self._fact_extract_lock.acquire(blocking=False):
+            return self.llm
+        try:
             cached = getattr(self, "_extract_llm", None)
             if cached is not None:
                 return cached
             try:
-                from .llm_client import LLMClient
-                if isinstance(self.llm, LLMClient):
-                    self._extract_llm = LLMClient(
-                        base_url=self.llm.base_url,
-                        api_key=self.llm.api_key,
-                        model=self.llm.model,
-                        timeout=self.llm.timeout,
-                        max_tokens=self.llm.max_tokens,
-                        top_p=self.llm.top_p,
-                        min_p=self.llm.min_p,
-                        top_k=self.llm.top_k,
-                        repetition_penalty=self.llm.repetition_penalty,
-                    )
-                    return self._extract_llm
+                self._extract_llm = LLMClient(
+                    base_url=self.llm.base_url,
+                    api_key=self.llm.api_key,
+                    model=self.llm.model,
+                    timeout=self.llm.timeout,
+                    max_tokens=self.llm.max_tokens,
+                    top_p=self.llm.top_p,
+                    min_p=self.llm.min_p,
+                    top_k=self.llm.top_k,
+                    repetition_penalty=self.llm.repetition_penalty,
+                )
+                return self._extract_llm
             except Exception:  # pragma: no cover — best-effort
                 pass
-        # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
-        # socket state to race).
+        finally:
+            self._fact_extract_lock.release()
         return self.llm
 
     def _append_daily_facts(self, facts: List[str]) -> None:
@@ -650,6 +699,11 @@ class Agent:
                 if f and f not in seen:
                     bucket_facts.append(f)
                     seen.add(f)
+            # 桶上限：事实每轮累积，不设上限会同时撑爆 work_memory.json
+            # 与注入的系统提示（注入侧另有 _MAX_INJECTED_FACTS 二次兜底）。
+            # 超限时丢弃最旧的，保留最近的。
+            if len(bucket_facts) > _MAX_DAILY_FACTS:
+                bucket_facts = bucket_facts[-_MAX_DAILY_FACTS:]
             wm.set(
                 "__auto_facts__",
                 json.dumps({"date": today, "facts": bucket_facts}, ensure_ascii=False),
@@ -778,7 +832,9 @@ class Agent:
                         seen_done = True
                         tool_calls = ev.tool_calls
                         usage = ev.usage
-                        completion_tokens = usage.get("completion_tokens", 0)
+                        # 网关可能返回 null → `or 0` 归一，避免后续算术抛 TypeError
+                        # 并被误报成「LLM 流错误」。
+                        completion_tokens = usage.get("completion_tokens") or 0
                         continue  # final speed is emitted below; skip live emit
                     # Live token-speed every 0.3s during streaming.
                     # First chunk: record TTFB but don't emit yet (we need at
@@ -875,7 +931,9 @@ class Agent:
             # Total tokens: use the API's total if it's non-zero and includes
             # reasoning (i.e. api_reasoning_tokens > 0 or no reasoning text was
             # streamed). Otherwise add our estimate on top.
-            api_total = usage.get("total_tokens", 0)
+            # 部分网关/代理会返回 null 字段；用 `or 0` 归一，否则 `None > 0`
+            # 抛 TypeError，而这行在 try 保护之外会让整轮 run() 直接崩溃。
+            api_total = usage.get("total_tokens") or 0
             if api_total > 0 and (api_reasoning_tokens or not reasoning_text):
                 # API total is trustworthy
                 self._total_tokens += api_total
@@ -1067,8 +1125,21 @@ class Agent:
                 parts = []
                 if today_facts:
                     # 当天事实用列表形式注入，更易读（而非嵌套 JSON）。
-                    parts.append("# Today's facts (auto-extracted)\n" +
-                                 "\n".join(f"- {f}" for f in today_facts))
+                    # 必须加条数/长度上限：事实每轮累积且系统提示不在上下文
+                    # 收缩范围内，放任不管会随会话时长单调膨胀直至挤爆窗口。
+                    capped = []
+                    used = 0
+                    for f in today_facts:
+                        if len(capped) >= _MAX_INJECTED_FACTS or used >= _MAX_FACTS_CHARS:
+                            break
+                        item = f if len(f) <= _MAX_FACT_CHARS else f[:_MAX_FACT_CHARS] + "…"
+                        capped.append(item)
+                        used += len(item)
+                    dropped = len(today_facts) - len(capped)
+                    fact_block = "\n".join(f"- {f}" for f in capped)
+                    if dropped > 0:
+                        fact_block += f"\n- (…{dropped} more omitted)"
+                    parts.append("# Today's facts (auto-extracted)\n" + fact_block)
                 if compact_wm:
                     parts.append("# Work memory (scratchpad)\n" +
                                  json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":")))
@@ -1087,7 +1158,13 @@ class Agent:
                     break
             matched = self.skills.match(user_text) if user_text else None
             if matched:
-                base += f"\n\n# Active skill: {matched.name}\n{matched.prompt}"
+                # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
+                # skill_load 读全文，避免长技能把系统提示撑大。
+                sp = matched.prompt or ""
+                if len(sp) > _MAX_SKILL_PROMPT_CHARS:
+                    sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
+                          "\n…（已截断，用 skill_load 读取完整技能内容）")
+                base += f"\n\n# Active skill: {matched.name}\n{sp}"
         except Exception:  # pragma: no cover
             pass
 
@@ -1261,8 +1338,8 @@ class Agent:
             llm = self._get_extract_llm()
             if llm is not None and llm is not self.llm:
                 prompt = (
-                    "用一句简短的中文说明以下代码/命令的用途（做什么事情），"
-                    "不要贴代码，不要输出多余解释，20 字以内：\n\n"
+                    "用 ≤20 字中文说明以下代码/命令做什么，只输出这一句，"
+                    "不要贴代码、不要以「这段代码」开头：\n\n"
                     + code[:2000]
                 )
                 # chat_stream 产出的是 StreamEvent 数据类，不是 dict。旧代码写

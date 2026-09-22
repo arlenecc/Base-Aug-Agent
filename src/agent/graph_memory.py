@@ -518,13 +518,13 @@ class GraphMemoryStore:
         self._ensure_vectors()
         if self._vec_ready and self._ef is not None:
             return self._semantic_search(query, top_k)
-        return self._keyword_search(query)
+        return self._keyword_search(query, top_k)
 
     def _semantic_search(self, query: str, top_k: int) -> List[dict]:
         try:
             table = self._ensure_table()
             if table is None:
-                return self._keyword_search(query)
+                return self._keyword_search(query, top_k)
             qvec = _normalize_vector(self._ef.embed_query(query))
             results = table.search(qvec).limit(top_k).to_list()
             out = []
@@ -543,9 +543,15 @@ class GraphMemoryStore:
             return out
         except Exception as e:
             logger.debug("graph_memory: semantic search failed: %s", e)
-            return self._keyword_search(query)
+            return self._keyword_search(query, top_k)
 
-    def _keyword_search(self, query: str) -> List[dict]:
+    def _keyword_search(self, query: str, top_k: int = 8) -> List[dict]:
+        """Keyword substring fallback.
+
+        ``top_k`` **必须**生效：这是没有装 rag 可选依赖时的默认路径，若不限制
+        条数，一次宽泛查询会把全部 observation 灌进上下文（其他检索工具都做了
+        钳制，这里不能例外）。
+        """
         q = query.lower()
         out = []
         with self._lock:
@@ -553,6 +559,8 @@ class GraphMemoryStore:
                 for obs in e["observations"]:
                     if q in obs.lower():
                         out.append({"entity": e["name"], "text": obs, "score": 0.5})
+                        if len(out) >= top_k:
+                            return out
         return out
 
     # ------------------------------------------------------------------
@@ -616,10 +624,22 @@ class GraphMemoryStore:
         still be using it.  The LanceDB connection is private and safe
         to close.
         """
+        # 真正关闭 LanceDB 连接：每次「应用配置」重建 Agent 都会走这里，
+        # 只把引用置 None 会泄漏连接及其对象存储缓存。
+        if self._db is not None:
+            try:
+                close_fn = getattr(self._db, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception as e:
+                logger.debug("graph_memory: closing LanceDB connection failed: %s", e)
         self._db = None
         self._table = None
         self._ef = None
         self._vec_ready = False
+        # 允许重新初始化：否则 close 后 _ensure_vectors 会提前返回，
+        # 后续（重建的）store 永远拿不到向量能力。
+        self._vec_tried = False
 
 
 # ---------------------------------------------------------------------------
@@ -635,17 +655,21 @@ Extract durable facts from the conversation as a knowledge graph. Return ONLY JS
 
 Rules:
 - Only concrete, durable facts about the user, their projects, preferences,
-  decisions, or domain knowledge. Skip chitchat and transient state.
+  decisions, or domain knowledge. Skip chitchat, transient state, file contents
+  and raw tool output.
 - Skip the assistant's own tools/capabilities (no entities for "rag_search", etc.).
 - Observations are short self-contained sentences still useful weeks later.
 - Canonical entity names ("PostgreSQL", not "postgres db").
+- Write observations in the same language as the conversation (mismatched
+  language makes later semantic recall fail).
+- Extract at most 5 entities and 3 observations each — keep only the most
+  durable. Exceeding this pollutes memory and inflates every later prompt.
 - If nothing to persist, return {"entities": [], "relations": []}.
 - Valid JSON only, no markdown fences or commentary.\
 """
 
 _EXTRACT_USER = """\
-Extract knowledge-graph facts from this conversation fragment.
-Return JSON only.
+Extract knowledge-graph facts from this conversation fragment (≤5 entities).
 
 --- Conversation ---
 {conversation}

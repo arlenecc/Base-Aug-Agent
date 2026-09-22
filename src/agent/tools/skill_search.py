@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Optional
 
 from ..config import AgentConfig
 from ..skill_index import SkillIndex
 from .base import Tool, ToolRegistry, ToolResult
+
+
+_skill_index_lock = threading.Lock()
 
 
 def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
@@ -24,21 +28,25 @@ def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
     The cache key includes the skills directory: 「应用配置」 can switch the
     workspace mid-session, and returning the previous workspace's index would
     silently show (and load) skills from the wrong place.
+
+    构造 SkillIndex 会全目录扫描并可能落盘 —— 无锁时并发首次调用会产生两个
+    实例（后写者覆盖缓存，前者泄漏一份扫描结果）。
     """
     skills_dir = os.path.join(config.workspace, ".agent", "skills")
-    cache = getattr(registry, "_skill_index_cache", None)
-    if isinstance(cache, dict):
-        idx = cache.get(skills_dir)
-        if idx is not None:
-            return idx
-    else:
-        cache = {}
-        setattr(registry, "_skill_index_cache", cache)
-    idx = SkillIndex(skills_dir)
-    cache[skills_dir] = idx
-    # Keep the legacy attribute in sync so shutdown()/other callers still see it.
-    setattr(registry, "_skill_index", idx)
-    return idx
+    with _skill_index_lock:
+        cache = getattr(registry, "_skill_index_cache", None)
+        if isinstance(cache, dict):
+            idx = cache.get(skills_dir)
+            if idx is not None:
+                return idx
+        else:
+            cache = {}
+            setattr(registry, "_skill_index_cache", cache)
+        idx = SkillIndex(skills_dir)
+        cache[skills_dir] = idx
+        # Keep the legacy attribute in sync so shutdown()/other callers still see it.
+        setattr(registry, "_skill_index", idx)
+        return idx
 
 
 def _resolve_within(base_dir: str, *parts: str) -> Optional[str]:
@@ -64,10 +72,10 @@ class SkillSearchTool(Tool):
     """
     name = "skill_search"
     description = (
-        "Search for available skills relevant to a task. "
-        "Returns matching skills with name, description, and path. "
-        "Use before attempting complex tasks — a skill may provide "
-        "specialized instructions. op: 'search' (query), 'list' (all)."
+        "Keyword search over the skill directory (.agent/skills). "
+        "Returns matching records (name, description, path, entry). "
+        "op: 'search' (query) or 'list' (all). "
+        "Then use skill_load to read the full skill."
     )
     parameters = {
         "type": "object",
@@ -87,6 +95,9 @@ class SkillSearchTool(Tool):
 
     def run(self, op: str = "search", query: str = "", top_k: int = 5) -> ToolResult:
         idx = _get_skill_index(self.config, self.registry)
+        # 模型可能传 null/超限值：归一化后再用（同仓其他检索工具一致）。
+        query = (query or "").strip()
+        top_k = max(1, min(int(top_k or 5), 20))
         if op == "list":
             results = idx.list_all()
             # Compact output: name + path + description (truncated)
@@ -100,7 +111,7 @@ class SkillSearchTool(Tool):
             ]
             return ToolResult(True, output=json.dumps(compact, ensure_ascii=False))
         # Default: search
-        if not query.strip():
+        if not query:
             return ToolResult(False, error="op 'search' requires 'query'")
         results = idx.search(query, top_k=top_k)
         return ToolResult(True, output=json.dumps(results, ensure_ascii=False))
@@ -118,14 +129,14 @@ class SkillSemanticSearchTool(Tool):
     """
     name = "skill_semantic_search"
     description = (
-        "根据任务描述语义检索最合适的 skill（向量 + BM25 混合检索 SKILL.md）。"
-        "当需要为当前任务寻找可复用的 skill/工作流时使用。"
-        "返回候选 skill 的 name + tags + description；配合 skill_load 读取完整指令。"
+        "语义检索最合适的 skill（扫描 workspace/skills 下的 SKILL.md，向量 + BM25）。"
+        "若要找的是 .agent/skills 下的技能请用 skill_search（两者目录不同）。"
+        "返回候选的 name + tags + description；再用 skill_load 读完整指令。"
     )
     parameters = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "任务描述，用于检索匹配的 skill"},
+            "query": {"type": "string", "description": "任务描述（用用户原始措辞，勿翻译/音译）"},
             "top_k": {"type": "integer", "description": "返回候选数，默认 5"},
         },
         "required": ["query"],

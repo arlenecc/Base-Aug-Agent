@@ -511,6 +511,7 @@ class RAGEngine:
                                 self.build_and_store_digest(
                                     os.path.basename(filepath),
                                     cleaned,
+                                    md_path=md_path,
                                 )
                                 _log("    ├─ 文档缩略版本已生成: %s", fname)
                             except Exception as e:
@@ -934,12 +935,16 @@ class RAGEngine:
         self,
         doc_name: str,
         markdown: str,
+        md_path: str = "",
     ) -> str:
         """Build a document's digest (缩略版本) and store it in the metadata table.
 
         The digest is the document's 目录结构（标题层级），不含逐章摘要——避免
         对每章调用 LLM 带来的慢速与空结果问题。标题层级已足以作为 Targeted RAG
         的全局结构元信息。
+
+        ``markdown`` 只用于**构建**目录结构，不会写入元数据表（全文已缓存在
+        ``rag/documents/*.md``，表内再存一份是第三份冗余且会被全量载入内存）。
         """
         digest, chapters = build_digest(markdown)
         # 兜底：纯文本解析结果（如 PDF OCR）通常没有 Markdown 标题，提取不到
@@ -956,13 +961,17 @@ class RAGEngine:
         store.upsert_document(
             doc_name=os.path.basename(doc_name),
             digest=digest,
-            markdown=markdown,
             chapters=chapters_json,
+            md_path=md_path,
         )
         return digest
 
     def get_document_outline(self, doc_name: str) -> Optional[Dict[str, Any]]:
-        """Return a document's stored digest + full markdown by (partial) name."""
+        """Return a document's stored digest + chapter list by (partial) name.
+
+        The full markdown is no longer persisted in the metadata table; use
+        the returned ``md_path`` (or the on-disk ingest cache) to read it.
+        """
         store = self._get_store()
         return store.get_document_digest(doc_name)
 

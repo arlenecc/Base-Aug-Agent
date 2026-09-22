@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # the `timeout` argument. Long enough for pip installs, short enough that a
 # hung command doesn't freeze the agent.
 _DEFAULT_TIMEOUT = 120
+# 上下限钳制：模型可能传 99999（agent 线程会阻塞 27 小时且无法被「终止对话」
+# 打断，因为协作式取消只在工具边界轮询），也可能传 0/负数（立刻判定超时并
+# kill 掉刚启动的命令）。与 code_run 的 _MIN/_MAX_TIMEOUT 同策略。
+_MIN_TIMEOUT = 1.0
+_MAX_TIMEOUT = 600.0
 
 # 单条命令 stdout/stderr 各保留的最大字符数。旧实现用 capture_output 全量
 # 读入内存——一条 `cat 大日志` / `find /` 就能把进程内存打满。
@@ -73,6 +78,9 @@ class ShellRunTool(Tool):
             timeout = float(timeout)
         except (TypeError, ValueError):
             timeout = float(_DEFAULT_TIMEOUT)
+        # 钳制到 [_MIN_TIMEOUT, _MAX_TIMEOUT]：过大阻塞 agent 线程无法取消，
+        # 过小（0/负数）会立刻 kill 掉刚启动的命令。
+        timeout = max(_MIN_TIMEOUT, min(timeout, _MAX_TIMEOUT))
 
         ws = os.path.abspath(self.config.workspace)
         try:

@@ -20,6 +20,10 @@ from typing import List, Optional
 from .memory import _JsonStore
 
 _TOKEN_RE = re.compile(r"\w+")
+# 中文没有空格，\w+ 会把整段连续中文当成一个 token（"提取pdf表格" →
+# {"提取pdf表格"}），导致 "pdf"/"提取" 这类关键词永远匹配不上，中文技能
+# 检索彻底失效。因此额外切出 CJK 子串及其二元组（bigram）用于匹配。
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 
 # 停用词表提到模块级：_request_key() 每轮对话都会调用，旧实现在函数体内重建
 # 这个集合，白白重复分配。
@@ -36,7 +40,19 @@ _MAX_TRACKED_REQUESTS = 500
 
 
 def _keywords_of(text: str) -> List[str]:
-    return [w.lower() for w in _TOKEN_RE.findall(text)]
+    """Tokenize for keyword matching, with CJK support.
+
+    Latin words are taken whole; CJK runs are additionally emitted as the full
+    run plus its character bigrams, so a keyword like "提取" matches inside
+    "提取pdf表格" (without this, ``\\w+`` yields one giant token and Chinese
+    skill matching silently never hits).
+    """
+    toks = [w.lower() for w in _TOKEN_RE.findall(text)]
+    for run in _CJK_RUN_RE.findall(text):
+        toks.append(run)
+        for i in range(len(run) - 1):
+            toks.append(run[i:i + 2])
+    return toks
 
 
 @dataclass

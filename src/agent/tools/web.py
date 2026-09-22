@@ -56,9 +56,13 @@ def _read_capped(client, url: str) -> str:
             if truncated:
                 text += f"\n… [响应超过 {_MAX_FETCH_BYTES // (1024 * 1024)} MB，已截断]"
             return text
-        except Exception:
-            # 流式路径失败（代理/测试替身/不完整的实现）→ 退回 get()。
+        except AttributeError:
+            # 仅当 client 没有真正的 stream 实现（测试替身/残缺实现）才回退。
             pass
+        except Exception:
+            # 真实传输失败（超时/断流/连接错误）必须向上抛：否则会对同一 URL
+            # 再发一次完整请求（最坏 2×30s 且重复下载），且已读内容被整段丢弃。
+            raise
 
     resp = client.get(url)
     try:

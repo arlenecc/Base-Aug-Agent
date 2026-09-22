@@ -467,6 +467,9 @@ class VectorStore:
         h = _hash_source(source)
         try:
             table.delete(f"id LIKE '{h}_%'")
+            # 向量删了，但 BM25 倒排索引里的 term 还在——必须失效索引，
+            # 否则已删除文档的内容仍会被关键词检索召回并返回给 LLM。
+            self._fts_ready = False
             logger.info("VectorStore: deleted records for source '%s'", source)
             return 1
         except Exception as e:
@@ -561,6 +564,10 @@ class VectorStore:
                 raise
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
+                # 单批写入也要重建 BM25 索引——否则这批新数据永远查不到，
+                # 混合检索会静默退化成纯向量检索（无报错）。
+                self._fts_ready = False
+                self._ensure_fts_index(self._table)
                 return total
 
         # 后续批次
@@ -657,11 +664,18 @@ class VectorStore:
             _time.sleep(0.01)
         vectors = all_vectors
         records: List[Dict[str, Any]] = []
+        # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
+        # 都重算一次 md5（写入侧纯浪费）。
+        _hash_cache: Dict[str, str] = {}
         for j, chunk in enumerate(chunks):
             idx = start_idx + j
             source = chunk.get("source", "unknown")
             chunk_idx = chunk.get("chunk_index", idx)
-            chunk_id = f"{_hash_source(source)}_{chunk_idx}"
+            h = _hash_cache.get(source)
+            if h is None:
+                h = _hash_source(source)
+                _hash_cache[source] = h
+            chunk_id = f"{h}_{chunk_idx}"
             records.append({
                 "id": chunk_id,
                 "text": chunk["text"],
@@ -1031,7 +1045,10 @@ class VectorStore:
             logger.warning(
                 "  ⚠ BGE Reranker 打分失败, 回退到向量距离排序: %s", e,
             )
-            self._reranker = None  # 标记不可用，后续直接走回退分支
+            # 标记不可用，后续直接走回退分支。必须同步置 failed，否则
+            # _reranker_state 长期停在 "done" 而模型为 None（状态机失真）。
+            self._reranker = None
+            self._reranker_state = "failed"
             return self._rerank_fallback(candidates, top_k)
 
         # Normalize to list if single result
@@ -1265,7 +1282,15 @@ class VectorStore:
         """
         self._table = None
         self._table_checked = False
-        logger.debug("VectorStore: table handle dropped for reload")
+        # documents 元数据表与其缓存同样持有打开时的快照：同步新增/更新了
+        # 文档后，agent 侧的 rag_outline 必须丢弃旧句柄与旧缓存才能看到
+        # 新 digest；FTS 标记同理，否则新写入的切片在 BM25 通道不可见。
+        with self._documents_lock:
+            self._documents_table = None
+            self._documents_cache = None
+        self._fts_ready = False
+        self._fts_checked = False
+        logger.debug("VectorStore: table handles dropped for reload")
 
     def list_sources(self) -> List[str]:
         """Return unique source filenames in the store."""
@@ -1320,14 +1345,16 @@ class VectorStore:
             self._documents_table = self._db.open_table(_DOCUMENTS_TABLE_NAME)
         else:
             # 首次创建：空表（含占位空记录，后续 upsert 时清理）。
+            # 注意：不建 markdown 列——全文已落在 rag/documents/*.md 缓存里，
+            # 表内再存一份是纯浪费（且会被 _documents_cache 全量载入内存）。
             self._documents_table = self._db.create_table(
                 _DOCUMENTS_TABLE_NAME,
                 data=[{
                     "doc_id": "",
                     "doc_name": "",
                     "digest": "",
-                    "markdown": "",
                     "chapters": "",
+                    "md_path": "",
                 }],
             )
         return self._documents_table
@@ -1336,13 +1363,21 @@ class VectorStore:
         self,
         doc_name: str,
         digest: str,
-        markdown: str,
+        markdown: str = "",
         chapters: str = "",
+        md_path: str = "",
     ) -> None:
-        """Store or update a document's digest (缩略版本) + full markdown.
+        """Store or update a document's digest (缩略版本) + chapter list.
 
         ``doc_id`` is a stable md5 of ``doc_name`` so re-ingesting the same
         document overwrites the previous entry (upsert semantics).
+
+        The full markdown is **not** stored in this table: it already lives on
+        disk in ``rag/documents/*.md`` (the ingest cache), and no consumer
+        reads it from here — only ``digest`` is used (by ``rag_outline``).
+        Keeping it would duplicate the whole corpus a third time on disk and
+        load it entirely into memory via ``_documents_cache``.  We persist
+        ``md_path`` instead so a consumer can read it on demand.
 
         The delete+add pair is serialized under ``_documents_lock`` because
         ingest workers call this concurrently (one per file). LanceDB table
@@ -1365,8 +1400,8 @@ class VectorStore:
                 "doc_id": doc_id,
                 "doc_name": doc_name,
                 "digest": digest,
-                "markdown": markdown,
                 "chapters": chapters,
+                "md_path": md_path,
             }])
             logger.info("  ├─ 文档元数据已写入: %s (digest %d 字符)", doc_name, len(digest))
             # 写入后失效缓存，下次读取时重新加载。
@@ -1376,23 +1411,33 @@ class VectorStore:
         """Load (and cache) all non-placeholder document rows.
 
         Returns a list of dicts, filtered to drop the placeholder row
-        (``doc_name`` empty).  Cached in ``_documents_cache``; callers should
-        hold ``_documents_lock`` when the cache could be invalidated
-        concurrently (or accept a benign re-read on a cache miss).
+        (``doc_name`` empty).  Cached in ``_documents_cache``.
+
+        Only the lightweight columns are read — the (now unused) ``markdown``
+        column must never be pulled into the cache, otherwise the whole corpus
+        is duplicated in memory for the process lifetime.
         """
-        if self._documents_cache is not None:
-            return self._documents_cache
-        table = self._ensure_documents_table()
-        if table is None:
-            return []
-        try:
-            rows = table.to_arrow().to_pylist()
-        except Exception as e:
-            logger.warning("读取文档元数据失败: %s", e)
-            return []
-        rows = [r for r in rows if r.get("doc_name")]
-        self._documents_cache = rows
-        return rows
+        with self._documents_lock:
+            if self._documents_cache is not None:
+                return self._documents_cache
+            table = self._ensure_documents_table_locked()
+            if table is None:
+                return []
+            try:
+                cols = ["doc_id", "doc_name", "digest", "chapters", "md_path"]
+                try:
+                    rows = table.to_arrow(columns=cols).to_pylist()
+                except Exception:
+                    # 旧表没有 md_path 列 → 退化为全列读取（仍不含 markdown 之外的重列）。
+                    rows = table.to_arrow().to_pylist()
+            except Exception as e:
+                logger.warning("读取文档元数据失败: %s", e)
+                return []
+            rows = [r for r in rows if r.get("doc_name")]
+            for r in rows:
+                r.pop("markdown", None)  # 兼容旧数据：绝不缓存 markdown
+            self._documents_cache = rows
+            return rows
 
     def get_document_digest(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """Return {doc_name, digest, markdown, chapters} for a document by name.
@@ -1413,8 +1458,8 @@ class VectorStore:
                 return {
                     "doc_name": r.get("doc_name", ""),
                     "digest": r.get("digest", ""),
-                    "markdown": r.get("markdown", ""),
                     "chapters": r.get("chapters", ""),
+                    "md_path": r.get("md_path", ""),
                 }
         # 2. Substring match (partial title).
         for r in rows:
@@ -1423,8 +1468,8 @@ class VectorStore:
                 return {
                     "doc_name": r.get("doc_name", ""),
                     "digest": r.get("digest", ""),
-                    "markdown": r.get("markdown", ""),
                     "chapters": r.get("chapters", ""),
+                    "md_path": r.get("md_path", ""),
                 }
         return None
 

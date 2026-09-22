@@ -260,7 +260,10 @@ class MemorySearchTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "What to recall"},
+            "query": {
+                "type": "string",
+                "description": "What to recall — use the user's own natural phrasing; never translate or transliterate",
+            },
             "top_k": {"type": "integer", "default": 5},
         },
         "required": ["query"],

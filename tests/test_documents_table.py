@@ -15,21 +15,22 @@ def test_upsert_and_get_document(store):
     store.upsert_document(
         doc_name="亲密关系.pdf",
         digest="# 目录\n第一章 沟通",
-        markdown="# 第一章 沟通\n\n沟通很重要。",
         chapters='[{"level":1,"title":"第一章 沟通","summary":"沟通很重要"}]',
+        md_path="/rag/documents/亲密关系.md",
     )
     doc = store.get_document_digest("亲密关系.pdf")
     assert doc is not None
     assert doc["digest"].startswith("# 目录")
-    assert "第一章 沟通" in doc["markdown"]
     assert doc["chapters"]
+    assert doc["md_path"] == "/rag/documents/亲密关系.md"
+    # 全文 markdown 不再入库（避免第三份冗余 + 全量载入内存）。
+    assert "markdown" not in doc
 
 
 def test_get_document_partial_match(store):
     store.upsert_document(
         doc_name="人生的活法-本多静六.pdf",
         digest="# 目录",
-        markdown="# 第一章",
         chapters="[]",
     )
     doc = store.get_document_digest("本多静六")
@@ -38,8 +39,8 @@ def test_get_document_partial_match(store):
 
 
 def test_upsert_overwrites_previous(store):
-    store.upsert_document("a.pdf", digest="v1", markdown="m1", chapters="[]")
-    store.upsert_document("a.pdf", digest="v2", markdown="m2", chapters="[]")
+    store.upsert_document("a.pdf", digest="v1", chapters="[]")
+    store.upsert_document("a.pdf", digest="v2", chapters="[]")
     doc = store.get_document_digest("a.pdf")
     assert doc["digest"] == "v2"
 
