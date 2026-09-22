@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -67,6 +68,10 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
         self._mcp_clients: list = []  # MCPClient instances, for cleanup
         self._rag_engine = None  # lazy-initialized RAGEngine
+        # 保护懒初始化的重资源单例（SkillRetriever / LongTermMemory）：
+        # agent 线程与 UI 线程可能并发首次调用。
+        self._singleton_lock = threading.RLock()
+        self._retriever_lock = self._singleton_lock
         self._register_defaults()
 
     # ------------------------------------------------------------------
@@ -226,12 +231,19 @@ class ToolRegistry:
         retriever = cache.get(skills_dir)
         if retriever is not None:
             return retriever
-        db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
-        from ..skill_retriever import SkillRetriever
-        retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
-        cache[skills_dir] = retriever
-        setattr(self, "_skill_retriever", retriever)
-        return retriever
+        # 首次构建是重活（扫描 + LanceDB 建表 + embedding），且 agent 线程与
+        # UI 线程可能并发首次调用：不加锁会各建一个 SkillRetriever，后写者
+        # 覆盖属性，先建的 LanceDB 连接泄漏（shutdown 只回收缓存里的那个）。
+        with self._retriever_lock:
+            retriever = cache.get(skills_dir)
+            if retriever is not None:
+                return retriever
+            db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
+            from ..skill_retriever import SkillRetriever
+            retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
+            cache[skills_dir] = retriever
+            setattr(self, "_skill_retriever", retriever)
+            return retriever
 
     def reload_rag(self) -> None:
         """Refresh the RAG engine's table handle so new sync data is visible.

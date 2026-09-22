@@ -116,9 +116,23 @@ def recording_callbacks():
             self.context_shrinks = []  # list of (summary, reason)
             self._confirm_return = True
             self._ask_return = "ok"
+            # 协作式取消测试钩子：设为 True 后 run() 应尽快退出。
+            self._cancel_after = None  # e.g. ("content", 2) → 收到第 2 个 content 后取消
+            self._cancel_count = 0
+
+        def is_cancelled(self):
+            if self._cancel_after is None:
+                return False
+            kind, n = self._cancel_after
+            count = self._cancel_count
+            if kind == "content":
+                return count >= n
+            return False
 
         def on_content(self, text):
             self.content.append(text)
+            if self._cancel_after is not None and self._cancel_after[0] == "content":
+                self._cancel_count += 1
 
         def on_reasoning(self, text):
             self.reasoning.append(text)

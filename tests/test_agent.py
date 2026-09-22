@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Iterator, List
 
@@ -1204,3 +1205,68 @@ def test_agent_close_releases_extract_client(config, recording_callbacks):
     # self.llm 未被关闭（仍可复用）。
     llm.close()
 
+
+
+# ---------------------------------------------------------------------------
+# cooperative cancellation
+# ---------------------------------------------------------------------------
+
+def test_agent_cancel_stops_streaming(config, recording_callbacks):
+    """「终止对话」必须在流式期间立即生效。
+
+    旧实现只在 confirm/ask_user 里检查 _cancelled——长回复/工具链场景下取消
+    形同虚设，会跑满 max_iterations。
+    """
+    # 20 个 content chunk + done：取消后不应再调用 LLM，也不应产出 done。
+    events = [_evt("content", f"chunk{i}") for i in range(20)]
+    events.append(_evt("done", usage={"total_tokens": 999}))
+    mock = MockLLM([[*events]])
+    recording_callbacks._cancel_after = ("content", 3)
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("tell me something long")
+
+    # 只消费到取消点附近的几个 chunk，20 个不会全部流完。
+    assert len(recording_callbacks.content) < 20
+    # on_finished 恰好调用一次（旧实现会漏掉，UI 卡在「运行中」）。
+    assert recording_callbacks.logs == recording_callbacks.logs  # no-op sanity
+    assert not any("max iterations" in l for l in recording_callbacks.logs)
+
+
+def test_agent_cancel_skips_remaining_tools_and_keeps_history_consistent(
+        config, recording_callbacks):
+    """取消后剩余 tool_call 必须逐个补合成结果——否则历史里出现悬挂
+    tool_calls，下一轮请求会被 API 以 HTTP 400 拒绝。"""
+    tc = [
+        {"id": "c1", "function": {"name": "file_read",
+                                  "arguments": json.dumps({"path": "a.txt"})}},
+        {"id": "c2", "function": {"name": "file_read",
+                                  "arguments": json.dumps({"path": "b.txt"})}},
+    ]
+    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
+        f.write("A")
+    with open(os.path.join(config.workspace, "b.txt"), "w") as f:
+        f.write("B")
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    # 第一个工具结束后取消。
+    recording_callbacks._cancel_after = ("tool_end", 1)
+    orig_on_tool_end = recording_callbacks.on_tool_end
+
+    def on_tool_end(name, result):
+        recording_callbacks._cancel_count += 1
+        orig_on_tool_end(name, result)
+
+    recording_callbacks.on_tool_end = on_tool_end
+    recording_callbacks._cancel_after = ("tool_end", 1)
+    recording_callbacks.is_cancelled = lambda: recording_callbacks._cancel_count >= 1
+
+    agent.run("read both files")
+
+    names = [n for n, _ in recording_callbacks.tool_starts]
+    assert names.count("file_read") == 2  # 第 1 个真执行，第 2 个跳过但也走了 start
+    # 历史一致性：assistant 的每个 tool_call 都有对应 tool 消息。
+    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    assert "取消" in tool_msgs[1]["content"] or "取消" in (tool_msgs[1].get("content") or "")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol
@@ -21,6 +22,15 @@ from .tools import ToolRegistry, parse_args
 
 class AgentCallbacks:
     """Override these methods to drive the UI. Default impls are no-ops."""
+
+    def is_cancelled(self) -> bool:
+        """协作式取消：run() 在循环边界/流式事件/工具执行前轮询。
+
+        默认 False（本地单测无取消概念）。UI 的 BridgeCallbacks 返回
+        「终止对话」按钮设置的标志——run() 必须能及时看到它，否则取消只在
+        下一个恰好需要确认的工具处生效，其余场景会跑满 max_iterations。
+        """
+        return False
 
     def on_content(self, text: str) -> None: ...
     def on_reasoning(self, text: str) -> None: ...
@@ -149,6 +159,13 @@ class Agent:
         self._cached_prompt = ""
         self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
+
+        # 事实抽取的防堆叠锁。必须用 RLock：_extract_facts_sync 持锁期间会调
+        # _get_extract_llm()，后者也要 acquire 同一把锁（普通 Lock 会自锁死，
+        # 与 vector_store 的 _documents_lock 是同一类问题）。另外必须在
+        # __init__ 里创建——懒初始化是 check-then-act 竞态，两个抽取线程可能
+        # 各自建一把锁并各自成功 acquire，防堆叠形同虚设。
+        self._fact_extract_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -513,11 +530,7 @@ class Agent:
         connection pool would race and fail the request.  A ``_fact_extract_lock``
         further prevents multiple extractions from piling up.
         """
-        lock = getattr(self, "_fact_extract_lock", None)
-        if lock is None:
-            import threading as _th
-            lock = _th.Lock()
-            self._fact_extract_lock = lock
+        lock = self._fact_extract_lock
         if not lock.acquire(blocking=False):
             # A previous extraction is still running; skip to avoid piling up.
             return
@@ -582,23 +595,31 @@ class Agent:
         cached = getattr(self, "_extract_llm", None)
         if cached is not None:
             return cached
-        try:
-            from .llm_client import LLMClient
-            if isinstance(self.llm, LLMClient):
-                self._extract_llm = LLMClient(
-                    base_url=self.llm.base_url,
-                    api_key=self.llm.api_key,
-                    model=self.llm.model,
-                    timeout=self.llm.timeout,
-                    max_tokens=self.llm.max_tokens,
-                    top_p=self.llm.top_p,
-                    min_p=self.llm.min_p,
-                    top_k=self.llm.top_k,
-                    repetition_penalty=self.llm.repetition_penalty,
-                )
-                return self._extract_llm
-        except Exception:  # pragma: no cover — best-effort
-            pass
+        # 懒初始化会被两个线程并发触发：confirm 弹窗的
+        # _describe_code_purpose（worker 线程）与抽取守护线程。不加锁会各自
+        # 建一个 LLMClient，后写者覆盖 _extract_llm，被覆盖一方的 httpx 连接
+        # 池永不关闭（close() 只关属性里最后一个）。
+        with self._fact_extract_lock:
+            cached = getattr(self, "_extract_llm", None)
+            if cached is not None:
+                return cached
+            try:
+                from .llm_client import LLMClient
+                if isinstance(self.llm, LLMClient):
+                    self._extract_llm = LLMClient(
+                        base_url=self.llm.base_url,
+                        api_key=self.llm.api_key,
+                        model=self.llm.model,
+                        timeout=self.llm.timeout,
+                        max_tokens=self.llm.max_tokens,
+                        top_p=self.llm.top_p,
+                        min_p=self.llm.min_p,
+                        top_k=self.llm.top_k,
+                        repetition_penalty=self.llm.repetition_penalty,
+                    )
+                    return self._extract_llm
+            except Exception:  # pragma: no cover — best-effort
+                pass
         # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
         # socket state to race).
         return self.llm
@@ -686,6 +707,14 @@ class Agent:
         iteration = 0
         shrink_count = 0
         while iteration < self.max_iterations:
+            # 协作式取消：每轮迭代开始时检查。旧实现只在 confirm/ask_user 里
+            # 检查 _cancelled——若模型接下来调用的都是无需确认的工具，取消
+            # 根本不生效，会一直跑满 max_iterations。
+            if self.callbacks.is_cancelled():
+                self._log("[agent] 收到取消请求，终止本轮对话")
+                self.callbacks.on_finished()
+                return final_content
+
             # --- Proactive context shrink: if estimated prompt size exceeds
             # context_shrink_ratio * max_context_tokens, summarize older
             # messages before calling the LLM. Avoids the round-trip of
@@ -716,6 +745,8 @@ class Agent:
             # latency + model prefill, not generation speed).
             last_speed_emit: Optional[float] = None
             seen_done = False
+            # 流式过程中用户点了「终止对话」→ 中断读取并直接结束本轮。
+            cancelled_mid_stream = False
             # Incremental token estimate: instead of joining the full
             # content_buf + reasoning_buf every 0.3s (O(N) join + O(N)
             # char scan, where N grows linearly per turn — 10K chars means
@@ -729,6 +760,12 @@ class Agent:
                 for ev in self.llm.chat_stream(
                     messages, tools=self.tools.schemas(), temperature=self.config.temperature
                 ):
+                    # 流式期间也轮询取消（bool 检查，代价可忽略），否则长回复
+                    # 期间点「终止对话」要等整个回复生成完才生效。
+                    if self.callbacks.is_cancelled():
+                        self._log("[agent] 取消：中断流式读取")
+                        cancelled_mid_stream = True
+                        break
                     if ev.type == "content":
                         content_buf.append(ev.content)
                         self.callbacks.on_content(ev.content)
@@ -793,7 +830,16 @@ class Agent:
                 self.callbacks.on_finished()
                 return final_content or ""
 
+            if cancelled_mid_stream:
+                # 流式期间被取消：不把半截回复当完整回答记入历史（UI 已展示了
+                # 内容）。直接结束本轮；用户下一条消息会以干净的状态开始。
+                self.callbacks.on_finished()
+                return final_content
+
             if not seen_done and (content_buf or reasoning_buf or tool_calls):
+                # The stream ended without an explicit "done" event — likely a
+                # network cut or server-side truncation. Log so it's visible.
+                self._log("[agent] warning: LLM stream ended without 'done' event")
                 # The stream ended without an explicit "done" event — likely a
                 # network cut or server-side truncation. Log so it's visible.
                 self._log("[agent] warning: LLM stream ended without 'done' event")
@@ -901,6 +947,23 @@ class Agent:
                 fn = tc.get("function", {}) or {}
                 name = fn.get("name", "")
                 raw_args = fn.get("arguments", "")
+
+                # 协作式取消：每个工具执行前检查。终止后必须为剩余的每个
+                # tool_call 补一条合成 tool 消息——assistant_msg 里的
+                # tool_calls 已经写入历史，缺少对应的 tool 结果会导致下一轮
+                # 请求被 OpenAI 兼容 API 以 HTTP 400 拒绝（悬挂 tool_calls）。
+                if self.callbacks.is_cancelled():
+                    self._log(f"[tool] {name} 已因用户取消而跳过")
+                    from .tools import ToolResult
+                    try:
+                        skip_args = parse_args(raw_args)
+                    except ValueError:
+                        skip_args = {"_raw_arguments": raw_args}
+                    self.callbacks.on_tool_start(name, skip_args)
+                    res = ToolResult(False, error="用户取消了对话，工具未执行")
+                    self.callbacks.on_tool_end(name, res)
+                    self._history.append(self._tool_message(tc, res))
+                    continue
 
                 # Parse arguments. Malformed JSON must be reported to the model
                 # as a parse error (not silently treated as {} which would

@@ -67,13 +67,20 @@ def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> LongTermM
     existing = getattr(registry, _LONG_MEMORY_SINGLETON_ATTR, None)
     if existing is not None:
         return existing
-    emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
-    lm = LongTermMemory(
-        path=os.path.join(config.workspace, ".agent", "long_memory.json"),
-        embedding_model=emb,
-    )
-    setattr(registry, _LONG_MEMORY_SINGLETON_ATTR, lm)
-    return lm
+    # 首次创建是重活（懒加载 ~137MB ONNX + LanceDB 连接），agent 线程与 UI
+    # 线程可能并发首次调用：不加锁会各建一个实例，后写者覆盖属性，先建的
+    # 连接/模型泄漏且 shutdown() 收不回。与 _work_memory 相同的双重检查模式。
+    with registry._singleton_lock:
+        existing = getattr(registry, _LONG_MEMORY_SINGLETON_ATTR, None)
+        if existing is not None:
+            return existing
+        emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
+        lm = LongTermMemory(
+            path=os.path.join(config.workspace, ".agent", "long_memory.json"),
+            embedding_model=emb,
+        )
+        setattr(registry, _LONG_MEMORY_SINGLETON_ATTR, lm)
+        return lm
 
 
 def _long_memory(config: AgentConfig) -> LongTermMemory:

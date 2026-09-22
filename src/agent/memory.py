@@ -184,7 +184,10 @@ class LongTermMemory:
         # path is like .../long_memory.json; the graph file is the same
         # path but with .json → .graph.json so old flat-memory files are
         # not clobbered.
-        graph_path = path.replace(".json", ".graph.json") if path.endswith(".json") else path + ".graph"
+        # 用切片而不是 replace：路径中更早的位置若也含 ".json"（如
+        # /data.json/long_memory.json），replace 会把它们一起改掉，得到一个
+        # 错误的目录路径。
+        graph_path = path[:-5] + ".graph.json" if path.endswith(".json") else path + ".graph"
         self._graph = GraphMemoryStore(path=graph_path, embedding_model=embedding_model)
         self._legacy_store = _JsonStore(path)
         # Migrate old flat facts into the graph on first use.

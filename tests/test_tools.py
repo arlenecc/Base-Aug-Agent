@@ -254,9 +254,11 @@ def test_shell_run_is_destructive(config):
 def test_web_scan_extracts_text(monkeypatch, config):
     from agent.tools import web as web_mod
 
+    HTML = "<html><body><h1>Hi</h1><p>Hello world</p><script>bad()</script></body></html>"
+
     class FakeResp:
         status_code = 200
-        text = "<html><body><h1>Hi</h1><p>Hello world</p><script>bad()</script></body></html>"
+        text = HTML
         headers = {"Content-Type": "text/html"}
 
         def raise_for_status(self):
@@ -265,8 +267,28 @@ def test_web_scan_extracts_text(monkeypatch, config):
         def close(self):
             pass
 
-    # The tool now uses a shared httpx.Client instance (_http attribute).
-    # Patch the Client.get method to return our fake response.
+    class FakeStreamResp(FakeResp):
+        # 流式路径需要 context manager + iter_bytes。
+        encoding = None
+
+        def __init__(self):
+            self._chunks = [HTML.encode("utf-8")]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self, chunk_size=65536):
+            return iter(self._chunks)
+
+    # web_scan 优先走流式（client.stream），拿不到才退回 get()。
+    # 两条路径都要打桩，否则有真实网络的机器会发真请求。
+    def _fake_stream(self, method, url, **kw):
+        return FakeStreamResp()
+
+    monkeypatch.setattr(httpx.Client, "stream", _fake_stream)
     monkeypatch.setattr(httpx.Client, "get", lambda self, url, **kw: FakeResp())
     reg = _reg(config)
     res = reg.execute("web_scan", {"url": "https://example.com"})
@@ -274,6 +296,32 @@ def test_web_scan_extracts_text(monkeypatch, config):
     assert "Hi" in res.output
     assert "Hello world" in res.output
     assert "bad()" not in res.output  # script stripped
+
+
+def test_web_scan_falls_back_to_get_when_stream_unsupported(monkeypatch, config):
+    """仅实现 get() 的客户端（极简适配器/旧替身）也要能工作。"""
+
+    class FakeResp:
+        status_code = 200
+        text = "<html><body><p>via-get</p></body></html>"
+        headers = {"Content-Type": "text/html"}
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+    class GetOnlyClient(httpx.Client):
+        # 模拟「没有 stream」的客户端：hasattr 检查会走 get() 分支。
+        stream = None  # noqa: 安排成属性即可被 hasattr 识别为缺失
+
+    monkeypatch.setattr(httpx.Client, "get", lambda self, url, **kw: FakeResp())
+    monkeypatch.delattr(httpx.Client, "stream", raising=False)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://example.com"})
+    assert res.success
+    assert "via-get" in res.output
 
 
 # ---------------------------------------------------------------------------

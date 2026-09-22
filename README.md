@@ -511,7 +511,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
 
-近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置。当前共 366 个用例。
+近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**。当前共 371 个用例。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -541,6 +541,21 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 18 | `web_scan` 无协议白名单、响应体全量入内存 | `file://` 读本地文件、OOM | http/https 白名单 + 8MB 截断 |
 | 19 | 技能缓存未按 workspace 区分 | 切换工作区后读到旧技能 | 按目录路径缓存 |
 | 20 | `chat_view` 无 `setMaximumBlockCount` | 长会话文档无限增长 | 限 5000 段 |
+| 21 | 取消标志只在 confirm/ask_user 被检查 | **「终止对话」对流式/工具链不生效** | `is_cancelled()` 在迭代/流式/工具边界轮询，跳过的工具补合成结果保持历史一致 |
+| 22 | `add_streaming` 异常后 worker 阻塞在 `q.put` | 每次同步失败泄漏 4 线程 + 文档内存 | 消费端失败置位 `_abort`，worker 立即退出 |
+| 23 | manifest 在写库成功前提交 | 失败/取消的文件下次被跳过，内容**永久缺失** | `pending_manifest` 延迟到整条链路成功才并入 |
+| 24 | `code_run` 劫持进程级 cwd/stdout | 超时泄漏线程永久破坏全局状态 | 主线程快照 + join 后恢复 |
+| 25 | `code_run` 沙箱 `abspath` 不解析 symlink | workspace 内 symlink 写穿到系统文件 | `realpath` 前缀校验 |
+| 26 | `file_read`/`code_run` 输出无上限 | 大文件 → OOM / 撑爆上下文 | 200K 上限（流式有界收集、按需读取） |
+| 27 | MCP `tools/call` 复用 30s 超时 | 长任务必然超时且结果被丢弃 | 独立 300s 下限 |
+| 28 | `_get_reranker` 无锁 check-then-act | 并发加载两份 ~500MB 模型；close 后复活 | 状态机加锁 + `_closed` 标志 |
+| 29 | `_escape_like` 不转义单引号/通配符 | 畸形 SQL；含 `%`/`_` 的文件名匹配所有文档 | 引号翻倍 + `ESCAPE '\\'`（实测验证） |
+| 30 | `_ensure_initialized` / 懒单例无锁 | 并发首调重复建连接/模型并泄漏 | 双重检查锁 |
+| 31 | 依赖检查异常仍启动同步 | 缺依赖环境跑 RAG 引擎，掩盖真实错误 | 异常与取消分开，失败不启动 |
+| 32 | `file_ops` 原子写固定 `.tmp` 名 | 并发互踩混合内容、失败残留 | `mkstemp` 唯一名 + finally 清理 |
+| 33 | `graph_memory` 批量嵌入 `zip` 截断 | 图谱与向量库永久不一致 | 数量校验，整批失败 |
+| 34 | `deps` 把 `config.json` 当重排序缓存命中 | 中断下载后跳过预下载 | 只认权重文件 |
+| 35 | `skill_load` 读过期 retriever 属性 | 切 workspace 后校验发生在旧目录 | 走按目录缓存的 `get_skill_retriever()` |
 
 ## 部署
 

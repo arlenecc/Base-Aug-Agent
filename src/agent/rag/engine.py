@@ -20,7 +20,7 @@ from .vector_store import VectorStore
 logger = logging.getLogger(__name__)
 
 
-def _is_stale_digest(old_digest: str, new_digest: str) -> bool:
+def _is_stale_digest(old_digest: str) -> bool:
     """判断 documents 表中已存的 digest 是否为旧格式、需要重刷。
 
     旧格式特征（任一即判定为 stale）：
@@ -113,10 +113,18 @@ def _content_hash(text: str) -> str:
 
 
 def _escape_like(s: str) -> str:
-    """Escape SQL LIKE wildcards so a user/doc keyword is matched literally."""
-    for ch in ("%", "_", "\\"):
+    """Escape a value used inside a SQL ``LIKE`` literal (with ``ESCAPE '\\'``).
+
+    1. SQL 字符串字面量：单引号翻倍，否则文件名含 ``'``（如 ``it's.pdf``）
+       会拼出畸形 SQL / 注入。
+    2. LIKE 通配符：``%`` ``_`` ``\\`` 前面加反斜杠。LanceDB 的 LIKE 默认
+       不带 ESCAPE 子句，必须在使用处显式写 ``ESCAPE '\\'``，否则 ``\\%``
+       不会被当作字面量，含 ``%``/``_`` 的文件名会匹配到所有文档。
+    """
+    s = s.replace("\\", "\\\\")
+    for ch in ("%", "_"):
         s = s.replace(ch, "\\" + ch)
-    return s
+    return s.replace("'", "''")
 
 
 def _extract_with_docling(filepath: str) -> tuple:
@@ -335,8 +343,11 @@ class RAGEngine:
                     stats["files_skipped"] += 1
                 skipped_detail.append(f"  ✓ 跳过(未修改): {os.path.basename(filepath)}")
                 if progress_callback is not None:
-                    progress_callback(stats["files_extracted"] + stats["files_skipped"],
-                                      total_files, os.path.basename(filepath))
+                    try:
+                        progress_callback(stats["files_extracted"] + stats["files_skipped"],
+                                          total_files, os.path.basename(filepath))
+                    except Exception as e:
+                        logger.warning("RAG: progress_callback error: %s", e)
             else:
                 files_to_process.append(filepath)
                 reason = "新增" if prev is None else "已修改"
@@ -440,18 +451,26 @@ class RAGEngine:
                             rel_path = os.path.relpath(filepath, self._knowledge_base)
                             md_name = _safe_filename(rel_path) + ".md"
                             md_path = os.path.join(self._markdown_dir, md_name)
-                            if (not force
+                            # 缓存是否可用。旧实现把「缓存命中」的判断写了两次：
+                            # 读缓存失败的 except 分支只把 cleaned 置空，但第二处
+                            # 判断仍然命中 → cleaned 保持 ""，后面既生成一份空
+                            # digest 又跳过切片。这里用同一个变量，读失败即视为
+                            # 缓存未命中，强制走重新清洗。
+                            cache_is_fresh = (not force
                                     and os.path.exists(md_path)
-                                    and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
+                                    and os.path.getmtime(filepath) <= os.path.getmtime(md_path))
+                            if cache_is_fresh:
                                 # ---- 2. 使用缓存的 Markdown ----
                                 try:
                                     with open(md_path, "r", encoding="utf-8") as f:
                                         cleaned = f.read()
+                                    if not cleaned.strip():
+                                        raise OSError("cached markdown is empty")
                                     _log("    ├─ 清洗文本: %s (使用缓存 Markdown, %d 字符)", fname, len(cleaned))
                                 except OSError:
                                     cleaned = ""
-                            if not (not force and os.path.exists(md_path)
-                                    and os.path.getmtime(filepath) <= os.path.getmtime(md_path)):
+                                    cache_is_fresh = False
+                            if not cache_is_fresh:
                                 if is_markdown:
                                     # docling 已输出规范 Markdown，无需再清洗/转换，
                                     # 直接作为最终文本（省去 clean_text 的 HTML 剥离，
@@ -478,8 +497,16 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
+                            del text
+
+                            if not cleaned.strip():
+                                logger.warning("    └─ ⚠ 清洗后文本为空: %s", fname)
+                                continue
+
                             # ---- 构建文档缩略版本（目录结构 + 标题）----
                             # 只存目录结构（标题层级），不做逐章摘要。
+                            # 放在空文本检查之后：空内容不该生成一份
+                            # "# 目录\n\n文件名" 的空 digest 入库。
                             try:
                                 self.build_and_store_digest(
                                     os.path.basename(filepath),
@@ -488,11 +515,6 @@ class RAGEngine:
                                 _log("    ├─ 文档缩略版本已生成: %s", fname)
                             except Exception as e:
                                 logger.warning("    ├─ ⚠ 缩略版本生成失败: %s: %s", fname, e)
-                            del text
-
-                            if not cleaned.strip():
-                                logger.warning("    └─ ⚠ 清洗后文本为空: %s", fname)
-                                continue
 
                             # ---- 4. 文档切片 ----
                             t_chunk = time.monotonic()
@@ -542,7 +564,7 @@ class RAGEngine:
                         # 使用 timeout + 循环检查取消标志，避免主线程因
                         # 取消/异常停止消费后 worker 永久阻塞在 put 上。
                         item = (filepath, doc_chunks, c_hash, len(doc_chunks))
-                        while not self._is_cancelled():
+                        while not self._is_cancelled() and not _abort.is_set():
                             try:
                                 q.put(item, timeout=2.0)
                                 break
@@ -567,6 +589,12 @@ class RAGEngine:
                         q.put(_SENTINEL, timeout=5.0)
                     except queue.Full:
                         pass
+
+            # 消费端（add_streaming）失败/中途放弃时置位，让所有 worker 立即
+            # 退出 put 循环。旧实现只靠 _is_cancelled()——向量化写入异常并非
+            # 用户取消，不会置位该标志，worker 会永远阻塞在 q.put 上：线程与
+            # 其持有的整文档切片内存一起泄漏到进程退出。
+            _abort = threading.Event()
 
             # 把文件列表分片给各 worker（保证负载均衡）
             # 动态调整并发数：文件数少于默认 worker 数时，只启动必要数量的线程
@@ -627,8 +655,13 @@ class RAGEngine:
                         consumer_file_no, fname, n_chunks,
                     )
                     # Update manifest for this processed file.
+                    # 先记到 pending，等 add_streaming 整体成功后才并入
+                    # new_manifest（见下方 except/cancel 分支）：旧实现在产出
+                    # chunks 的同时就写 manifest，一旦后续 embedding/写库失败
+                    # 或用户中途取消，文件只入库了一部分，manifest 却已记录
+                    # 完成——下次同步因 mtime/size 未变被跳过，内容永久缺失。
                     try:
-                        new_manifest[filepath] = {
+                        pending_manifest[filepath] = {
                             **_file_signature(filepath),
                             "content_hash": c_hash,
                             "chunk_count": n_chunks,
@@ -655,6 +688,8 @@ class RAGEngine:
                     except Exception as e:
                         logger.warning("RAG: on_batch callback error: %s", e)
 
+            write_failed = False
+            pending_manifest: Dict[str, Dict[str, Any]] = {}
             try:
                 _log("  开始流式向量化写入 (每批 %d 个切片)", 20)
                 added = store.add_streaming(
@@ -673,6 +708,23 @@ class RAGEngine:
                 # 解析的数据。改为将异常记录到 errors，让 ingest 正常结束。
                 stats["chunks"] = store.count()
                 stats["errors"].append(f"Vector store add failed: {e}")
+                write_failed = True
+            finally:
+                # 让阻塞在 q.put 上的 worker 立即退出（成功路径是空操作）。
+                _abort.set()
+
+            # 只有整条写入链路成功完成才提交 manifest；失败/取消路径下这些
+            # 文件下次同步会被重新处理（幂等），保证不会出现「manifest 记录
+            # 了但向量库里只有半个文件」的永久性内容缺失。
+            if write_failed:
+                pending_manifest.clear()
+                _log("  ⚠ 写入失败，本次处理的 %d 个文件将不在同步记录中（下次同步会重新处理）",
+                     stats["files_extracted"])
+            elif self._is_cancelled():
+                pending_manifest.clear()
+                _log("  ⚠ 同步被取消，本次处理的文件不写入同步记录")
+            else:
+                new_manifest.update(pending_manifest)
 
             # 等待所有 worker 线程结束
             _log("  等待所有 Worker 线程结束...")
@@ -810,7 +862,7 @@ class RAGEngine:
         # 构造 SQL 过滤条件：source 字段存完整路径，用 LIKE 匹配文档名。
         where = None
         if source:
-            where = f"source LIKE '%{_escape_like(source)}%'"
+            where = f"source LIKE '%{_escape_like(source)}%' ESCAPE '\\'"
             logger.info("  ├─ 定向检索: 限定来源包含 %r", source)
         logger.info(
             "🔍 知识库检索开始: 查询=%r 目标结果数=%d 向量库总量=%d",
@@ -949,19 +1001,22 @@ class RAGEngine:
 
             md_path = os.path.join(self._markdown_dir, fn)
             try:
+                # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
+                # digest 记录已是最新——旧实现无条件全文读入 + build_digest，
+                # 大知识库下每次同步都白跑一遍全文 IO 和解析。
+                existing = store.get_document_digest(doc_name)
+                if existing is not None:
+                    if not refresh_stale:
+                        continue
+                    if not _is_stale_digest(existing.get("digest", "")):
+                        continue
                 with open(md_path, "r", encoding="utf-8") as f:
                     markdown = f.read()
                 if not markdown.strip():
                     continue
                 digest, _ = build_digest(markdown)
-                # 判断是否需要写入：缺记录 或 旧格式需重刷。
-                existing = store.get_document_digest(doc_name)
-                need_write = existing is None
-                if existing is not None and refresh_stale:
-                    old_digest = existing.get("digest", "")
-                    if _is_stale_digest(old_digest, digest):
-                        need_write = True
-                if not need_write:
+                # 记录存在但格式合法时只有内容真的变了才需要重写。
+                if existing is not None and digest == existing.get("digest", ""):
                     continue
                 self.build_and_store_digest(doc_name, markdown)
                 created += 1

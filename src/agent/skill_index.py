@@ -107,6 +107,10 @@ class SkillIndex:
             # 记日志后按空索引处理，下次 scan() 会重建。
             logger.warning("skill_index: failed to load %s: %s", self._index_path, e)
             self._index = []
+            # 关键：同时把 _last_scan 前移。否则它停留在 0，_should_scan() 恒
+            # 为真——每次 search()/list_all() 都全量扫描目录并重写一个下次
+            # 仍会加载失败的索引文件（磁盘写放大 + 查询延迟）。
+            self._last_scan = time.time()
 
     def _save(self) -> None:
         """Atomic write of the index."""

@@ -524,12 +524,18 @@ class SkillVectorStore:
             return {"added": len(skills), "updated": 0, "removed": 0}
 
         # Current table contents: dir -> fingerprint.
-        # 只取需要的两列——表内还有两条 768 维向量列，整表 to_pylist() 会把
-        # 全部向量转成 Python float 列表（数千技能 ≈ 百万级对象、数百 MB），
-        # 直接抵消了 build() 分批嵌入防内存爆炸的设计。
+        # 必须在 LanceDB 层做列裁剪：表内还有两条 768 维向量列，旧实现
+        # ``to_arrow().select([...])`` 是先物化**全部列**再 select——数千技能
+        # 仍是数百 MB 的 Arrow 拷贝，注释声称「只取两列」并未兑现。
+        # search().limit(N).select(cols) 会把列裁剪下推到存储层。
         try:
+            n_rows = table.count_rows()
             existing_rows = (
-                table.to_arrow().select(["dir", "fingerprint"]).to_pylist()
+                table.search()
+                .limit(max(n_rows, 1))
+                .select(["dir", "fingerprint"])
+                .to_arrow()
+                .to_pylist()
             )
         except Exception as e:
             logger.warning("skill_retriever: sync failed to read table: %s", e)

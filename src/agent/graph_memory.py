@@ -100,6 +100,8 @@ class GraphMemoryStore:
         self._table = None
         self._ef = None
         self._vec_ready = False
+        # 向量索引只探测一次；lancedb/fastembed 缺失时不反复重试 connect+import。
+        self._vec_tried = False
         self._backfilled = False
         self._load()
 
@@ -154,10 +156,10 @@ class GraphMemoryStore:
         in the JSON graph but missing from the vector table (so facts stored
         before the vector index existed become searchable too).
         """
-        if self._vec_ready:
+        if self._vec_ready or self._vec_tried:
             return
         with self._vec_lock:
-            if self._vec_ready:  # double-check
+            if self._vec_ready or self._vec_tried:  # double-check
                 return
             try:
                 import lancedb
@@ -174,6 +176,11 @@ class GraphMemoryStore:
                 # Non-fatal: semantic search just falls back to keyword.
                 logger.debug("graph_memory: vector index unavailable: %s", e)
                 self._vec_ready = False
+            finally:
+                # 只尝试一次：lancedb/fastembed 缺失的环境下，旧的
+                # 「失败不记忆」会让每次 search() 都重新 connect + import
+                # （并且每次都把同样那条 debug 日志刷出来）。
+                self._vec_tried = True
         # Backfill outside the lock (embedding is slow). Only once per instance.
         if self._vec_ready and not getattr(self, "_backfilled", False):
             self._backfilled = True
@@ -328,6 +335,15 @@ class GraphMemoryStore:
             return
         try:
             vecs = self._ef.embed_documents(observations)
+            if len(vecs) != len(observations):
+                # embedding 返回数量不足（模型异常/截断）时不能静默用 zip 截断
+                # ——被丢掉的内容已写进 JSON 图谱，会造成「图里有、向量库没有」
+                # 的永久性检索缺口。这里宁可整批失败（外层有兜底），也不留
+                # 半截索引。
+                raise RuntimeError(
+                    f"embedding returned {len(vecs)} vectors for "
+                    f"{len(observations)} observations"
+                )
             records = [
                 {
                     "id": _hash(entity_name + "|" + obs),

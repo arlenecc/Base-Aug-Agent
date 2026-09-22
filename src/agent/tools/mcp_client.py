@@ -14,6 +14,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# tools/call 的下限超时（秒）。握手/枚举用实例的 timeout（默认 30s）足够，
+# 但工具调用本身可能是构建、批量处理、爬取等长任务——共用 30s 会让长任务
+# 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
+_TOOL_CALL_TIMEOUT = 300.0
+
 # ------------------------------------------------------------------
 # MCP JSON-RPC wire types
 # ------------------------------------------------------------------
@@ -208,7 +213,14 @@ class MCPClient:
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Call a tool on the MCP server and return the text content."""
-        resp = self._call("tools/call", {"name": name, "arguments": arguments})
+        # tools/call 与 initialize/tools/list 不能共用同一个 30s 超时：构建、
+        # 批量处理、爬取这类工具跑几分钟是常态。旧实现让它们共用初始化超时，
+        # 长任务必然超时失败——而服务端还在继续跑，结果被当迟到响应丢弃。
+        resp = self._call(
+            "tools/call",
+            {"name": name, "arguments": arguments},
+            timeout=max(self.timeout, _TOOL_CALL_TIMEOUT),
+        )
         if resp.error:
             raise MCPError(
                 f"MCP tool '{name}' error: {resp.error.get('message', 'unknown')}"
@@ -237,8 +249,17 @@ class MCPClient:
     # JSON-RPC internals
     # ------------------------------------------------------------------
 
-    def _call(self, method: str, params: Dict[str, Any]) -> JSONRPCResponse:
-        """Send a JSON-RPC request and wait for the response."""
+    def _call(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> JSONRPCResponse:
+        """Send a JSON-RPC request and wait for the response.
+
+        ``timeout`` 缺省用初始化超时（适合握手/枚举类调用）；长任务方法应
+        传入更长的值（见 call_tool）。
+        """
         with self._lock:
             req_id = self._request_id
             self._request_id += 1
@@ -253,7 +274,7 @@ class MCPClient:
                 self._pending.pop(req_id, None)
             raise
 
-        if not ev.wait(timeout=self.timeout):
+        if not ev.wait(timeout=timeout if timeout is not None else self.timeout):
             with self._lock:
                 self._pending.pop(req_id, None)
             raise MCPError(f"MCP server '{self.name}': timeout waiting for '{method}'")

@@ -73,6 +73,11 @@ class AgentConfig:
         Returns ``None`` when the value cannot be coerced, so the caller can
         fall back to the dataclass default instead of storing a wrong type.
         """
+        # null 一律视为「字段缺失」：str(None) 会产生字符串 "None"，随后
+        # base_url + "/models" 之类的拼接会把它当真实值用；workspace = "None"
+        # 更是会在当前目录创建一个名为 None 的目录。
+        if value is None:
+            return None
         try:
             if name in cls._INT_FIELDS:
                 return int(value)
@@ -81,7 +86,18 @@ class AgentConfig:
             if name in cls._STR_FIELDS:
                 return str(value)
             if name in cls._BOOL_FIELDS:
-                return bool(value)
+                # bool("false") 是 True——手工编辑配置时常见的 "false"/"no"/"0"
+                # 字符串会把用户显式的关闭悄悄变成打开。只接受明确的映射。
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                s = str(value).strip().lower()
+                if s in ("true", "1", "yes", "on"):
+                    return True
+                if s in ("false", "0", "no", "off", ""):
+                    return False
+                return None
         except (TypeError, ValueError):
             return None
         return value

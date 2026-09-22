@@ -271,6 +271,10 @@ class BridgeCallbacks(AgentCallbacks):
         self._confirm_event.clear()
         self._ask_event.clear()
 
+    def is_cancelled(self) -> bool:
+        """供 Agent.run() 在流式/迭代/工具边界轮询（协作式取消）。"""
+        return self._cancelled
+
     def cancel(self) -> None:
         self._cancelled = True
         self._confirm_event.set()
@@ -312,14 +316,27 @@ class FetchModelsWorker(QThread):
         self._api_key = api_key
 
     def run(self) -> None:  # type: ignore[override]
+        client = None
         try:
             client = LLMClient(base_url=self._base_url, api_key=self._api_key, model="",
                                timeout=30.0, max_tokens=1)
             models = client.list_models()
+            # 先取结果再 emit：emit 之后 close 若抛异常，错误会出现在
+            # finished 之后无法显示。
             client.close()
+            client = None
             self.fetched.emit(models)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+        finally:
+            # close 不放进 try 的正常路径：list_models 对 4xx/5xx、网络错误
+            # 都会抛异常，旧实现此时跳过了 close，httpx 连接池（socket +
+            # 线程池）依赖 GC 兜底——每次「获取模型失败」泄漏一个。
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
 
 class SyncKnowledgeWorker(QThread):
@@ -1027,10 +1044,29 @@ class MainWindow(QMainWindow):
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
             self.progress.setRange(0, 1)
+            self.progress.setValue(0)
             self.status_label.setText("依赖缺失，无法同步")
             QMessageBox.critical(
                 self, "依赖缺失",
                 f"以下必要依赖未能自动安装，请手动安装后重试：\n\n{report.summary()}"
+            )
+            return
+        if report is None:
+            # worker 的 None 只有「用户取消」一种正常语义（上面已处理）；
+            # ensure_dependencies 抛异常时也 emit None。依赖状态未知/缺失时
+            # 绝不能照常启动 RAG 同步——那会在缺 lancedb/fastembed 的环境里
+            # 跑引擎，产生难懂的二次异常并吞掉真正的失败原因。
+            logger.error("Deps check failed with an exception — aborting sync")
+            self.sync_knowledge_btn.setEnabled(True)
+            self.sync_knowledge_btn.setText("同步知识")
+            self.stop_sync_btn.setEnabled(False)
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.status_label.setText("依赖检查失败")
+            QMessageBox.critical(
+                self, "依赖检查失败",
+                "依赖检查过程中出现异常，无法确认解析依赖是否可用。\n"
+                "请查看日志面板中的错误信息，修复后重试。"
             )
             return
 
@@ -1042,6 +1078,11 @@ class MainWindow(QMainWindow):
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
             self.stop_sync_btn.setEnabled(False)
+            # 防御分支同样要复位不确定态进度条——_on_sync_knowledge 已把它设
+            # 为 setRange(0,0)，不恢复的话进度条会永久转圈。
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.status_label.setText("未选择知识库目录")
             return
         self.sync_knowledge_btn.setText("同步中…")
         self.status_label.setText("正在同步知识库…")

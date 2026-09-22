@@ -23,10 +23,43 @@ _MAX_FETCH_BYTES = 8 * 1024 * 1024
 def _read_capped(client, url: str) -> str:
     """GET ``url`` and return the body text, capped at ``_MAX_FETCH_BYTES``.
 
-    The cap keeps a multi-GB download from being materialised into a Python
-    string (and then into BeautifulSoup): we take only the bytes we intend to
-    keep and release the response immediately afterwards.
+    优先走流式读取：``client.get()`` 是非流式的——整个响应体会先完整读进内存，
+    才轮到我们截断，对一个 2GB 的直链内存峰值仍然是 2GB。``client.stream()``
+    让我们读够上限就关掉连接。测试替身/极简适配器可能只实现了 ``get()``，
+    那条路径退化为「get 后截断」。
     """
+    if hasattr(client, "stream"):
+        chunks: list = []
+        total = 0
+        truncated = False
+        try:
+            with client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    return f"__HTTP_ERROR__{resp.status_code}"
+                for block in resp.iter_bytes(chunk_size=65536):
+                    if not block:
+                        continue
+                    remaining = _MAX_FETCH_BYTES - total
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(block) > remaining:
+                        chunks.append(block[:remaining])
+                        total += remaining
+                        truncated = True
+                        break
+                    chunks.append(block)
+                    total += len(block)
+                encoding = getattr(resp, "encoding", None) or "utf-8"
+            text = b"".join(chunks).decode(encoding, errors="replace")
+            del chunks
+            if truncated:
+                text += f"\n… [响应超过 {_MAX_FETCH_BYTES // (1024 * 1024)} MB，已截断]"
+            return text
+        except Exception:
+            # 流式路径失败（代理/测试替身/不完整的实现）→ 退回 get()。
+            pass
+
     resp = client.get(url)
     try:
         if resp.status_code >= 400:

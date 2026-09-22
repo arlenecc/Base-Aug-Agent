@@ -205,7 +205,11 @@ class SkillLoadTool(Tool):
             )
 
         # 1) Try the semantic retriever first (SKILL.md directory).
-        retriever = getattr(self.registry, "_skill_retriever", None)
+        # 必须走 get_skill_retriever()（按目录缓存、跟随当前 workspace）。
+        # 旧实现读 registry._skill_retriever 这个 legacy 属性：它只指向第一次
+        # 创建时的 workspace，切换工作区后 skill_semantic_search 用新目录而
+        # skill_load 还在旧目录上做路径校验——新技能读不出、旧技能照读。
+        retriever = self.registry.get_skill_retriever()
         if retriever is not None:
             abs_dir = retriever.read_skill_dir(path)
             if abs_dir:

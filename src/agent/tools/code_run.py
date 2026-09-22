@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
 from typing import List
 
 from ..config import AgentConfig
@@ -32,6 +31,14 @@ logger = logging.getLogger(__name__)
 # Default timeout (seconds). Long enough for pip installs and network calls,
 # short enough that a stuck script doesn't freeze the agent.
 _DEFAULT_TIMEOUT = 30
+# timeout 上下限：模型可能传 0 / 负数（会导致 join(timeout=0) 立即误判超时），
+# 也可能传个天文数字把 agent 挂死。
+_MIN_TIMEOUT = 1.0
+_MAX_TIMEOUT = 600.0
+
+# stdout/stderr 每路保留的最大字符数。旧实现用无限 StringIO——一段
+# `while True: print(...)` 在超时窗口内能产出数 GB 字符串。
+_MAX_STREAM_CHARS = 200_000
 
 # Track leaked daemon threads from timed-out code_run calls.
 # We can't kill them, but we can warn the user and track the count.
@@ -86,22 +93,48 @@ class CodeRunTool(Tool):
             timeout = float(timeout)
         except (TypeError, ValueError):
             timeout = float(_DEFAULT_TIMEOUT)
+        timeout = max(_MIN_TIMEOUT, min(timeout, _MAX_TIMEOUT))
 
-        ws = os.path.abspath(self.config.workspace)
+        ws = os.path.realpath(self.config.workspace)
         _real_open = _b.open
 
         def _guard_open(file, mode="r", *a, **kw):
             if isinstance(file, int):
                 raise PermissionError("File descriptor access is not allowed in code_run")
-            path = os.path.abspath(file if isinstance(file, (str, os.PathLike)) else "")
+            # 用 realpath 而不是 abspath：workspace 里的 symlink 指向外部文件时
+            # （如 os.symlink("/etc/cron.d/x", "pwn") 后 open("pwn","w")），
+            # abspath 仍落在 workspace 前缀内，防护被绕过。
+            path = os.path.realpath(file if isinstance(file, (str, os.PathLike)) else "")
             if any(m in str(mode) for m in ("w", "a", "x", "+")):
                 if not (path == ws or path.startswith(ws + os.sep)):
                     raise PermissionError(f"Refusing to write outside workspace: {file}")
             return _real_open(file, mode, *a, **kw)
 
         namespace: dict = {"__name__": "__code_run__", "__file__": "<code_run>"}
-        out = io.StringIO()
-        err = io.StringIO()
+
+        class _BoundedIO(io.StringIO):
+            """有界 StringIO：超出上限后丢弃后续写入（只标记一次）。"""
+
+            def __init__(self, limit: int = _MAX_STREAM_CHARS):
+                super().__init__()
+                self._limit = limit
+                self._truncated = False
+
+            def write(self, s) -> int:
+                if self._truncated:
+                    return 0
+                if self.tell() + len(s) > self._limit:
+                    super().write("\n… [输出超限，已截断]")
+                    self._truncated = True
+                    return len(s)
+                return super().write(s)
+
+        out = _BoundedIO()
+        err = _BoundedIO()
+
+        # 主线程侧的进程级状态快照（cwd / stdout / stderr），join 后恢复。
+        _prev_cwd = os.getcwd()
+        _prev_stdout, _prev_stderr = sys.stdout, sys.stderr
 
         # Cooperative cancellation event: set by the main thread on timeout,
         # checked by user code via an injected `_cancelled()` function so
@@ -115,13 +148,25 @@ class CodeRunTool(Tool):
         def _worker():
             cwd = os.getcwd()
             try:
+                # os.chdir / sys.stdout 替换是**进程级**全局状态，不是线程级的：
+                # 执行期间其它线程的相对路径与 print 都会受影响。这里接受这段
+                # 时间的短暂影响（相对路径语义是工具契约的一部分），但恢复动作
+                # 必须由主线程在 join 之后完成——旧实现放在 worker 的 finally，
+                # 超时泄漏的线程会在未来任意时刻把整个进程 cwd 拽回来，并且
+                # 只要它不结束，sys.stdout 就一直被劫持到 StringIO，agent 的
+                # 所有 print 输出从此全部丢失。
                 os.chdir(ws)
                 # Inject cancellation checker into the sandbox namespace so
                 # user code can call `_cancelled()` to poll and exit early.
                 namespace["__builtins__"] = {**vars(_b), "open": _guard_open}
                 namespace["_cancelled"] = _cancel_evt.is_set
-                with redirect_stdout(out), redirect_stderr(err):
+                _saved_stdout, _saved_stderr = sys.stdout, sys.stderr
+                try:
+                    sys.stdout, sys.stderr = out, err
                     exec(compile(code, "<code_run>", "exec"), namespace)
+                finally:
+                    result["done"] = True
+                    sys.stdout, sys.stderr = _saved_stdout, _saved_stderr
             except PermissionError as e:
                 result["exc"] = e
             except SystemExit as e:
@@ -129,7 +174,6 @@ class CodeRunTool(Tool):
             except BaseException as e:
                 result["exc"] = e
             finally:
-                os.chdir(cwd)
                 result["done"] = True
 
         # Run exec in a daemon thread so a timeout can return control to the
@@ -138,6 +182,13 @@ class CodeRunTool(Tool):
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         t.join(timeout=timeout)
+
+        # 无论是否超时都由主线程恢复进程级全局状态（见 _worker 注释）。
+        try:
+            os.chdir(_prev_cwd)
+            sys.stdout, sys.stderr = _prev_stdout, _prev_stderr
+        except OSError as e:
+            logger.warning("code_run: failed to restore process cwd/stdout: %s", e)
 
         if not result["done"]:
             # Thread is still running (infinite loop or slow code).

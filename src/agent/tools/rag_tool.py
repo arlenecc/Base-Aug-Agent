@@ -45,11 +45,19 @@ class RagSearchTool(Tool):
         pass
 
     def run(self, query: str = "", top_k: int = 3, source: str = "") -> ToolResult:
-        if not query.strip():
+        # 模型可能传 null（JSON null → None），None.strip() 会抛异常并被
+        # registry 兜底误报成 "Invalid arguments"，模型会原样重试。这里统一
+        # 归一化成空串再判断。
+        query = (query or "").strip()
+        if not query:
             return ToolResult(success=False, error="请提供搜索查询词")
 
         # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
-        top_k = max(1, min(int(top_k), 10))
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 3
+        top_k = max(1, min(top_k, 10))
 
         source = (source or "").strip()
         logger.info(
@@ -97,7 +105,8 @@ class RagOutlineTool(Tool):
         pass
 
     def run(self, book_name: str = "", **kwargs) -> ToolResult:
-        if not book_name.strip():
+        book_name = (book_name or "").strip()
+        if not book_name:
             # 未指定书名时，列出所有已建立缩略版本的文档。
             docs = self._engine.list_documents()
             if not docs:

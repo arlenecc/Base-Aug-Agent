@@ -233,7 +233,16 @@ class VectorStore:
         # 保护 documents 表懒创建 + 写操作。用 RLock：upsert_document /
         # delete_document 会「持锁后再调用 _ensure_documents_table()」，普通
         # Lock 会在此自锁死（见 _ensure_documents_table 的注释）。
+        # 保护 documents 表懒创建 + 写操作。用 RLock：upsert_document /
+        # delete_document 会「持锁后再调用 _ensure_documents_table()」，普通
+        # Lock 会在此自锁死（见 _ensure_documents_table 的注释）。
         self._documents_lock = threading.RLock()
+        # 保护整个 store 的懒初始化（连接/建表/schema 迁移只允许一次）。
+        self._init_lock = threading.RLock()
+        # 保护 reranker 状态机（避免并发加载两份 ~500MB 模型）。
+        self._reranker_lock = threading.RLock()
+        # close() 后置位：后台加载线程完成时不得把模型写回本实例。
+        self._closed = False
         # documents 表内容缓存：避免 get_document_digest / list_documents 每次
         # 都全表 to_pylist()（表内含完整 markdown，反复全量扫描既慢又占内存）。
         # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
@@ -251,7 +260,17 @@ class VectorStore:
     def _ensure_initialized(self) -> None:
         if self._initialized:
             return
+        # ingest 的 4 个 worker 会并发走到这里（upsert_document / add_streaming
+        # 都会触发），若不加锁，多个线程会同时执行 lancedb.connect /
+        # create_table / schema 迁移，轻则重复建表报错，重则 schema 迁移互相
+        # 覆盖。与 _ensure_documents_table 相同的双重检查模式。
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._initialize_locked()
 
+    def _initialize_locked(self) -> None:
+        """``_ensure_initialized`` 的实现，调用方必须已持有 _init_lock。"""
         logger.info("  正在初始化向量库...")
         try:
             import lancedb
@@ -845,76 +864,92 @@ class VectorStore:
         state = getattr(self, "_reranker_state", "idle")
         if state == "done":
             return self._reranker
-        if state == "failed":
-            return None
-        if state == "loading":
-            # Another caller already started the load. Don't spawn a duplicate;
-            # return None so this call falls back to distance ranking, and the
-            # result will be available on a later call.
+        if state in ("failed", "loading"):
+            # failed → 不可用；loading → 另一个线程已在加载，本次调用回退到
+            # 距离排序，加载完成后的调用自然能拿到模型。
             return None
 
-        # torch/numpy 兼容性探测：FlagEmbedding 依赖 torch，而某些旧版 torch
-        # （如 macOS Intel 上最高可装的 2.2.2）与 numpy 2.x 不兼容，调用
-        # ``tensor.numpy()`` 会抛 ``Numpy is not available``，导致重排序崩溃。
-        # 这里不凭 numpy 版本号猜测，而是真正执行一次 tensor→numpy 转换来
-        # 验证 torch 与 numpy 是否兼容，避免误伤 numpy 2.x + 新版 torch 的
-        # 正常组合（如 arm64 上的 torch 2.13 + numpy 2.5 是完全兼容的）。
-        try:
-            import torch as _torch
+        # 状态转换必须串行：torch 探测 + import FlagEmbedding 可耗时数秒，
+        # 旧实现从「读到 idle」到「写入 loading」之间没有任何锁，两个并发
+        # 调用方都会各自起一个加载线程——各加载一份 ~500MB 模型，后写者覆盖
+        # 前者，先建的那份成为纯泄漏。
+        with self._reranker_lock:
+            state = getattr(self, "_reranker_state", "idle")
+            if state == "done":
+                return self._reranker
+            if state in ("failed", "loading"):
+                return None
+
+            # torch/numpy 兼容性探测：FlagEmbedding 依赖 torch，而某些旧版 torch
+            # （如 macOS Intel 上最高可装的 2.2.2）与 numpy 2.x 不兼容，调用
+            # ``tensor.numpy()`` 会抛 ``Numpy is not available``，导致重排序崩溃。
+            # 这里不凭 numpy 版本号猜测，而是真正执行一次 tensor→numpy 转换来
+            # 验证 torch 与 numpy 是否兼容，避免误伤 numpy 2.x + 新版 torch 的
+            # 正常组合（如 arm64 上的 torch 2.13 + numpy 2.5 是完全兼容的）。
             try:
-                _torch.tensor([1.0, 2.0]).numpy()
-            except Exception as _e:
-                import numpy as _np
+                import torch as _torch
+                try:
+                    _torch.tensor([1.0, 2.0]).numpy()
+                except Exception as _e:
+                    import numpy as _np
+                    logger.warning(
+                        "  ⚠ BGE Reranker 不可用: torch %s 与 numpy %s 不兼容 "
+                        "（tensor.numpy() 失败: %s）。重排序回退到向量距离排序。"
+                        "如需启用，请升级 torch 或降级 numpy 到 1.26.x。",
+                        getattr(_torch, "__version__", "?"),
+                        getattr(_np, "__version__", "?"),
+                        _e,
+                    )
+                    self._reranker = None
+                    self._reranker_state = "failed"
+                    return None
+            except ImportError:
+                pass  # torch 缺失时交由后续 import FlagEmbedding 报错处理
+
+            try:
+                from FlagEmbedding import FlagReranker
+            except ImportError:
                 logger.warning(
-                    "  ⚠ BGE Reranker 不可用: torch %s 与 numpy %s 不兼容 "
-                    "（tensor.numpy() 失败: %s）。重排序回退到向量距离排序。"
-                    "如需启用，请升级 torch 或降级 numpy 到 1.26.x。",
-                    getattr(_torch, "__version__", "?"),
-                    getattr(_np, "__version__", "?"),
-                    _e,
+                    "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
                 )
                 self._reranker = None
                 self._reranker_state = "failed"
                 return None
-        except ImportError:
-            pass  # torch 缺失时交由后续 import FlagEmbedding 报错处理
 
-        try:
-            from FlagEmbedding import FlagReranker
-        except ImportError:
-            logger.warning(
-                "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
-            )
-            self._reranker = None
-            self._reranker_state = "failed"
-            return None
+            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
+            import time as _time
+            _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
-        logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
-        import time as _time
-        _time.sleep(0.01)  # 释放 GIL 让 UI 更新
+            def _load():
+                try:
+                    reranker = FlagReranker(
+                        self._rerank_model,
+                        use_fp16=False,
+                    )
+                    if getattr(self, "_closed", False):
+                        # close() 已经执行：不要再把 500MB 模型写回实例
+                        # （旧实现会让 close 之后的实例「复活」持有权重）。
+                        try:
+                            del reranker
+                        except UnboundLocalError:
+                            pass
+                        return
+                    self._reranker = reranker
+                    self._reranker_state = "done"
+                    logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
+                except Exception as e:
+                    logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
+                    self._reranker = None
+                    self._reranker_state = "failed"
 
-        # Mark loading before spawning so concurrent callers see it.
-        self._reranker_state = "loading"
-
-        def _load():
-            try:
-                self._reranker = FlagReranker(
-                    self._rerank_model,
-                    use_fp16=False,
-                )
-                self._reranker_state = "done"
-                logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
-            except Exception as e:
-                logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
-                self._reranker = None
-                self._reranker_state = "failed"
-
-        try:
-            import threading
+            # 先置 loading 再启动线程，并发的其他调用方看到 loading 即返回。
+            self._reranker_state = "loading"
             t = threading.Thread(target=_load, daemon=True)
             t.start()
-            t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
 
+        # join 放在锁外：避免其他调用方为等这个 join 阻塞 2 分钟。
+        try:
+            t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
             if t.is_alive():
                 # 加载仍在后台进行（网络慢）。不丢弃结果——后台线程完成时会
                 # 写入 self._reranker/_reranker_state，后续调用直接复用。
@@ -927,7 +962,7 @@ class VectorStore:
             self._reranker = None
             self._reranker_state = "failed"
 
-        return self._reranker
+        return self._reranker if getattr(self, "_reranker_state", "idle") == "done" else None
 
     def _rerank_fallback(
         self,
@@ -1172,6 +1207,9 @@ class VectorStore:
         # This is best-effort: if the attribute layout changes in a future
         # FastEmbed version, the AttributeError is swallowed and we fall
         # back to simply dropping the Python reference.
+        # 先标记关闭：后台 reranker 加载线程完成时看到 _closed 就不再把模型
+        # 写回本实例（否则 close 之后的实例会「复活」持有 ~500MB 权重）。
+        self._closed = True
         self._table = None
         self._db = None
         self._documents_cache = None

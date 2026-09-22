@@ -2,10 +2,36 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+import tempfile
 
 from ..config import AgentConfig
 from .base import Tool, ToolRegistry, ToolResult
+
+# file_read 单次返回的最大字符数。模型把一次 file_read 的输出原样放进上下文，
+# 没有上限的话一个几 GB 的日志/数据文件就能撑爆内存和模型窗口。与 shell_run
+# (200K)、web (8MB) 的上限策略保持一致。
+_MAX_READ_CHARS = 200_000
+
+
+def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
+    """Temp + os.replace 原子写。
+
+    临时文件名必须唯一：固定 ``full + ".tmp"`` 在两个线程并发写同一目标时会
+    互相覆盖、落盘混合内容；写失败时固定名还会把 .tmp 残留在 workspace 里被
+    后续读取当成数据。用 mkstemp 生成唯一名，finally 里清理。
+    """
+    dir_name = os.path.dirname(full) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=dir_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(content)
+        os.replace(tmp, full)
+    finally:
+        # os.replace 成功后 tmp 已不存在；失败时清理掉半成品。
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 class _FileTool(Tool):
@@ -48,13 +74,22 @@ class FileReadTool(_FileTool):
         if not os.path.isfile(full):
             return ToolResult(False, error=f"File does not exist: {path}")
         try:
+            size = os.path.getsize(full)
+            truncated = size > _MAX_READ_CHARS
             with open(full, "r", encoding="utf-8") as f:
-                return ToolResult(True, output=f.read())
+                # 只读需要的部分，而不是把整个文件读进内存再截断。
+                data = f.read(_MAX_READ_CHARS) if truncated else f.read()
+            if truncated:
+                data += f"\n… [文件共 {size} 字节，仅显示前 {_MAX_READ_CHARS} 字符]"
+            return ToolResult(True, output=data)
         except UnicodeDecodeError:
             import base64
 
             with open(full, "rb") as f:
-                return ToolResult(True, output="(binary) " + base64.b64encode(f.read()).decode())
+                # 二进制同样限制体积：base64 会再放大 4/3，不截断的话一个
+                # 大二进制文件就能把内存和模型上下文一起撑爆。
+                raw = f.read(_MAX_READ_CHARS // 2)
+            return ToolResult(True, output="(binary) " + base64.b64encode(raw).decode())
 
 
 class FileWriteTool(_FileTool):
@@ -77,12 +112,10 @@ class FileWriteTool(_FileTool):
         except PermissionError as e:
             return ToolResult(False, error=str(e))
         os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
-        # Atomic write: write to temp then os.replace. A crash mid-write leaves
-        # the original file intact rather than a truncated/partial one.
-        tmp = full + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, full)
+        try:
+            _atomic_write(full, content)
+        except OSError as e:
+            return ToolResult(False, error=f"Write failed: {e}")
         return ToolResult(True, output=f"Wrote {len(content)} chars to {path}")
 
 
@@ -118,8 +151,8 @@ class FileModifyTool(_FileTool):
         else:
             text = text.replace(old, new, 1)
         # Atomic write: write to temp then os.replace.
-        tmp = full + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, full)
+        try:
+            _atomic_write(full, text)
+        except OSError as e:
+            return ToolResult(False, error=f"Modify failed: {e}")
         return ToolResult(True, output=f"Modified {path}")

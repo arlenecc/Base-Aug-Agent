@@ -627,8 +627,11 @@ def _is_reranker_cached() -> bool:
         from huggingface_hub import try_to_load_from_cache
     except Exception:
         return False
-    key_files = ["pytorch_model.bin", "model.safetensors", "config.json"]
-    for kf in key_files:
+    # 只有真实的权重文件才算「已缓存」。config.json 是 HF 下载的第一个文件，
+    # 一次中断的下载很容易只留下它——如果它也算缓存，就会跳过预下载，
+    # 首次检索时 FlagEmbedding 仍要现场下载 ~500MB。
+    weight_files = ["pytorch_model.bin", "model.safetensors"]
+    for kf in weight_files:
         try:
             cached = try_to_load_from_cache(RERANK_MODEL_ID, kf)
         except Exception:

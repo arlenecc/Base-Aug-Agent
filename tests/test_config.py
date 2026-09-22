@@ -160,6 +160,28 @@ def test_ensure_workspace_creates_dir(tmp_path):
     assert os.path.isdir(str(tmp_path / "ws"))
 
 
+def test_coerce_string_bools(tmp_path):
+    """`"rag_auto_ingest": "false"` was `bool("false")` == True — the user's
+    explicit opt-out silently became opt-in on every load."""
+    for raw, expected in [("false", False), ("no", False), ("0", False),
+                          ("true", True), ("1", True)]:
+        p = tmp_path / "c.json"
+        p.write_text(json.dumps({"rag_auto_ingest": raw}))
+        assert AgentConfig.load(str(p)).rag_auto_ingest is expected, raw
+
+
+def test_coerce_null_string_fields_fall_back_to_default(tmp_path):
+    """`"api_key": null` used to become the literal string "None" — then
+    `base_url + "/models"` and friends used it as a real value, and
+    `workspace = "None"` created a directory literally named None."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"api_key": None, "workspace": None}))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.api_key == AgentConfig().api_key
+    assert cfg.workspace == AgentConfig().workspace
+    assert cfg.workspace != "None"
+
+
 # ---------------------------------------------------------------------------
 # Robustness: corrupted config files and user-chosen small budgets
 # ---------------------------------------------------------------------------

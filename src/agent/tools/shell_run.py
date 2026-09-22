@@ -7,6 +7,7 @@ the agent's confirmation policy prompts the user before execution.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import signal
@@ -109,31 +110,61 @@ def _combine(out: str, err: str) -> str:
 
 
 class _Collector:
-    """Bounded stdout/stderr collector (keeps head + tail of the stream)."""
+    """Bounded stdout/stderr collector that keeps the head *and* the tail.
+
+    超长输出里最有价值的信息往往在末尾（报错摘要、最后几行结果）。
+    只保留开头会让模型看不到命令为什么失败。这里用 deque 保留尾部、
+    单独字符串保留头部，中间用省略标记衔接。
+    """
+
+    _TAIL_RATIO = 0.25  # 尾部至少保留 25% 的预算
 
     def __init__(self, limit: int = _MAX_OUTPUT_CHARS):
         self.limit = limit
-        self.parts: list = []
-        self.size = 0
+        self._head_budget = limit - int(limit * self._TAIL_RATIO)
+        self._head = []
+        self._head_size = 0
+        self._tail = collections.deque()
+        self._tail_size = 0
         self.truncated = False
+
+    def _drop_tail_overflow(self) -> None:
+        while self._tail_size > int(self.limit * self._TAIL_RATIO) and self._tail:
+            dropped = self._tail.popleft()
+            self._tail_size -= len(dropped)
 
     def feed(self, text: str) -> None:
         if not text:
             return
-        if self.size + len(text) <= self.limit:
-            self.parts.append(text)
-            self.size += len(text)
+        if not self.truncated:
+            if self._head_size + len(text) <= self._head_budget:
+                self._head.append(text)
+                self._head_size += len(text)
+                return
+            # 头部预算用尽 → 进入尾部模式
+            keep = self._head_budget - self._head_size
+            if keep > 0:
+                self._head.append(text[:keep])
+                rest = text[keep:]
+            else:
+                rest = text
+            self.truncated = True
+            self._feed_tail(rest)
             return
-        keep = self.limit - self.size
-        if keep > 0:
-            self.parts.append(text[:keep])
-            self.size += keep
-        self.truncated = True
+        self._feed_tail(text)
+
+    def _feed_tail(self, text: str) -> None:
+        if not text:
+            return
+        self._tail.append(text)
+        self._tail_size += len(text)
+        self._drop_tail_overflow()
 
     def value(self) -> str:
-        text = "".join(self.parts)
+        text = "".join(self._head)
         if self.truncated:
-            text += f"\n… [输出超过 {self.limit} 字符，已截断]"
+            text += f"\n… [输出超过 {self.limit} 字符，中间已截断] …"
+        text += "".join(self._tail)
         return text
 
 

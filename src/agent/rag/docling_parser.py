@@ -143,19 +143,24 @@ def extract_markdown(filepath: str) -> Optional[str]:
 
 
 def _is_scan_pdf(path: Path) -> bool:
-    """Detect whether a PDF is a pure scan (no text layer on any page).
+    """Detect whether a PDF looks like a scan (no text layer at the front).
 
-    Uses PyMuPDF for a cheap first-page probe; returns False if PyMuPDF is
-    unavailable (let docling try).
+    只探测前几页：旧实现 ``for page in doc`` 把整本 PDF 的文本全提取一遍——
+    而「判定为扫描件」后走的解析器又要逐页提取/OCR 一遍，大 PDF 的解析时间
+    近乎翻倍。扫描件几乎不可能前 5 页都没有文本层，这里采样首页+中间页即可。
+
+    Uses PyMuPDF; returns False if PyMuPDF is unavailable (let docling try).
     """
+    _PROBE_PAGES = 5
     try:
         import fitz  # PyMuPDF
     except ImportError:
         return False
     try:
         with fitz.open(str(path)) as doc:
-            for page in doc:
-                if page.get_text("text").strip():
+            n = min(_PROBE_PAGES, doc.page_count)
+            for i in range(n):
+                if doc[i].get_text("text").strip():
                     return False
         return True
     except Exception:

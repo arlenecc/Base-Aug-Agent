@@ -230,10 +230,17 @@ class SkillManager:
             requests[key] = requests.get(key, 0) + 1
             # 请求计数表只增不删：长期使用的 skills.json 会无界膨胀（既占内存
             # 也让每次 set() 的 JSON 序列化越来越大）。超过上限时淘汰最旧的
-            # 一半条目（dict 保持插入顺序）。
+            # 一半条目（dict 保持插入顺序），但必须跳过当前 key——否则刚 +1
+            # 的计数会被立刻删掉，返回值与持久化状态不一致（下次从 1 重新计）。
             if len(requests) > _MAX_TRACKED_REQUESTS:
-                for k in list(requests)[:_MAX_TRACKED_REQUESTS // 2]:
+                evict = _MAX_TRACKED_REQUESTS // 2
+                for k in list(requests):
+                    if evict <= 0:
+                        break
+                    if k == key:
+                        continue
                     requests.pop(k, None)
+                    evict -= 1
             self._store.set("requests", requests)
             count = requests[key]
 
