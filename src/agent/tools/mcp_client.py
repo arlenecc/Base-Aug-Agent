@@ -165,45 +165,32 @@ class MCPClient:
             self._running = False
             process = self._process
             self._process = None
-        # Close stdin / terminate the process OUTSIDE the lock so the reader
-        # thread (which may be in its finally block trying to acquire the lock)
-        # doesn't deadlock waiting for us to release it.
+        # Terminate / wait happen OUTSIDE the lock so the reader thread (which
+        # may be in its finally block trying to acquire the lock) doesn't
+        # deadlock waiting for us to release it.
         if process:
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                try:
-                    if pipe:
-                        pipe.close()
-                except Exception:
-                    pass
-            try:
-                # 整棵进程组一起收：npx 之类的包装进程会把真正的 server 挂成
-                # 孙进程，只 terminate 顶层 PID 会留下孤儿。
-                try:
-                    import os
-                    import signal
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                except Exception:
-                    process.terminate()
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    import os
-                    import signal
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except Exception:
-                    process.kill()
-                # SIGKILL 后仍设超时：进程处于不可中断状态（D，常见于 NFS/
-                # FUSE I/O）时 wait() 会永久挂起，进而卡死 shutdown/重建。
-                # 这种情况下只能放弃等待，让 init 在进程退出后收尸。
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        "MCP server '%s': pid %d unkillable (D state?), giving up wait",
-                        self.name, process.pid,
-                    )
-            except Exception:
-                pass
+            self._terminate(process)
+
+        # 管道必须在进程结束之后才关：读线程正阻塞在 stdout.readline() 时，
+        # BufferedReader 的内部锁会让 close() 一直阻塞到子进程退出（实测一个
+        # 挂起 60s 的 server 会把 stop() 卡住 59s），而且因为旧实现把关管道
+        # 排在前面，SIGTERM 根本来不及发出去 —— 握手超时路径尤其明显。
+        if process:
+            if process.poll() is None:
+                # 进程还活着（D 状态等）：放弃关管道也比原地卡死好。管道会在
+                # 进程最终退出后随 GC 一起回收。
+                logger.warning(
+                    "MCP server '%s': pid %d still alive after terminate; "
+                    "skipping pipe close (would block on the reader thread)",
+                    self.name, process.pid,
+                )
+            else:
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    try:
+                        if pipe:
+                            pipe.close()
+                    except Exception:
+                        pass
         # Clear pending requests under the lock.
         with self._lock:
             self._process = None
@@ -217,6 +204,38 @@ class MCPClient:
         for t in (self._reader_thread, self._stderr_thread):
             if t and t.is_alive():
                 t.join(timeout=3)
+
+    def _terminate(self, process: "subprocess.Popen") -> None:
+        """SIGTERM → wait → SIGKILL → wait，全程带超时，绝不无限等待。"""
+        try:
+            # 整棵进程组一起收：npx 之类的包装进程会把真正的 server 挂成
+            # 孙进程，只 terminate 顶层 PID 会留下孤儿。
+            try:
+                import os
+                import signal
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except Exception:
+                process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                import os
+                import signal
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except Exception:
+                process.kill()
+            # SIGKILL 后仍设超时：进程处于不可中断状态（D，常见于 NFS/
+            # FUSE I/O）时 wait() 会永久挂起，进而卡死 shutdown/重建。
+            # 这种情况下只能放弃等待，让 init 在进程退出后收尸。
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "MCP server '%s': pid %d unkillable (D state?), giving up wait",
+                    self.name, process.pid,
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # public API
@@ -257,8 +276,15 @@ class MCPClient:
                         texts.append(json.dumps(block, ensure_ascii=False))
                 else:
                     texts.append(str(block))
-            return _cap_output("\n".join(texts))
-        return _cap_output(json.dumps(result, ensure_ascii=False))
+            text = _cap_output("\n".join(texts))
+        else:
+            text = _cap_output(json.dumps(result, ensure_ascii=False))
+        # MCP 规范：工具执行失败仍然是 JSON-RPC 成功响应，失败由 result.isError
+        # 标记。只检查 resp.error 会把 "permission denied" 之类的错误正文当成
+        # 成功结果喂给模型，模型会拿错误信息继续推理。
+        if result.get("isError"):
+            raise MCPError(f"MCP tool '{name}' failed: {text}")
+        return text
 
     # ------------------------------------------------------------------
     # JSON-RPC internals

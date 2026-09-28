@@ -625,6 +625,74 @@ def test_mcp_client_send_after_stop_raises_clean_error():
     assert raised == "mcp"
 
 
+def test_mcp_call_tool_reports_iserror_as_failure():
+    """MCP 规范里工具失败是 result.isError=true，必须报错而不是当成功结果。"""
+    from agent.tools.mcp_client import MCPClient, MCPError, JSONRPCResponse
+
+    c = MCPClient(name="t", command="true")
+    c._call = lambda method, params, timeout=None: JSONRPCResponse(
+        id=0,
+        result={"content": [{"type": "text", "text": "permission denied"}],
+                "isError": True},
+    )
+    try:
+        c.call_tool("boom", {})
+        assert False, "isError=true 必须被当作失败"
+    except MCPError as e:
+        assert "permission denied" in str(e)
+
+
+def test_mcp_stop_does_not_block_on_hung_server(tmp_path):
+    """server 挂起时 stop() 不能卡在管道 close() 上（读线程阻塞在 readline）。"""
+    import sys
+    import time
+    from agent.tools.mcp_client import MCPClient
+
+    script = tmp_path / "hang.py"
+    script.write_text("import time\ntime.sleep(30)\n")
+    c = MCPClient(name="hang", command=sys.executable, args=[str(script)], timeout=1)
+    t0 = time.time()
+    try:
+        c.start()
+    except Exception:
+        pass  # 握手必然超时
+    c.stop()
+    elapsed = time.time() - t0
+    assert elapsed < 12, f"stop() 被挂起的 server 卡住 {elapsed:.1f}s（旧实现会等到子进程退出）"
+
+
+def test_mcp_tool_rejects_missing_required_args():
+    """MCP 工具必须本地校验 required，否则缺参会原样发给远端。"""
+    from agent.tools.mcp_tool import MCPTool
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def call_tool(self, name, arguments):
+            self.calls.append((name, arguments))
+            return "ok"
+
+    client = FakeClient()
+    t = MCPTool(client, {
+        "name": "echo",
+        "description": "echo",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+        },
+    })
+    res = t.run()
+    assert not res.success
+    assert "message" in res.error and "Invalid arguments" in res.error
+    assert client.calls == [], "缺参时不该真的打到远端"
+
+    ok = t.run(message="hi")
+    assert ok.success and ok.output == "ok"
+    assert client.calls == [("echo", {"message": "hi"})]
+
+
 # ---------------------------------------------------------------------------
 # execute() argument validation vs internal errors (round 4)
 # ---------------------------------------------------------------------------

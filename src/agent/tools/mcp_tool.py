@@ -34,6 +34,17 @@ class MCPTool(Tool):
         pass
 
     def run(self, **kwargs) -> ToolResult:
+        # run(**kwargs) 吞掉所有参数，base.execute() 的签名预检对它无效：
+        # 缺 required 参数不会被拦下，而是原样发给远端。server 若不自己校验，
+        # 就会静默产生错误结果（模型拿到的是「成功」）。这里按 schema 先本地
+        # 校验，错误信息与 base.execute() 的口径一致，便于模型修正调用。
+        missing = [k for k in (self.parameters.get("required") or []) if k not in kwargs]
+        if missing:
+            return ToolResult(
+                success=False,
+                error=f"Invalid arguments for {self.name}: "
+                      f"missing required argument(s): {', '.join(missing)}",
+            )
         try:
             output = self._client.call_tool(self.name, kwargs)
             return ToolResult(success=True, output=output)
