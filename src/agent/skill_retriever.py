@@ -81,13 +81,19 @@ _EXAMPLES_HEADINGS = (
 # SKILL.md parsing
 # ---------------------------------------------------------------------------
 
+_BLOCK_SCALAR_RE = re.compile(r"^([>|])([+-]?)$")
+
+
 def _parse_frontmatter(text: str) -> Dict[str, Any]:
     """Parse the YAML frontmatter (``---`` delimited block) at the top.
 
     The frontmatter is simple key/value YAML; we parse top-level scalar fields
     (``name``, ``description``, ``license``, ``compatibility``,
-    ``allowed-tools``) and nested ``metadata`` (version, author), plus a
-    ``tags`` list if present.  Returns a flat dict.
+    ``allowed-tools``) plus a ``tags`` list if present.  Returns a flat dict.
+
+    支持块标量（``description: >-`` / ``|``）：社区与官方 SKILL.md 大量用
+    折叠块写多行 description，只按单行解析会把值取成 ">-"，技能照样进索引
+    但描述是垃圾 —— 语义检索永远召回不到它。
     """
     result: Dict[str, Any] = {}
     if not text.startswith("---"):
@@ -99,18 +105,39 @@ def _parse_frontmatter(text: str) -> Dict[str, Any]:
     fm_text = text[3:end]
 
     tags: List[str] = []
-    for raw in fm_text.splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            continue
-        # Nested metadata block — keep only version/author.
-        m = re.match(r"^\s*(\w[\w-]*)\s*:\s*(.*)$", line)
+    lines = fm_text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)(\w[\w-]*)\s*:\s*(.*)$", lines[i].rstrip())
         if not m:
+            i += 1
             continue
-        key, val = m.group(1), m.group(2).strip()
-        if key == "metadata":
-            # nested block: skip; we don't need version/author for retrieval
+        indent, key, val = len(m.group(1)), m.group(2), m.group(3).strip()
+        if indent > 0:
+            # 嵌套块（metadata: 之类）内的行，不作为顶层字段解析。
+            i += 1
             continue
+
+        block = _BLOCK_SCALAR_RE.match(val)
+        if block:
+            kind = block.group(1)
+            i += 1
+            collected: List[str] = []
+            while i < len(lines):
+                ln = lines[i]
+                if not ln.strip():
+                    collected.append("")
+                    i += 1
+                    continue
+                if not ln[:1].isspace():
+                    break  # 缩进行结束，回到顶层
+                collected.append(ln.strip())
+                i += 1
+            # '>' 折叠：换行变空格；'|' 字面：保留换行。
+            val = " ".join(x for x in collected if x) if kind == ">" else "\n".join(collected).strip()
+        else:
+            i += 1
+
         # strip surrounding quotes
         if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
             val = val[1:-1]
@@ -266,6 +293,50 @@ def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
 # Scanner
 # ---------------------------------------------------------------------------
 
+def _walk_skill_dirs(root: str):
+    """Yield ``(dirpath, dirnames, filenames)`` like ``os.walk``, but following
+    directory symlinks.
+
+    ``os.walk`` 默认 ``followlinks=False``：符号链接的技能目录会被列进
+    ``dirs`` 但不会被递归进去，里面的 SKILL.md 永远扫不到。而把外部技能
+    ``ln -s`` 挂进 skills/ 是最常见的用法（例如链接 ~/.claude/skills/*），
+    旧行为等于这些技能不存在。
+
+    跟随链接必须自己防环：自引用/互引用的链接会让递归无限下去，这里用
+    realpath 集合去重（同一个目录不会被第二次展开）。
+    """
+    visited = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            real = os.path.realpath(current)
+        except OSError:
+            continue
+        if real in visited:
+            continue
+        visited.add(real)
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        dirs: List[str] = []
+        files: List[str] = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=True):
+                    dirs.append(e.name)
+                elif e.is_file():
+                    files.append(e.name)
+            except OSError:
+                continue
+        # 先 yield 再压栈：调用方（scan/_dir_mtime）会就地裁剪 dirs 做剪枝，
+        # 裁剪结果必须能被下面的入栈逻辑看到。
+        yield current, dirs, files
+        for name in reversed(sorted(dirs)):
+            stack.append(os.path.join(current, name))
+
+
 class SkillScanner:
     """Recursively scan a skills directory for SKILL.md files.
 
@@ -293,7 +364,7 @@ class SkillScanner:
         if not os.path.isdir(self._dir):
             return 0.0
         try:
-            for root, dirs, files in os.walk(self._dir):
+            for root, dirs, files in _walk_skill_dirs(self._dir):
                 dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
                 try:
                     mtime = os.stat(root).st_mtime
@@ -331,7 +402,7 @@ class SkillScanner:
                 return list(self._skills)
             skills: List[SkillMetadata] = []
             if os.path.isdir(self._dir):
-                for root, dirs, files in os.walk(self._dir):
+                for root, dirs, files in _walk_skill_dirs(self._dir):
                     dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
                     if _SKILL_FILENAME not in files:
                         continue
@@ -589,16 +660,35 @@ class SkillVectorStore:
         return {"added": len(added_dirs), "updated": len(updated_dirs), "removed": len(removed_dirs)}
 
     def _ensure_fts_index(self, table) -> None:
-        """Create a BM25 full-text index on the ``combined_fts`` column."""
+        """Create/refresh the BM25 full-text index on the ``combined_fts`` column.
+
+        必须 ``replace=True``：索引已存在时重复创建会抛
+        ``Index name 'combined_fts_idx' already exists``，于是每次 sync（新增/
+        修改/删除技能）都重建失败，索引停在首次建表时的快照上。
+        参数与 RAG 侧 ``VectorStore._ensure_fts_index`` 保持一致（jieba 预分词
+        列 + simple tokenizer，不 stem、不做 ascii folding，否则中文词形被破坏）。
+        """
+        fts_kwargs = dict(
+            base_tokenizer="simple",
+            lower_case=True,
+            stem=False,
+            remove_stop_words=False,
+            ascii_folding=False,
+            with_position=True,
+        )
         try:
             from lancedb.index import FTS
-            table.create_index("combined_fts", config=FTS())
-        except Exception:
-            # lancedb 0.25.x fallback
+            table.create_index("combined_fts", config=FTS(**fts_kwargs), replace=True)
+        except TypeError:
+            # lancedb 0.25.x 的 create_index 无 config 参数。
             try:
-                table.create_fts_index("combined_fts", use_tantivy=False)
+                table.create_fts_index(
+                    "combined_fts", use_tantivy=False, replace=True, **fts_kwargs
+                )
             except Exception as e:
                 logger.warning("skill_retriever: BM25 index failed (fallback to vector only): %s", e)
+        except Exception as e:
+            logger.warning("skill_retriever: BM25 index failed (fallback to vector only): %s", e)
 
     def search_vector(self, query: str, top_k: int = _VECTOR_TOP_K) -> List[Dict[str, Any]]:
         """Vector search. Returns [{dir, name, tags, description, score}]."""
@@ -799,7 +889,14 @@ class SkillRetriever:
 
         candidates = list(merged.values())
         # Filter by minimum similarity (vector similarity in [0,1]).
-        candidates = [c for c in candidates if c["score"] >= _MIN_SIMILARITY]
+        # 但 BM25 命中本身就是关键词证据，不能因为余弦没过阈值就丢掉：缩写 /
+        # 专有名词 / 跨语言查询下余弦天然偏低（实测查询 "CI" 对中文描述的技能
+        # BM25 命中 0.88、余弦 0.478 —— 旧逻辑会把它整条丢弃，模型只看到
+        # 「找不到匹配的技能」）。这类候选保留但分数仍是余弦，排序自然靠后。
+        candidates = [
+            c for c in candidates
+            if c["score"] >= _MIN_SIMILARITY or c.get("bm25_score", 0) > 0
+        ]
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
         if not candidates:
@@ -892,11 +989,21 @@ class SkillRetriever:
         return None
 
     def read_skill_dir(self, dir: str) -> Optional[str]:
-        """Return the absolute path to a skill's directory (for reading support files)."""
-        base = os.path.realpath(self._skills_dir)
-        resolved = os.path.realpath(os.path.join(base, dir))
-        if resolved == base or not resolved.startswith(base + os.sep):
+        """Return the absolute path to a skill's directory (for reading support files).
+
+        ``dir`` 由模型提供 → 拒绝绝对路径与 ``..`` 穿越（这两类不是用户建立
+        的链接，而是调用方的恶意输入）。但**允许**技能目录本身是符号链接：
+        外部技能常以 ``ln -s`` 挂载，此时 realpath 必然落在 skills 目录之外，
+        旧实现的 ``startswith(base)`` 校验会把它们一律判为非法 —— 既搜不到
+        也读不出。链接是用户自己建立的，风险由用户承担。
+        """
+        dir = (dir or "").strip()
+        if not dir or os.path.isabs(dir) or ".." in dir.replace("\\", "/").split("/"):
             return None
+        base = os.path.realpath(self._skills_dir)
+        # 到这里为止路径在词法上仍位于 base 之内；唯一能走出 base 的途径就是
+        # 链接，而这正是要放行的情况。
+        resolved = os.path.realpath(os.path.join(base, dir))
         if os.path.isdir(resolved):
             return resolved
         return None
