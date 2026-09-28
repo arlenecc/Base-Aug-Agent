@@ -583,6 +583,21 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 56 | `_get_extract_llm()` 阻塞等 `_fact_extract_lock` | **确认弹窗被抽取线程阻塞最长一个 LLM 请求（~120s）**，与「不延迟弹窗」意图相反 | 非阻塞取锁，取不到直接复用 `self.llm` |
 | 57 | `memory_search` 关键词兜底路径完全忽略 `top_k` | 未装 rag 依赖时（默认路径）一次查询灌入全部观察 | `_keyword_search` 接收并生效 top_k |
 | 58 | 技能分词用 `\w+` 对中文失效 | `"提取pdf表格"` 成单 token，中文关键词**永远匹配不上** | 补 CJK 整串 + bigram |
+| 59 | `mcp.stop()` 先关管道再发 SIGTERM | 读线程阻塞在 `readline()` 时 `close()` 等到子进程退出（实测挂起 60s 的 server 卡 59s），且信号根本发不出去 | 先 `killpg` + 带超时 `wait`，进程退出后才关管道；仍存活则放弃关管道 |
+| 60 | `call_tool` 只看 JSON-RPC `error`，忽略 `result.isError` | 工具失败（"permission denied"）被当成成功结果喂给模型 | `isError` 为真时抛 `MCPError`，错误正文一并带出 |
+| 61 | MCP 工具不校验 `required`（`run(**kwargs)` 使签名预检失效） | 缺参原样发到远端，server 不校验时静默产生错误结果 | 按 `inputSchema.required` 本地校验，缺参不发请求 |
+| 62 | skill 扫描 `os.walk` 不跟随链接 + `read_skill_dir` 用 realpath 判包含 | **`ln -s` 挂载的外部技能完全搜不到、也读不出来**（最常用挂载方式） | 自写 walker 跟随链接 + realpath 集合防环；`read_skill_dir` 只拦绝对路径与 `..` |
+| 63 | SKILL.md frontmatter 只按单行解析 | `description: >-` 折叠块被解析成 `"-"`，技能进了索引但语义检索**永远召回不到** | 支持 `>` / `\|` 块标量；缩进行不再污染顶层字段 |
+| 64 | skill BM25 索引缺 `replace=True` | 每次 sync 重建失败（`index already exists`），索引停在首建快照 | 与 RAG 侧一致：`replace=True` + simple tokenizer 参数 |
+| 65 | `retrieve()` 用向量阈值统一过滤 BM25 候选 | 关键词精确命中（实测查询 "CI"：BM25 0.88、余弦 0.478）被整体丢弃 | BM25 命中不再受余弦阈值影响，排序仍用余弦 |
+| 66 | `list_sources` 用 `to_arrow(columns=[...])`（lancedb 0.25 不支持该参数） | 两次调用都抛 `TypeError` → 永远回退全表**全列**物化（含 768 维向量），而它每轮对话都被 `_system_prompt()` 调一次：2 万切片 **7.5s**、内存 GB 级 | 只投影 `source` 列（2 万切片 7.47s → 35ms，结果一致） |
+| 67 | LLM 调用失败即整轮终止 | 首字节前的网络抖动 / 429 / 502 让用户白等一场，只能手动重发 | 仅在「未收到任何 chunk」时退避重试 2 次；已吐内容、上下文过长、4xx 不重试 |
+| 68 | 多个独立工具串行执行 | 多工具回合 wall time = Σ（每个 0.4s 的两个调用要 0.8s） | 只读白名单工具并发执行（UI 回调仍在主线程发出，历史保持原序）；写操作永不并发 |
+| 69 | 工具执行期间无法响应取消 | `shell_run` 最长 600s、MCP `tools/call` 300s → 点「终止对话」要等它跑完 | 工具放到线程执行，主线程 0.1s 轮询取消，命中立即返回合成结果 |
+| 70 | 历史里旧 tool 输出从不裁剪（单条上限 200K） | 上下文随轮次线性膨胀，且每轮整体重发 | 较早的 tool 结果裁剪为 head+tail 并标注（末尾 6 条不动）；需要完整内容可重新调用 |
+| 71 | tools schema 每轮、每次迭代都重建 | 工具集固定后的无谓开销 | 缓存 schema 列表与 token 估算 |
+| 72 | 迭代上限耗尽只写日志 | 回复戛然而止，模型以为任务已完成 | 追加一条 user 角色提示：先总结进展，再询问是否继续 |
+| 73 | 「流未收到 done 事件」日志连写两行 | 日志噪音 | 去重 |
 | 59 | `GraphMemoryStore.close()` 只置 None 从不 close | 每次「应用配置」泄漏一个 LanceDB 连接 | 显式 close + 重置 `_vec_tried` |
 | 60 | 工具层 RAG 引擎初始化在 try 之外 | 知识库不可用时**所有工具（文件/shell/web）一起失效** | 整段包 try，失败仅跳过 RAG 工具 |
 | 61 | `shell_run` 的 `timeout` 无上下限钳制 | 传 99999 → 阻塞 27h 且无法取消；传 0 → 立刻 kill | 钳制到 [1s, 600s] |

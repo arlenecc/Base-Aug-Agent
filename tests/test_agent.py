@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Iterator, List
 
@@ -1270,3 +1271,206 @@ def test_agent_cancel_skips_remaining_tools_and_keeps_history_consistent(
     tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
     assert len(tool_msgs) == 2
     assert "取消" in tool_msgs[1]["content"] or "取消" in (tool_msgs[1].get("content") or "")
+
+
+# ---------------------------------------------------------------------------
+# Harness: LLM 重试 / 工具并发 / 工具执行中取消 / 历史裁剪
+# ---------------------------------------------------------------------------
+
+class FlakyLLM:
+    """前 N 次调用直接抛错（首字节前失败），之后返回正常脚本。"""
+
+    def __init__(self, failures, script):
+        self.failures = failures
+        self.script = script
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None, temperature=0.7):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("connection reset")
+        return iter(self.script)
+
+
+class PartialThenFailLLM:
+    """先吐出内容再断流 —— 不该重试（重试会把两段内容拼在一起）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None, temperature=0.7):
+        self.calls += 1
+
+        def _gen():
+            yield _evt("content", "half")
+            raise RuntimeError("stream cut")
+
+        return _gen()
+
+
+def test_llm_retries_before_first_chunk(config, recording_callbacks, monkeypatch):
+    """首字节前的失败（网络抖动/502）应退避重试，而不是整轮失败。"""
+    import agent.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+    mock = FlakyLLM(1, [_evt("content", "ok"), _evt("done", usage={"total_tokens": 3})])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+
+    assert agent.run("hi") == "ok"
+    assert mock.calls == 2
+
+
+def test_llm_does_not_retry_after_partial_output(config, recording_callbacks, monkeypatch):
+    """已经吐过内容的流中断后不能重试。"""
+    import agent.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+    mock = PartialThenFailLLM()
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+
+    agent.run("hi")
+    assert mock.calls == 1, "半截输出后重试会把两段内容拼在一起"
+
+
+def test_context_length_error_is_not_retried(config, recording_callbacks, monkeypatch):
+    """上下文过长交给收缩逻辑处理，重试同一个超长 prompt 没有意义。"""
+    import agent.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+
+    class TooLongLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream(self, messages, tools=None, temperature=0.7):
+            self.calls += 1
+            raise RuntimeError("context_length_exceeded: prompt is too long")
+
+    mock = TooLongLLM()
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("hi")
+    assert mock.calls == 1
+
+
+class SlowReadTool:
+    """只读的慢工具，用于验证并发执行。"""
+
+    name = "slow_read"
+    description = "slow read-only tool"
+    parameters = {"type": "object", "properties": {"i": {"type": "integer"}}}
+    destructive = False
+
+    def bind(self, config, registry):
+        pass
+
+    def should_confirm(self, args):
+        return False
+
+    def schema(self):
+        return {"type": "function",
+                "function": {"name": self.name, "description": self.description,
+                             "parameters": self.parameters}}
+
+    def run(self, i: int = 0):
+        time.sleep(0.4)
+        from agent.tools.base import ToolResult
+        return ToolResult(True, output=f"R{i}")
+
+
+def test_independent_read_only_tools_run_in_parallel(config, recording_callbacks, monkeypatch):
+    """多个互相独立的只读工具并发执行：wall time 从 Σ 降为 max。"""
+    import agent.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_PARALLEL_SAFE_TOOLS", frozenset({"slow_read"}))
+    tc = [
+        {"id": "c1", "function": {"name": "slow_read", "arguments": json.dumps({"i": 1})}},
+        {"id": "c2", "function": {"name": "slow_read", "arguments": json.dumps({"i": 2})}},
+    ]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 6})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.tools._tools["slow_read"] = SlowReadTool()
+
+    t0 = time.time()
+    agent.run("read both")
+    elapsed = time.time() - t0
+    assert elapsed < 0.75, f"串行执行了？两个 0.4s 的工具耗时 {elapsed:.2f}s"
+
+    # 历史顺序必须仍与 tool_calls 一致
+    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2"]
+    assert [m["content"] for m in tool_msgs] == ["R1", "R2"]
+
+
+def test_cancel_during_tool_execution_returns_promptly(config, recording_callbacks, monkeypatch):
+    """工具执行期间取消：不能等工具跑完（shell/MCP 可能是几分钟）。"""
+    import agent.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "_PARALLEL_SAFE_TOOLS", frozenset())
+    cbs = recording_callbacks
+    t_start = time.time()
+    cbs.is_cancelled = lambda: (time.time() - t_start) > 0.15
+
+    tc = [{"id": "c1", "function": {"name": "slow_read", "arguments": json.dumps({"i": 1})}}]
+    mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=cbs)
+    agent.tools._tools["slow_read"] = SlowReadTool()
+
+    t0 = time.time()
+    agent.run("read")
+    elapsed = time.time() - t0
+    assert elapsed < 0.35, f"取消后仍等了 {elapsed:.2f}s（工具本身要跑 0.4s）"
+    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
+    assert tool_msgs and "取消" in tool_msgs[0]["content"]
+
+
+def test_old_tool_outputs_are_trimmed(config, recording_callbacks, monkeypatch):
+    """历史里较早的超长 tool 输出必须被裁剪，否则上下文随轮次线性膨胀。"""
+    import agent.agent as agent_mod
+
+    agent = Agent(llm=MockLLM([[_evt("content", "ok"), _evt("done", usage={})]]),
+                  config=config, callbacks=recording_callbacks)
+    big = "x" * 50_000
+    agent._history.append({"role": "tool", "tool_call_id": "c0", "name": "file_read",
+                           "content": big})
+    for i in range(8):
+        agent._history.append({"role": "user", "content": f"msg {i}"})
+
+    agent.run("next")
+
+    trimmed = agent._history[0]["content"]
+    assert len(trimmed) < 12_000, f"未裁剪: {len(trimmed)}"
+    assert agent_mod._TOOL_TRIM_MARKER in trimmed
+    # 最近的 tool 输出不受影响
+    assert len(agent._history) > 1
+
+
+def test_max_iterations_leaves_continuation_hint(config, recording_callbacks):
+    """迭代上限耗尽时，必须让下一轮知道上一轮是被截断的。"""
+    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
+        f.write("A")
+    tc = [{"id": "c1", "function": {"name": "file_read",
+                                    "arguments": json.dumps({"path": "a.txt"})}}]
+    mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.max_iterations = 1
+
+    agent.run("read")
+    last = agent._history[-1]
+    assert last.get("role") == "user"
+    assert "最大迭代次数" in last["content"]
+
+
+def test_tools_schemas_are_cached(config, recording_callbacks):
+    """工具 schema 在注册表构造后即固定，不该每轮重建。"""
+    mock = MockLLM([
+        [_evt("content", "a"), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "b"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("one")
+    agent.run("two")
+    assert mock.calls[0]["tools"] is mock.calls[1]["tools"]
+    assert agent._tools_schemas() is agent._tools_schemas()

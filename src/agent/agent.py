@@ -126,6 +126,43 @@ _MAX_FACT_CHARS = 120           # 单条事实字符上限
 _MAX_SKILL_PROMPT_CHARS = 1500  # 命中技能 prompt 的字符上限
 _MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
 
+# ---------------------------------------------------------------------------
+# Harness 调优参数
+# ---------------------------------------------------------------------------
+
+# 历史里较早的 tool 结果裁剪阈值（字符）。单条工具输出上限是 200K，历史保留
+# 50 条 —— 不裁剪的话每轮都要把几 MB 的旧输出整个重发给模型。只裁剪「已经
+# 过去若干条消息」的旧结果，最近的保持原样，模型需要完整内容可以重新调用。
+_MAX_HISTORY_TOOL_CHARS = 8_000
+_TOOL_TRIM_HEAD = 6_000
+_TOOL_TRIM_TAIL = 1_500
+# 末尾多少条消息不做裁剪（保护当前回合的工具结果）。
+_TOOL_TRIM_KEEP_RECENT = 6
+_TOOL_TRIM_MARKER = "…[历史工具输出已裁剪"
+
+# 并发执行的工具上限。模型一次返回多个互相独立的只读调用时（多个 file_read /
+# rag_search / web_scan），串行会让 wall time 变成 Σ，并发后是 max。
+_MAX_PARALLEL_TOOLS = 8
+# 允许并发的工具白名单：纯只读、彼此无顺序依赖。写操作（file_write /
+# file_modify）即使 destructive=False（工作区锁定）也不能并发——两个写操作
+# 可能落在同一个文件上。
+#
+# 只放真正耗时的 I/O / 检索型工具：并发的收益来自网络与向量检索的等待，
+# 本地瞬时操作并发意义不大，却会改变「取消后剩余调用逐个跳过」的既有语义
+# （两个 file_read 同时启动后，中途取消就无法再拦住第二个）。因此 file_read /
+# skill_load / rag_status / memory_graph 保持串行。
+_PARALLEL_SAFE_TOOLS = frozenset({
+    "web_scan",                                   # 网络请求
+    "rag_search", "rag_outline",                  # 向量 + BM25 检索
+    "skill_search", "skill_semantic_search",      # 技能检索（含 LanceDB 查询）
+    "memory_search",                              # 长期记忆语义检索
+})
+
+# LLM 调用失败重试：仅在「一个 chunk 都没收到」时重试（网络抖动、429/502、
+# 连接超时都发生在首字节之前，此时重试不会产生重复输出）。已经吐过内容的
+# 流中断后重试会把两段内容拼在一起，因此不重试。
+_LLM_RETRY_BASE_DELAY = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Agent
@@ -172,6 +209,11 @@ class Agent:
         # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
         self._tool_schema_tokens_cache: Optional[int] = None
         self._tool_schema_tokens_turn = -1
+        # schema 列表缓存：工具集在 ToolRegistry 构造完成后就不再变化（MCP 工具
+        # 也是在 __init__ 里注册的），没必要每轮、每次迭代都重建一遍 dict。
+        self._tools_schemas_cache: Optional[List[Dict[str, Any]]] = None
+        # LLM 首字节前失败的退避重试次数（见 run() 的流式重试）。
+        self._max_llm_retries = 2
 
         # 事实抽取的防堆叠锁。必须用 RLock：_extract_facts_sync 持锁期间会调
         # _get_extract_llm()，后者也要 acquire 同一把锁（普通 Lock 会自锁死，
@@ -261,21 +303,57 @@ class Agent:
         tools_tokens = self._tool_schema_tokens()
         return system_tokens + history_tokens + tools_tokens
 
+    def _tools_schemas(self) -> List[Dict[str, Any]]:
+        """Cached tool schemas (sent with every request).
+
+        工具集在 ToolRegistry 构造完成后即固定，旧实现每次 LLM 调用都重建
+        一遍（每轮至少两次：chat_stream + _tool_schema_tokens），纯属浪费。
+        """
+        if self._tools_schemas_cache is None:
+            try:
+                self._tools_schemas_cache = self.tools.schemas() if self.tools else []
+            except Exception:
+                self._tools_schemas_cache = []
+        return self._tools_schemas_cache
+
     def _tool_schema_tokens(self) -> int:
         """Cached token estimate of the tools schema (JSON sent every request)."""
-        n = len(self._history)
         cached = getattr(self, "_tool_schema_tokens_cache", None)
-        if cached is not None and self._tool_schema_tokens_turn == n:
+        if cached is not None:
             return cached
         try:
-            schemas = self.tools.schemas() if self.tools else []
+            schemas = self._tools_schemas()
             text = json.dumps(schemas, ensure_ascii=False) if schemas else ""
             est = _estimate_tokens(text) if text else 0
         except Exception:
             est = 0
         self._tool_schema_tokens_cache = est
-        self._tool_schema_tokens_turn = n
         return est
+
+    def _trim_old_tool_outputs(self) -> None:
+        """裁剪历史中较早的 tool 结果，抑制上下文随轮次线性膨胀。
+
+        只处理「末尾 _TOOL_TRIM_KEEP_RECENT 条之外」的 tool 消息：当前回合的
+        工具输出必须完整保留。裁剪成 head+tail，而不是整条丢掉——模型至少还
+        看得到开头与结尾（错误/总结常在结尾）。已裁剪过的用标记识别，避免
+        反复截断。
+        """
+        if len(self._history) <= _TOOL_TRIM_KEEP_RECENT:
+            return
+        for msg in self._history[:-_TOOL_TRIM_KEEP_RECENT]:
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) <= _MAX_HISTORY_TOOL_CHARS:
+                continue
+            if _TOOL_TRIM_MARKER in content:
+                continue
+            msg["content"] = (
+                content[:_TOOL_TRIM_HEAD]
+                + f"\n{_TOOL_TRIM_MARKER}：原 {len(content)} 字符；"
+                f"需要完整内容请重新调用该工具]\n"
+                + content[-_TOOL_TRIM_TAIL:]
+            )
 
     def _should_shrink_context(self) -> bool:
         """Return True if the estimated context size exceeds the shrink
@@ -782,16 +860,19 @@ class Agent:
                     shrink_count += 1
                     continue  # re-evaluate; don't burn an iteration on shrink
 
+            # 裁剪较早的 tool 输出（在发给模型之前），抑制历史随轮次膨胀。
+            self._trim_old_tool_outputs()
+
             iteration += 1
             messages = self._build_messages()
             self._log(f"[iter {iteration}] -> LLM ({self.config.model})")
 
-            content_buf = []
-            reasoning_buf = []
+            content_buf: List[str] = []
+            reasoning_buf: List[str] = []
             tool_calls: List[Dict[str, Any]] = []
             usage: Dict[str, int] = {}
             t0 = time.time()
-            ttfb = None  # time to first byte — set on first content/reasoning chunk
+            ttfb: Optional[float] = None  # time to first byte — set on first chunk
             completion_tokens = 0
             # Live token-speed every 0.3s during streaming.
             # Start at None (not 0.0) so the first chunk doesn't immediately
@@ -809,51 +890,93 @@ class Agent:
             # which is tiny. The total is O(Σ chunk_len) = O(N) across the
             # whole turn, versus O(N²/0.3) for the naive approach.
             live_est_tokens = 0
+            attempt = 0
 
             try:
-                for ev in self.llm.chat_stream(
-                    messages, tools=self.tools.schemas(), temperature=self.config.temperature
-                ):
-                    # 流式期间也轮询取消（bool 检查，代价可忽略），否则长回复
-                    # 期间点「终止对话」要等整个回复生成完才生效。
-                    if self.callbacks.is_cancelled():
-                        self._log("[agent] 取消：中断流式读取")
-                        cancelled_mid_stream = True
-                        break
-                    if ev.type == "content":
-                        content_buf.append(ev.content)
-                        self.callbacks.on_content(ev.content)
-                        live_est_tokens += _estimate_tokens(ev.content)
-                    elif ev.type == "reasoning":
-                        reasoning_buf.append(ev.content)
-                        self.callbacks.on_reasoning(ev.content)
-                        live_est_tokens += _estimate_tokens(ev.content)
-                    elif ev.type == "done":
-                        seen_done = True
-                        tool_calls = ev.tool_calls
-                        usage = ev.usage
-                        # 网关可能返回 null → `or 0` 归一，避免后续算术抛 TypeError
-                        # 并被误报成「LLM 流错误」。
-                        completion_tokens = usage.get("completion_tokens") or 0
-                        continue  # final speed is emitted below; skip live emit
-                    # Live token-speed every 0.3s during streaming.
-                    # First chunk: record TTFB but don't emit yet (we need at
-                    # least 0.3s of generation to compute a meaningful speed).
-                    now = time.time()
-                    if ttfb is None:
-                        ttfb = now
-                    if last_speed_emit is None:
-                        last_speed_emit = now
-                    elif now - last_speed_emit >= 0.3:
-                        # Use generation time (now - ttfb), not total time
-                        # (now - t0), to exclude TTFB from the speed calc.
-                        gen_elapsed = max(now - ttfb, 1e-6)
-                        if live_est_tokens > 0:
-                            live_speed = live_est_tokens / gen_elapsed
-                            self.callbacks.on_token_speed(
-                                self._total_tokens + live_est_tokens, live_speed
-                            )
-                        last_speed_emit = now
+                while True:
+                    # 重试前必须清空上一轮的半截缓冲，否则两次尝试的内容会
+                    # 被拼成一条回复。
+                    content_buf = []
+                    reasoning_buf = []
+                    tool_calls = []
+                    usage = {}
+                    ttfb = None
+                    completion_tokens = 0
+                    last_speed_emit = None
+                    seen_done = False
+                    live_est_tokens = 0
+                    got_any_chunk = False
+                    try:
+                        for ev in self.llm.chat_stream(
+                            messages, tools=self._tools_schemas(),
+                            temperature=self.config.temperature,
+                        ):
+                            got_any_chunk = True
+                            # 流式期间也轮询取消（bool 检查，代价可忽略），否则
+                            # 长回复期间点「终止对话」要等整个回复生成完才生效。
+                            if self.callbacks.is_cancelled():
+                                self._log("[agent] 取消：中断流式读取")
+                                cancelled_mid_stream = True
+                                break
+                            if ev.type == "content":
+                                content_buf.append(ev.content)
+                                self.callbacks.on_content(ev.content)
+                                live_est_tokens += _estimate_tokens(ev.content)
+                            elif ev.type == "reasoning":
+                                reasoning_buf.append(ev.content)
+                                self.callbacks.on_reasoning(ev.content)
+                                live_est_tokens += _estimate_tokens(ev.content)
+                            elif ev.type == "done":
+                                seen_done = True
+                                tool_calls = ev.tool_calls
+                                usage = ev.usage
+                                # 网关可能返回 null → `or 0` 归一，避免后续算术抛
+                                # TypeError 并被误报成「LLM 流错误」。
+                                completion_tokens = usage.get("completion_tokens") or 0
+                                continue  # final speed is emitted below; skip live emit
+                            # Live token-speed every 0.3s during streaming.
+                            # First chunk: record TTFB but don't emit yet (we need
+                            # at least 0.3s of generation for a meaningful speed).
+                            now = time.time()
+                            if ttfb is None:
+                                ttfb = now
+                            if last_speed_emit is None:
+                                last_speed_emit = now
+                            elif now - last_speed_emit >= 0.3:
+                                # Use generation time (now - ttfb), not total time
+                                # (now - t0), to exclude TTFB from the speed calc.
+                                gen_elapsed = max(now - ttfb, 1e-6)
+                                if live_est_tokens > 0:
+                                    live_speed = live_est_tokens / gen_elapsed
+                                    self.callbacks.on_token_speed(
+                                        self._total_tokens + live_est_tokens, live_speed
+                                    )
+                                last_speed_emit = now
+                        break  # 收流完成（或被取消中断）→ 退出重试循环
+                    except Exception as e:
+                        # 只有「一个 chunk 都没收到」的失败才重试：网络抖动、
+                        # 429/502、连接超时都发生在首字节之前，此时重试不会
+                        # 产生重复输出。已经吐过内容的流中断后重试会把两段
+                        # 内容拼在一起，因此直接抛出。
+                        if got_any_chunk or attempt >= self._max_llm_retries:
+                            raise
+                        err_s = str(e)
+                        # 上下文过长交给下面的收缩逻辑处理（重试同一个超长
+                        # prompt 只会再失败一次）；4xx 是请求本身的问题
+                        # （参数/鉴权），重试同样没有意义。
+                        if self._is_context_too_long_error(err_s) or re.search(
+                            r"HTTP 4\d\d", err_s
+                        ):
+                            raise
+                        attempt += 1
+                        delay = _LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        self._log(
+                            f"[agent] LLM 调用失败（尚未收到输出），{delay:.1f}s 后重试 "
+                            f"({attempt}/{self._max_llm_retries}): {e}"
+                        )
+                        if self.callbacks.is_cancelled():
+                            raise
+                        time.sleep(delay)
             except Exception as e:
                 err_str = str(e)
                 # Friendly message for streaming read timeouts (the most common
@@ -893,9 +1016,6 @@ class Agent:
                 return final_content
 
             if not seen_done and (content_buf or reasoning_buf or tool_calls):
-                # The stream ended without an explicit "done" event — likely a
-                # network cut or server-side truncation. Log so it's visible.
-                self._log("[agent] warning: LLM stream ended without 'done' event")
                 # The stream ended without an explicit "done" event — likely a
                 # network cut or server-side truncation. Log so it's visible.
                 self._log("[agent] warning: LLM stream ended without 'done' event")
@@ -1000,19 +1120,26 @@ class Agent:
                 self.callbacks.on_finished()
                 return final_content
 
-            # execute each tool call
-            for tc in tool_calls:
+            # --- 执行工具调用 ---
+            # 分两阶段：先顺序处理「需交互/已确定结果」的调用（取消、参数解析
+            # 失败、未知工具、需确认——确认必须与用户交互，不能并发）；再把
+            # 剩下互相独立、只读的调用并发执行（多工具回合的 wall time 从 Σ
+            # 降为 max）。历史始终按 tool_calls 原序写入。
+            from .tools import ToolResult
+
+            results: Dict[int, Any] = {}
+            parallel_jobs: List[Tuple[int, str, Dict[str, Any]]] = []
+
+            for idx, tc in enumerate(tool_calls):
                 fn = tc.get("function", {}) or {}
                 name = fn.get("name", "")
                 raw_args = fn.get("arguments", "")
 
-                # 协作式取消：每个工具执行前检查。终止后必须为剩余的每个
-                # tool_call 补一条合成 tool 消息——assistant_msg 里的
-                # tool_calls 已经写入历史，缺少对应的 tool 结果会导致下一轮
-                # 请求被 OpenAI 兼容 API 以 HTTP 400 拒绝（悬挂 tool_calls）。
+                # 协作式取消：终止后必须为剩余的每个 tool_call 补一条合成
+                # tool 消息——assistant_msg 里的 tool_calls 已写入历史，缺少
+                # 对应结果会让下一轮请求被 API 以 HTTP 400 拒绝（悬挂 tool_calls）。
                 if self.callbacks.is_cancelled():
                     self._log(f"[tool] {name} 已因用户取消而跳过")
-                    from .tools import ToolResult
                     try:
                         skip_args = parse_args(raw_args)
                     except ValueError:
@@ -1020,7 +1147,7 @@ class Agent:
                     self.callbacks.on_tool_start(name, skip_args)
                     res = ToolResult(False, error="用户取消了对话，工具未执行")
                     self.callbacks.on_tool_end(name, res)
-                    self._history.append(self._tool_message(tc, res))
+                    results[idx] = res
                     continue
 
                 # Parse arguments. Malformed JSON must be reported to the model
@@ -1030,18 +1157,15 @@ class Agent:
                     args = parse_args(raw_args)
                 except ValueError as e:
                     self._log(f"[tool] {name} arg-parse error: {e}")
-                    from .tools import ToolResult
                     # Notify UI of start (with raw args for visibility) before
                     # reporting the failure, so the UI shows a complete cycle.
                     self.callbacks.on_tool_start(name, {"_raw_arguments": raw_args})
                     res = ToolResult(False, error=str(e))
                     self.callbacks.on_tool_end(name, res)
-                    msg = self._tool_message(tc, res)
-                    self._history.append(msg)
+                    results[idx] = res
                     continue
 
                 tool = self.tools.get(name)
-
                 needs_confirm = bool(tool and tool.should_confirm(args)) if tool else False
                 self._log(f"[tool] {name}({raw_args}) needs_confirm={needs_confirm}")
 
@@ -1050,36 +1174,126 @@ class Agent:
                     self.callbacks.on_tool_start(name, args)
                     res = self.tools.execute(name, args)  # returns unknown error
                     self.callbacks.on_tool_end(name, res)
-                    msg = self._tool_message(tc, res)
-                    self._history.append(msg)
+                    results[idx] = res
                     continue
 
                 if needs_confirm:
                     confirm_msg = self._confirm_message(name, args)
                     if not self.callbacks.confirm(confirm_msg):
                         self._log(f"[tool] {name} DENIED by user")
-                        from .tools import ToolResult
                         # Tool never actually started (user declined before
                         # invocation); only report the denial result. The UI
                         # intentionally does not receive on_tool_start here so
                         # that "never started" semantics are preserved.
                         res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
                         self.callbacks.on_tool_end(name, res)
-                        msg = self._tool_message(tc, res)
-                        self._history.append(msg)
+                        results[idx] = res
                         continue
+                    self.callbacks.on_tool_start(name, args)
+                    res = self._execute_tool(name, args)
+                    self._log_tool_result(name, res)
+                    self.callbacks.on_tool_end(name, res)
+                    results[idx] = res
+                    continue
+
+                if name in _PARALLEL_SAFE_TOOLS:
+                    parallel_jobs.append((idx, name, args))
+                    continue
 
                 self.callbacks.on_tool_start(name, args)
-                res = self.tools.execute(name, args)
+                res = self._execute_tool(name, args)
+                self._log_tool_result(name, res)
                 self.callbacks.on_tool_end(name, res)
-                self._log(f"[tool] {name} -> success={res.success} "
-                          f"out_len={len(res.output)} err={(res.error or '')[:120]}")
-                msg = self._tool_message(tc, res)
-                self._history.append(msg)
+                results[idx] = res
+
+            if parallel_jobs:
+                self._run_parallel_tools(parallel_jobs, results)
+
+            # 按 tool_calls 原序写入历史（并发执行不改变顺序）
+            for idx, tc in enumerate(tool_calls):
+                res = results.get(idx)
+                if res is None:  # pragma: no cover - defensive
+                    res = ToolResult(False, error="工具未执行（harness 内部错误）")
+                self._history.append(self._tool_message(tc, res))
 
         self._log("[agent] max iterations reached, stopping.")
+        # 让下一轮知道上一轮是被迭代上限截断的：否则模型会以为任务已完成，
+        # 用户也会看到回复戛然而止却没有任何解释。
+        self._history.append({
+            "role": "user",
+            "content": (
+                f"[系统提示] 上一轮在达到最大迭代次数（{self.max_iterations}）后被中断，"
+                "任务可能尚未完成。请先总结已完成的进展，再询问用户是否继续。"
+            ),
+        })
         self.callbacks.on_finished()
         return final_content
+
+    # ------------------------------------------------------------------
+    # Tool execution helpers
+    # ------------------------------------------------------------------
+
+    def _log_tool_result(self, name: str, res) -> None:
+        self._log(f"[tool] {name} -> success={res.success} "
+                  f"out_len={len(res.output)} err={(res.error or '')[:120]}")
+
+    def _execute_tool(self, name: str, args: Dict[str, Any]):
+        """在后台线程执行工具，主线程轮询取消标志。
+
+        协作式取消原本只在工具**之间**轮询：单个 shell_run 最长 600s、MCP
+        tools/call 300s，用户点「终止对话」后要等它跑完才有反应。这里把执行
+        放进线程，主线程每 0.1s 检查一次取消标志，命中就立刻返回合成结果
+        （后台线程继续跑，由工具自身的超时/kill 逻辑收尾）。
+        """
+        from .tools import ToolResult
+
+        box: Dict[str, Any] = {}
+
+        def _target() -> None:
+            try:
+                box["res"] = self.tools.execute(name, args)
+            except Exception as e:  # pragma: no cover - defensive
+                box["res"] = ToolResult(False, error=f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=_target, daemon=True, name=f"tool-{name}")
+        t.start()
+        while True:
+            t.join(0.1)
+            if not t.is_alive():
+                break
+            if self.callbacks.is_cancelled():
+                self._log(f"[tool] {name} 执行中被取消，立即返回（后台仍在运行）")
+                return ToolResult(False, error="用户取消了对话，工具未执行完")
+        return box.get("res") or ToolResult(False, error="工具无返回值")
+
+    def _run_parallel_tools(
+        self,
+        jobs: List[Tuple[int, str, Dict[str, Any]]],
+        results: Dict[int, Any],
+    ) -> None:
+        """并发执行一组互相独立的只读工具，结果按索引回填。
+
+        UI 回调（on_tool_start / on_tool_end）全部在主线程发出，只有工具本身
+        在线程池里跑，因此界面上的工具顺序不受并发影响。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from .tools import ToolResult
+
+        workers = min(_MAX_PARALLEL_TOOLS, len(jobs))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tool-par") as ex:
+            futures = {}
+            for idx, name, args in jobs:
+                self.callbacks.on_tool_start(name, args)
+                futures[ex.submit(self._execute_tool, name, args)] = (idx, name)
+            for fut in as_completed(futures):
+                idx, name = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:  # pragma: no cover - defensive
+                    res = ToolResult(False, error=f"{type(e).__name__}: {e}")
+                self._log_tool_result(name, res)
+                self.callbacks.on_tool_end(name, res)
+                results[idx] = res
 
     # ------------------------------------------------------------------
     def _build_messages(self) -> List[Dict[str, Any]]:

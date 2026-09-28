@@ -1298,21 +1298,37 @@ class VectorStore:
         table = self._ensure_table()
         if table is None or table.count_rows() == 0:
             return []
-        # 用 pyarrow compute 的 unique() 在 Arrow 层去重，
-        # 避免 to_pylist() 把全部行转换成 Python 对象（10 万行 = 10 万字符串）
+        # 只投影 source 列：lancedb 0.25（pyproject 锁 <0.26）的
+        # ``Table.to_arrow()`` 签名就是 ``(self)``，**不接受 columns 参数**，
+        # 旧实现两次调用都抛 TypeError 后回退到 ``to_arrow().to_pylist()``
+        # —— 把全部行 × 全部列（含 768 维向量）转成 Python 对象。实测 2 万
+        # 切片 7.5s、内存峰值 GB 级，而它每轮对话都被 _system_prompt() 调一次。
+        try:
+            n = table.count_rows()
+            rows = (
+                table.search()
+                .limit(max(n, 1))
+                .select(["source"])
+                .to_arrow()
+                .to_pylist()
+            )
+            return sorted({r.get("source", "") for r in rows if r and r.get("source")})
+        except Exception as e:
+            logger.debug("VectorStore: list_sources 列投影不可用，回退 Arrow 去重: %s", e)
+        # Fallback: Arrow 层去重（不转 Python 对象）；再不行才整表物化。
         try:
             import pyarrow.compute as pc
-            arrow_tbl = table.to_arrow(columns=["source"])
-            unique_sources = pc.unique(arrow_tbl["source"]).to_pylist()
+            unique_sources = pc.unique(table.to_arrow()["source"]).to_pylist()
             return sorted([s for s in unique_sources if s])
-        except Exception:
-            # Fallback: load source column and dedupe in Python
-            try:
-                all_data = table.to_arrow(columns=["source"]).to_pylist()
-            except Exception:
-                all_data = table.to_arrow().to_pylist()
+        except Exception as e:
+            logger.debug("VectorStore: list_sources Arrow 去重失败，回退全表: %s", e)
+        try:
+            all_data = table.to_arrow().to_pylist()
             sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
             return sources
+        except Exception as e:
+            logger.warning("VectorStore: list_sources failed: %s", e)
+            return []
 
     # ------------------------------------------------------------------
     # documents metadata table (Meta-context + Targeted RAG)
