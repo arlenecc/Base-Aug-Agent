@@ -21,6 +21,9 @@ from .base import Tool, ToolRegistry, ToolResult
 
 _skill_index_lock = threading.Lock()
 
+# skill_load 单次读取的最大字符数（与 file_ops._MAX_READ_CHARS 同策略）。
+_MAX_SKILL_READ_CHARS = 200_000
+
 
 def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
     """Get or create the singleton SkillIndex, cached on the registry.
@@ -150,8 +153,16 @@ class SkillSemanticSearchTool(Tool):
         self.registry = registry
 
     def run(self, query: str, top_k: int = 5) -> ToolResult:
-        if not query.strip():
+        # 模型可能传 JSON null / 数字：`(query or "")` 归一，避免 AttributeError
+        # 被 registry 兜底成一句没有上下文的裸异常。
+        query = (query or "").strip() if isinstance(query, str) else str(query or "").strip()
+        if not query:
             return ToolResult(False, error="requires 'query'")
+        try:
+            top_k = int(top_k or 5)
+        except (TypeError, ValueError):
+            top_k = 5
+        top_k = max(1, min(top_k, 20))
         retriever = self.registry.get_skill_retriever()
         # 只做混合检索 + 阈值过滤；最终的「选哪个」由 agent（大模型）根据
         # 返回的 name+tags+description 自行判断，避免工具层再调一次 LLM。
@@ -242,9 +253,21 @@ class SkillLoadTool(Tool):
                 if os.path.isfile(target):
                     try:
                         with open(target, "r", encoding="utf-8") as f:
-                            return ToolResult(True, output=f.read())
+                            content = f.read(_MAX_SKILL_READ_CHARS + 1)
                     except (OSError, UnicodeDecodeError) as e:
                         return ToolResult(False, error=f"read failed: {e}")
+                    # 技能文件同样要有上限：一个塞了整本手册的 SKILL.md 会把
+                    # 上下文一次吃光（与 file_ops 的读取上限同策略）。
+                    if len(content) > _MAX_SKILL_READ_CHARS:
+                        return ToolResult(
+                            True,
+                            output=(
+                                content[:_MAX_SKILL_READ_CHARS]
+                                + f"\n\n… [内容超过 {_MAX_SKILL_READ_CHARS} 字符已截断，"
+                                f"完整文件见 {target}]"
+                            ),
+                        )
+                    return ToolResult(True, output=content)
 
         # 2) Fall back to the legacy SkillIndex (skill.json + prompt.md).
         idx = _get_skill_index(self.config, self.registry)

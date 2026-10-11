@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -113,21 +114,36 @@ class SkillIndex:
             self._last_scan = time.time()
 
     def _save(self) -> None:
-        """Atomic write of the index."""
+        """Atomic write of the index.
+
+        临时文件用唯一名（而非常量的 ``.tmp``）：并发写入会互相覆盖同一个
+        临时文件，产出截断/混杂的 JSON。异常路径还要清理临时文件，否则每次
+        失败就在技能目录里留一个垃圾文件。
+        """
+        tmp = None
         try:
             os.makedirs(self._dir, exist_ok=True)
-            tmp = self._index_path + ".tmp"
+            fd, tmp = tempfile.mkstemp(
+                prefix=".index_", suffix=".tmp", dir=self._dir
+            )
             payload = {
                 "version": 1,
                 "updated_at": _now_iso(),
                 "updated_at_ts": time.time(),
                 "skills": self._index,
             }
-            with open(tmp, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self._index_path)
-        except OSError as e:
+            tmp = None
+        except (OSError, TypeError, ValueError) as e:
             logger.warning("skill_index: failed to save %s: %s", self._index_path, e)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # scanning

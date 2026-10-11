@@ -177,6 +177,8 @@ class Bridge(QObject):
     # blocking requests (worker -> UI)
     confirm_request = pyqtSignal(str)
     ask_request = pyqtSignal(str)
+    # 上下文被压缩的通知（summary, reason）——不转发的话用户只会觉得「失忆」。
+    context_shrunk = pyqtSignal(str, str)
 
 
 class BridgeCallbacks(AgentCallbacks):
@@ -213,6 +215,8 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.skill.emit(skill)
     def on_error(self, message: str) -> None:
         self.bridge.error.emit(message)
+    def on_context_shrunk(self, summary: str, reason: str) -> None:
+        self.bridge.context_shrunk.emit(summary, reason)
     def on_finished(self) -> None:
         self.bridge.finished.emit()
 
@@ -364,11 +368,18 @@ class SyncKnowledgeWorker(QThread):
         # 用 Lock 保护，避免多 worker 线程 append 与主线程清空之间的竞态。
         self._log_buffer: list = []
         self._log_buffer_lock = threading.Lock()
+        # 缓冲区上限：主线程被模态对话框（确认/技能固化/同步结果）阻塞时
+        # 事件循环不转，_poll_sync_logs 无法消费，而同步线程仍在持续 append
+        # —— 无上限会在长同步 + 弹窗等待的组合下把内存吃光。超限后丢弃最旧的
+        # 一半（而不是丢弃新日志），保证「最新进展」始终可见。
+        self._log_buffer_max = 10000
 
     def _emit_log(self, msg: str) -> None:
         """将日志追加到缓冲区，由 _poll_sync_logs 消费写入日志面板。"""
         with self._log_buffer_lock:
             self._log_buffer.append(msg)
+            if len(self._log_buffer) > self._log_buffer_max:
+                del self._log_buffer[: self._log_buffer_max // 2]
 
     def run(self) -> None:  # type: ignore[override]
         self._emit_log("[rag] ────────── 同步引擎启动 ──────────")
@@ -393,9 +404,9 @@ class SyncKnowledgeWorker(QThread):
             logging.Formatter("%(message)s")
         )
         def _on_rag_log(record):
-            msg = _tmp_handler.format(record)
-            with self._log_buffer_lock:
-                self._log_buffer.append(msg)
+            # 复用 _emit_log 而不是直接 append：缓冲区上限只在 _emit_log 里
+            # 生效，绕过它会让这条路径无上限增长。
+            self._emit_log(_tmp_handler.format(record))
         _tmp_handler.emit = _on_rag_log
         # 只挂父 logger；子 logger 保持 NOTSET（默认传播到父 logger）。
         _rag_loggers = [f"{_PKG_ROOT}.rag"]
@@ -533,8 +544,26 @@ class InstallDepsWorker(QThread):
 class SendEditor(QPlainTextEdit):
     send_requested = pyqtSignal()
 
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        # 输入法组合态（中文/日文等）：候选框打开时回车用于「选词」，不应发送。
+        self._composing = False
+
+    def inputMethodEvent(self, e) -> None:  # type: ignore[override]
+        try:
+            self._composing = bool(e.preeditString())
+        except Exception:
+            self._composing = False
+        super().inputMethodEvent(e)
+
     def keyPressEvent(self, e: QKeyEvent) -> None:  # type: ignore[override]
-        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+        if (
+            e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            # 长按回车会持续触发 auto-repeat，导致同一条消息被连发多次。
+            if e.isAutoRepeat() or self._composing:
+                return
             self.send_requested.emit()
             return
         super().keyPressEvent(e)
@@ -564,6 +593,13 @@ class MainWindow(QMainWindow):
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
+        # 「获取模型」/「同步知识」各有独立的忙碌态。旧实现让 _set_controls_busy
+        # 统一用 self._busy 决定这两个按钮的 enable：agent 一轮结束就把它们
+        # 解锁，即使用户的 fetch/sync 还在跑 —— 再点一次会覆盖 worker 引用，
+        # 先结束的旧 worker 会把新 worker 的引用清成 None（取消能力丢失、
+        # 结果乱序）。这里用独立标志合成 enable 状态。
+        self._fetch_busy = False
+        self._sync_busy = False
         self._total_tokens = 0
         # 日志轮询定时器：每 100ms 检查 sync_worker._log_buffer，
         # 把新日志追加到 log_view。绕过 Qt queued signal 机制，
@@ -583,6 +619,7 @@ class MainWindow(QMainWindow):
         self._setup_log_bridge()
         self._apply_config_to_widgets()
         self._rebuild_agent()
+        self._restore_geometry()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -596,6 +633,8 @@ class MainWindow(QMainWindow):
 
         # Top config strip (~1/6 height) + main area below.
         main_split = QSplitter(Qt.Orientation.Vertical)
+        # 保存引用以便持久化分割比例（见 _save_geometry）。
+        self._main_split = main_split
         outer.addWidget(main_split)
 
         main_split.addWidget(self._build_config_panel())
@@ -609,9 +648,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.progress = QProgressBar()
         self.progress.setFixedWidth(220)
-        self.progress.setRange(0, 0)  # indeterminate off by default
         self.progress.setRange(0, 1)
-        self.status.addPermanentWidget(QLabel(""))
+        self.progress.setValue(0)
         self.status.addPermanentWidget(self.progress)
         self.status_label = QLabel("就绪")
         self.status.addWidget(self.status_label)
@@ -835,6 +873,7 @@ class MainWindow(QMainWindow):
         b.error.connect(self._on_error)
         b.confirm_request.connect(self._on_confirm_request)
         b.ask_request.connect(self._on_ask_request)
+        b.context_shrunk.connect(self._on_context_shrunk)
 
     # ------------------------------------------------------------------
     # config <-> widgets
@@ -925,8 +964,14 @@ class MainWindow(QMainWindow):
                 old_llm.close()
             except Exception:
                 pass
+        # 构造失败时必须清空引用：旧 agent / llm 已在上面被 close()，
+        # 继续持有它们会让 _on_send 用一套已关闭的 httpx 连接池和 MCP 客户端
+        # 发起新一轮对话，报出与真实原因无关的二次错误。
+        self._llm = None
+        self._agent = None
+        new_llm = None
         try:
-            self._llm = LLMClient(
+            new_llm = LLMClient(
                 base_url=self.config.base_url, api_key=self.config.api_key,
                 model=self.config.model, timeout=self.config.request_timeout,
                 max_tokens=self.config.max_tokens,
@@ -935,10 +980,20 @@ class MainWindow(QMainWindow):
                 top_k=self.config.top_k,
                 repetition_penalty=self.config.repetition_penalty,
             )
-            self._agent = Agent(llm=self._llm, config=self.config, callbacks=self._callbacks)
-            self._agent.max_iterations = self.config.max_iterations
+            new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
+            new_agent.max_iterations = self.config.max_iterations
         except Exception as e:
+            # new_llm 已建好但 Agent 构造失败 → 必须关掉它，否则每次失败
+            # 泄漏一个 httpx 连接池。
+            if new_llm is not None:
+                try:
+                    new_llm.close()
+                except Exception:
+                    pass
             self._on_error(f"无法创建 agent: {e}")
+            return
+        self._llm = new_llm
+        self._agent = new_agent
 
     # ------------------------------------------------------------------
     # config actions
@@ -986,6 +1041,14 @@ class MainWindow(QMainWindow):
             return False
 
     def _on_sync_knowledge(self, force: bool = False) -> None:
+        # Agent 正在跑时不允许同步：同步线程与 agent 的 RAG 检索会并发读写
+        # 同一个 LanceDB 目录，且同步结束后 UI 线程还会 reload 表句柄。
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再同步知识库。",
+            )
+            return
         if self._is_worker_running(self._sync_worker):
             logger.warning("Sync already running, ignoring duplicate request")
             return
@@ -999,6 +1062,7 @@ class MainWindow(QMainWindow):
             return
         logger.info("Knowledge sync triggered: kb=%s workspace=%s force=%s", kb, ws, force)
         # Step 1: check dependencies before starting sync
+        self._sync_busy = True
         self.sync_knowledge_btn.setEnabled(False)
         self.sync_knowledge_btn.setText("检查依赖…")
         # Enable stop-sync during the deps-check phase too so the user can
@@ -1019,6 +1083,18 @@ class MainWindow(QMainWindow):
         self._deps_worker.finished.connect(self._deps_worker.deleteLater)
         self._deps_worker.start()
 
+    def _reset_sync_ui(self) -> None:
+        """结束同步忙碌态：清标志 + 恢复「同步知识」按钮 + 禁用「停止同步」。
+
+        所有同步结束路径（正常/失败/取消/异常兜底）都必须走这里，否则
+        ``_sync_busy`` 会永久停在 True —— 而 _set_controls_busy(False) 又
+        依赖它决定是否解锁按钮，结果就是同步按钮再也点不动。
+        """
+        self._sync_busy = False
+        self.sync_knowledge_btn.setEnabled(True)
+        self.sync_knowledge_btn.setText("同步知识")
+        self.stop_sync_btn.setEnabled(False)
+
     def _on_deps_progress(self, msg: str) -> None:
         self.status_label.setText(msg)
         self._append_log(f"[deps] {msg}")
@@ -1029,9 +1105,7 @@ class MainWindow(QMainWindow):
         if self._deps_cancelled:
             self._deps_cancelled = False
             logger.info("Deps check finished but user cancelled — aborting sync")
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.status_label.setText("已取消同步")
@@ -1040,9 +1114,7 @@ class MainWindow(QMainWindow):
         if report is not None and report.has_blocking:
             # Required deps still missing after auto-install attempt
             logger.warning("Deps check: blocking dependencies missing, aborting sync")
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.status_label.setText("依赖缺失，无法同步")
@@ -1057,9 +1129,7 @@ class MainWindow(QMainWindow):
             # 绝不能照常启动 RAG 同步——那会在缺 lancedb/fastembed 的环境里
             # 跑引擎，产生难懂的二次异常并吞掉真正的失败原因。
             logger.error("Deps check failed with an exception — aborting sync")
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.status_label.setText("依赖检查失败")
@@ -1075,9 +1145,7 @@ class MainWindow(QMainWindow):
         kb = getattr(self, "_pending_sync_kb", "")
         force = getattr(self, "_pending_sync_force", False)
         if not ws or not kb:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             # 防御分支同样要复位不确定态进度条——_on_sync_knowledge 已把它设
             # 为 setRange(0,0)，不恢复的话进度条会永久转圈。
             self.progress.setRange(0, 1)
@@ -1118,9 +1186,7 @@ class MainWindow(QMainWindow):
         # 最后消费一次 _log_buffer，确保残余日志被显示
         self._poll_sync_logs()
         try:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             # Fully reset the progress bar: both range AND value. Without
             # setValue(0), a stale value from the last _on_sync_progress
             # call can persist (clamped to the new max), making the bar
@@ -1178,9 +1244,7 @@ class MainWindow(QMainWindow):
             logger.error("UI: _on_sync_finished error: %s", e, exc_info=True)
             # 确保按钮状态恢复，即使弹窗失败
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
-                self.stop_sync_btn.setEnabled(False)
+                self._reset_sync_ui()
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
                 self._sync_worker = None
@@ -1211,9 +1275,7 @@ class MainWindow(QMainWindow):
                 btn_text,
             )
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
-                self.stop_sync_btn.setEnabled(False)
+                self._reset_sync_ui()
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
                 self.status_label.setText("知识库同步完成（状态已自动恢复）")
@@ -1233,9 +1295,7 @@ class MainWindow(QMainWindow):
             logger.info("UI: sync_failed received, emit_count=%d emit_errors=%d",
                         self._log_handler._emit_count, self._log_handler._emit_errors)
         try:
-            self.sync_knowledge_btn.setEnabled(True)
-            self.sync_knowledge_btn.setText("同步知识")
-            self.stop_sync_btn.setEnabled(False)
+            self._reset_sync_ui()
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.status_label.setText("知识库同步失败")
@@ -1244,9 +1304,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error("UI: _on_sync_failed error: %s", e, exc_info=True)
             try:
-                self.sync_knowledge_btn.setEnabled(True)
-                self.sync_knowledge_btn.setText("同步知识")
-                self.stop_sync_btn.setEnabled(False)
+                self._reset_sync_ui()
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
                 self._sync_worker = None
@@ -1259,6 +1317,7 @@ class MainWindow(QMainWindow):
         if not base_url:
             QMessageBox.warning(self, "缺少配置", "请先填写 Base URL")
             return
+        self._fetch_busy = True
         self.fetch_btn.setEnabled(False)
         self.status_label.setText("正在获取模型列表…")
         self.progress.setRange(0, 0)
@@ -1273,6 +1332,7 @@ class MainWindow(QMainWindow):
         # 会让 closeEvent 里的 isRunning() 抛 RuntimeError（PyQt 默认 qFatal
         # → 进程 abort）。典型触发：获取模型成功后关闭窗口。
         self._fetch_worker = None
+        self._fetch_busy = False
         self.fetch_btn.setEnabled(True)
         self.progress.setRange(0, 1)
         current = self.model_combo.currentText().strip()
@@ -1286,6 +1346,7 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_failed(self, msg: str) -> None:
         self._fetch_worker = None
+        self._fetch_busy = False
         self.fetch_btn.setEnabled(True)
         self.progress.setRange(0, 1)
         self.status_label.setText("获取模型失败")
@@ -1323,7 +1384,12 @@ class MainWindow(QMainWindow):
 
     def _on_stop(self) -> None:
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
+        if not self._busy:
+            return
         self._callbacks.cancel()
+        # 已发出终止请求后禁用按钮：重复点击只是反复刷状态栏，而取消是协作
+        # 式的、本身不会更快生效。
+        self.stop_btn.setEnabled(False)
         self.status_label.setText("已请求终止对话（将在当前工具完成后生效）")
 
     def _on_stop_sync(self) -> None:
@@ -1400,12 +1466,19 @@ class MainWindow(QMainWindow):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.connect_btn.setEnabled(not busy)
-        self.fetch_btn.setEnabled(not busy)
         self.clear_btn.setEnabled(not busy)
         self.workspace_btn.setEnabled(not busy)
         self.knowledge_base_btn.setEnabled(not busy)
-        self.sync_knowledge_btn.setEnabled(not busy)
+        # 「获取模型」「同步知识」有各自的忙碌态：agent 一轮结束不能把它们
+        # 解锁（它们的 worker 可能还在跑，再点一次会覆盖 worker 引用）。
+        self.fetch_btn.setEnabled(not (busy or self._fetch_busy))
+        self.sync_knowledge_btn.setEnabled(not (busy or self._sync_busy))
+        # 进度条同理：同步进行中不能被 agent 的 busy 切换重置掉百分比。
+        if self._sync_busy:
+            return
         self.progress.setRange(0, 0 if busy else 1)
+        if not busy:
+            self.progress.setValue(0)
 
     # ------------------------------------------------------------------
     # streaming slots
@@ -1432,7 +1505,10 @@ class MainWindow(QMainWindow):
         # 思考过程（_on_reasoning）也用 insertPlainText，所以一直显示正常。
         cursor.insertText(text)
         self.chat_view.setTextCursor(cursor)
-        self._scroll_to_bottom(self.chat_view)
+        # 光标此刻已在文末，无需再走 _scroll_to_bottom 的第二次
+        # textCursor()+movePosition()+setTextCursor()——每个流式 chunk 都要
+        # 做一遍这三步，长回复下是主线程最主要的无谓开销。
+        self._pin_to_bottom(self.chat_view)
 
     def _on_reasoning(self, text: str) -> None:
         text = _sanitize_stream_text(text)
@@ -1446,7 +1522,7 @@ class MainWindow(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.think_view.setTextCursor(cursor)
         self.think_view.insertPlainText(text)
-        self._scroll_to_bottom(self.think_view)
+        self._pin_to_bottom(self.think_view)
 
     def _on_tool_start(self, name: str, args: Any) -> None:
         import json as _json
@@ -1460,10 +1536,15 @@ class MainWindow(QMainWindow):
 
     def _on_tool_end(self, name: str, result: Any) -> None:
         out = result.to_message() if hasattr(result, "to_message") else str(result)
-        snippet = out if len(out) < 400 else out[:400] + " …"
+        # 长输出保留头 + 尾：报错摘要、最终状态几乎总在末尾，只截开头会让
+        # 用户（和模型）看不到关键信息。完整内容进日志面板。
+        if len(out) > 400:
+            snippet = f"{out[:260]}\n  …（省略 {len(out) - 380} 字符）…\n{out[-120:]}"
+        else:
+            snippet = out
         cls = "t" if getattr(result, "success", True) else "sys"
         self._append_chat(f'<p class="{cls}">↳ <b>{self._escape(name)}</b> → {self._escape(snippet)}</p>')
-        self._append_log(f"[tool-end] {name} success={getattr(result,'success',True)} :: {snippet}")
+        self._append_log(f"[tool-end] {name} success={getattr(result,'success',True)} :: {out[:4000]}")
 
     def _on_log(self, line: str) -> None:
         self._append_log(line)
@@ -1516,29 +1597,64 @@ class MainWindow(QMainWindow):
                 self._append_log(f"[skill] saved '{name}'")
 
     def _on_finished(self) -> None:
-        if not self._busy:  # guard against double-call from _on_error + bridge.finished
+        # 幂等判据用 worker 引用而不是 _busy：agent.run() 有多条路径调用
+        # on_finished()，worker 的 finally 还会再发一次。若某条路径已经把
+        # _busy 置 False，后续调用会直接 return，跳过 worker.wait() 和引用
+        # 清理 —— QThread 可能在 OS 线程收尾时被 GC（Qt 直接 abort）。
+        worker = self._worker
+        if worker is None and not self._busy:
             return
+        self._worker = None
         self._busy = False
         self._streaming_assistant = False
         self._set_controls_busy(False)
-        self.status_label.setText("就绪")
+        # 同步进行中不要让「就绪」覆盖掉同步进度文案。
+        if not self._sync_busy:
+            self.status_label.setText("就绪")
         # Join the worker thread before dropping our reference. bridge.finished
         # is emitted from the worker's `finally`, so run() has already returned
         # and wait() returns near-instantly -- but without it, dropping the last
         # Python reference can GC the QThread while its OS thread is still
         # winding down, which Qt aborts as "destroyed while still running".
-        worker = self._worker
-        self._worker = None
-        if worker is not None:
-            worker.wait(2000)
+        if worker is not None and not worker.wait(2000):
+            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。保留引用，
+            # 由 closeEvent 兜底处理。
+            logger.warning("UI: agent worker did not join within 2s — keeping reference")
+            self._worker = worker
         # Now that streaming is done and the worker thread has joined, it's
         # safe to show the skill-suggestion modal dialog without blocking
         # the UI event loop during streaming.
         self._show_pending_skill_dialog()
 
     def _on_error(self, msg: str) -> None:
-        self._append_chat(f'<p class="sys">⚠ {self._escape(msg)}</p>')
+        self._append_chat(f'<p class="sys">⚠ {self._escape(self._friendly_error(msg))}</p>')
         self._append_log(f"[error] {msg}")
+
+    @staticmethod
+    def _friendly_error(msg: str) -> str:
+        """把裸异常串翻译成可执行的排查建议。
+
+        直接把 ``httpx.ConnectError: ...`` / ``KeyError: 'choices'`` 抛给用户
+        等于没有信息量。这里只做最小必要的分类，原始信息仍进日志面板。
+        """
+        low = (msg or "").lower()
+        if "connecterror" in low or "connection refused" in low or "connecttimeout" in low:
+            return f"{msg}\n→ 无法连接模型服务：请检查 Base URL 是否正确、服务是否已启动。"
+        if "401" in low or "unauthorized" in low or "invalid api key" in low:
+            return f"{msg}\n→ 认证失败：请检查 API Key 是否正确。"
+        if "403" in low or "forbidden" in low:
+            return f"{msg}\n→ 拒绝访问：API Key 可能没有该模型的权限。"
+        if "404" in low or "not found" in low:
+            return f"{msg}\n→ 接口或模型不存在：请检查 Base URL 路径与模型名称。"
+        if "429" in low or "rate limit" in low or "quota" in low:
+            return f"{msg}\n→ 被限流或配额耗尽：请稍后重试，或联系服务提供商。"
+        if "timeout" in low or "timed out" in low:
+            return f"{msg}\n→ 请求超时：可在配置里调大「请求超时」，或稍后重试。"
+        if "'choices'" in low or "expecting value" in low or "jsondecodeerror" in low:
+            return f"{msg}\n→ 返回内容不是合法的 OpenAI 兼容响应：请确认服务端确为 /v1/chat/completions 接口。"
+        if "context_length" in low or "context length" in low or "maximum context" in low:
+            return f"{msg}\n→ 上下文超出模型窗口：可减少历史长度（清空对话）或调小 max_tokens。"
+        return msg
         # bridge.finished signal will call _on_finished from the worker's finally block
 
     # ------------------------------------------------------------------
@@ -1556,6 +1672,20 @@ class MainWindow(QMainWindow):
     def _on_ask_request(self, prompt: str) -> None:
         text, ok = QInputDialog.getText(self, "需要你的输入", prompt)
         self._callbacks.set_ask_result(text if ok else None)
+
+    def _on_context_shrunk(self, summary: str, reason: str) -> None:
+        """历史被压缩时给出可见提示。
+
+        否则用户会以为 agent「失忆」——早期内容其实已经进了摘要并存到
+        workspace/memory.md（可用 memory_search 找回）。
+        """
+        preview = (summary or "").strip().replace("\n", " ")[:160]
+        self._append_chat(
+            f'<p class="sys">🗜 上下文已压缩（{self._escape(reason or "上下文超限")}）'
+            f'：早期对话已替换为摘要，可通过 memory_search 找回。'
+            f'{(" 摘要：" + self._escape(preview) + "…") if preview else ""}</p>'
+        )
+        self._append_log(f"[context] shrunk: {reason} | {preview}")
 
     # ------------------------------------------------------------------
     # helpers
@@ -1640,6 +1770,17 @@ class MainWindow(QMainWindow):
         self._scroll_to_bottom(self.log_view)
 
     @staticmethod
+    def _pin_to_bottom(widget) -> None:
+        """把视口钉到底部（**前置条件**：widget 的光标已经在文末）。
+
+        用于流式插入这类高频路径——调用方刚把光标移到 End 并写回，这里只补
+        上「滚动」这一步，省掉 _scroll_to_bottom 里重复的取光标 + 移动 + 写回。
+        """
+        widget.ensureCursorVisible()
+        sb = widget.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    @staticmethod
     def _scroll_to_bottom(widget) -> None:
         """Pin the widget's viewport to the bottom so the latest content is
         always visible.
@@ -1662,6 +1803,10 @@ class MainWindow(QMainWindow):
         self.chat_view.clear()
         self.think_view.clear()
         self._streaming_assistant = False
+        # 清空对话后 token/速度标签也要复位，否则仍显示上一轮的累计值。
+        self._total_tokens = 0
+        self.token_label.setText("总计 0 tokens")
+        self.speed_label.setText("0.0 tok/s")
         if self._agent is not None:
             self._agent.reset()
 
@@ -1669,6 +1814,33 @@ class MainWindow(QMainWindow):
     def _escape(text: str) -> str:
         import html as _html
         return _html.escape(text).replace("\n", "<br>")
+
+    # ------------------------------------------------------------------
+    # window geometry persistence
+    # ------------------------------------------------------------------
+    def _restore_geometry(self) -> None:
+        """恢复上次的窗口尺寸与分割比例（失败就用默认值，不影响启动）。"""
+        try:
+            from PyQt6.QtCore import QSettings
+            s = QSettings()
+            geo = s.value("ui/geometry")
+            if isinstance(geo, bytes) and geo:
+                self.restoreGeometry(geo)
+            state = s.value("ui/splitter")
+            if isinstance(state, bytes) and state and hasattr(self, "_main_split"):
+                self._main_split.restoreState(state)
+        except Exception as e:
+            logger.debug("UI: restore geometry failed: %s", e)
+
+    def _save_geometry(self) -> None:
+        try:
+            from PyQt6.QtCore import QSettings
+            s = QSettings()
+            s.setValue("ui/geometry", self.saveGeometry())
+            if hasattr(self, "_main_split"):
+                s.setValue("ui/splitter", self._main_split.saveState())
+        except Exception as e:
+            logger.debug("UI: save geometry failed: %s", e)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """Clean up background resources before the window closes.
@@ -1683,6 +1855,8 @@ class MainWindow(QMainWindow):
         3. wait() with a timeout; if it doesn't finish, terminate() as a last
            resort — unsafe, but safer than the crash.
         """
+        # 本方法末尾会清空模块级 _LOG_HANDLER（见那里的注释）。
+        global _LOG_HANDLER
         # --- 停止日志轮询定时器
         try:
             self._log_poll_timer.stop()
@@ -1802,15 +1976,65 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
+                _LOG_HANDLER.message_received.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
                 _LOG_HANDLER.close()
             except Exception:
                 pass
+            try:
+                _LOG_HANDLER.deleteLater()
+            except RuntimeError:
+                pass
+            # 置空模块级引用：Handler.close() 不会断开信号，而被
+            # message_received 连接的 self._append_log 绑定方法持有整个
+            # MainWindow（含 agent / LLM 连接池 / 全部控件）。不清掉这个引用，
+            # 关窗后整个窗口在进程生命周期内都无法回收。
+            _LOG_HANDLER = None
+        self._log_handler = None
+        # 断开 Bridge：worker 在 terminate() 之前已 post 到主线程事件队列的
+        # content / sync_progress 等 queued 事件不会被 worker.disconnect()
+        # 撤销，控件开始销毁后再派发会打到已释放的 C++ 对象上。
+        try:
+            self._bridge.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self._save_geometry()
         super().closeEvent(event)
 
 
 def run() -> None:
+    """应用入口。
+
+    安装全局 ``sys.excepthook``：PyQt6 中槽函数里未捕获的异常会走
+    excepthook 然后直接 abort —— 进程静默退出、没有 traceback，用户只能
+    看到「应用闪退」。这里至少把栈打出来，便于定位。
+    """
     app = QApplication(sys.argv)
-    w = MainWindow()
+    app.setApplicationName("Base-Aug-Agent")
+    app.setOrganizationName("base-agent")
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.critical(
+            "Unhandled exception in Qt slot: %s: %s",
+            exc_type.__name__, exc_value, exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    sys.excepthook = _excepthook
+    try:
+        w = MainWindow()
+    except Exception as e:
+        logger.critical("MainWindow 初始化失败: %s", e, exc_info=True)
+        QMessageBox.critical(
+            None, "启动失败",
+            f"主窗口初始化失败：\n{type(e).__name__}: {e}\n\n"
+            "若为依赖缺失，请安装后重试（RAG 相关：poetry install -E rag）。",
+        )
+        return
     w.show()
     sys.exit(app.exec())
 

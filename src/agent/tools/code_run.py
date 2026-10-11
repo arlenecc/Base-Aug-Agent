@@ -16,7 +16,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -126,7 +125,10 @@ class CodeRunTool(Tool):
                 if self.tell() + len(s) > self._limit:
                     super().write("\n… [输出超限，已截断]")
                     self._truncated = True
-                    return len(s)
+                    # 必须返回「实际写入的字符数」。返回 len(s) 是对调用方的
+                    # 谎报（print/f.write 依赖返回值判断进度），截断场景下会
+                    # 让上层误以为全部写入成功。
+                    return 0
                 return super().write(s)
 
         out = _BoundedIO()
@@ -211,9 +213,18 @@ class CodeRunTool(Tool):
                     "Stuck threads are cleaned up on process exit.",
                     leaked_count,
                 )
+            # 超时前已经产生的输出必须回传：否则模型看不到「卡在哪一步」，
+            # 只能瞎猜重试（比如一个跑到 90% 才卡住的循环会完全丢失线索）。
+            partial = out.getvalue()
+            if err.getvalue():
+                partial += ("\n" if partial else "") + "[stderr]\n" + err.getvalue()
             return ToolResult(
                 False,
-                error=f"Code execution timed out after {timeout:.0f}s",
+                output=partial,
+                error=(
+                    f"Code execution timed out after {timeout:.0f}s"
+                    + ("（以下为超时前已产生的输出）" if partial else "")
+                ),
             )
 
         # Worker completed within timeout — check if the thread we just

@@ -256,14 +256,20 @@ def _run_capture(command: str, cwd: str, timeout: float):
 
     timed_out = False
     try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_group(proc)
         try:
-            proc.wait(timeout=_TERM_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:  # pragma: no cover - 极端情况
-            pass
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=_TERM_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:  # pragma: no cover - 极端情况
+                pass
+    except BaseException:
+        # Popen 成功到 wait() 之间出现的任何异常（含 KeyboardInterrupt）都不
+        # 能让子进程变成孤儿：这里必须把整个进程组杀掉再往上抛。
+        _kill_process_group(proc)
+        raise
 
     # Give the reader threads a moment to drain whatever is left in the pipes.
     t_out.join(timeout=2.0)
@@ -276,4 +282,12 @@ def _run_capture(command: str, cwd: str, timeout: float):
         except Exception:
             pass
 
-    return proc.returncode, out.value(), err.value(), timed_out
+    returncode = proc.returncode
+    if returncode is None:
+        # SIGKILL 之后仍然 wait 不到（极端情况下内核尚未回收）→ 不能再等，
+        # 否则子进程一直不被 reap 变成僵尸。按被强杀处理并记日志。
+        logger.warning(
+            "shell_run: process still unreaped after kill — treating as SIGKILL (-9)"
+        )
+        returncode = -9
+    return returncode, out.value(), err.value(), timed_out

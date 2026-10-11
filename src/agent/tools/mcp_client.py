@@ -292,6 +292,10 @@ class MCPClient:
         if not ev.wait(timeout=timeout if timeout is not None else self.timeout):
             with self._lock:
                 self._pending.pop(req_id, None)
+                # 超时路径必须同时清掉 _results：响应可能刚好在 wait 返回后
+                # 才被 reader 线程写入，那条记录将永远留在字典里（键是自增
+                # 的请求 id，永不再被访问）→ 长会话下持续泄漏。
+                self._results.pop(req_id, None)
             raise MCPError(f"MCP server '{self.name}': timeout waiting for '{method}'")
 
         with self._lock:

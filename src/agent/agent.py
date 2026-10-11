@@ -1,6 +1,7 @@
 """The agent: reasoning loop, tool dispatch, streaming, confirmation, skills."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,14 @@ class AgentCallbacks:
     def on_context_shrunk(self, summary: str, reason: str) -> None: ...
 
     def confirm(self, message: str) -> bool:
-        return True
+        """默认**拒绝**而非放行。
+
+        ``confirm`` 用于 code_run / shell_run / MCP 这类可影响系统的操作。
+        未显式实现回调的场景（脚本、无头测试、自动化调用）下返回 True 等于
+        把「确认」这一步整个架空 —— 模型生成的任意命令都会被执行。安全侧是
+        拒绝：需要放行时由调用方显式实现。
+        """
+        return False
 
     def ask_user(self, prompt: str) -> Optional[str]:
         return None
@@ -172,6 +180,9 @@ class Agent:
         # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
         self._tool_schema_tokens_cache: Optional[int] = None
         self._tool_schema_tokens_turn = -1
+        self._tool_schema_fingerprint: str = ""
+        # UI 回调异常计数（见 _safe_callback）：只记录前几条，避免刷屏。
+        self._callback_errors = 0
 
         # 事实抽取的防堆叠锁。必须用 RLock：_extract_facts_sync 持锁期间会调
         # _get_extract_llm()，后者也要 acquire 同一把锁（普通 Lock 会自锁死，
@@ -262,19 +273,36 @@ class Agent:
         return system_tokens + history_tokens + tools_tokens
 
     def _tool_schema_tokens(self) -> int:
-        """Cached token estimate of the tools schema (JSON sent every request)."""
-        n = len(self._history)
-        cached = getattr(self, "_tool_schema_tokens_cache", None)
-        if cached is not None and self._tool_schema_tokens_turn == n:
-            return cached
+        """Cached token estimate of the tools schema (JSON sent every request).
+
+        缓存键是**工具集指纹**（工具名 + 参数 schema 的哈希），而不是历史长度：
+
+        * 旧实现以 ``len(self._history)`` 为键 —— 每追加一条消息键就失配，
+          于是每轮迭代都要把整套 schema 重新 ``json.dumps`` 一遍再全量
+          扫描字符（MCP 工具多时是数千 token 的纯浪费）。
+        * 反之，历史长度不变而工具集变化（动态注册/注销 MCP 工具）时缓存
+          又永不失效，估算失真。
+        """
         try:
             schemas = self.tools.schemas() if self.tools else []
+        except Exception:
+            schemas = []
+        try:
+            fingerprint = hashlib.md5(
+                json.dumps(schemas, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            fingerprint = ""
+        cached = getattr(self, "_tool_schema_tokens_cache", None)
+        if cached is not None and self._tool_schema_fingerprint == fingerprint:
+            return cached
+        try:
             text = json.dumps(schemas, ensure_ascii=False) if schemas else ""
             est = _estimate_tokens(text) if text else 0
         except Exception:
             est = 0
         self._tool_schema_tokens_cache = est
-        self._tool_schema_tokens_turn = n
+        self._tool_schema_fingerprint = fingerprint
         return est
 
     def _should_shrink_context(self) -> bool:
@@ -335,7 +363,11 @@ class Agent:
         # back from old_messages into recent_messages.
         while recent_messages and recent_messages[0].get("role") == "tool":
             if not old_messages:
-                break
+                # old_messages 已抽空却仍是 tool 消息 → 前面不可能再有对应的
+                # assistant(tool_calls)。此时必须**丢弃**这条孤儿 tool 消息，
+                # 否则收缩后的历史以裸 tool 开头，API 会以 400 拒绝整轮请求。
+                recent_messages.pop(0)
+                continue
             recent_messages.insert(0, old_messages.pop())
 
         transcript = self._format_messages_for_summary(old_messages)
@@ -822,11 +854,11 @@ class Agent:
                         break
                     if ev.type == "content":
                         content_buf.append(ev.content)
-                        self.callbacks.on_content(ev.content)
+                        self._safe_callback("on_content", ev.content)
                         live_est_tokens += _estimate_tokens(ev.content)
                     elif ev.type == "reasoning":
                         reasoning_buf.append(ev.content)
-                        self.callbacks.on_reasoning(ev.content)
+                        self._safe_callback("on_reasoning", ev.content)
                         live_est_tokens += _estimate_tokens(ev.content)
                     elif ev.type == "done":
                         seen_done = True
@@ -882,7 +914,9 @@ class Agent:
                         iteration -= 1
                         continue
                 self._log(f"[agent] LLM stream error: {err_str}")
-                self.callbacks.on_error(err_str)
+                # on_error 也要隔离：它一旦抛出，下面的 on_finished 就永远
+                # 不会执行，UI 会一直停在忙碌状态（没有任何报错可见）。
+                self._safe_callback("on_error", err_str)
                 self.callbacks.on_finished()
                 return final_content or ""
 
@@ -892,13 +926,14 @@ class Agent:
                 self.callbacks.on_finished()
                 return final_content
 
-            if not seen_done and (content_buf or reasoning_buf or tool_calls):
+            if not seen_done and (content_buf or reasoning_buf):
                 # The stream ended without an explicit "done" event — likely a
                 # network cut or server-side truncation. Log so it's visible.
-                self._log("[agent] warning: LLM stream ended without 'done' event")
-                # The stream ended without an explicit "done" event — likely a
-                # network cut or server-side truncation. Log so it's visible.
-                self._log("[agent] warning: LLM stream ended without 'done' event")
+                # （tool_calls 只在 "done" 分支赋值，此处恒为 []，不应参与判断。）
+                self._log(
+                    "[agent] warning: LLM stream ended without 'done' event — "
+                    "回复可能被截断"
+                )
 
             # Total elapsed time (includes TTFB, used for total turn timing)
             elapsed = max(time.time() - t0, 1e-6)
@@ -988,7 +1023,11 @@ class Agent:
                         tc["id"] = f"call_{self._tool_call_counter}_{idx}"
                 assistant_msg["tool_calls"] = tool_calls
             self._history.append(assistant_msg)
-            final_content = assistant_msg.get("content") or ""
+            # 只在有实际文本时更新 final_content：带 tool_calls 的轮次
+            # content 为 None，无条件覆盖会把上一轮的最终答复抹成 ""，
+            # 触及 max_iterations 时用户会看到一个空回复。
+            if assistant_msg.get("content"):
+                final_content = assistant_msg["content"]
 
             if not tool_calls:
                 # no further action -> done
@@ -1017,69 +1056,106 @@ class Agent:
                         skip_args = parse_args(raw_args)
                     except ValueError:
                         skip_args = {"_raw_arguments": raw_args}
-                    self.callbacks.on_tool_start(name, skip_args)
+                    self._safe_callback("on_tool_start", name, skip_args)
                     res = ToolResult(False, error="用户取消了对话，工具未执行")
-                    self.callbacks.on_tool_end(name, res)
+                    self._safe_callback("on_tool_end", name, res)
                     self._history.append(self._tool_message(tc, res))
                     continue
 
-                # Parse arguments. Malformed JSON must be reported to the model
-                # as a parse error (not silently treated as {} which would
-                # surface as a confusing "missing required argument" later).
-                try:
-                    args = parse_args(raw_args)
-                except ValueError as e:
-                    self._log(f"[tool] {name} arg-parse error: {e}")
-                    from .tools import ToolResult
-                    # Notify UI of start (with raw args for visibility) before
-                    # reporting the failure, so the UI shows a complete cycle.
-                    self.callbacks.on_tool_start(name, {"_raw_arguments": raw_args})
-                    res = ToolResult(False, error=str(e))
-                    self.callbacks.on_tool_end(name, res)
-                    msg = self._tool_message(tc, res)
-                    self._history.append(msg)
-                    continue
+                # 任何路径都必须产出一条 tool 消息：assistant_msg 的 tool_calls
+                # 已写入历史，缺一条结果就会变成悬挂 tool_calls（下一轮 400）。
+                # 故整段执行包在 _run_one_tool_call 里，异常一律转成失败结果。
+                res = self._run_one_tool_call(tc)
+                self._history.append(self._tool_message(tc, res))
 
-                tool = self.tools.get(name)
+            # 单轮内也可能突破 max_history（一轮最多追加 1+N 条 × 迭代次数），
+            # 只在 run() 开头裁剪是不够的。
+            self._trim_history()
 
-                needs_confirm = bool(tool and tool.should_confirm(args)) if tool else False
-                self._log(f"[tool] {name}({raw_args}) needs_confirm={needs_confirm}")
-
-                if tool is None:
-                    # Unknown tool: still notify UI of start for a complete cycle.
-                    self.callbacks.on_tool_start(name, args)
-                    res = self.tools.execute(name, args)  # returns unknown error
-                    self.callbacks.on_tool_end(name, res)
-                    msg = self._tool_message(tc, res)
-                    self._history.append(msg)
-                    continue
-
-                if needs_confirm:
-                    confirm_msg = self._confirm_message(name, args)
-                    if not self.callbacks.confirm(confirm_msg):
-                        self._log(f"[tool] {name} DENIED by user")
-                        from .tools import ToolResult
-                        # Tool never actually started (user declined before
-                        # invocation); only report the denial result. The UI
-                        # intentionally does not receive on_tool_start here so
-                        # that "never started" semantics are preserved.
-                        res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
-                        self.callbacks.on_tool_end(name, res)
-                        msg = self._tool_message(tc, res)
-                        self._history.append(msg)
-                        continue
-
-                self.callbacks.on_tool_start(name, args)
-                res = self.tools.execute(name, args)
-                self.callbacks.on_tool_end(name, res)
-                self._log(f"[tool] {name} -> success={res.success} "
-                          f"out_len={len(res.output)} err={(res.error or '')[:120]}")
-                msg = self._tool_message(tc, res)
-                self._history.append(msg)
+        if not final_content and self._history:
+            # 触及 max_iterations 时最后一轮通常是「只有 tool_calls、没有文本」
+            # 的 assistant 消息，final_content 被覆盖成 ""。回退到最近一条非空
+            # assistant 文本，避免用户看到一次「什么都没回答」的空回复。
+            for msg in reversed(self._history):
+                if msg.get("role") == "assistant" and (msg.get("content") or "").strip():
+                    final_content = msg["content"]
+                    break
 
         self._log("[agent] max iterations reached, stopping.")
         self.callbacks.on_finished()
         return final_content
+
+    def _run_one_tool_call(self, tc: Dict[str, Any]):
+        """执行单个 tool_call，返回 ToolResult——**保证不抛异常**。
+
+        参数解析失败、工具不存在、用户拒绝、UI 回调抛错等全部转换成失败的
+        ToolResult，让调用方始终能补上配对的 tool 消息。
+        """
+        from .tools import ToolResult
+
+        fn = tc.get("function", {}) or {}
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", "")
+
+        # Parse arguments. Malformed JSON must be reported to the model
+        # as a parse error (not silently treated as {} which would
+        # surface as a confusing "missing required argument" later).
+        try:
+            args = parse_args(raw_args)
+        except ValueError as e:
+            self._log(f"[tool] {name} arg-parse error: {e}")
+            # Notify UI of start (with raw args for visibility) before
+            # reporting the failure, so the UI shows a complete cycle.
+            self._safe_callback("on_tool_start", name, {"_raw_arguments": raw_args})
+            res = ToolResult(False, error=str(e))
+            self._safe_callback("on_tool_end", name, res)
+            return res
+
+        try:
+            tool = self.tools.get(name)
+        except Exception as e:
+            tool = None
+            self._log(f"[tool] {name} lookup error: {e}")
+
+        needs_confirm = bool(tool and tool.should_confirm(args)) if tool else False
+        self._log(f"[tool] {name}({raw_args}) needs_confirm={needs_confirm}")
+
+        if tool is None:
+            # Unknown tool: still notify UI of start for a complete cycle.
+            self._safe_callback("on_tool_start", name, args)
+            res = self.tools.execute(name, args)  # returns unknown error
+            self._safe_callback("on_tool_end", name, res)
+            return res
+
+        if needs_confirm:
+            confirm_msg = self._confirm_message(name, args)
+            try:
+                allowed = self.callbacks.confirm(confirm_msg)
+            except Exception as e:
+                # 确认环节本身出错 → 按「未获授权」处理（安全侧）。
+                self._log(f"[tool] {name} confirm error: {e}")
+                allowed = False
+            if not allowed:
+                self._log(f"[tool] {name} DENIED by user")
+                # Tool never actually started (user declined before
+                # invocation); only report the denial result. The UI
+                # intentionally does not receive on_tool_start here so
+                # that "never started" semantics are preserved.
+                res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
+                self._safe_callback("on_tool_end", name, res)
+                return res
+
+        self._safe_callback("on_tool_start", name, args)
+        try:
+            res = self.tools.execute(name, args)
+        except Exception as e:
+            # registry.execute 已兜底，这里防的是 UI 回调与未知工具实现。
+            self._log(f"[tool] {name} raised {type(e).__name__}: {e}")
+            res = ToolResult(False, error=f"{type(e).__name__}: {e}")
+        self._safe_callback("on_tool_end", name, res)
+        self._log(f"[tool] {name} -> success={res.success} "
+                  f"out_len={len(res.output)} err={(res.error or '')[:120]}")
+        return res
 
     # ------------------------------------------------------------------
     def _build_messages(self) -> List[Dict[str, Any]]:
@@ -1410,4 +1486,33 @@ class Agent:
         return f"即将调用工具 `{name}`：\n{pretty}\n\n是否继续？"
 
     def _log(self, line: str) -> None:
-        self.callbacks.on_log(line)
+        self._safe_callback("on_log", line)
+
+    def _safe_callback(self, method: str, *args) -> None:
+        """调用 UI 回调并隔离其异常。
+
+        UI 回调最终跑在 Qt 信号槽里，可能因控件已销毁等原因抛异常
+        （RuntimeError / TypeError）。若不隔离：
+        1. 流式循环里的异常会被外层 ``except Exception`` 当成「LLM 流错误」
+           上报，并在 except 块里二次抛出，导致 ``on_finished()`` 永不执行
+           —— UI 一直停在忙碌状态。
+        2. 工具循环里的异常会让已写入历史的 assistant(tool_calls) 得不到
+           对应的 tool 消息，下一轮请求被 API 以 400 拒绝。
+
+        这里统一吞掉并记日志：一次 UI 渲染失败不该毁掉整轮对话。
+        """
+        fn = getattr(self.callbacks, method, None)
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception as e:  # pragma: no cover - 取决于 UI 状态
+            self._callback_errors += 1
+            # 只记录前几条，避免 UI 持续抛错时日志被刷屏。
+            if self._callback_errors <= 5:
+                try:
+                    self.callbacks.on_log(
+                        f"[agent] callback {method} raised: {type(e).__name__}: {e}"
+                    )
+                except Exception:
+                    pass
