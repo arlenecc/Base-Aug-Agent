@@ -378,6 +378,26 @@ class VectorStore:
             self._table_checked = True
         return self._table
 
+    def _create_table_atomic(self, records: List[Dict[str, Any]]):
+        """并发安全建表。
+
+        返回 ``(table, created)``：
+          * ``created=True`` —— 本次调用用 ``records`` 新建了表；
+          * ``created=False`` —— 表已存在（可能刚被并发线程创建），调用方
+            必须走正常的 upsert 路径而不是提前返回。
+
+        修复竞态：ingest worker / 多线程首次写入时，旧实现里两个线程同时
+        看到「表不存在」→ 都执行 create_table → 一方抛 "Table already
+        exists"，该 worker 的 ingest 直接崩掉。
+        """
+        with self._init_lock:  # RLock，内部可再进 _ensure_table
+            table = self._ensure_table()
+            if table is not None:
+                return table, False
+            self._table = self._db.create_table(_TABLE_NAME, records)
+            self._table_checked = True
+            return self._table, True
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -419,11 +439,13 @@ class VectorStore:
         table = self._ensure_table()
 
         if table is None:
-            # First add: create table with all records
-            self._table = self._db.create_table(_TABLE_NAME, records)
-            self._table_checked = True
-            logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
-            return len(records)
+            # First add: create table with all records（并发安全）
+            table, created = self._create_table_atomic(records)
+            if created:
+                self._fts_ready = False  # 推迟到下次 search 重建 BM25 索引
+                logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
+                return len(records)
+            # 并发线程刚建了表 → 继续走下面的 upsert 路径
 
         # Upsert: 按 source 删除该来源的全部旧记录。
         # 用 source 的 md5 hash 作为 LIKE 模式（hash 是 hex 字符串，无 SQL 注入风险），
@@ -457,9 +479,11 @@ class VectorStore:
         if failed_batches > 0:
             logger.warning("VectorStore: %d batch(es) failed during add", failed_batches)
 
-        # 数据写入后重建 BM25 全文索引，覆盖新增的行。
+        # 数据写入后**不立即**重建 BM25 全文索引：一次同步会多次调 add()，
+        # 每次都全表重建是 O(N) 的浪费。置 _fts_ready=False 把重建推迟到
+        # 下一次 search_fts()（那里已有惰性建索引路径），一次同步只付一次
+        # 建索引成本。
         self._fts_ready = False
-        self._ensure_fts_index(self._table)
 
         logger.info("VectorStore: added %d chunks", total)
         return total
@@ -533,24 +557,25 @@ class VectorStore:
 
         table = self._ensure_table()
         # 跟踪已删除过旧数据的 source，避免后续批次重复写入时新旧数据共存。
-        sources_seen: set = set()
+        sources_seen = {r["source"] for r in first_records}
+        created = False
         if table is None:
-            # 首次：创建表（用第一批 records），无需删除旧数据。
-            self._table = self._db.create_table(_TABLE_NAME, first_records)
-            self._table_checked = True
-            table = self._table  # 更新局部变量，后续批次需要 table 引用
+            # 首次：创建表（用第一批 records），无需删除旧数据。并发安全。
+            table, created = self._create_table_atomic(first_records)
+        if created:
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
-            sources_seen = {r["source"] for r in first_records}
             if on_batch:
                 on_batch(len(first_records), total)
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
+                # 置脏即可——BM25 索引推迟到下次 search_fts 惰性重建。
+                self._fts_ready = False
                 return total
+            # 未耗尽：继续后续批次（table 已建好）
         else:
-            # 已有表：先按 source 删除旧记录
+            # 已有表（或并发线程刚建）：先按 source 删除旧记录
             existing_count = table.count_rows()
-            sources_seen = {r["source"] for r in first_records}
             logger.info(
                 "  ├─ 向量库: 已有表 (%d 行), 将替换 %d 个来源的旧数据",
                 existing_count, len(sources_seen),
@@ -570,13 +595,12 @@ class VectorStore:
                     on_batch(len(first_records), total)
             except Exception as e:
                 logger.error("  向量库写入失败(首批): %s", e)
+                self._fts_ready = False  # 已删旧数据但新数据未写入 → 索引必须重建
                 raise
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
-                # 单批写入也要重建 BM25 索引——否则这批新数据永远查不到，
-                # 混合检索会静默退化成纯向量检索（无报错）。
+                # 置脏即可——BM25 索引推迟到下次 search_fts 惰性重建。
                 self._fts_ready = False
-                self._ensure_fts_index(self._table)
                 return total
 
         # 后续批次
@@ -588,6 +612,9 @@ class VectorStore:
             batch_buf.append(chunk)
             if len(batch_buf) >= batch_size:
                 if is_cancelled is not None and is_cancelled():
+                    # 已写入的行必须让 BM25 索引重建（置脏），否则这批新数据
+                    # 对关键词检索不可见，混合检索静默退化成纯向量检索。
+                    self._fts_ready = False
                     return total
                 batch_num += 1
                 logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
@@ -616,6 +643,8 @@ class VectorStore:
         # 处理剩余
         if batch_buf:
             if is_cancelled is not None and is_cancelled():
+                # 同取消分支：已写入的行要让 BM25 索引置脏重建。
+                self._fts_ready = False
                 return total
             batch_num += 1
             logger.info("  ├─ 向量化: 最后批次 (%d 切片) 正在嵌入...", len(batch_buf))
@@ -641,11 +670,11 @@ class VectorStore:
 
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
 
-        # 数据写入后重建 BM25 全文索引，覆盖新增的行。
-        # 注：LanceDB 的 FTS 索引不会在 add() 后自动增量更新，
-        # 必须用 replace=True 重建才能检索到新写入的切片。
+        # 数据写入后只置脏 BM25 全文索引：旧实现每次 add_streaming 都全表
+        # rebuild（replace=True），一次同步 N 批 = N 次全库建索引。重建推迟
+        # 到下一次 search_fts()（惰性路径已存在），一次同步只付一次成本。
+        # 注：LanceDB 的 FTS 索引不会在 add() 后自动增量更新。
         self._fts_ready = False
-        self._ensure_fts_index(self._table)
 
         return total
 
@@ -745,15 +774,25 @@ class VectorStore:
 
         # lancedb >= 0.37：create_index(config=FTS(...))（Tantivy 已移除）。
         # lancedb 0.25.x：create_fts_index(use_tantivy=False, ...)。
+        # 注意：ImportError 必须单独捕获——0.25.x 上根本没有 lancedb.index.FTS
+        # 这个模块，裸 import 会抛 ImportError；若掉进通用 except Exception 分支，
+        # _fts_failed 被置 True 后 0.25.x 的回退路径就永远走不到了（BM25 永久禁用）。
         try:
             from lancedb.index import FTS
-            table.create_index(
-                _FTS_COLUMN,
-                config=FTS(**fts_kwargs),
-                replace=True,
-            )
+        except ImportError:
+            FTS = None
+        try:
+            if FTS is not None:
+                table.create_index(
+                    _FTS_COLUMN,
+                    config=FTS(**fts_kwargs),
+                    replace=True,
+                )
+            else:
+                raise TypeError  # 走 0.25.x 回退分支
         except TypeError:
-            # 0.25.x 的 create_index 无 config 参数，回退到 create_fts_index。
+            # 0.25.x 的 create_index 无 config 参数（或 FTS 不可用），回退到
+            # create_fts_index。
             table.create_fts_index(
                 _FTS_COLUMN,
                 use_tantivy=False,
@@ -1228,6 +1267,13 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
+            # 必须同时重置 FTS 三标记（与 close() 同款）：漏掉的话 _fts_ready
+            # 仍为 True，add() 重建新表时会跳过建索引，search_fts 也认为索引
+            # 就绪 → 在未索引列上跑 FTS 抛异常被吞掉 → BM25 通道从此永久
+            # 静默返回空，无任何告警。
+            self._fts_ready = False
+            self._fts_checked = False
+            self._fts_failed = False
             logger.info("VectorStore: cleared %d documents", count)
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
