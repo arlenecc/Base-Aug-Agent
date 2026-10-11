@@ -95,9 +95,17 @@ class FastEmbedEmbeddingFunction:
     def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
         self._model_name = model_name
         self._model = None  # lazy-init
+        # 懒加载的双检锁：InferenceSession.run() 的线程安全只覆盖推理，不覆盖
+        # 这里的懒初始化——两个线程同时首次调用会各自加载一份 ~130MB 模型，
+        # 后写覆盖先写，先建的那份成为纯泄漏。
+        self._model_lock = threading.Lock()
 
     def _ensure_model(self):
-        if self._model is None:
+        if self._model is not None:
+            return
+        with self._model_lock:
+            if self._model is not None:
+                return
             from fastembed import TextEmbedding
             logger.info("  🔧 正在加载嵌入模型: %s (首次加载, 约 130MB)...", self._model_name)
             import time as _time
