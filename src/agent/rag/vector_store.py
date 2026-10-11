@@ -952,6 +952,10 @@ class VectorStore:
         is NOT abandoned — when it eventually finishes it stores the result
         (or error) on ``self`` so a later call can pick it up without reloading.
         """
+        # close() 之后的实例不允许再拉起 reranker：后台加载线程看到 _closed
+        # 会直接 return（状态置 failed），避免状态机卡死或「复活」持有权重。
+        if getattr(self, "_closed", False):
+            return None
         state = getattr(self, "_reranker_state", "idle")
         if state == "done":
             return self._reranker
@@ -1131,8 +1135,10 @@ class VectorStore:
             )
             # 标记不可用，后续直接走回退分支。必须同步置 failed，否则
             # _reranker_state 长期停在 "done" 而模型为 None（状态机失真）。
-            self._reranker = None
-            self._reranker_state = "failed"
+            # 加锁写：与 _get_reranker 的状态读写并发属于数据竞争。
+            with self._reranker_lock:
+                self._reranker = None
+                self._reranker_state = "failed"
             return self._rerank_fallback(candidates, top_k)
 
         # Normalize to list if single result
