@@ -1993,12 +1993,15 @@ class MainWindow(QMainWindow):
             # 关窗后整个窗口在进程生命周期内都无法回收。
             _LOG_HANDLER = None
         self._log_handler = None
-        # 断开 Bridge：worker 在 terminate() 之前已 post 到主线程事件队列的
-        # content / sync_progress 等 queued 事件不会被 worker.disconnect()
-        # 撤销，控件开始销毁后再派发会打到已释放的 C++ 对象上。
+        # 屏蔽 Bridge：worker 是**直接**调 bridge.xxx.emit() 的（不是通过
+        # worker 的信号），所以 worker.disconnect() 挡不住它们。terminate()
+        # 之前已 post 到主线程事件队列的 content / sync_progress 等 queued
+        # 事件，会在控件开始销毁后被派发 —— 打到已释放的 C++ 对象上。
+        # 用 blockSignals 而不是 disconnect()：后者在这种场景下会让 Qt 打印
+        # "wildcard call disconnects from destroyed signal" 警告。
         try:
-            self._bridge.disconnect()
-        except (TypeError, RuntimeError):
+            self._bridge.blockSignals(True)
+        except RuntimeError:
             pass
         self._save_geometry()
         super().closeEvent(event)

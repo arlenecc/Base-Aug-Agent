@@ -344,6 +344,13 @@ class ToolRegistry:
                       f"got {type(args).__name__}",
             )
 
+        # 按 JSON Schema 做一次宽容的类型归一：模型经常把数字写成字符串
+        # （"top_k": "5"、"timeout": "30"）。直接传给 run() 会让工具内部
+        # 的算术/比较炸掉，或者被 int(x or 5) 静默吞成默认值。这里只在
+        # 转换无歧义时改写，**不**因为类型不符而拒绝调用（严格校验会让
+        # 模型陷入「参数无效」的重试循环）。
+        args = _coerce_arg_types(tool, args)
+
         # 签名级预检：把「模型传错参数」和「工具内部抛 TypeError」区分开。
         # 旧实现靠捕获 run() 抛出的 TypeError 一律报 "Invalid arguments"——
         # 工具内部代码出 bug（比如对 None 调 .strip()）时模型会收到"参数
@@ -365,6 +372,47 @@ class ToolRegistry:
             )
         except Exception as e:  # pragma: no cover - defensive
             return ToolResult(success=False, error=f"{type(e).__name__}: {e}")
+
+
+def _coerce_arg_types(tool: Tool, args: Dict[str, Any]) -> Dict[str, Any]:
+    """按工具的 JSON Schema 把参数值归一到声明类型（宽容，不拒绝）。
+
+    只处理两种最常见的模型输出偏差：
+      * ``"5"``（字符串）→ ``5``（integer/number）
+      * ``"true"``/``"false"`` → bool
+    无法安全转换时保持原值不动——严格校验会让模型陷入「参数无效」的
+    重试循环，而工具内部大多已有自己的归一化（如 int(top_k or 5)）。
+    """
+    schema = getattr(tool, "parameters", None)
+    if not isinstance(schema, dict):
+        return args
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return args
+    coerced: Dict[str, Any] = {}
+    for key, value in args.items():
+        spec = props.get(key)
+        if not isinstance(spec, dict) or not isinstance(value, str):
+            coerced[key] = value
+            continue
+        declared = spec.get("type")
+        raw = value.strip()
+        if declared == "integer" or declared == "number":
+            try:
+                coerced[key] = int(raw) if declared == "integer" else float(raw)
+                continue
+            except ValueError:
+                pass
+        elif declared == "boolean":
+            low = raw.lower()
+            if low in ("true", "1", "yes", "on"):
+                coerced[key] = True
+                continue
+            if low in ("false", "0", "no", "off"):
+                coerced[key] = False
+                continue
+        coerced[key] = value
+    return coerced
 
 
 def parse_args(raw: str) -> Dict[str, Any]:

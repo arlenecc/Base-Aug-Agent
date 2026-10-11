@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,11 @@ class AgentConfig:
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "browser_endpoint")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
+    # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
+    # knowledge_base 故意不在其中：它本来就可以为空（表示「用 workspace 下的
+    # 默认目录」）。
+    _NON_EMPTY_STR_FIELDS = ("base_url", "model", "workspace",
+                             "rag_embedding_model", "rag_rerank_model")
 
     @classmethod
     def _coerce(cls, name: str, value):
@@ -84,7 +90,14 @@ class AgentConfig:
             if name in cls._FLOAT_FIELDS:
                 return float(value)
             if name in cls._STR_FIELDS:
-                return str(value)
+                s = str(value)
+                # 关键路径字段不能是空串：workspace="" 会让 ensure_workspace()
+                # 的 os.makedirs("") 抛 FileNotFoundError；base_url="" 会把请求
+                # 打到 "/chat/completions"。这里统一按「字段缺失」处理，让调用
+                # 方回退到 dataclass 默认值。
+                if not s.strip() and name in cls._NON_EMPTY_STR_FIELDS:
+                    return None
+                return s
             if name in cls._BOOL_FIELDS:
                 # bool("false") 是 True——手工编辑配置时常见的 "false"/"no"/"0"
                 # 字符串会把用户显式的关闭悄悄变成打开。只接受明确的映射。
@@ -118,7 +131,12 @@ class AgentConfig:
             # 备份坏文件后用默认配置启动，用户重新「应用配置」即可恢复。
             logger.warning("config: %s 无法解析 (%s)，备份后使用默认配置", path, e)
             try:
-                os.replace(path, path + ".corrupt")
+                # 优先用固定名 .corrupt（既有行为/测试依赖）；若已存在则加
+                # 时间戳，避免第二次损坏覆盖掉第一次的备份。
+                backup = path + ".corrupt"
+                if os.path.exists(backup):
+                    backup = f"{backup}.{int(time.time())}"
+                os.replace(path, backup)
             except OSError:
                 pass
             return cls()
@@ -178,11 +196,20 @@ class AgentConfig:
         # 写一半崩溃（断电/强杀）会留下截断的 JSON，下次启动 load() 直接抛
         # JSONDecodeError 导致程序无法启动。
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            # 写失败时必须清掉临时文件：否则每次失败都在配置目录里留一个
+            # .tmp 垃圾文件（json.dump 对不可序列化值失败是会发生的）。
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def ensure_workspace(self) -> str:
         os.makedirs(self.workspace, exist_ok=True)

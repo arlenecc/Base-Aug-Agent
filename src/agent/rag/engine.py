@@ -49,6 +49,34 @@ _QUEUE_CAPACITY_FACTOR = 2  # = parallel_workers * 2
 # 哨兵：worker 全部完成后投递到队列，主线程据此退出消费循环
 _SENTINEL = object()
 
+# 向量库写入批大小。LanceDB 每次 add 都会产生新 fragment，批太小会在大库上
+# 留下海量碎片，检索退化为逐段扫描；批太大则单次失败要重做的量变多。
+_WRITE_BATCH_SIZE = 200
+
+
+def _md_meta_path(md_path: str) -> str:
+    """Markdown 缓存的 sidecar 路径：保存「缓存文件名 → 原始文档名」映射。"""
+    return md_path + ".meta.json"
+
+
+def _write_md_meta(md_path: str, payload: Dict[str, Any]) -> None:
+    """写 sidecar。失败只告警——它只是加速/纠错的辅助数据，不影响主流程。"""
+    try:
+        with open(_md_meta_path(md_path), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning("Markdown meta 写入失败: %s: %s", md_path, e)
+
+
+def _read_md_meta(md_path: str) -> Optional[Dict[str, Any]]:
+    """读 sidecar；不存在或损坏返回 None。"""
+    try:
+        with open(_md_meta_path(md_path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
 
 # ---------------------------------------------------------------------------
 # Manifest — tracks which documents have been processed so incremental syncs
@@ -385,6 +413,8 @@ class RAGEngine:
 
         # Step 3: worker 并行解析+chunk，主线程消费并增量写入
         # 只有 files_to_process 才进入 worker 池——跳过的文件不解析不 chunk
+        # 本次实际写入的切片数（取消/失败分支要用它，而不是全库总数）。
+        added = 0
         if files_to_process:
             _log("━━━ Step 3/6: 解析文档 + 清洗 + 切片（%d 个文件，%d 个并行 Worker） ━━━",
                         len(files_to_process), self._parallel_workers)
@@ -497,6 +527,14 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
+                            # 无论走缓存还是重新清洗，都补写一次 sidecar：
+                            # 「缓存文件名 → 原始文档名」的映射无法从文件名反推
+                            # （_safe_filename 会删空格、截断），历史缓存文件也
+                            # 借此在下次同步时自动获得正确映射。
+                            _write_md_meta(md_path, {
+                                "doc_name": os.path.basename(filepath),
+                                "source": rel_path,
+                            })
                             del text
 
                             if not cleaned.strip():
@@ -692,14 +730,17 @@ class RAGEngine:
             write_failed = False
             pending_manifest: Dict[str, Dict[str, Any]] = {}
             try:
-                _log("  开始流式向量化写入 (每批 %d 个切片)", 20)
+                # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
+                # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。
+                _log("  开始流式向量化写入 (每批 %d 个切片)", _WRITE_BATCH_SIZE)
                 added = store.add_streaming(
                     _chunk_iter(),
-                    batch_size=20,
+                    batch_size=_WRITE_BATCH_SIZE,
                     on_batch=_on_batch,
                     is_cancelled=self._is_cancelled,
                 )
                 stats["chunks"] = added
+                stats["chunks_total"] = store.count()
                 _log("  向量化写入完成: 共 %d 个切片已存入向量库", added)
             except Exception as e:
                 logger.error("  向量化写入失败: %s", e, exc_info=True)
@@ -707,7 +748,10 @@ class RAGEngine:
                 # 失败、磁盘满、LanceDB 写入异常）不是用户主动取消，不应该设置
                 # cancelled 标志。否则 UI 会错误地显示"同步已取消"并丢弃已
                 # 解析的数据。改为将异常记录到 errors，让 ingest 正常结束。
-                stats["chunks"] = store.count()
+                #
+                # stats["chunks"] 必须记「本次写入量」而不是全库总数：UI 用它
+                # 展示「本次新增多少切片」，写全库数会让用户以为全部重算了。
+                stats["chunks"] = added
                 stats["errors"].append(f"Vector store add failed: {e}")
                 write_failed = True
             finally:
@@ -742,7 +786,8 @@ class RAGEngine:
         cancelled = self._is_cancelled()
         if cancelled:
             stats["cancelled"] = True
-            stats["chunks"] = store.count()
+            # 记本次写入量而非全库总数：UI 展示的是「这次同步了多少切片」。
+            stats["chunks"] = added
             _log("⚠ 同步已被用户取消: %d/%d 文件已提取, %d 切片已存储",
                         stats["files_extracted"], stats["files_found"], stats["chunks"])
 
@@ -1003,16 +1048,26 @@ class RAGEngine:
         for fn in sorted(os.listdir(self._markdown_dir)):
             if not fn.endswith(".md"):
                 continue
-            # 缓存文件名格式：{safe_base}_{md5[:12]}.md → 还原 doc_name。
-            stem = fn[:-3]  # 去掉 .md
-            # 剥离末尾的 _{12位hex}
-            doc_name = stem
-            if len(stem) > 13 and stem[-13] == "_":
-                suffix = stem[-12:]
-                if all(c in "0123456789abcdef" for c in suffix):
-                    doc_name = stem[:-13]
-
             md_path = os.path.join(self._markdown_dir, fn)
+            # doc_name 的解析优先级：
+            #   1) sidecar（写缓存时落下的原始 basename，最权威）
+            #   2) documents 表按 md_path 反查（表里的 md_path 也是原值）
+            #   3) 从缓存文件名反推（**不可靠**：_safe_filename 会删掉空格、
+            #      并把名字截断到 32 字符，"Report 2024.pdf" → "Report2024.pdf"）
+            # 只用第 3 种会导致每次同步都查不到已有记录 → 全文重读 + 重建
+            # digest，并用错名字再写一条 → documents 表出现永久重复条目。
+            meta = _read_md_meta(md_path)
+            doc_name = (meta or {}).get("doc_name") or ""
+            if not doc_name:
+                doc_name = (store.get_document_by_md_path(md_path) or {}).get("doc_name", "")
+            if not doc_name:
+                stem = fn[:-3]  # 去掉 .md
+                doc_name = stem
+                if len(stem) > 13 and stem[-13] == "_":
+                    suffix = stem[-12:]
+                    if all(c in "0123456789abcdef" for c in suffix):
+                        doc_name = stem[:-13]
+
             try:
                 # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
                 # digest 记录已是最新——旧实现无条件全文读入 + build_digest，

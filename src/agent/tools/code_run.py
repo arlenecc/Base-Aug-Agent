@@ -5,6 +5,11 @@ blocked by a guarded builtins.open wrapper, while still allowing pip installs
 and network access (the whole point of code_run). A timeout prevents infinite
 loops from hanging the agent.
 
+**这不是安全边界**：限制只覆盖 ``builtins.open``。``pathlib.Path.write_text``、
+``os.open``、``os.remove``、``shutil`` 等路径都能绕过它。真正的隔离需要在
+受限子进程里执行。因此 code_run 被标记为 destructive，每次执行都必须经用户
+确认（见 AgentCallbacks.confirm）—— 确认弹窗才是这里唯一的实际防线。
+
 Timeout handling: Python threads cannot be forcefully killed, but we use a
 threading.Event-based cooperative cancellation to signal the worker thread
 to stop as soon as possible. For truly stuck code (infinite C extension loop),

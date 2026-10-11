@@ -7,10 +7,14 @@ Supports:
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,10 +31,18 @@ class StreamEvent:
     content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Dict[str, int] = field(default_factory=dict)
+    # 服务端的结束原因（"stop" / "length" / "tool_calls" / ...）。
+    # finish_reason="length" 说明回复被 max_tokens 截断——上层需要能识别，
+    # 否则半截回答会被当成完整答案写进历史。
+    finish_reason: str = ""
 
 
 class LLMError(RuntimeError):
     pass
+
+
+class _RetryWithoutStreamOptions(RuntimeError):
+    """内部信号：服务端拒绝了 ``stream_options``，需降级重试一次。"""
 
 
 class LLMClient:
@@ -94,6 +106,12 @@ class LLMClient:
             if resp.status_code >= 400:
                 raise LLMError(f"list_models failed: HTTP {resp.status_code} {resp.text[:200]}")
             data = resp.json()
+        except ValueError as e:
+            # 服务端返回了非 JSON（HTML 错误页、网关拦截页）。裸 ValueError 会让
+            # 「获取模型」按钮抛一句没有上下文的异常。
+            raise LLMError(
+                f"list_models: 响应不是合法 JSON ({e})：{resp.text[:200]!r}"
+            )
         finally:
             resp.close()
         items = data.get("data", []) if isinstance(data, dict) else data
@@ -103,7 +121,65 @@ class LLMClient:
     # ------------------------------------------------------------------
     # chat (streaming)
     # ------------------------------------------------------------------
+    # 瞬时错误的重试策略。旧实现零重试：一次网络抖动 / 服务端 5xx / 429 就
+    # 让整轮对话失败。注意只在**尚未产出任何事件**时重试——已经流式输出过内容
+    # 再重试会造成重复输出。
+    _MAX_RETRIES = 2
+    _RETRY_BASE_DELAY = 0.5
+
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        """判断是否为值得重试的瞬时错误。"""
+        if isinstance(exc, (httpx.ConnectError, httpx.ReadError,
+                            httpx.WriteError, httpx.RemoteProtocolError,
+                            httpx.PoolTimeout, httpx.ConnectTimeout)):
+            return True
+        # httpx.ReadTimeout 是 TimeoutException 的子类：读超时意味着还没收到
+        # 完整响应，重试是安全的（前提是还没有消费过任何 chunk）。
+        if isinstance(exc, httpx.ReadTimeout):
+            return True
+        if isinstance(exc, LLMError):
+            msg = str(exc)
+            # 服务端瞬时故障：5xx / 429。
+            if "HTTP 5" in msg or "HTTP 429" in msg or "429" in msg:
+                return True
+        return False
+
     def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+    ) -> Iterator[StreamEvent]:
+        last_err: Optional[BaseException] = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            produced = False
+            try:
+                for ev in self._chat_stream_once(messages, tools, temperature):
+                    if ev.type != "done":
+                        produced = True
+                    yield ev
+                return
+            except _RetryWithoutStreamOptions:
+                # 降级后立刻重试（不计入普通重试次数预算的等待）。
+                if attempt >= self._MAX_RETRIES:
+                    raise LLMError("chat_stream: 服务端拒绝了 stream_options，降级后仍失败")
+                continue
+            except Exception as e:
+                # 已经吐出过内容 → 重试会造成重复输出，直接上抛。
+                if produced or attempt >= self._MAX_RETRIES or not self._is_retryable(e):
+                    raise
+                last_err = e
+                delay = self._RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "chat_stream: %s，%.1fs 后重试 (%d/%d)",
+                    type(e).__name__, delay, attempt + 1, self._MAX_RETRIES,
+                )
+                time.sleep(delay)
+        if last_err is not None:  # pragma: no cover - 防御性
+            raise last_err
+
+    def _chat_stream_once(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -117,8 +193,11 @@ class LLMClient:
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,
             "stream": True,
-            "stream_options": {"include_usage": True},
         }
+        # 部分本地服务端（旧版 llama.cpp 等）不认识 stream_options，会直接
+        # 400。首次因此失败后降级重试不带该字段（见 _send_once 的调用方）。
+        if getattr(self, "_stream_options_ok", True):
+            payload["stream_options"] = {"include_usage": True}
         if self.min_p > 0:
             payload["min_p"] = self.min_p
         if self.top_k > 0:
@@ -130,6 +209,7 @@ class LLMClient:
 
         tool_acc: Dict[int, Dict[str, Any]] = {}
         final_usage: Dict[str, int] = {}
+        final_finish_reason = ""
 
         with self._http.stream("POST", url, headers=self._headers(), content=json.dumps(payload)) as resp:
             if resp.status_code >= 400:
@@ -137,6 +217,15 @@ class LLMClient:
                     body = resp.read().decode("utf-8", errors="replace")
                 except Exception:
                     body = ""
+                # 服务端不认识 stream_options → 永久降级并重试一次，而不是让
+                # 整个对话能力在这个服务端上不可用。
+                if (
+                    resp.status_code == 400
+                    and "stream_options" in body
+                    and payload.get("stream_options")
+                ):
+                    self._stream_options_ok = False
+                    raise _RetryWithoutStreamOptions()
                 raise LLMError(f"chat_stream failed: HTTP {resp.status_code} {body[:300]}")
 
             for raw in resp.iter_lines():
@@ -161,6 +250,11 @@ class LLMClient:
                     continue
                 choice = choices[0]
                 delta = choice.get("delta", {}) or {}
+                # 记录结束原因（"stop" / "length" / "tool_calls"）。最后一个
+                # 非空值即为本轮结束原因——中途 chunk 通常不带。
+                fr = choice.get("finish_reason")
+                if fr:
+                    final_finish_reason = fr
 
                 rc = delta.get("reasoning_content")
                 if rc:
@@ -180,11 +274,24 @@ class LLMClient:
                         slot["type"] = tc["type"]
                     fn = tc.get("function", {}) or {}
                     if fn.get("name"):
-                        slot["function"]["name"] += fn["name"]
+                        name_delta = fn["name"]
+                        cur = slot["function"]["name"]
+                        if not cur:
+                            slot["function"]["name"] = name_delta
+                        elif name_delta not in cur:
+                            # 只在确实是「续传片段」时才拼接。部分服务端会在每个
+                            # chunk 重复下发完整 name，无条件 += 会拼成
+                            # "read_fileread_file" 这类鬼名字。
+                            slot["function"]["name"] = cur + name_delta
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
 
-        yield StreamEvent("done", tool_calls=[tool_acc[k] for k in sorted(tool_acc)], usage=final_usage)
+        yield StreamEvent(
+            "done",
+            tool_calls=[tool_acc[k] for k in sorted(tool_acc)],
+            usage=final_usage,
+            finish_reason=final_finish_reason,
+        )
 
     # ------------------------------------------------------------------
     def close(self) -> None:

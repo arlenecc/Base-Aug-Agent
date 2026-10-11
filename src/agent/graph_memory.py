@@ -358,11 +358,25 @@ class GraphMemoryStore:
                 if table is None:
                     self._table = self._db.create_table("observations", records)
                     return
-                for rec in records:
+                # 单条 IN 删除而不是逐条 delete：典型 N+1 —— 一批 N 条记录
+                # 就是 N 次 LanceDB 删除事务。
+                ids = [rec["id"] for rec in records]
+                if len(ids) == 1:
                     try:
-                        table.delete(f"id = '{rec['id']}'")
+                        table.delete(f"id = '{ids[0]}'")
                     except Exception:
                         pass
+                elif ids:
+                    try:
+                        in_list = ", ".join("'" + i.replace("'", "''") + "'" for i in ids)
+                        table.delete(f"id IN ({in_list})")
+                    except Exception:
+                        # 少数后端不支持 IN → 退回逐条删除，保证语义不丢。
+                        for rec in records:
+                            try:
+                                table.delete(f"id = '{rec['id']}'")
+                            except Exception:
+                                pass
                 table.add(records)
         except Exception as e:
             logger.debug("graph_memory: index_observations_batch failed: %s", e)
@@ -411,9 +425,12 @@ class GraphMemoryStore:
             if key not in self._entities:
                 return False
             del self._entities[key]
+            # 用 .get：损坏的历史数据可能缺 source/target 键，直接下标取会让
+            # 整个 delete_entity 抛 KeyError —— 删除失败且图处于半删状态。
             self._relations = [
                 r for r in self._relations
-                if r["source"].lower() != key and r["target"].lower() != key
+                if (r.get("source") or "").lower() != key
+                and (r.get("target") or "").lower() != key
             ]
             self._deindex_observations(name)
             self._save()
@@ -501,6 +518,108 @@ class GraphMemoryStore:
     def list_relations(self) -> List[dict]:
         with self._lock:
             return [dict(r) for r in self._relations]
+
+    # ------------------------------------------------------------------
+    # batch write (fact extraction)
+    # ------------------------------------------------------------------
+
+    def batch_apply(self, entities: List[dict], relations: List[dict]) -> int:
+        """一次写入一批实体的 observations + 关系，返回新增 observation 数。
+
+        事实抽取一次会产出 ≤5 个实体 + ≤3 条关系。逐个调
+        ``add_observations`` / ``create_relation`` 会让**每个**元素都触发
+        一次 ``_save()`` —— 而每次 _save() 都要把整张图 JSON 序列化一遍再
+        原子写盘（图越大越贵），也就是最多 8 次全量落盘换一批事实。
+
+        这里在一把锁内完成所有内存更新，只 _save() 一次；embedding 仍按实体
+        在锁外批量执行（ONNX 计算绝不能持图锁）。
+        """
+        # 先归一化入参，尽量少占用锁的时间。
+        # name.lower() -> (name, entity_type, observations)
+        merged: Dict[str, tuple] = {}
+        for ent in entities or []:
+            name = _norm_name((ent or {}).get("name", ""))
+            if not name:
+                continue
+            key = name.lower()
+            etype = ((ent or {}).get("type") or "").strip()
+            obs = [o.strip() for o in (ent or {}).get("observations", []) if o and o.strip()]
+            if key not in merged:
+                merged[key] = (name, etype, list(obs))
+                continue
+            # 同一实体在抽取结果里重复出现 → 合并而不是丢弃后者，否则后一条
+            # 里独有的 observation 会被静默丢掉。
+            prev_name, prev_type, prev_obs = merged[key]
+            for o in obs:
+                if o not in prev_obs:
+                    prev_obs.append(o)
+            if etype and not prev_type:
+                merged[key] = (prev_name, etype, prev_obs)
+        wanted: List[tuple] = list(merged.values())
+
+        rels: List[tuple] = []
+        for rel in relations or []:
+            src = _norm_name((rel or {}).get("source", ""))
+            tgt = _norm_name((rel or {}).get("target", ""))
+            lbl = ((rel or {}).get("label") or "").strip()
+            if src and tgt and lbl:
+                rels.append((src, tgt, lbl))
+
+        to_index: List[tuple] = []  # (name, [new observations])
+        added = 0
+        with self._lock:
+            for name, etype, obs in wanted:
+                key = name.lower()
+                e = self._entities.get(key)
+                if e is None:
+                    e = {
+                        "name": name,
+                        "type": etype,
+                        "observations": [],
+                        "created_at": _now(),
+                    }
+                    self._entities[key] = e
+                elif etype and not e.get("type"):
+                    e["type"] = etype
+                if not isinstance(e.get("observations"), list):
+                    e["observations"] = []
+                fresh = []
+                for o in obs:
+                    if o not in e["observations"]:
+                        e["observations"].append(o)
+                        fresh.append(o)
+                if fresh:
+                    to_index.append((name, fresh))
+                    added += len(fresh)
+
+            for src, tgt, lbl in rels:
+                for n in (src, tgt):
+                    k = n.lower()
+                    if k not in self._entities:
+                        self._entities[k] = {
+                            "name": n,
+                            "type": "",
+                            "observations": [],
+                            "created_at": _now(),
+                        }
+                # 去重：source+target+label 相同视为同一条边。
+                if any(
+                    (r.get("source") or "").lower() == src.lower()
+                    and (r.get("target") or "").lower() == tgt.lower()
+                    and (r.get("label") or "").lower() == lbl.lower()
+                    for r in self._relations
+                ):
+                    continue
+                self._relations.append({"source": src, "target": tgt, "label": lbl})
+
+            if added or rels:
+                # 只落盘一次。
+                self._save()
+
+        # 锁外批量 embedding：每个实体一批 ONNX 前向。
+        for name, fresh in to_index:
+            self._index_observations_batch(name, fresh)
+        return added
 
     # ------------------------------------------------------------------
     # search
@@ -640,6 +759,9 @@ class GraphMemoryStore:
         # 允许重新初始化：否则 close 后 _ensure_vectors 会提前返回，
         # 后续（重建的）store 永远拿不到向量能力。
         self._vec_tried = False
+        # _backfilled 同样必须复位：它一旦为 True 就永久跳过 backfill，
+        # 重建的 store 会漏掉「JSON 图里有、向量表里没有」的历史事实。
+        self._backfilled = False
 
 
 # ---------------------------------------------------------------------------

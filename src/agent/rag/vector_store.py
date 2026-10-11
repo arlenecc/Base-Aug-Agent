@@ -249,6 +249,7 @@ class VectorStore:
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
+        self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -651,17 +652,26 @@ class VectorStore:
         在 C++ 计算期间持有 GIL，整批一次性嵌入会导致 UI 长时间冻结。
         """
         import time as _time
-        _SUB_BATCH = 5  # 每子批 5 个 chunk，平衡吞吐与 UI 响应
+        # 子批大小：ONNX Runtime 的批处理吞吐远高于逐条推理，5 太小
+        # （10 万切片 ≈ 2 万次调用 + 2 万次 sleep ≈ 200s 纯等待）。32 兼顾
+        # 吞吐与单次持锁时长。
+        _SUB_BATCH = 32
+        # 让出 GIL 的累计耗时阈值：不是「每子批都 sleep」，而是累计占用 GIL
+        # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
+        _YIELD_INTERVAL = 0.05
         texts = [c["text"] for c in chunks]
         all_vectors: List[List[float]] = []
+        _last_yield = _time.monotonic()
         for sub_start in range(0, len(texts), _SUB_BATCH):
             sub_texts = texts[sub_start:sub_start + _SUB_BATCH]
             sub_vectors = self._ef(sub_texts)
             all_vectors.extend(sub_vectors)
-            # 每个子批次完成后释放 GIL，让 Qt 事件循环有机会处理
-            # 排队的日志/进度信号。这是关键：ONNX Runtime 在 embed()
-            # 期间持有 GIL，只有在 Python 层主动 sleep 时才释放。
-            _time.sleep(0.01)
+            # 主动释放 GIL，让 Qt 事件循环有机会处理排队的日志/进度信号。
+            # 这是关键：ONNX Runtime 在 embed() 期间持有 GIL，只有在 Python
+            # 层主动 sleep 时才释放。
+            if _time.monotonic() - _last_yield >= _YIELD_INTERVAL:
+                _time.sleep(0.01)
+                _last_yield = _time.monotonic()
         vectors = all_vectors
         records: List[Dict[str, Any]] = []
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
@@ -705,6 +715,11 @@ class VectorStore:
         """
         if self._fts_ready:
             return True
+        # 建索引失败过就不再重试：旧实现只把 _fts_checked 置 True，而
+        # _fts_checked 全项目没有任何读取点 —— 于是每次检索都会重跑一遍
+        # 昂贵的全库建索引，然后再次失败。
+        if getattr(self, "_fts_failed", False):
+            return False
 
         # 原生 FTS 配置（两种 lancedb 版本共用同一语义）：
         #  - simple base tokenizer 按空格/标点切分，配合 jieba 预分词列，
@@ -741,6 +756,7 @@ class VectorStore:
             logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
             self._fts_checked = True
             self._fts_ready = False
+            self._fts_failed = True
             return False
 
         self._fts_ready = True
@@ -765,6 +781,9 @@ class VectorStore:
         channels consistently.
         """
         self._ensure_initialized()
+        # 空查询直接短路：否则会白白触发一次全库 FTS 建索引 + 一次空查询。
+        if not (query or "").strip():
+            return []
         table = self._ensure_table()
         if table is None:
             return []
@@ -787,13 +806,20 @@ class VectorStore:
 
         output: List[Dict[str, Any]] = []
         for r in results:
-            # Tantivy returns BM25 score in `_score` (higher is better).
+            # Tantivy/原生 FTS 返回的 BM25 分在 `_score`（越大越好），是无上界
+            # 的原始分（常见 5~30+）。绝不能把它直接塞进 `score`：
+            # `score` 在有向量候选的场合被当作 [0,1] 余弦相似度使用，
+            # _rerank_fallback 会对其做 `1 - s²/2` 换算 —— BM25=15 会被算成
+            # 1-112.5 → clamp 到 0.0，纯关键词候选集体排到末尾，混合检索
+            # 在 reranker 不可用时静默退化成纯向量检索。
+            # 这里用 s/(1+s) 归一化到 [0,1)，原始分另存 fts_score。
             raw = float(r.get("_score", 0.0))
+            norm = raw / (1.0 + raw) if raw > 0 else 0.0
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
                 "chunk_index": r.get("chunk_index", 0),
-                "score": raw,
+                "score": norm,
                 "fts_score": raw,
             })
         return output
@@ -829,7 +855,14 @@ class VectorStore:
         logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
         search = table.search(query_vec).limit(top_k)
         if where:
-            search = search.where(where)
+            # prefilter=True：先按条件过滤再做 ANN。默认的后置过滤是「先取
+            # ANN top-k 再过滤」，定向检索（rag_search(source=...)）下候选
+            # 会被先截断再筛，可能漏召回甚至返回空。
+            try:
+                search = search.where(where, prefilter=True)
+            except TypeError:
+                # 旧版 lancedb 的 where() 不接受 prefilter 关键字。
+                search = search.where(where)
         results = search.to_list()
         logger.info("  ├─ 向量检索完成: 获得 %d 个候选切片", len(results))
 
@@ -1055,9 +1088,11 @@ class VectorStore:
         if not isinstance(scores, list):
             scores = [scores]
 
-        # Attach rerank scores and sort (higher is better)
-        for i, score in enumerate(scores):
-            candidates[i]["rerank_score"] = float(score)
+        # Attach rerank scores and sort (higher is better).
+        # 用 zip 而不是按索引取：scores 与 candidates 长度不一致时（服务端
+        # 返回了意外条数）enumerate 版本会 IndexError 崩掉整个检索。
+        for cand, score in zip(candidates, scores):
+            cand["rerank_score"] = float(score)
 
         candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
 
@@ -1267,6 +1302,9 @@ class VectorStore:
         # 于是 BM25 检索静默失效（新表上没有索引）。
         self._fts_ready = False
         self._fts_checked = False
+        # close() 后可以重新 open：失败标记必须一并复位，否则新建的实例会
+        # 永久跳过全文索引。
+        self._fts_failed = False
         logger.info("VectorStore: resources released")
 
     def reload(self) -> None:
@@ -1290,6 +1328,7 @@ class VectorStore:
             self._documents_cache = None
         self._fts_ready = False
         self._fts_checked = False
+        self._fts_failed = False
         logger.debug("VectorStore: table handles dropped for reload")
 
     def list_sources(self) -> List[str]:
@@ -1465,6 +1504,27 @@ class VectorStore:
         for r in rows:
             name = (r.get("doc_name") or "").lower()
             if target and (target in name or name in target):
+                return {
+                    "doc_name": r.get("doc_name", ""),
+                    "digest": r.get("digest", ""),
+                    "chapters": r.get("chapters", ""),
+                    "md_path": r.get("md_path", ""),
+                }
+        return None
+
+    def get_document_by_md_path(self, md_path: str) -> Optional[Dict[str, Any]]:
+        """按 ``md_path``（写库时落下的权威键）定位文档元数据。
+
+        缓存文件名经过 ``_safe_filename`` 改写（删除空格、截断到 32 字符），
+        无法可靠地反推出入库时用的 ``doc_name``；``md_path`` 是原值，用它
+        匹配才准。返回 None 表示还没有对应记录。
+        """
+        self._ensure_initialized()
+        target = (md_path or "").strip()
+        if not target:
+            return None
+        for r in self._load_documents():
+            if (r.get("md_path") or "").strip() == target:
                 return {
                     "doc_name": r.get("doc_name", ""),
                     "digest": r.get("digest", ""),

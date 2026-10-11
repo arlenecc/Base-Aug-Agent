@@ -554,6 +554,15 @@ class SkillVectorStore:
         updated_dirs = [d for d in scanned if d in existing and existing[d] != scanned[d].fingerprint]
         removed_dirs = [d for d in existing if d not in scanned]
 
+        # 先完成所有 embedding，再进锁做删除 + 写入。
+        # 旧实现在锁内「先 delete 再 embed」：一旦 _embed_batch 中途抛异常
+        # （模型下载失败、ONNX 报错），被删除的 updated 行就永久丢失了 ——
+        # 技能在磁盘上存在、在索引里消失，直到下次全量重建才能找回。
+        to_add = [scanned[d] for d in (added_dirs + updated_dirs)]
+        new_rows: List[Dict[str, Any]] = []
+        for i in range(0, len(to_add), batch_size):
+            new_rows.extend(self._embed_batch(to_add[i:i + batch_size]))
+
         with self._lock:
             # Remove deleted skills.
             # 目录名来自文件系统/LLM，可能含单引号——直接拼进 SQL 字面量会
@@ -571,12 +580,8 @@ class SkillVectorStore:
                 except Exception:
                     pass
 
-            # Embed + add new and updated skills in small batches.
-            to_add = [scanned[d] for d in (added_dirs + updated_dirs)]
-            for i in range(0, len(to_add), batch_size):
-                batch = to_add[i:i + batch_size]
-                rows = self._embed_batch(batch)
-                table.add(rows)
+            if new_rows:
+                table.add(new_rows)
 
             # 数据增删后重建 FTS（BM25）索引，确保新增/删除项参与全文检索。
             if added_dirs or updated_dirs or removed_dirs:
@@ -846,12 +851,24 @@ class SkillRetriever:
                 norm = math.sqrt(sum(x * x for x in qv))
                 if norm > 0:
                     qv = [x / norm for x in qv]
-            res = (
-                table.search(qv, vector_column_name="desc_vec")
-                .where(f"dir = '{_sql_quote(dir)}'")
-                .limit(1)
-                .to_list()
-            )
+            # 必须 prefilter：默认的后置过滤会先取全库 ANN top-1 再套 where，
+            # 只要那个 top-1 不是目标 dir 就返回空 → 0.0 分 → 被
+            # _MIN_SIMILARITY 过滤掉。结果是 BM25 通道基本失效（BM25-only
+            # 候选几乎全部拿不到向量分）。
+            try:
+                search = (
+                    table.search(qv, vector_column_name="desc_vec")
+                    .where(f"dir = '{_sql_quote(dir)}'", prefilter=True)
+                    .limit(1)
+                )
+            except TypeError:
+                # 旧版 lancedb 的 where() 不接受 prefilter 关键字。
+                search = (
+                    table.search(qv, vector_column_name="desc_vec")
+                    .where(f"dir = '{_sql_quote(dir)}'")
+                    .limit(1)
+                )
+            res = search.to_list()
             if res:
                 return self._store._distance_to_similarity(res[0].get("_distance"))
         except Exception as e:
@@ -877,8 +894,12 @@ class SkillRetriever:
             events = list(llm.chat_stream([{"role": "user", "content": prompt}]))
             answer = ""
             for ev in events:
-                if ev.get("type") == "content":
-                    answer += ev.get("content", "")
+                # chat_stream 产出的是 StreamEvent 数据类，不是 dict；
+                # ev.get("type") 会抛 AttributeError 被下面的 except 吞掉，
+                # 让 _llm_pick 永远返回 None（静默失效）。
+                etype = ev.get("type") if isinstance(ev, dict) else getattr(ev, "type", "")
+                if etype == "content":
+                    answer += ev.get("content", "") if isinstance(ev, dict) else getattr(ev, "content", "")
             answer = answer.strip()
         except Exception as e:
             logger.warning("skill_retriever: LLM pick failed: %s", e)

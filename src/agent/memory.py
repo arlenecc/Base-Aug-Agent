@@ -75,7 +75,16 @@ class _JsonStore:
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     self._data = json.load(f)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as e:
+                # 损坏文件必须先备份再置空：旧实现直接 _data = {} 且 _dirty
+                # 保持 False，下一次 set() 就会用新内容**覆盖**掉损坏文件 ——
+                # 用户原有的记忆数据被静默抹掉，连恢复的机会都没有。
+                logger.warning("memory: %s 损坏或不可读 (%s)，已备份为 .corrupt", self.path, e)
+                try:
+                    backup = f"{self.path}.corrupt.{int(time.time())}"
+                    os.replace(self.path, backup)
+                except OSError:
+                    pass
                 self._data = {}
 
     def reload(self) -> None:

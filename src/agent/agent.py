@@ -621,24 +621,13 @@ class Agent:
             # 收集本次抽取到的所有 observation（实体观察），同时用于
             # 长期记忆（graph）与短期记忆（当天事实）两份写入。
             all_observations: List[str] = []
+            # 批量写入：逐个调 add_observations/create_relation 会让每个元素
+            # 各触发一次整图 JSON 序列化 + 原子写盘（≤8 次）。batch_apply 在
+            # 一把锁内改完内存、只落盘一次。
+            added = g.batch_apply(entities, relations)
             for ent in entities:
-                name = ent.get("name", "").strip()
-                if not name:
-                    continue
-                etype = ent.get("type", "")
-                obs = [o.strip() for o in ent.get("observations", []) if o and o.strip()]
-                if obs:
-                    g.add_observations(name, obs)
-                    added += len(obs)
-                    all_observations.extend(obs)
-                elif etype:
-                    g.create_entity(name, entity_type=etype)
-            for rel in relations:
-                src = rel.get("source", "").strip()
-                tgt = rel.get("target", "").strip()
-                lbl = rel.get("label", "").strip()
-                if src and tgt and lbl:
-                    g.create_relation(src, tgt, lbl)
+                obs = [o.strip() for o in (ent or {}).get("observations", []) if o and o.strip()]
+                all_observations.extend(obs)
             if added:
                 self._log(f"[memory] 抽取 {added} 条 observation + {len(relations)} 条 relation 存入长期记忆")
             # 同时追加到短期记忆（当天桶）：一次抽取，两份写入，避免重复抽取。
@@ -831,6 +820,8 @@ class Agent:
             # latency + model prefill, not generation speed).
             last_speed_emit: Optional[float] = None
             seen_done = False
+            # 服务端的结束原因（"stop" / "length" / "tool_calls"）。
+            finish_reason = ""
             # 流式过程中用户点了「终止对话」→ 中断读取并直接结束本轮。
             cancelled_mid_stream = False
             # Incremental token estimate: instead of joining the full
@@ -864,6 +855,7 @@ class Agent:
                         seen_done = True
                         tool_calls = ev.tool_calls
                         usage = ev.usage
+                        finish_reason = getattr(ev, "finish_reason", "") or ""
                         # 网关可能返回 null → `or 0` 归一，避免后续算术抛 TypeError
                         # 并被误报成「LLM 流错误」。
                         completion_tokens = usage.get("completion_tokens") or 0
@@ -933,6 +925,16 @@ class Agent:
                 self._log(
                     "[agent] warning: LLM stream ended without 'done' event — "
                     "回复可能被截断"
+                )
+            if finish_reason == "length":
+                # 被 max_tokens 截断：回复是半截的。必须让用户可见，否则
+                # 一个被截断的答案会被当成完整结论使用。
+                self._log(
+                    "[agent] warning: 本轮回复被 max_tokens 截断 "
+                    "(finish_reason=length)，内容可能不完整"
+                )
+                self._safe_callback(
+                    "on_log", "⚠ 本轮回复达到 max_tokens 上限被截断，可能不完整"
                 )
 
             # Total elapsed time (includes TTFB, used for total turn timing)

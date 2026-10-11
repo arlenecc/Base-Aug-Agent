@@ -1,9 +1,11 @@
 """Web tools: web_scan (fetch + extract text) and webexec_js (browser control)."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -18,6 +20,37 @@ from .base import Tool, ToolRegistry, ToolResult
 # 单次抓取最多读入的字节数。httpx 的非流式 get() 会把整个响应体读进内存，
 # 一个几 GB 的文件/流式接口就能把进程打满。
 _MAX_FETCH_BYTES = 8 * 1024 * 1024
+
+
+def _is_ssrf_target(url: str) -> bool:
+    """检测典型的 SSRF 目标（云元数据端点 / 链路本地地址）。
+
+    URL 由模型提供，只做协议白名单是不够的：`http://169.254.169.254/latest/
+    meta-data/` 会拿到云主机的 IAM 凭据。这里只拦截**字面量** IP——不做 DNS
+    解析（会引入阻塞，且对 DNS rebinding 也无能为力），因此是纵深防御的一层，
+    不是完整防护。
+
+    有意放行 127.0.0.0/8 与 ::1：本地开发/自测服务是 web_fetch 的正常用途，
+    拦掉会让工具在本地场景下不可用。
+    """
+    try:
+        host = (urlparse(url).hostname or "").strip().strip("[]")
+        if not host:
+            return False
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # 主机名（非 IP 字面量）→ 不做判断。
+        return False
+    if ip.is_loopback or ip.is_global:
+        return False
+    # 链路本地（169.254.0.0/16 含 AWS/GCP/Azure 元数据；fe80::/10）
+    if ip.is_link_local:
+        return True
+    if ip.version == 4:
+        # fd00:ec2::254 之外的 IPv4 元数据地址已由 link-local 覆盖。
+        return False
+    # IPv6 唯一本地地址 fd00::/8 —— 含 fd00:ec2::254（AWS IMDSv6）。
+    return ip.is_private
 
 
 def _read_capped(client, url: str) -> str:
@@ -115,6 +148,12 @@ class WebScanTool(Tool):
         # 可被用来读取本地文件或探测内网。
         if not url.lower().startswith(("http://", "https://")):
             return ToolResult(False, error=f"Only http/https URLs are supported: {url[:80]}")
+        # SSRF：拦掉云元数据端点等链路本地地址（见 _is_ssrf_target）。
+        if _is_ssrf_target(url):
+            return ToolResult(
+                False,
+                error=f"Refusing to fetch link-local/metadata address: {url[:80]}",
+            )
         try:
             text = _read_capped(self._http, url)
         except Exception as e:

@@ -35,6 +35,10 @@ from .base import Tool, ToolRegistry, ToolResult
 
 _work_memory_by_path: dict = {}
 _work_memory_lock = threading.Lock()
+# 缓存上限：按 workspace 路径缓存的实例永不淘汰，用户反复切换工作目录
+# （或与 tmp 目录配合的长跑测试）会让这个字典单调增长，每个条目都持有一个
+# _JsonStore（含其数据与 atexit WeakSet 引用）。超过上限就淘汰最久未用的。
+_WORK_MEMORY_MAX_ENTRIES = 32
 
 
 def _work_memory(config: AgentConfig) -> WorkMemory:
@@ -44,7 +48,22 @@ def _work_memory(config: AgentConfig) -> WorkMemory:
         with _work_memory_lock:
             wm = _work_memory_by_path.get(path)
             if wm is None:
+                # 先强制淘汰，再建新实例：避免刚创建的实例立刻被挤出去。
+                if len(_work_memory_by_path) >= _WORK_MEMORY_MAX_ENTRIES:
+                    for stale in list(_work_memory_by_path)[
+                        : max(1, _WORK_MEMORY_MAX_ENTRIES // 4)
+                    ]:
+                        victim = _work_memory_by_path.pop(stale, None)
+                        if victim is not None:
+                            try:
+                                victim.flush(force=True)
+                            except Exception:
+                                pass
                 wm = WorkMemory(path=path)
+                _work_memory_by_path[path] = wm
+            else:
+                # 命中即「最近使用」：dict 保持插入序，移到末尾实现简易 LRU。
+                _work_memory_by_path.pop(path)
                 _work_memory_by_path[path] = wm
     return wm
 
