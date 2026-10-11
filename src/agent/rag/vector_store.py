@@ -1024,6 +1024,10 @@ class VectorStore:
                             del reranker
                         except UnboundLocalError:
                             pass
+                        # 必须把状态机从 "loading" 里救出来：旧实现直接 return，
+                        # 状态永远停在 loading → 之后所有 rerank() 都命中
+                        # loading 分支永久返回 None，重排序静默失效且无日志。
+                        self._reranker_state = "failed"
                         return
                     self._reranker = reranker
                     self._reranker_state = "done"
