@@ -89,6 +89,7 @@ class ToolRegistry:
         from .web import WebScanTool, WebExecJsTool
         from .interact import AskUserTool
         from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
+        from .planning import TaskPlanTool
         from .skill_search import SkillSearchTool, SkillLoadTool, SkillSemanticSearchTool
 
         tools_to_register = [
@@ -98,6 +99,7 @@ class ToolRegistry:
             WebScanTool(),
             AskUserTool(),
             WorkMemoryTool(),
+            TaskPlanTool(),
             MemoryGraphTool(),
             MemorySearchTool(),
             SkillSearchTool(),

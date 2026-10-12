@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -14,6 +15,8 @@ from .config import AgentConfig
 from .llm_client import LLMClient, StreamEvent
 from .skills import SkillManager
 from .tools import ToolRegistry, parse_args
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -67,15 +70,16 @@ class AgentCallbacks:
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
 Rules:
-1. Plan, then call tools. After each result, decide the next step.
-2. Prefer the least destructive path. Risky/irreversible actions need confirmation.
-3. Missing info → `ask_user`, never guess.
-4. Recall prior context with `memory_search` before answering about the user or past work. Use `work_memory` only for multi-step notes (intermediate results, decisions, preferences).
-5. Complex task → `skill_semantic_search` first; if it finds nothing, try `skill_search` (they index different directories). Then `skill_load` and follow it. No match → proceed.
-6. User names a book/document → `rag_outline` for structure, then `rag_search` (with source) for details.
-7. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
-8. On tool ERROR: fix the arguments and retry. Two identical failures in a row → change approach or `ask_user`. Never loop on the same failing call.
-9. Reply concisely in plain text when done.
+1. Non-trivial task → first call `task_plan` (create: goal + 3-8 concrete steps). After each tool result, mark progress (`task_plan` update) and decide the next step; add steps as you learn more. Recreate the plan if the user's request is a different task; clear it when done.
+2. After each tool result, reflect: did it move you toward the goal? Decide the next step before acting.
+3. Prefer the least destructive path. Risky/irreversible actions need confirmation.
+4. Missing info → `ask_user`, never guess.
+5. Recall prior context with `memory_search` before answering about the user or past work. Use `work_memory` only for multi-step notes (intermediate results, decisions, preferences).
+6. Complex task → `skill_semantic_search` first; if it finds nothing, try `skill_search` (they index different directories). Then `skill_load` and follow it. No match → proceed.
+7. User names a book/document → `rag_outline` for structure, then `rag_search` (with source) for details.
+8. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
+9. On tool ERROR: fix the arguments and retry. Two identical failures in a row → change approach or `ask_user`. Never loop on the same failing call.
+10. Reply concisely in plain text when done.
 
 Paths are relative to the workspace. Only `code_run`, `shell_run` and external MCP tools require confirmation."""
 
@@ -133,6 +137,38 @@ _MAX_FACTS_CHARS = 2000         # 事实段总字符上限
 _MAX_FACT_CHARS = 120           # 单条事实字符上限
 _MAX_SKILL_PROMPT_CHARS = 1500  # 命中技能 prompt 的字符上限
 _MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
+
+# ---------------------------------------------------------------------------
+# 反思/防停滞机制（run() 内的看门狗）。
+# 目标：不让任务「半路跑丢或直接就停」。四道防线：
+#   1) 空响应（无内容无工具调用）→ 撤掉空消息、注入反思提醒后重试；
+#   2) 同一 (工具, 参数) 连续失败 → 在工具结果里附加重试指引；
+#   3) 连续多次工具失败（不管参数是否相同）→ 注入整段反思提醒；
+#   4) 迭代预算耗尽 → 强制做一次「无工具」收尾总结，绝不静默终止。
+# 每类提醒每个 run() 有次数上限，防止提醒本身变成新的循环。
+# ---------------------------------------------------------------------------
+
+_MAX_EMPTY_NUDGES = 2                 # 空响应重试次数
+_MAX_REFLECTION_NUDGES = 2            # 连续失败反思注入次数
+_IDENTICAL_FAIL_GUIDANCE_AT = 2       # 相同调用失败几次后附加重试指引
+_CONSECUTIVE_FAIL_NUDGE_AT = 4        # 连续失败几次后注入反思提醒
+
+_EMPTY_RESPONSE_NUDGE = (
+    "[系统提示] 你上一条回复是空的。请反思当前任务目标：如果还没完成，"
+    "调用合适的工具继续下一步；如果已完成，直接给出最终答复。不要输出空回复。"
+)
+
+_FAILURE_REFLECTION_NUDGE = (
+    "[系统提示] 已连续多次工具调用失败。请先停下反思：当前目标是什么？"
+    "已经尝试了什么？失败原因可能是什么？然后换一种方法或修正参数继续；"
+    "缺少必要信息时用 ask_user 向用户确认，不要继续盲目重试。"
+)
+
+_WRAPUP_NUDGE = (
+    "[系统提示] 你已达到本轮工具调用次数上限，不能再调用工具。"
+    "请基于当前进度做最终答复：总结已完成的工作与关键结果，说明还剩哪些"
+    "未完成的步骤、下一步该做什么，方便用户后续继续。"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +238,13 @@ class Agent:
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
+        # 「清空对话」= 会话状态归零：任务计划属于当前会话，一并清除，
+        # 否则旧计划会在新会话的系统提示里残留、误导模型。
+        try:
+            from .planner import clear_plan
+            clear_plan(self.config.workspace)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def close(self) -> None:
         """Release the dedicated fact-extraction LLM client's connection pool.
@@ -816,6 +859,13 @@ class Agent:
         # agent's reasoning budget.
         iteration = 0
         shrink_count = 0
+        # --- 反思/防停滞看门狗状态（每个 run() 重置）---
+        empty_nudges = 0            # 空响应已重试次数
+        reflection_nudges = 0       # 连续失败反思已注入次数
+        identical_fail_streak = 0   # 相同 (工具, 参数) 连续失败次数
+        consecutive_failures = 0    # 连续工具失败次数（不管参数）
+        last_tool_sig = None        # 上一次工具调用签名 (name, raw_args)
+
         while iteration < self.max_iterations:
             # 协作式取消：每轮迭代开始时检查。旧实现只在 confirm/ask_user 里
             # 检查 _cancelled——若模型接下来调用的都是无需确认的工具，取消
@@ -1070,6 +1120,28 @@ class Agent:
             if assistant_msg.get("content"):
                 final_content = assistant_msg["content"]
 
+            assistant_has_text = bool((assistant_msg.get("content") or "").strip())
+            if not tool_calls and not assistant_has_text:
+                # 防线 1：空响应（无文本、无工具调用）。模型可能卡住或"不知道
+                # 做什么就什么都不做"。处理：
+                #   a) 从历史撤掉这条空 assistant 消息——content=None 且无
+                #      tool_calls 的消息部分服务端会以 400 拒绝，留着还会污染
+                #      下一轮请求；
+                #   b) 注入反思提醒后重试（有次数上限），而不是静默结束；
+                #   c) 重试用尽 → 带着已有内容正常收尾，不让用户干等。
+                self._history.pop()
+                if empty_nudges < _MAX_EMPTY_NUDGES and not self._safe_is_cancelled():
+                    empty_nudges += 1
+                    self._log(
+                        f"[agent] 模型返回空响应，注入反思提醒重试 "
+                        f"({empty_nudges}/{_MAX_EMPTY_NUDGES})"
+                    )
+                    self._history.append({"role": "user", "content": _EMPTY_RESPONSE_NUDGE})
+                    continue
+                self._log("[agent] 空响应重试用尽，结束本轮")
+                self._safe_callback("on_finished")
+                return final_content
+
             if not tool_calls:
                 # no further action -> done
                 # Best-effort: extract facts from this conversation turn and
@@ -1107,11 +1179,73 @@ class Agent:
                 # 已写入历史，缺一条结果就会变成悬挂 tool_calls（下一轮 400）。
                 # 故整段执行包在 _run_one_tool_call 里，异常一律转成失败结果。
                 res = self._run_one_tool_call(tc)
-                self._history.append(self._tool_message(tc, res))
+                tool_msg = self._tool_message(tc, res)
+
+                # 防线 2/3：失败模式追踪。同一 (工具, 参数) 连续失败 → 在工具
+                # 结果末尾附加重试指引；连续多次失败（不管参数）→ 注入整段
+                # 反思提醒。让模型在下一步决策前被迫先复盘，而不是盲目重试。
+                sig = (name, raw_args)
+                if res.success:
+                    identical_fail_streak = 0
+                    consecutive_failures = 0
+                else:
+                    identical_fail_streak = (
+                        identical_fail_streak + 1 if sig == last_tool_sig else 1
+                    )
+                    consecutive_failures += 1
+                    if identical_fail_streak >= _IDENTICAL_FAIL_GUIDANCE_AT:
+                        tool_msg["content"] += (
+                            f"\n\n[系统提示] 相同的调用已连续失败 "
+                            f"{identical_fail_streak} 次。请修改参数、更换方法，"
+                            "或用 ask_user 向用户求助；不要原样重试。"
+                        )
+                last_tool_sig = sig
+                self._history.append(tool_msg)
+
+            # 防线 3：连续多次失败后注入反思提醒（次数有上限，防止提醒本身
+            # 变成新的循环）。重置计数器，让下一次提醒需要重新积累失败。
+            if (consecutive_failures >= _CONSECUTIVE_FAIL_NUDGE_AT
+                    and reflection_nudges < _MAX_REFLECTION_NUDGES):
+                reflection_nudges += 1
+                consecutive_failures = 0
+                self._log(
+                    f"[agent] 连续工具失败，注入反思提醒 "
+                    f"({reflection_nudges}/{_MAX_REFLECTION_NUDGES})"
+                )
+                self._history.append({"role": "user", "content": _FAILURE_REFLECTION_NUDGE})
 
             # 单轮内也可能突破 max_history（一轮最多追加 1+N 条 × 迭代次数），
             # 只在 run() 开头裁剪是不够的。
             self._trim_history()
+
+        # --- 防线 4：迭代预算耗尽，绝不静默终止 ---
+        # 走到这里说明最后一轮仍以工具调用收尾（正常完成会在循环内 return）。
+        # 旧行为只打一行日志就返回，用户看到的是「任务跑一半突然停了」。
+        # 现在注入收尾提醒，并做一次不带工具的最终调用，强制模型基于当前
+        # 进度总结成果与剩余步骤；失败/取消时退回最近一条非空回复。
+        self._log("[agent] max iterations reached，执行收尾总结")
+        if not self._safe_is_cancelled():
+            self._history.append({"role": "user", "content": _WRAPUP_NUDGE})
+            try:
+                messages = self._build_messages()
+                wrapup_parts: List[str] = []
+                for ev in self.llm.chat_stream(
+                    messages, tools=None, temperature=self.config.temperature
+                ):
+                    if self._safe_is_cancelled():
+                        self._log("[agent] 收尾总结被取消")
+                        break
+                    if ev.type == "content":
+                        wrapup_parts.append(ev.content)
+                        self._safe_callback("on_content", ev.content)
+                wrapup_text = "".join(wrapup_parts).strip()
+                if wrapup_text:
+                    self._history.append({"role": "assistant", "content": wrapup_text})
+                    final_content = wrapup_text
+                    self._maybe_extract_facts_async(wrapup_text)
+            except Exception as e:
+                # 收尾调用本身失败不能掩盖已有进度：退回回退逻辑。
+                self._log(f"[agent] 收尾总结失败: {e}")
 
         if not final_content and self._history:
             # 触及 max_iterations 时最后一轮通常是「只有 tool_calls、没有文本」
@@ -1122,7 +1256,6 @@ class Agent:
                     final_content = msg["content"]
                     break
 
-        self._log("[agent] max iterations reached, stopping.")
         self._safe_callback("on_finished")
         return final_content
 
@@ -1283,6 +1416,17 @@ class Agent:
                           "\n…（已截断，用 skill_load 读取完整技能内容）")
                 base += f"\n\n# Active skill: {matched.name}\n{sp}"
         except Exception:  # pragma: no cover
+            pass
+
+        # Inject the current task plan so every iteration (and every post-shrink
+        # request) re-anchors the model to the goal and its progress. The plan
+        # lives in the system prompt, which context shrinking never touches.
+        try:
+            from .planner import load_plan, render_plan
+            plan = load_plan(self.config.workspace)
+            if plan is not None:
+                base += "\n\n" + render_plan(plan)
+        except Exception:  # pragma: no cover - defensive
             pass
 
         # Dynamically inject knowledge base status so the agent knows RAG

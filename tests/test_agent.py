@@ -192,7 +192,109 @@ def test_agent_stops_after_max_iterations(config, recording_callbacks):
     agent.max_iterations = 3
     agent.run("loop")
 
-    assert len(mock.calls) <= 3
+    # 3 tool iterations + 1 forced wrap-up call (tools=None) — the agent must
+    # not just stop silently at the budget; it summarizes instead.
+    assert len(mock.calls) <= 4
+    assert mock.calls[-1]["tools"] is None
+
+
+def test_wrapup_summary_when_budget_exhausted(config, recording_callbacks):
+    """预算耗尽后必须注入收尾提醒并做一次无工具调用，产出最终总结，
+    而不是静默返回半截结果。"""
+    tc = [{"id": "c1", "function": {"name": "file_read", "arguments": json.dumps({"path": "a.txt"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "总结：已读取 a.txt；剩余：写入结果"),
+         _evt("done", usage={"total_tokens": 8})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.max_iterations = 2
+    final = agent.run("do task")
+
+    assert final == "总结：已读取 a.txt；剩余：写入结果"
+    # 最后一次调用不带工具（强制文本总结）
+    assert mock.calls[-1]["tools"] is None
+    # 收尾提醒已注入历史
+    assert any(m.get("role") == "user" and "工具调用次数上限" in (m.get("content") or "")
+               for m in agent.history())
+
+
+# ---------------------------------------------------------------------------
+# 反思/防停滞看门狗：空响应、重复失败、连续失败
+# ---------------------------------------------------------------------------
+
+def test_empty_response_triggers_nudge_then_recovers(config, recording_callbacks):
+    """模型返回完全空的响应（无内容无工具调用）时：撤掉空消息、注入反思
+    提醒重试，而不是静默结束一轮对话。"""
+    mock = MockLLM([
+        [],  # 空响应
+        [_evt("content", "recovered"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    final = agent.run("hi")
+
+    assert final == "recovered"
+    assert len(mock.calls) == 2
+    # 第二次调用包含反思提醒
+    nudge = [m for m in mock.calls[1]["messages"]
+             if m.get("role") == "user" and "上一条回复是空的" in (m.get("content") or "")]
+    assert len(nudge) == 1
+    # 最终历史里不残留「content=None 且无 tool_calls」的空 assistant 消息
+    # （部分服务端会以 400 拒绝这种消息）
+    for m in agent.history():
+        if m.get("role") == "assistant":
+            assert m.get("content") or m.get("tool_calls")
+
+
+def test_empty_response_exhausts_nudges_and_returns(config, recording_callbacks):
+    """空响应重试用尽后必须正常收尾（不崩溃、回调 on_finished），
+    而不是卡死或抛异常。"""
+    mock = MockLLM([[], [], []])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    final = agent.run("hi")
+
+    assert final == ""
+    # 1 次原始请求 + 2 次重试 = 3 次调用，不会无限循环
+    assert len(mock.calls) == 3
+
+
+def test_identical_failed_call_gets_retry_guidance(config, recording_callbacks):
+    """同一 (工具, 参数) 连续失败 2 次后，第二次的工具结果必须附加重试指引。"""
+    tc = [{"id": "c1", "function": {"name": "file_read",
+            "arguments": json.dumps({"path": "missing.txt"})}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "gave up"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("read missing")
+
+    third_msgs = mock.calls[2]["messages"]
+    tool_msgs = [m for m in third_msgs if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    assert "连续失败" not in tool_msgs[0]["content"]
+    assert "连续失败 2 次" in tool_msgs[1]["content"]
+
+
+def test_consecutive_failures_trigger_reflection_nudge(config, recording_callbacks):
+    """连续 4 次工具失败（不同参数）后，注入一条整段反思提醒。"""
+    scripts = []
+    for i in range(4):
+        tc = [{"id": f"c{i}", "function": {"name": "file_read",
+                "arguments": json.dumps({"path": f"missing_{i}.txt"})}}]
+        scripts.append([_evt("done", tool_calls=tc, usage={"total_tokens": 5})])
+    scripts.append([_evt("content", "reflected"), _evt("done", usage={"total_tokens": 5})])
+    mock = MockLLM(scripts)
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    final = agent.run("flail")
+
+    assert final == "reflected"
+    # 第 5 次调用的消息里包含反思提醒（紧跟在失败的工具结果之后）
+    nudge = [m for m in mock.calls[4]["messages"]
+             if m.get("role") == "user" and "连续多次工具调用失败" in (m.get("content") or "")]
+    assert len(nudge) == 1
 
 
 # ---------------------------------------------------------------------------
