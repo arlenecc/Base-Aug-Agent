@@ -67,7 +67,13 @@ class ToolRegistry:
         self.callbacks = callbacks
         self.config.ensure_workspace()
         self._tools: Dict[str, Tool] = {}
+        # 保护 _tools / _mcp_clients：MCP 工具由后台线程注册，而 agent 线程
+        # 会并发读（schemas/get/execute）。没有锁时后台线程写入期间读到的可能
+        # 是「注册了一半」的工具表。
+        self._tools_lock = threading.RLock()
         self._mcp_clients: list = []  # MCPClient instances, for cleanup
+        self._mcp_threads: list = []  # 后台连接线程，shutdown 时要回收
+        self._shutdown = False
         self._rag_engine = None  # lazy-initialized RAGEngine
         # 保护懒初始化的重资源单例（SkillRetriever / LongTermMemory）：
         # agent 线程与 UI 线程可能并发首次调用。
@@ -109,6 +115,7 @@ class ToolRegistry:
         for t in tools_to_register:
             t.bind(self.config, self)
             self._tools[t.name] = t
+        self._invalidate_schema_cache()
 
         # Register RAG tools
         self._register_rag_tools()
@@ -117,14 +124,25 @@ class ToolRegistry:
         self._register_mcp_tools()
 
     def _register_mcp_tools(self) -> None:
-        """Connect to configured MCP servers and register their tools."""
+        """Connect to configured MCP servers and register their tools.
+
+        **在后台线程连接**：握手 + tools/list 是同步阻塞的，一个起不来的
+        server 要等满 30s 超时。旧实现在 ``ToolRegistry.__init__`` 里同步跑，
+        而它在 UI 线程上被 ``_rebuild_agent()`` 调用 —— 配了 N 个 server 就是
+        最长 30s × N 的界面冻结，且期间没有任何提示。
+
+        现在只在这里创建 client（廉价）并起一个守护线程去连接；工具连好后
+        才注册进 ``_tools``（读侧有锁保护）。代价是「配置生效后的第一轮对话」
+        可能还看不到 MCP 工具——远好于界面卡死。工具被调用时若尚未连接，
+        ``MCPClient.ensure_started()`` 会现场拉起。
+        """
         mcp_servers = getattr(self.config, "mcp_servers", None) or []
         if not mcp_servers:
             return
 
-        from .mcp_client import MCPClient, MCPError
-        from .mcp_tool import MCPTool
+        from .mcp_client import MCPClient
 
+        clients = []
         for server_cfg in mcp_servers:
             if not isinstance(server_cfg, dict):
                 continue
@@ -133,27 +151,75 @@ class ToolRegistry:
             if not name or not command:
                 logger.warning("MCP server config missing name or command: %s", server_cfg)
                 continue
+            clients.append(MCPClient(
+                name=name,
+                command=command,
+                args=server_cfg.get("args", []),
+                env=server_cfg.get("env"),
+            ))
+
+        if not clients:
+            return
+
+        with self._tools_lock:
+            self._mcp_clients.extend(clients)
+
+        t = threading.Thread(
+            target=self._mcp_connect_worker,
+            args=(clients,),
+            daemon=True,
+            name="mcp-connect",
+        )
+        with self._tools_lock:
+            self._mcp_threads.append(t)
+        t.start()
+
+    def _mcp_connect_worker(self, clients: list) -> None:
+        """后台连接各 MCP server 并注册其工具（见 _register_mcp_tools）。"""
+        from .mcp_client import MCPError
+        from .mcp_tool import MCPTool
+
+        for client in clients:
+            if self._is_shutdown():
+                return
+            try:
+                client.start()
+            except MCPError as e:
+                logger.warning("MCP server '%s' init failed: %s", client.name, e)
+                continue
+            except Exception as e:
+                logger.warning("MCP server '%s' unexpected error: %s", client.name, e)
+                continue
 
             try:
-                client = MCPClient(
-                    name=name,
-                    command=command,
-                    args=server_cfg.get("args", []),
-                    env=server_cfg.get("env"),
-                )
-                client.start()
-                self._mcp_clients.append(client)
+                tool_defs = client.list_tools()
+            except Exception as e:
+                logger.warning("MCP server '%s' tools/list failed: %s", client.name, e)
+                continue
 
-                for tool_def in client.list_tools():
+            with self._tools_lock:
+                if self._shutdown:
+                    # 连接期间 registry 已关闭：这个 client 已登记在
+                    # _mcp_clients 里，交给 shutdown() 回收，不再注册工具。
+                    return
+                registered = 0
+                for tool_def in tool_defs:
                     t = MCPTool(client, tool_def)
                     if t.name and t.name not in self._tools:
                         t.bind(self.config, self)
                         self._tools[t.name] = t
-                        logger.info("MCP tool registered: %s (server: %s)", t.name, name)
-            except MCPError as e:
-                logger.warning("MCP server '%s' init failed: %s", name, e)
-            except Exception as e:
-                logger.warning("MCP server '%s' unexpected error: %s", name, e)
+                        registered += 1
+                if registered:
+                    # 工具表变了 → 让 agent 侧的 schema 缓存失效，否则新注册
+                    # 的 MCP 工具永远进不了模型可见的 schema。
+                    self._invalidate_schema_cache()
+            logger.info(
+                "MCP server '%s' ready: %d tools registered", client.name, registered
+            )
+
+    def _is_shutdown(self) -> bool:
+        with self._tools_lock:
+            return self._shutdown
 
     def _register_rag_tools(self) -> None:
         """Initialize RAG engine and register RAG tools."""
@@ -200,6 +266,8 @@ class ToolRegistry:
                     t.bind(self.config, self)
                     self._tools[t.name] = t
                     registered.append(t.name)
+            if registered:
+                self._invalidate_schema_cache()
             logger.info("RAG: tools registered: %s", ", ".join(registered))
         except Exception as e:
             logger.warning(
@@ -267,14 +335,27 @@ class ToolRegistry:
 
     def shutdown(self) -> None:
         """Stop all MCP server subprocesses and release RAG engine resources."""
-        for client in self._mcp_clients:
+        # 标记关闭：后台连接线程看到后不再注册工具、不再新建子进程。
+        with self._tools_lock:
+            self._shutdown = True
+            threads = list(self._mcp_threads)
+            clients = list(self._mcp_clients)
+            tools = list(self._tools.values())
+        # 等后台线程收手（它连接的子进程随后由下面的 stop() 回收）。
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=2.0)
+        with self._tools_lock:
+            self._mcp_threads.clear()
+        for client in clients:
             try:
                 client.stop()
             except Exception:
                 pass
-        self._mcp_clients.clear()
+        with self._tools_lock:
+            self._mcp_clients.clear()
         # Close shared httpx clients in web tools to release connection pools.
-        for tool in self._tools.values():
+        for tool in tools:
             http_client = getattr(tool, "_http", None)
             if http_client is not None:
                 try:
@@ -322,17 +403,40 @@ class ToolRegistry:
         setattr(self, "_skill_retriever_cache", None)
 
     def get(self, name: str) -> Optional[Tool]:
-        return self._tools.get(name)
+        with self._tools_lock:
+            return self._tools.get(name)
 
     def names(self) -> List[str]:
-        return list(self._tools.keys())
+        with self._tools_lock:
+            return list(self._tools.keys())
 
     def schemas(self) -> List[Dict[str, Any]]:
-        return [t.schema() for t in self._tools.values()]
+        """返回工具 schema 列表（带缓存）。
+
+        旧实现每次调用都重建全部 schema。而 agent 每轮迭代会调它两次
+        （一次算 token 估算的 md5 指纹、一次真正发请求），MCP server 多时
+        是几十 KB JSON 的重复序列化。缓存由 `_invalidate_schema_cache()`
+        在工具表变动时失效。
+        """
+        cached = getattr(self, "_schemas_cache", None)
+        if cached is not None:
+            return cached
+        # 快照：后台线程可能正在往 _tools 里注册 MCP 工具。
+        with self._tools_lock:
+            tools = list(self._tools.values())
+        result = [t.schema() for t in tools]
+        with self._tools_lock:
+            self._schemas_cache = result
+        return result
+
+    def _invalidate_schema_cache(self) -> None:
+        """工具表变动后调用（默认工具注册/MCP 后台注册）。"""
+        self._schemas_cache = None
 
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:
-        tool = self._tools.get(name)
+        with self._tools_lock:
+            tool = self._tools.get(name)
         if tool is None:
             return ToolResult(success=False, error=f"Unknown tool: {name}")
         if args is None:

@@ -380,7 +380,10 @@ class SkillVectorStore:
         self._ef = embedding_function
         self._db = None
         self._table = None
-        self._lock = threading.Lock()
+        # 必须是 RLock：_get_table() 持锁后会调用 _get_db()，而后者也要拿同一
+        # 把锁（用普通 Lock 会自锁死，这与 vector_store 的 _documents_lock 是
+        # 同一类问题）。build()/sync() 的写段同样用这把锁。
+        self._lock = threading.RLock()
 
     def _get_ef(self):
         if self._ef is None:
@@ -389,19 +392,29 @@ class SkillVectorStore:
         return self._ef
 
     def _get_db(self):
-        if self._db is None:
-            import lancedb
-            os.makedirs(self._db_path, exist_ok=True)
-            self._db = lancedb.connect(self._db_path)
+        if self._db is not None:
+            return self._db
+        # 必须加锁：agent 线程与 UI 线程会并发首次调用（ensure_indexed /
+        # search_vector / _lookup_similarity 都会走到这里），两个线程同时看到
+        # _db is None 就各自 lancedb.connect()，后写者覆盖前者 —— 先建的那个
+        # 连接再也不会被 close() 回收。
+        with self._lock:
+            if self._db is None:
+                import lancedb
+                os.makedirs(self._db_path, exist_ok=True)
+                self._db = lancedb.connect(self._db_path)
         return self._db
 
     def _get_table(self):
-        db = self._get_db()
-        if self._table is None:
-            if _SKILL_TABLE_NAME in db.table_names():
-                self._table = db.open_table(_SKILL_TABLE_NAME)
-            else:
-                self._table = None
+        if self._table is not None:
+            return self._table
+        with self._lock:
+            if self._table is None:
+                db = self._get_db()
+                if _SKILL_TABLE_NAME in db.table_names():
+                    self._table = db.open_table(_SKILL_TABLE_NAME)
+                else:
+                    self._table = None
         return self._table
 
     def _embed(self, texts: List[str]) -> List[List[float]]:

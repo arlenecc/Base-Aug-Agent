@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -131,13 +132,22 @@ def _gap_between(source: Optional[str], left: str, right: str) -> str:
     """
     if not source or not left or not right:
         return "\n\n"
-    i = source.find(left)
-    if i < 0:
-        return "\n\n"
-    j = source.find(right, i + len(left))
-    if j < 0:
-        return "\n\n"
-    return source[i + len(left):j]
+    # left 可能在原文出现多次（重复段落/样板文本），str.find 命中更早实例后
+    # j 会跨越真实 chunk 边界，算出的 gap 把不属于这两个 chunk 的文本拼进
+    # 结果——合并后的 chunk 不再是原文子串，极端情况下 gap 巨大。这里限定
+    # gap 上限，超限时尝试 left 的下一个出现位置。
+    _MAX_GAP = 256
+    start = 0
+    while True:
+        i = source.find(left, start)
+        if i < 0:
+            return "\n\n"
+        j = source.find(right, i + len(left))
+        if j < 0:
+            return "\n\n"
+        if j - (i + len(left)) <= _MAX_GAP:
+            return source[i + len(left):j]
+        start = i + 1
 
 
 def _merge_to_target_size(
@@ -250,6 +260,11 @@ def _tail_by_tokens(text: str, max_tokens: int) -> str:
 
 _shared_ef = None
 _shared_ef_resolved = False
+# 短时负缓存：模型不可用（如离线）时，同一次同步内每个 worker/每篇文档都
+# 会重复走一遍可能很慢的加载/下载失败路径。失败后 60s 内直接返回 None，
+# 网络恢复后超过间隔会自动重试（不破坏「失败后能自动升级」的原有语义）。
+_shared_ef_failed_at: Optional[float] = None
+_SHARED_EF_RETRY_INTERVAL = 60.0
 
 
 _shared_ef_lock = threading.Lock()
@@ -266,9 +281,17 @@ def _shared_embedding_function():
     切片，即使后来网络恢复/模型下载完成也不会再试。同时加载过程加锁，避免多个
     worker 线程并发触发多次模型加载。
     """
-    global _shared_ef, _shared_ef_resolved
+    global _shared_ef, _shared_ef_resolved, _shared_ef_failed_at
     if _shared_ef_resolved:
         return _shared_ef
+    # 短时负缓存：模型不可用（如离线）时，同一次同步内每个 worker/每篇文档
+    # 都会重复走一遍可能很慢的加载/下载失败路径；60s 内直接返回 None，
+    # 超过间隔自动重试（网络恢复后语义切片能自动升级，语义不丢）。
+    if (
+        _shared_ef_failed_at is not None
+        and time.monotonic() - _shared_ef_failed_at < _SHARED_EF_RETRY_INTERVAL
+    ):
+        return None
     with _shared_ef_lock:
         if _shared_ef_resolved:
             return _shared_ef
@@ -277,9 +300,12 @@ def _shared_embedding_function():
             _shared_ef = get_or_create_embedding_function()
             # 只在成功时置位，失败时留给下次重试。
             _shared_ef_resolved = _shared_ef is not None
+            if _shared_ef_resolved:
+                _shared_ef_failed_at = None
         except Exception as e:
             logger.debug("shared embedding function unavailable: %s", e)
             _shared_ef = None
+            _shared_ef_failed_at = time.monotonic()
     return _shared_ef
 
 

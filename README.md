@@ -9,13 +9,13 @@
 - **工具调用** — 内置 15 个工具（12 通用 + 3 RAG；`webexec_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
-- **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
+- **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理。manifest 写入走**跨进程文件锁（flock）+ 读改写合并**，多个入口（UI 同步 / agent 自动 ingest）并发时不会互相抹掉条目
 - **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
-- **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
-- **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
+- **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性。`code_run` 走独立子进程组，超时时 **SIGTERM → SIGKILL killpg** 真正杀掉整棵进程树（线程版只能等进程退出），同时立起取消标志文件供 `_cancelled()` 协作退出
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler；`VectorStore` 用**在途操作计数 + 条件变量**保证 `clear()`/`close()`/`reload()` 不与在途检索/写入并发；「应用配置」的重资源释放移到后台线程，不冻结界面
+- **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；`code_run` 在**受限子进程**中执行且写路径防护覆盖 `builtins.open` / `io.open` / `os.*` 写类操作 / `pathlib.Path` / `shutil`，`rename`/`link`/`symlink` 的**目标路径**同样校验；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https、拦截云元数据地址（SSRF）并限制响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
 - **确认机制** — 工作区内操作自动执行，`shell_run` / `code_run` 等高风险操作需用户确认；确认弹窗只显示**用途说明**（启发式优先：注释/docstring/命令名映射，零延迟；无注释时才用 LLM 兜底生成 ≤20 字用途），不贴代码全文，避免超长文本把按钮顶出屏幕
@@ -120,7 +120,7 @@ python main.py
 | `file_write` | 写入文件 | ❌ |
 | `file_modify` | 修改文件（搜索替换） | ❌ |
 | `shell_run` | 执行 Shell 命令 | ✅ |
-| `code_run` | 执行 Python 代码 | ✅ |
+| `code_run` | 在受限子进程中执行 Python 代码（可强杀，写限工作区） | ✅ |
 | `web_scan` | 抓取网页内容 | ❌ |
 | `webexec_js` | 浏览器执行 JS（仅配置浏览器端点时注册） | ❌ |
 | `ask_user` | 向用户提问 | ❌ |
@@ -239,13 +239,13 @@ python main.py
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
 - **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
-- **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
+- **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 32 条/子批，累计持 GIL 达到阈值才主动让出（不逐个 sleep），让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
-- **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
+- **BM25 索引一致性**：写入（含单批写完、取消等提前出口）与删除都会失效 FTS 标记，`reload()` / `clear()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。重建**推迟到下次检索**惰性执行（旧实现每次 `add()` 都全表重建，一次同步 N 批 = N 次全库建索引）。
 - **Reranker 加载去重**：BGE reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
 
 ### 支持的文档格式
@@ -461,7 +461,12 @@ Agent 在长对话中会自动管理上下文窗口，避免超出模型 token �
 }
 ```
 
-启动后自动连接 MCP Server，注册其提供的工具。
+启动后**在后台线程连接** MCP Server 并注册其提供的工具：
+
+- 连接（握手 + `tools/list`）是同步阻塞的，一个起不来的 server 要等满 30s。放在 UI 线程会让「应用配置」/启动时冻结 30s×N 且无提示。
+- 因此构造 `ToolRegistry` 时只创建 client（廉价）并起守护线程去连接；工具表读写有锁，读侧取快照。
+- 工具被调用时尚未连上时，`MCPClient.ensure_started()` 会现场拉起；握手失败属于可重试的瞬时故障（不会被误判为永久停止）。
+- 代价：配置生效后的**第一轮对话**可能还看不到 MCP 工具——远好于界面卡死。
 
 ## 项目结构
 
@@ -489,7 +494,7 @@ src/agent/
 │   ├── base.py           # 工具注册中心（MCP + RAG 生命周期管理）
 │   ├── file_ops.py       # 文件读写工具
 │   ├── shell_run.py      # Shell 执行
-│   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
+│   ├── code_run.py       # Python 代码执行（受限子进程沙箱 + killpg 强杀 + 写路径防护）
 │   ├── web.py            # 网页抓取 / JS 执行
 │   ├── interact.py       # 用户交互
 │   ├── memory.py         # 记忆工具（work_memory / memory_graph / memory_search）
@@ -590,6 +595,33 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 63 | `_reranker_state` 打分失败后停在 `"done"` 而模型为 None | 状态机失真 | 同步置 `"failed"` |
 | 64 | 每 chunk 重复计算 `_hash_source` | 写入侧纯浪费（同批同源） | 批次内缓存 source→hash |
 | 65 | SYSTEM_PROMPT 含模型已知的协议说明与冗余反例 | 每轮浪费 ~100 tok | 精简；补充「语义检索 query 语言」与「工具报错重试」两条关键约束 |
+| 66 | `code_run` 在进程内 `exec`，线程**杀不掉** | 死循环线程存活到进程退出，持续占满一个核 | 改为受限子进程，超时 SIGTERM→SIGKILL `killpg` 整棵树（实测无残留忙循环） |
+| 67 | `code_run` 只 patch `builtins.open` | `pathlib.write_text` / `os.open` / `os.remove` / `shutil` 均可绕过写保护 | 子进程内覆盖 `builtins.open`、`io.open`、`os.*` 写类、`pathlib.Path`、`shutil` |
+| 68 | `code_run` 未校验 `rename`/`replace`/`link`/`symlink` 的**目标** | 先在工作区写好再 rename 出去即可落盘到任意位置 | 源与目标双向校验（含 pathlib 的 `rename`/`replace`/`symlink_to`） |
+| 69 | MCP 连接在 `ToolRegistry.__init__` 同步执行 | **UI 线程冻结 30s×N**（配多个 server 时） | 后台守护线程连接 + 工具表加锁；未连上时 `ensure_started()` 懒拉起 |
+| 70 | MCP 握手失败调 `stop()` 置 `_stopped` | 一次瞬时失败 = 该 server 本进程内**永久无法连接** | 拆出 `_teardown(stopped=False)`，失败可重试；重连前先收掉存活的旧进程 |
+| 71 | `_get_extract_llm()` 取不到锁/构造失败时退回 `self.llm` | 抽取线程与主线程流式请求共用同一 `httpx.Client`（流交错损坏） | 返回 `None` 并放弃本次抽取，绝不降级到共享连接池 |
+| 72 | `close()`/`shutdown()` 后抽取线程仍可新建资源 | 专用 LLM 连接池、~137MB ONNX 长期记忆**无人回收** | `Agent._closed` 标志 + `_get_long_memory` 检查 `registry._shutdown` |
+| 73 | `on_token_speed` / `on_usage` / `on_finished` 未隔离 | UI 回调一次异常 → `on_finished()` 永不执行，**界面永久忙碌** | 统一走 `_safe_callback`；`is_cancelled()` 也加隔离版 |
+| 74 | `_on_send` 只看 `_busy` 就覆盖 `self._worker` | 旧 QThread 仍运行时丢引用 → Qt `qFatal`，**进程静默退出** | 发送前校验 `_is_worker_running(_worker)`，并在同步进行中拒绝发送 |
+| 75 | `closeEvent` 用通配 `disconnect()` | 把精心连的 `finished→deleteLater` 一起断掉；`terminate()` 后无条件丢引用 | 改用 `blockSignals` + 统一 `_shutdown_worker()`，未确认结束**保留引用** |
+| 76 | 「应用配置」在主线程跑 `tools.shutdown()` | 逐个 MCP `join(2s)` + 释放 ~600MB 模型 → **界面冻结十几秒** | 旧资源释放移到后台线程（`_release_old_agent_async`） |
+| 77 | 「应用配置」与同步/依赖安装互不互斥 | 同步线程与主线程并发开关同一 LanceDB 目录与进程级单例 | 双方对称加守卫（agent 忙 / sync 忙 / deps 忙均拒绝） |
+| 78 | 同步临时 logging handler 仅靠 `finally` 摘除 | `terminate()` 时不执行 → handler 永久残留、日志重复、闭包持有整个 worker | `QThread.finished` 槽无条件补摘；`setLevel` 旧值恢复 |
+| 79 | manifest 全量覆盖写 | 两个入口并发时后写者用旧快照**抹掉**前者刚写入的条目 | `_ManifestLock`（flock + TLS 防自锁）+ 读改写合并；`removed` 集合区分「我删的」与「别人写的」 |
+| 80 | `RAGEngine.clear()` 无锁删 manifest | 被并发写**复活** → 向量库空、记录满，检索永远返回空且不自愈 | 持 manifest 锁删除 |
+| 81 | `clear()`/`close()` 与在途 `add`/`search` 并发 | 打到已 drop 的表或 `None` 连接（随机 AttributeError） | 在途计数 + 条件变量排空；`_begin_op` 同时检查 `_closing`；`reload()` 同样排空 |
+| 82 | `SkillVectorStore._get_db()`/`_get_table()` 无锁 | 并发首调建立两个 LanceDB 连接，泄漏一个 | 双重检查加锁（锁改 RLock：两者会嵌套） |
+| 83 | graph 向量回填失败前先置 `_backfilled` | 本进程内**永不重试**，历史事实一直检索不到 | 仅成功后置位，失败告警并允许重试 |
+| 84 | 回填用 `to_arrow().to_pylist()` 取 id 集合 | 物化全部列（含 768 维向量）→ 数百 MB 峰值 | `search().select(["id"])` 列裁剪下推 |
+| 85 | 流式每个 chunk 都做一次文档重排 + 压入 undo 栈 | 长回复主线程持续重排；undo 栈无上限增长 | 100ms 攒批写入；只读视图 `setUndoRedoEnabled(False)` |
+| 86 | `_tool_schema_tokens` 每轮迭代重复序列化整套 schema | MCP 工具多时一轮 15 次迭代的几十 KB JSON ×2 | `ToolRegistry.schemas()` 加缓存，工具表变动时失效 |
+| 87 | `_trim_history` 边界缺失 | 尾部连续 tool 消息时**历史被清空**，模型失去全部上下文 | 至少保留一条 |
+| 88 | 文档目录提取把代码块内的 `#` 当标题 | shell/Python 注释污染目录 digest | 围栏代码块感知（与 hybrid_chunker 一致） |
+| 89 | `shell_run` 子进程继承 stdin、严格解码 | `cat`/`ssh` 挂到超时；一个非法字节让该流**剩余输出静默丢失** | `stdin=DEVNULL` + `utf-8`/`errors="replace"` |
+| 90 | `code_run` 超时后孙进程持有管道 → pump 线程永久挂起 | 每次调用白等 4s，泄漏两个线程 + 两个 fd | 短宽限后从父进程侧关闭管道唤醒；单行长度也封顶 |
+| 91 | `web_scan` 可被诱导访问 `169.254.169.254` | SSRF 拿到云主机 IAM 凭据 | 拦截链路本地/云元数据地址（放行 127.0.0.0/8 不影响本地开发） |
+| 92 | `graph_memory` 批量抽取逐元素落盘 | ≤8 次整图 JSON 序列化 + 原子写盘换一批事实 | `batch_apply()` 一把锁改完内存、只落盘一次 |
 
 ## 部署
 

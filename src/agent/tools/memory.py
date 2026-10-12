@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from typing import Any, List
+from typing import Any, List, Optional
 
 from ..config import AgentConfig
 from ..memory import LongTermMemory, WorkMemory
@@ -81,8 +81,17 @@ def _work_memory(config: AgentConfig) -> WorkMemory:
 _LONG_MEMORY_SINGLETON_ATTR = "_long_memory_instance"
 
 
-def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> LongTermMemory:
-    """Return the singleton LongTermMemory, creating it on first access."""
+def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> Optional[LongTermMemory]:
+    """Return the singleton LongTermMemory, creating it on first access.
+
+    Returns ``None`` when the registry has already been shut down: a late
+    background thread (fact extraction) would otherwise build a brand-new
+    ``GraphMemoryStore`` *after* ``shutdown()`` released the old one — that
+    instance (~137MB ONNX + a LanceDB connection) would then have no owner
+    and leak for the rest of the process.
+    """
+    if getattr(registry, "_shutdown", False):
+        return None
     existing = getattr(registry, _LONG_MEMORY_SINGLETON_ATTR, None)
     if existing is not None:
         return existing
@@ -218,6 +227,8 @@ class MemoryGraphTool(Tool):
             observations: List[str] = None, source: str = "",
             target: str = "", label: str = "") -> ToolResult:
         lm = _get_long_memory(self.registry, self.config)
+        if lm is None:
+            return ToolResult(False, error="长期记忆已释放（registry 已关闭）")
         g = lm.graph
         if op == "create_entity":
             if not name:
@@ -307,5 +318,7 @@ class MemorySearchTool(Tool):
             top_k = 5
         top_k = max(1, min(top_k, 20))
         lm = _get_long_memory(self.registry, self.config)
+        if lm is None:
+            return ToolResult(False, error="长期记忆已释放（registry 已关闭）")
         results = lm.graph.search(query, top_k=top_k)
         return ToolResult(True, output=json.dumps(results, ensure_ascii=False))

@@ -131,7 +131,13 @@ class SkillManager:
             return self._load_skills()
 
     def create_skill(self, name: str, keywords: List[str], prompt: str) -> Skill:
-        skill = Skill(name=name, keywords=[k.lower() for k in keywords], prompt=prompt)
+        # 元素类型不设防的话，UI/调用方传入 [123] 这类 keywords 会在 k.lower()
+        # 处抛 AttributeError；Skill.score/match 全生命周期都假设 str。
+        skill = Skill(
+            name=name,
+            keywords=[str(k).lower() for k in (keywords or [])],
+            prompt=prompt,
+        )
         with self._lock:
             skills = [s for s in self._load_skills() if s.name != name]
             skills.append(skill)
@@ -173,8 +179,8 @@ class SkillManager:
         meta = {
             "name": name,
             "description": description or f"Skill: {name}",
-            "keywords": [k.lower() for k in keywords],
-            "tags": tags or [],
+            "keywords": [str(k).lower() for k in (keywords or [])],
+            "tags": [str(t) for t in (tags or [])],
             "version": "1.0",
             "entry": "prompt.md",
         }

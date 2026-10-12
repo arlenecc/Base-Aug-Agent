@@ -13,6 +13,7 @@ import importlib
 import logging
 import os
 import subprocess
+import time
 import warnings
 import sys
 from dataclasses import dataclass, field
@@ -20,6 +21,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 重排序模型下载失败的短时负缓存（monotonic 时间戳）：见 ensure_rag_deps Step 3。
+_RERANKER_DOWNLOAD_FAILED_AT: Optional[float] = None
+_RERANKER_RETRY_INTERVAL = 600.0  # 10 分钟内不重复尝试下载
 
 # ---------------------------------------------------------------------------
 # Dependency registry
@@ -581,15 +586,29 @@ def ensure_dependencies(
 
     # ---- Step 3: Pre-download reranker model (optional, non-blocking) ----
     if report.reranker_model_missing:
-        if progress_callback:
-            progress_callback(f"重排序模型未缓存，开始后台下载 {RERANK_MODEL_LABEL}…")
-        success, msg = _download_reranker_model(progress_callback)
-        if success:
-            report.reranker_model_missing = False
-            installed_anything = True
+        global _RERANKER_DOWNLOAD_FAILED_AT
+        recent_failure = (
+            _RERANKER_DOWNLOAD_FAILED_AT is not None
+            and time.monotonic() - _RERANKER_DOWNLOAD_FAILED_AT < _RERANKER_RETRY_INTERVAL
+        )
+        if recent_failure:
+            # 负缓存：上次下载失败（网络不通等）后不再每次同步都同步阻塞一整轮
+            # 网络超时。重排序是可选能力，跳过不影响同步。
+            report.install_errors.append(
+                "重排序模型此前下载失败，短时间内不再重试（可选，不影响同步）"
+            )
         else:
-            # Reranker is optional — don't block sync if download fails
-            report.install_errors.append(f"重排序模型下载失败（可选，不影响同步）: {msg}")
+            if progress_callback:
+                progress_callback(f"重排序模型未缓存，开始后台下载 {RERANK_MODEL_LABEL}…")
+            success, msg = _download_reranker_model(progress_callback)
+            if success:
+                report.reranker_model_missing = False
+                installed_anything = True
+                _RERANKER_DOWNLOAD_FAILED_AT = None
+            else:
+                # Reranker is optional — don't block sync if download fails
+                report.install_errors.append(f"重排序模型下载失败（可选，不影响同步）: {msg}")
+                _RERANKER_DOWNLOAD_FAILED_AT = time.monotonic()
 
     if installed_anything and progress_callback:
         progress_callback("依赖检查完成。")

@@ -182,12 +182,15 @@ class GraphMemoryStore:
                 # （并且每次都把同样那条 debug 日志刷出来）。
                 self._vec_tried = True
         # Backfill outside the lock (embedding is slow). Only once per instance.
+        # 注意：只在**成功**后把 _backfilled 置 True。旧实现先置位再执行，
+        # 中途失败（模型下载失败、embed 批次报错）后状态永久为 True，本进程内
+        # 再也不会重试 —— 「JSON 图里有、向量表里没有」的历史事实一直检索不到。
         if self._vec_ready and not getattr(self, "_backfilled", False):
-            self._backfilled = True
             try:
                 self._backfill_vectors()
+                self._backfilled = True
             except Exception as e:
-                logger.debug("graph_memory: backfill failed: %s", e)
+                logger.warning("graph_memory: backfill failed (下次调用将重试): %s", e)
 
     def _backfill_vectors(self) -> None:
         """Index any observations present in the graph JSON but missing from
@@ -206,9 +209,20 @@ class GraphMemoryStore:
         existing_ids: set = set()
         if table is not None:
             try:
-                for r in table.to_arrow().to_pylist():
+                # 只取 id 列：to_arrow() 会物化全部列（含 768 维向量列），
+                # to_pylist() 再转成 Python 对象 —— 上万条 observation 时是
+                # 数百 MB 的一次性峰值，只为拿一个 id 集合。
+                rows = (
+                    table.search()
+                    .select(["id"])
+                    .limit(max(table.count_rows(), 1))
+                    .to_arrow()
+                    .to_pylist()
+                )
+                for r in rows:
                     existing_ids.add(r.get("id", ""))
-            except Exception:
+            except Exception as e:
+                logger.debug("graph_memory: 读取已索引 id 失败 (%s)，按全量回填", e)
                 existing_ids = set()
         # Collect missing (entity, observation) pairs.
         missing = [

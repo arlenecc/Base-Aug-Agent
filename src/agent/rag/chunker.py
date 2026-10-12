@@ -319,6 +319,11 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
             break
 
         # Advance position with overlap — incremental token count
+        if chunk_overlap <= 0:
+            # 零重叠：直接推进。旧实现循环条件 >= 0 恒真，仍会先吃进 1 个
+            # 字符再判断，导致永远有 1 字符重叠，与「零重叠」语义不符。
+            pos = end
+            continue
         overlap_start = end
         ov_cjk = 0
         ov_other = 0

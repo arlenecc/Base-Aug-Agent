@@ -6,10 +6,12 @@ Vectors are stored in LanceDB (Lance columnar format on local disk).
 """
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
 import threading
+import time
 import warnings
 from typing import Any, Dict, List, Optional
 
@@ -191,6 +193,24 @@ _EF_SINGLETONS: Dict[str, "FastEmbedEmbeddingFunction"] = {}
 _EF_SINGLETONS_LOCK = threading.Lock()
 
 
+def _store_op(func):
+    """装饰 VectorStore 的公开方法：登记在途操作，与 clear()/close() 互斥。
+
+    不装饰内部方法（``_*``）：它们由已登记的操作调用，重复计数会让
+    clear() 永远等不到排空（自己等自己）。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self._begin_op()
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            self._end_op()
+
+    return wrapper
+
+
 def get_or_create_embedding_function(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
 ) -> "FastEmbedEmbeddingFunction":
@@ -248,6 +268,14 @@ class VectorStore:
         self._reranker_lock = threading.RLock()
         # close() 后置位：后台加载线程完成时不得把模型写回本实例。
         self._closed = False
+        # ---- 在途操作计数：与 clear()/close() 互斥 ----
+        # clear() 会 drop_table、close() 会把 _db 置 None，二者若与在途的
+        # add/search 并发，在途操作会打到已删除的表或 None 连接上（表现是
+        # 随机 AttributeError / 检索到已删数据）。这里用在途计数 + 条件变量：
+        # 业务操作进出各记一次，clear/close 先排空在途操作再动手。
+        self._op_cv = threading.Condition(threading.Lock())
+        self._inflight = 0
+        self._closing = False
         # documents 表内容缓存：避免 get_document_digest / list_documents 每次
         # 都全表 to_pylist()（表内含完整 markdown，反复全量扫描既慢又占内存）。
         # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
@@ -263,9 +291,63 @@ class VectorStore:
     # lifecycle
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 在途操作计数（与 clear/close 互斥）
+    # ------------------------------------------------------------------
+
+    def _begin_op(self) -> None:
+        """登记一次在途操作。store 已关闭/正在关闭时抛明确的错误。
+
+        ``_closing`` 必须一起检查：``clear()`` 排空完在途操作后会执行
+        drop_table，若此时新操作仍能进来，就正好撞上这次改动想消除的竞态
+        （读到/写到一张已被删除的表）。旧实现只检查 ``_closed``，漏了它。
+        """
+        with self._op_cv:
+            if self._closed:
+                raise RuntimeError("VectorStore is closed")
+            if self._closing:
+                raise RuntimeError("VectorStore is shutting down (clear in progress)")
+            self._inflight += 1
+
+    def _end_op(self) -> None:
+        with self._op_cv:
+            self._inflight = max(0, self._inflight - 1)
+            if self._inflight == 0:
+                self._op_cv.notify_all()
+
+    def _drain_ops(self, timeout: float = 10.0) -> bool:
+        """排空在途操作，期间拒绝新的操作。返回 True 表示已排空。
+
+        超时后仍会继续：关闭/清空不能因为某个卡住的操作（例如慢 embedding）
+        而永久挂起，宁可冒一次竞态也不能把 UI 卡死。
+        """
+        deadline = time.monotonic() + timeout
+        with self._op_cv:
+            self._closing = True
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "VectorStore: %d 个在途操作未在 %.0fs 内结束，将继续关闭",
+                        self._inflight, timeout,
+                    )
+                    return False
+                self._op_cv.wait(remaining)
+            return True
+
+    def _resume_ops(self) -> None:
+        """clear() 结束后解除「拒绝新操作」状态。"""
+        with self._op_cv:
+            self._closing = False
+            self._op_cv.notify_all()
+
     def _ensure_initialized(self) -> None:
         if self._initialized:
             return
+        # close() 之后 _db 已被置 None：这里给出明确错误，而不是让后面的
+        # lancedb.connect / create_table 撞上 None。
+        if getattr(self, "_closed", False):
+            raise RuntimeError("VectorStore is closed")
         # ingest 的 4 个 worker 会并发走到这里（upsert_document / add_streaming
         # 都会触发），若不加锁，多个线程会同时执行 lancedb.connect /
         # create_table / schema 迁移，轻则重复建表报错，重则 schema 迁移互相
@@ -402,6 +484,7 @@ class VectorStore:
     # CRUD
     # ------------------------------------------------------------------
 
+    @_store_op
     def add(
         self,
         chunks: List[Dict[str, Any]],
@@ -488,6 +571,7 @@ class VectorStore:
         logger.info("VectorStore: added %d chunks", total)
         return total
 
+    @_store_op
     def delete_by_source(self, source: str) -> int:
         """删除指定 source 的全部记录。返回删除前的记录数（若可查）。
 
@@ -509,6 +593,7 @@ class VectorStore:
             logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
             return 0
 
+    @_store_op
     def add_streaming(
         self,
         chunk_iter,
@@ -811,6 +896,7 @@ class VectorStore:
         logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
         return True
 
+    @_store_op
     def search_fts(
         self,
         query: str,
@@ -871,6 +957,7 @@ class VectorStore:
             })
         return output
 
+    @_store_op
     def search(
         self,
         query: str,
@@ -1090,6 +1177,7 @@ class VectorStore:
         logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
         return result
 
+    @_store_op
     def rerank(
         self,
         query: str,
@@ -1189,6 +1277,7 @@ class VectorStore:
             )
         return kept
 
+    @_store_op
     def search_with_rerank(
         self,
         query: str,
@@ -1265,8 +1354,12 @@ class VectorStore:
             results = self._rerank_fallback(merged, top_k)
         return results
 
-    def clear(self) -> None:
-        """Delete all documents from the store."""
+    def _clear_locked(self) -> None:
+        """Delete all documents from the store.
+
+        调用方必须已排空在途操作（见 ``clear``）：drop_table 与在途的
+        add/search 并发，会让后者打到一张已被删除的表上。
+        """
         self._ensure_initialized()
         table = self._ensure_table()
         if table is None:
@@ -1288,10 +1381,29 @@ class VectorStore:
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
             self._db.drop_table(_DOCUMENTS_TABLE_NAME)
+        # documents 表**不存在**时也要清缓存/句柄：否则残留的旧缓存会让
+        # get_document_digest 继续返回已删除文档的 digest。清缓存必须与
+        # _load_documents 一样持 _documents_lock。
+        with self._documents_lock:
             self._documents_table = None
             self._documents_cache = None
-            logger.info("VectorStore: cleared documents metadata table")
+        logger.info("VectorStore: cleared documents metadata table")
 
+    def clear(self) -> None:
+        """清空向量库与文档元数据。
+
+        真正实现在 ``_clear_locked``：``clear`` 需要在拿到在途操作排空权之后
+        再动手——drop_table 与在途的 add/search 并发会让后者打到已删除的表上。
+        注意这里**不能**加 ``@_store_op``：它会先把自己登记为在途操作，随后
+        ``_drain_ops()`` 就会等自己结束（自锁）。
+        """
+        self._drain_ops()
+        try:
+            self._clear_locked()
+        finally:
+            self._resume_ops()
+
+    @_store_op
     def count(self) -> int:
         self._ensure_initialized()
         table = self._ensure_table()
@@ -1311,6 +1423,10 @@ class VectorStore:
         nulling the references here ensures the C++ destructors run as soon
         as possible, which is critical when SyncKnowledgeWorker creates a fresh
         RAGEngine per sync run.
+
+        Waits for in-flight ``add``/``search`` operations to finish first:
+        tearing down the LanceDB connection underneath them produces random
+        AttributeErrors (``self._db`` is None) or silently wrong results.
         """
         # Try to explicitly release the ONNX InferenceSession held by
         # FastEmbed's OnnxEmbeddings. FastEmbed wraps the model in a
@@ -1320,6 +1436,11 @@ class VectorStore:
         # This is best-effort: if the attribute layout changes in a future
         # FastEmbed version, the AttributeError is swallowed and we fall
         # back to simply dropping the Python reference.
+        # 先排空并**保持**排空态：若此时正有 add/search 在跑，它们会撞上被置
+        # None 的 _db 或已被 drop 的表。这里不能像 clear() 那样 _resume_ops()——
+        # close() 之后本实例永久不可用，_closing 保持 True 正好与
+        # _begin_op() 的检查一致（close 后新操作一律被拒）。
+        self._drain_ops()
         # 先标记关闭：后台 reranker 加载线程完成时看到 _closed 就不再把模型
         # 写回本实例（否则 close 之后的实例会「复活」持有 ~500MB 权重）。
         self._closed = True
@@ -1381,7 +1502,18 @@ class VectorStore:
 
         Call this after a sync completes to ensure the agent's VectorStore sees
         the freshly written data on its next search.
+
+        与 clear()/close() 一样先排空在途操作：``_table = None`` 与在途的
+        search() 并发时，后者可能正持有旧句柄做查询，行为未定义。
         """
+        self._drain_ops()
+        try:
+            self._reload_locked()
+        finally:
+            self._resume_ops()
+
+    def _reload_locked(self) -> None:
+        """``reload()`` 的实现，调用方必须已排空在途操作。"""
         self._table = None
         self._table_checked = False
         # documents 元数据表与其缓存同样持有打开时的快照：同步新增/更新了
@@ -1395,6 +1527,7 @@ class VectorStore:
         self._fts_failed = False
         logger.debug("VectorStore: table handles dropped for reload")
 
+    @_store_op
     def list_sources(self) -> List[str]:
         """Return unique source filenames in the store."""
         self._ensure_initialized()
@@ -1462,6 +1595,7 @@ class VectorStore:
             )
         return self._documents_table
 
+    @_store_op
     def upsert_document(
         self,
         doc_name: str,
@@ -1491,11 +1625,19 @@ class VectorStore:
         with self._documents_lock:
             # 已在锁内 → 用不重复加锁的版本，避免嵌套 acquire。
             table = self._ensure_documents_table_locked()
-            doc_id = _hash_source(doc_name)
+            # doc_id 必须唯一：旧实现用 basename/doc_name 生成，不同目录下的
+            # 同名文件（dir1/report.pdf 与 dir2/report.pdf）共用同一 doc_id，
+            # 互相覆盖；删除其中一个时另一个的 digest 也被一并删掉。md_path
+            # 是每篇文档唯一的缓存路径，优先用它做主键。
+            doc_id = _hash_source(md_path) if md_path else _hash_source(doc_name)
 
             # Delete any previous entry (and the placeholder row), then add the new one.
             try:
                 table.delete(f"doc_id = '{doc_id}'")
+                # 清理旧版（doc_id 用 basename 生成）的同名残留行，避免升级后
+                # documents 表出现新旧两份记录。旧记录本身已因 basename 碰撞
+                # 互相覆盖，最多只剩一条，删掉无损失。
+                table.delete(f"doc_id = '{_hash_source(os.path.basename(doc_name))}'")
                 table.delete("doc_id = ''")
             except Exception:
                 pass
@@ -1542,6 +1684,7 @@ class VectorStore:
             self._documents_cache = rows
             return rows
 
+    @_store_op
     def get_document_digest(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """Return {doc_name, digest, markdown, chapters} for a document by name.
 
@@ -1576,6 +1719,18 @@ class VectorStore:
                 }
         return None
 
+    @_store_op
+    def list_document_records(self) -> List[Dict[str, Any]]:
+        """返回 documents 表全部记录（轻量列）。
+
+        供批量预检使用：旧实现每处理一个缓存文件就调一次按名查询——而每次
+        upsert 都会作废 _documents_cache，导致 O(M·N) 的重复全表加载。
+        调用方应一次性取快照后在内存中匹配。
+        """
+        self._ensure_initialized()
+        return list(self._load_documents())
+
+    @_store_op
     def get_document_by_md_path(self, md_path: str) -> Optional[Dict[str, Any]]:
         """按 ``md_path``（写库时落下的权威键）定位文档元数据。
 
@@ -1597,22 +1752,31 @@ class VectorStore:
                 }
         return None
 
+    @_store_op
     def list_documents(self) -> List[str]:
         """Return the list of stored document names (for the outline tool)."""
         self._ensure_initialized()
         rows = self._load_documents()
         return sorted({r.get("doc_name", "") for r in rows if r.get("doc_name")})
 
+    @_store_op
     def delete_document(self, doc_name: str) -> None:
-        """Remove a document's metadata entry."""
+        """Remove a document's metadata entry.
+
+        同时按 doc_name 列精确删除（兼容 doc_id 主键从 basename 切换到
+        md_path 之前的旧版记录——它们的 doc_id 是 basename 的哈希）。
+        """
         self._ensure_initialized()
         with self._documents_lock:
             table = self._ensure_documents_table_locked()
             if table is None:
                 return
             doc_id = _hash_source(doc_name)
+            safe_name = (doc_name or "").replace("'", "''")
             try:
                 table.delete(f"doc_id = '{doc_id}'")
+                if safe_name:
+                    table.delete(f"doc_name = '{safe_name}'")
             except Exception as e:
                 logger.warning("删除文档元数据失败: %s", e)
             self._documents_cache = None

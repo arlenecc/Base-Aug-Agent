@@ -240,8 +240,18 @@ def _run_capture(command: str, cwd: str, timeout: float):
         command,
         shell=True,
         cwd=cwd,
+        # stdin=DEVNULL：子进程默认继承 agent 的 stdin——模型执行 cat / read /
+        # python REPL / ssh 这类读 stdin 的命令会挂到超时（且可能真实消费宿主
+        # 输入）。没有交互式输入是这个工具的正确语义。
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        # 显式 utf-8 + errors="replace"：text=True 默认按 locale 编码且
+        # errors="strict"，命令输出含一个非法字节（curl 抓到的二进制、损坏
+        # 文件名）就会让 _reader 线程的 read 抛 UnicodeDecodeError，被 except
+        # 吞掉后**该流剩余输出全部静默丢失**，模型看到的是截断且无标注的结果。
+        encoding="utf-8",
+        errors="replace",
         text=True,
         bufsize=1,
         start_new_session=True,

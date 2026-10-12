@@ -82,6 +82,14 @@ class MCPClient:
         self._running = False
         self._server_info: Dict[str, Any] = {}
         self._tools: List[Dict[str, Any]] = []
+        # 保护「连接」这一段：后台注册线程与工具调用线程可能同时首次触发
+        # start()——两处都各自 spawn 一个 server 子进程的话，后建者覆盖
+        # _process，先建的那个成为永不回收的孤儿进程。
+        self._start_lock = threading.Lock()
+        # stop() 之后不再允许重新连接：后台注册线程可能在 shutdown 之后才
+        # 跑到连接那一步，此时必须放弃，否则会在「已关闭」的 registry 上
+        # 拉起一个没人负责回收的子进程。
+        self._stopped = False
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -91,6 +99,31 @@ class MCPClient:
         """Launch the MCP server subprocess and perform the initialize handshake."""
         if self._running:
             return
+        with self._start_lock:
+            if self._running:
+                return
+            if getattr(self, "_stopped", False):
+                raise MCPError(f"MCP server '{self.name}': already stopped")
+            # 读线程可能只是因为 stdout 关闭而退出（_running 已被它的 finally
+            # 置 False），但 server 进程**仍然活着**。此时再 Popen 一个新进程
+            # 会让旧进程变成没人 terminate 的孤儿——先按「失败清理」收掉它
+            # （不置 _stopped，仍可重连）。
+            if self._process is not None and self._process.poll() is None:
+                self._teardown(stopped=False)
+            self._start_locked()
+
+    def ensure_started(self) -> None:
+        """幂等地确保已连接（懒连接入口）。
+
+        后台注册线程还没跑到、或首次连接失败后重试时，工具调用路径可以用它
+        现场拉起连接，而不是直接报「未连接」。
+        """
+        if self._running:
+            return
+        self.start()
+
+    def _start_locked(self) -> None:
+        """``start()`` 的实现，调用方必须已持有 ``_start_lock``。"""
 
         env = None
         if self.env:
@@ -146,11 +179,27 @@ class MCPClient:
                 self.name, len(self._tools),
             )
         except Exception:
-            self.stop()
+            # 握手失败属于**可重试的瞬时故障**（首次启动慢、30s 超时、网络抖动）。
+            # 这里只能清理本次拉起的进程，**绝不能**置 _stopped —— 旧实现调用
+            # stop()，而 stop() 会置 _stopped，导致该 server 在本进程内永远
+            # 无法再连接（ensure_started() 的"失败后重试"承诺直接失效）。
+            self._teardown(stopped=False)
             raise
 
     def stop(self) -> None:
         """Terminate the MCP server subprocess and wait for threads.
+
+        Sets ``_stopped`` so that a late background registration thread cannot
+        resurrect this client after shutdown.  For a *failed handshake* use
+        ``_teardown(stopped=False)`` instead — that keeps the client retryable.
+        """
+        self._teardown(stopped=True)
+
+    def _teardown(self, stopped: bool) -> None:
+        """``stop()`` 的实现。
+
+        ``stopped=True`` 表示调用方是 shutdown/close：此后禁止重新连接。
+        ``stopped=False`` 用于启动失败后的清理：进程收掉，但允许下次重试。
 
         Cleanup is driven by ``self._process``, NOT by ``self._running``.
         The reader thread sets ``_running = False`` in its ``finally`` block
@@ -162,6 +211,7 @@ class MCPClient:
         # Signal the reader thread to stop first. We set _running=False under
         # the lock so the reader sees it on its next loop iteration.
         with self._lock:
+            self._stopped = stopped
             self._running = False
             process = self._process
             self._process = None
@@ -228,6 +278,12 @@ class MCPClient:
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Call a tool on the MCP server and return the text content."""
+        # 懒连接兜底：后台注册线程可能还没跑到（或上次连接失败）。这里现场
+        # 拉起连接；失败时给出带上下文的错误，而不是裸的「未连接」。
+        try:
+            self.ensure_started()
+        except Exception as e:
+            raise MCPError(f"MCP server '{self.name}' is not available: {e}")
         # tools/call 与 initialize/tools/list 不能共用同一个 30s 超时：构建、
         # 批量处理、爬取这类工具跑几分钟是常态。旧实现让它们共用初始化超时，
         # 长任务必然超时失败——而服务端还在继续跑，结果被当迟到响应丢弃。

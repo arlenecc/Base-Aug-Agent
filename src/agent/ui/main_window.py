@@ -410,8 +410,17 @@ class SyncKnowledgeWorker(QThread):
         _tmp_handler.emit = _on_rag_log
         # 只挂父 logger；子 logger 保持 NOTSET（默认传播到父 logger）。
         _rag_loggers = [f"{_PKG_ROOT}.rag"]
+        # 记住原 level：setLevel 是**全局副作用**，同步结束后必须恢复，否则
+        # 之后该 logger 的 DEBUG 日志会静默丢失。
+        _prev_levels = {}
+        # 把 handler 暴露到 self：线程被 terminate() 时 Python 的 finally 不保证
+        # 执行，handler 会永久残留（闭包强引用整个 worker），下次同步再挂一个
+        # → 日志重复 N 遍。_on_sync_thread_finished 会无条件再摘一次。
+        self._sync_tmp_handler = _tmp_handler
+        self._sync_tmp_loggers = _rag_loggers
         for _name in _rag_loggers:
             _l = logging.getLogger(_name)
+            _prev_levels[_name] = _l.level
             _l.setLevel(logging.INFO)
             _l.addHandler(_tmp_handler)
         emit_stats = None
@@ -450,6 +459,11 @@ class SyncKnowledgeWorker(QThread):
             for _name in _rag_loggers:
                 try:
                     logging.getLogger(_name).removeHandler(_tmp_handler)
+                except Exception:
+                    pass
+            for _name, _lvl in _prev_levels.items():
+                try:
+                    logging.getLogger(_name).setLevel(_lvl)
                 except Exception:
                     pass
             # Release the VectorStore's resources (LanceDB connection, FastEmbed
@@ -592,6 +606,9 @@ class MainWindow(QMainWindow):
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
+        # 流式文本的攒批缓冲（见 _on_content / _flush_stream_buffer）。
+        self._stream_buf: list = []
+        self._stream_flush_timer: Optional[QTimer] = None
         self._busy = False
         # 「获取模型」/「同步知识」各有独立的忙碌态。旧实现让 _set_controls_busy
         # 统一用 self._busy 决定这两个按钮的 enable：agent 一轮结束就把它们
@@ -775,6 +792,9 @@ class MainWindow(QMainWindow):
         # chat view
         self.chat_view = QTextEdit()
         self.chat_view.setReadOnly(True)
+        # 关闭撤销栈：流式渲染会做数千次 insertText，每一条都会压进
+        # QTextDocument 的 undo 栈（无上限），长会话内存持续增长。
+        self.chat_view.setUndoRedoEnabled(False)
         # 限制对话区保留的段落数。长会话（多轮工具调用 + 大段输出）会让
         # QTextDocument 无限增长，最终吃光内存并让滚动/重排越来越卡。
         self.chat_view.document().setMaximumBlockCount(5000)
@@ -811,6 +831,8 @@ class MainWindow(QMainWindow):
         llay.addLayout(think_header)
         self.think_view = QPlainTextEdit()
         self.think_view.setReadOnly(True)
+        # 同 chat_view：只读展示区不需要撤销栈（流式写入量极大）。
+        self.think_view.setUndoRedoEnabled(False)
         font = QFont("Menlo")
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.think_view.setFont(font)
@@ -834,6 +856,7 @@ class MainWindow(QMainWindow):
         rlay.addLayout(log_header)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setUndoRedoEnabled(False)
         self.log_view.setFont(font)
         self.log_view.setMaximumBlockCount(5000)  # 限制日志行数，防止内存无限增长
         rlay.addWidget(self.log_view, 1)
@@ -943,6 +966,30 @@ class MainWindow(QMainWindow):
             kb = os.path.join(self.config.workspace, "knowledge_base")
         self.config.knowledge_base = kb
 
+    def _release_old_agent_async(self, old_agent) -> None:
+        """在后台线程释放旧 agent 的重资源（见 _rebuild_agent 的注释）。
+
+        线程只做 ``close()`` + ``tools.shutdown()``，不碰任何 Qt 控件；
+        daemon=True 保证关窗时不会拖住进程退出。
+        """
+
+        def _release():
+            try:
+                old_agent.close()
+            except Exception as e:
+                logger.warning("UI: 旧 agent 关闭异常: %s", e)
+            try:
+                old_agent.tools.shutdown()
+            except Exception as e:
+                logger.warning("UI: 旧工具资源释放异常: %s", e)
+
+        # 保活引用：否则这个线程对象可能在跑完前被 GC。
+        t = threading.Thread(target=_release, daemon=True, name="release-old-agent")
+        self._release_threads = getattr(self, "_release_threads", [])
+        self._release_threads[:] = [x for x in self._release_threads if x.is_alive()]
+        self._release_threads.append(t)
+        t.start()
+
     def _rebuild_agent(self) -> None:
         self._gather_config_from_widgets()
         # Shut down the old agent's resources (MCP subprocesses, httpx client)
@@ -950,14 +997,11 @@ class MainWindow(QMainWindow):
         # MCP server subprocesses and an open httpx connection.
         old_agent = getattr(self, "_agent", None)
         if old_agent is not None:
-            try:
-                old_agent.close()
-            except Exception:
-                pass
-            try:
-                old_agent.tools.shutdown()
-            except Exception:
-                pass
+            # 旧资源的释放**不能**在主线程同步做：`tools.shutdown()` 会逐个
+            # MCP server join(2s)、停子进程、释放 RAG 引擎的 LanceDB 连接与
+            # ONNX/OCR 模型（数百 MB）——配了多个 server 时是十几秒的界面冻结。
+            # 交给后台线程处理；新 agent 的创建不依赖旧资源，可以同时进行。
+            self._release_old_agent_async(old_agent)
         old_llm = getattr(self, "_llm", None)
         if old_llm is not None:
             try:
@@ -1003,10 +1047,20 @@ class MainWindow(QMainWindow):
         # the old agent's tools/MCP/httpx mid-execution, causing the running
         # AgentWorker to crash when its next tool call hits destroyed tools.
         # The user must wait for the current turn to finish (or stop it first).
-        if self._busy:
+        if self._busy or self._is_worker_running(self._worker):
             QMessageBox.warning(
                 self, "正在运行",
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再应用配置。",
+            )
+            return
+        # 同步/依赖安装在跑时同样不能重建：shutdown() 会释放进程级共享的
+        # OCR/docling 单例和 RAG 引擎，而同步线程可能正在用它们；同步结束后
+        # 的 reload_rag() 也会作用到新 agent 上，结果不可预期。
+        if (self._sync_busy or self._is_worker_running(self._sync_worker)
+                or self._is_worker_running(self._deps_worker)):
+            QMessageBox.warning(
+                self, "正在同步",
+                "知识库同步/依赖安装进行中，请先停止或等待其完成，再应用配置。",
             )
             return
         self.config.save(CONFIG_PATH)
@@ -1091,7 +1145,10 @@ class MainWindow(QMainWindow):
         依赖它决定是否解锁按钮，结果就是同步按钮再也点不动。
         """
         self._sync_busy = False
-        self.sync_knowledge_btn.setEnabled(True)
+        # 不能无条件解锁：agent 正在跑时（`self._busy`）同步按钮必须保持禁用，
+        # 否则按钮可见可点，点下去只得到一个「正在运行」弹窗 —— 与
+        # _set_controls_busy 合成的忙碌态不一致。
+        self.sync_knowledge_btn.setEnabled(not self._busy)
         self.sync_knowledge_btn.setText("同步知识")
         self.stop_sync_btn.setEnabled(False)
 
@@ -1252,6 +1309,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _remove_sync_tmp_handler(self) -> None:
+        """摘除同步线程挂上的临时 logging handler（幂等）。
+
+        ``SyncKnowledgeWorker.run()`` 的 finally 会摘一次，但线程被
+        ``terminate()`` 时 Python 的 finally 不保证执行；这里作为兜底，在
+        QThread.finished 的槽里无条件再摘一次，避免 handler 泄漏与日志重复。
+        """
+        handler = getattr(self, "_sync_tmp_handler", None)
+        loggers = getattr(self, "_sync_tmp_loggers", None)
+        if handler is None or not loggers:
+            return
+        for name in loggers:
+            try:
+                logging.getLogger(name).removeHandler(handler)
+            except Exception:
+                pass
+        self._sync_tmp_handler = None
+        self._sync_tmp_loggers = None
+
     def _on_sync_thread_finished(self) -> None:
         """兜底检查：QThread.finished 信号在 run() 返回后自动发射。
 
@@ -1265,6 +1341,10 @@ class MainWindow(QMainWindow):
         self._log_poll_timer.stop()
         if hasattr(self, '_log_handler') and self._log_handler is not None:
             self._log_handler._sync_active = False
+        # 无条件补摘一次同步用的临时 handler：线程被 terminate() 时 run() 里的
+        # finally 不保证执行，handler 会永久挂在 agent.rag logger 上（闭包还
+        # 强引用整个 worker），下次同步再挂一个 → 日志重复输出。
+        self._remove_sync_tmp_handler()
         self._poll_sync_logs()
         btn_text = self.sync_knowledge_btn.text()
         if btn_text in ("同步中…", "检查依赖…", "正在同步知识库…"):
@@ -1337,6 +1417,9 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 1)
         current = self.model_combo.currentText().strip()
         self.model_combo.clear()
+        # 服务端可能返回非字符串元素（数字 id / null），addItems 会抛
+        # TypeError → 槽函数异常 → PyQt6 abort。统一转成字符串。
+        models = [str(m) for m in (models or []) if m is not None]
         self.model_combo.addItems(models)
         if current in models:
             self.model_combo.setCurrentText(current)
@@ -1357,6 +1440,21 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_send(self) -> None:
         if self._busy:
+            return
+        # 只看 _busy 是不够的：_on_finished 在 worker 没能 2s 内 join 时会保留
+        # self._worker 并把 _busy 置 False。此时再发送会**覆盖**那个仍在运行的
+        # QThread 的最后一个 Python 引用 —— GC 一旦回收就是 Qt 的
+        # "QThread: Destroyed while thread is still running" qFatal，进程直接
+        # 退出（无提示）。必须等旧线程真正结束。
+        if self._is_worker_running(self._worker):
+            self.status_label.setText("上一轮对话仍在收尾，请稍候再发送")
+            return
+        # 同步知识库时禁止对话：两个线程会并发读写同一个 LanceDB 目录，
+        # 且同步结束的 reload_rag() 会把 agent 正在用的表句柄置空重开。
+        if self._sync_busy or self._is_worker_running(self._sync_worker):
+            QMessageBox.information(
+                self, "正在同步", "知识库同步进行中，请等待同步完成或先停止同步。"
+            )
             return
         text = self.send_editor.toPlainText().strip()
         if not text:
@@ -1493,6 +1591,23 @@ class MainWindow(QMainWindow):
         if not self._streaming_assistant:
             self._append_chat('<p><b class="a">助手</b>: </p>')
             self._streaming_assistant = True
+        # 攒批写入：每个 token chunk 都做一次「取光标 → 移到末尾 → insertText
+        # → 写回 → 滚动到底」会让主线程在长回复上持续做重排。这里先入缓冲，
+        # 由 _flush_stream_buffer（100ms 定时）一次性 flush。
+        self._stream_buf.append(text)
+        if self._stream_flush_timer is None:
+            self._stream_flush_timer = QTimer(self)
+            self._stream_flush_timer.setSingleShot(True)
+            self._stream_flush_timer.timeout.connect(self._flush_stream_buffer)
+        if not self._stream_flush_timer.isActive():
+            self._stream_flush_timer.start(100)
+
+    def _flush_stream_buffer(self) -> None:
+        """把攒下的流式文本一次性写入对话视图（见 _on_content）。"""
+        if not self._stream_buf:
+            return
+        text = "".join(self._stream_buf)
+        self._stream_buf.clear()
         # Always append at the document end: grab the widget cursor, move the
         # *copy* to End, insert, then write it back so the widget's real cursor
         # is at the end (otherwise ensureCursorVisible scrolls to the wrong place
@@ -1526,6 +1641,8 @@ class MainWindow(QMainWindow):
 
     def _on_tool_start(self, name: str, args: Any) -> None:
         import json as _json
+        # 工具调用前必须先把攒下的流式文本落地，否则工具输出会插在它前面。
+        self._flush_stream_buffer()
         self._streaming_assistant = False  # close any streaming assistant block
         try:
             pretty = _json.dumps(args, ensure_ascii=False)
@@ -1601,6 +1718,9 @@ class MainWindow(QMainWindow):
         # on_finished()，worker 的 finally 还会再发一次。若某条路径已经把
         # _busy 置 False，后续调用会直接 return，跳过 worker.wait() 和引用
         # 清理 —— QThread 可能在 OS 线程收尾时被 GC（Qt 直接 abort）。
+        # 先把攒下的流式文本落地：否则最后一小段要等到 100ms 定时器才显示，
+        # 而本轮已经结束了。
+        self._flush_stream_buffer()
         worker = self._worker
         if worker is None and not self._busy:
             return
@@ -1616,15 +1736,93 @@ class MainWindow(QMainWindow):
         # and wait() returns near-instantly -- but without it, dropping the last
         # Python reference can GC the QThread while its OS thread is still
         # winding down, which Qt aborts as "destroyed while still running".
-        if worker is not None and not worker.wait(2000):
-            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。保留引用，
-            # 由 closeEvent 兜底处理。
-            logger.warning("UI: agent worker did not join within 2s — keeping reference")
+        if worker is not None and not self._join_worker(worker, msecs=300):
+            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。保留引用
+            # （_on_send 会据此拒绝新消息），并用定时器异步重试——旧实现在这
+            # 里阻塞等 2s，同步跑 ONNX 时主线程被 GIL 饿死，很容易命中。
             self._worker = worker
+            self._schedule_worker_join(worker)
         # Now that streaming is done and the worker thread has joined, it's
         # safe to show the skill-suggestion modal dialog without blocking
         # the UI event loop during streaming.
         self._show_pending_skill_dialog()
+
+    def _shutdown_worker(self, worker, label: str, cancel: bool = False,
+                         wait_ms: int = 3000, term_wait_ms: int = 2000) -> bool:
+        """关窗时回收一个 worker 线程。返回 True 表示已确认结束。
+
+        两个关键点：
+        1. **不能用通配 ``disconnect()``**：它会把 ``finished → deleteLater``
+           一起断掉（那是 `_on_send` 等处精心连的），此后 QThread 只能靠
+           Python 引用计数析构；而 terminate() 之后若仍没 join 成功就丢引用，
+           GC 会撞上 Qt 的 "Destroyed while thread is still running" qFatal。
+           这里改用 ``blockSignals(True)`` 屏蔽业务信号，并保持引用直到确认
+           线程结束。
+        2. terminate() 后必须**检查 wait() 的返回值**：失败时不能把引用置
+           None，宁可让 Python 侧泄漏一个对象，也不能让进程 abort。
+        """
+        if worker is None:
+            return True
+        try:
+            worker.blockSignals(True)
+        except RuntimeError:
+            pass
+        if cancel:
+            # 协作式取消：让 agent 循环在当前工具/分块边界退出，比 terminate()
+            # 干净得多。
+            try:
+                self._callbacks.cancel()
+            except Exception:
+                pass
+        if not self._is_worker_running(worker):
+            return True
+        try:
+            cancel_fn = getattr(worker, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn()
+        except Exception:
+            pass
+        if self._join_worker(worker, wait_ms):
+            return True
+        logger.warning("UI: %s worker 未在 %dms 内结束，强制 terminate", label, wait_ms)
+        try:
+            worker.terminate()
+        except RuntimeError:
+            return True
+        if self._join_worker(worker, term_wait_ms):
+            return True
+        # 仍没结束（例如线程卡在不可中断的 D 状态）：**保住引用**，交给
+        # Python GC 在进程退出时处理，绝不能在此丢弃。
+        logger.error(
+            "UI: %s worker 强制终止后仍未结束，保留引用避免 Qt abort", label
+        )
+        return False
+
+    def _join_worker(self, worker, msecs: int) -> bool:
+        """``worker.wait(msecs)`` 的容错版本。
+
+        QThread 被 ``deleteLater`` 后 C++ 对象可能已销毁，``wait()`` 会抛
+        RuntimeError；这里按「已结束」处理（对象都没了，自然不需要等）。
+        """
+        if worker is None:
+            return True
+        try:
+            return bool(worker.wait(msecs))
+        except RuntimeError:
+            return True
+
+    def _schedule_worker_join(self, worker, attempt: int = 0) -> None:
+        """异步轮询回收 agent worker，避免在主线程阻塞等待。"""
+        if worker is None:
+            return
+        if self._join_worker(worker, msecs=200):
+            if self._worker is worker:
+                self._worker = None
+            return
+        if attempt >= 20:  # 约 4s，交给 closeEvent 兜底
+            logger.warning("UI: agent worker 未能及时退出，保留引用由 closeEvent 兜底")
+            return
+        QTimer.singleShot(200, lambda: self._schedule_worker_join(worker, attempt + 1))
 
     def _on_error(self, msg: str) -> None:
         self._append_chat(f'<p class="sys">⚠ {self._escape(self._friendly_error(msg))}</p>')
@@ -1664,14 +1862,31 @@ class MainWindow(QMainWindow):
         # 兜底保护：确认消息过长会把 Yes/No 按钮顶出屏幕，这里截断到合理长度。
         if len(message) > 800:
             message = message[:800] + "…\n\n（内容过长已截断）"
-        reply = QMessageBox.question(self, "确认操作", message,
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                     QMessageBox.StandardButton.No)
-        self._callbacks.set_confirm_result(reply == QMessageBox.StandardButton.Yes)
+        try:
+            reply = QMessageBox.question(
+                self, "确认操作", message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            result = reply == QMessageBox.StandardButton.Yes
+        except Exception as e:
+            logger.warning("UI: 确认对话框异常，按「拒绝」处理: %s", e)
+            result = False
+        finally:
+            # 必须无条件回结果：这两个槽一旦抛异常或提前返回，
+            # set_confirm_result 永不调用，worker 线程会卡满 600s 才返回拒绝，
+            # 期间 UI 一直停在忙碌态。
+            self._callbacks.set_confirm_result(result)
 
     def _on_ask_request(self, prompt: str) -> None:
-        text, ok = QInputDialog.getText(self, "需要你的输入", prompt)
-        self._callbacks.set_ask_result(text if ok else None)
+        try:
+            text, ok = QInputDialog.getText(self, "需要你的输入", prompt)
+            result = text if ok else None
+        except Exception as e:
+            logger.warning("UI: 提问对话框异常，按「无输入」处理: %s", e)
+            result = None
+        finally:
+            self._callbacks.set_ask_result(result)
 
     def _on_context_shrunk(self, summary: str, reason: str) -> None:
         """历史被压缩时给出可见提示。
@@ -1800,6 +2015,8 @@ class MainWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     def _on_clear_chat(self) -> None:
+        # 丢弃未落地的流式缓冲，避免清空后定时器再把旧文本写回视图。
+        self._stream_buf.clear()
         self.chat_view.clear()
         self.think_view.clear()
         self._streaming_assistant = False
@@ -1866,62 +2083,20 @@ class MainWindow(QMainWindow):
         # Without this, closing the window during an agent run leaves the
         # worker thread alive; its bridge.finished/error/content signals
         # will emit into the already-destroyed Bridge → RuntimeError.
-        if self._worker is not None:
-            try:
-                self._worker.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            # Cooperative cancel: set the _cancelled flag so the agent loop
-            # exits after the current tool/chunk. This is faster than
-            # terminate() and avoids corrupting tool state mid-execution.
-            try:
-                self._callbacks.cancel()
-            except Exception:
-                pass
-            if self._is_worker_running(self._worker):
-                self._worker.wait(3000)
-                if self._is_worker_running(self._worker):
-                    logger.warning("UI: agent worker did not finish in 3s, terminating")
-                    self._worker.terminate()
-                    self._worker.wait(2000)
+        # 只有确认线程已结束才丢弃引用：terminate() 后仍未结束时丢引用会让
+        # GC 撞上 Qt 的 "Destroyed while thread is still running" qFatal。
+        if self._shutdown_worker(self._worker, "agent", cancel=True):
             self._worker = None
         # --- FetchModelsWorker: a quick HTTP call, usually finishes fast.
-        if self._fetch_worker is not None:
-            try:
-                self._fetch_worker.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            if self._is_worker_running(self._fetch_worker):
-                self._fetch_worker.wait(2000)
-                if self._is_worker_running(self._fetch_worker):
-                    self._fetch_worker.terminate()
-                    self._fetch_worker.wait(1000)
+        if self._shutdown_worker(self._fetch_worker, "fetch",
+                                 wait_ms=2000, term_wait_ms=1000):
             self._fetch_worker = None
         # --- SyncKnowledgeWorker: cooperative cancel (finishes current file).
-        if self._sync_worker is not None:
-            try:
-                self._sync_worker.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            if self._is_worker_running(self._sync_worker):
-                self._sync_worker.cancel()
-                self._sync_worker.wait(3000)
-                if self._is_worker_running(self._sync_worker):
-                    logger.warning("UI: sync worker did not finish in 3s, terminating")
-                    self._sync_worker.terminate()
-                    self._sync_worker.wait(2000)
+        if self._shutdown_worker(self._sync_worker, "sync"):
             self._sync_worker = None
         # --- InstallDepsWorker: no cancel mechanism, just wait.
-        if self._deps_worker is not None:
-            try:
-                self._deps_worker.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-            if self._is_worker_running(self._deps_worker):
-                self._deps_worker.wait(2000)
-                if self._is_worker_running(self._deps_worker):
-                    self._deps_worker.terminate()
-                    self._deps_worker.wait(1000)
+        if self._shutdown_worker(self._deps_worker, "deps",
+                                 wait_ms=2000, term_wait_ms=1000):
             self._deps_worker = None
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:

@@ -190,6 +190,9 @@ class Agent:
         # __init__ 里创建——懒初始化是 check-then-act 竞态，两个抽取线程可能
         # 各自建一把锁并各自成功 acquire，防堆叠形同虚设。
         self._fact_extract_lock = threading.RLock()
+        # close() 后置位：抽取守护线程不被跟踪/join，看到它就不再新建
+        # 任何资源（专用 LLM client、LongTermMemory），否则无人回收。
+        self._closed = False
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -206,7 +209,13 @@ class Agent:
         ``self.llm`` is owned by the UI (which closes it separately); we only
         own ``_extract_llm`` (a lazily-built independent LLMClient created to
         avoid racing the agent's shared httpx.Client from the extraction thread).
+
+        Also latches ``_closed``: the extraction daemon thread is not tracked
+        or joined, so it can otherwise create ``_extract_llm`` (and a fresh
+        LongTermMemory) *after* this point — and nothing would ever close them.
         """
+        # 先置标志再关：抽取线程看到 _closed 就不再新建任何资源。
+        self._closed = True
         ext = getattr(self, "_extract_llm", None)
         if ext is not None and ext is not self.llm:
             try:
@@ -229,7 +238,11 @@ class Agent:
             return
         # Start with a simple slice, then skip any leading tool messages.
         cut = len(self._history) - limit
-        while cut < len(self._history) and self._history[cut].get("role") == "tool":
+        # 边界：尾部若连续若干条都是 tool 消息，cut 会一路递增把历史**清空**
+        # （max_history 被设得很小时可达）。至少保留最后一条，否则模型拿不到
+        # 任何上下文，部分服务端还会因没有 user 消息直接报错。
+        while (cut < len(self._history) - 1
+               and self._history[cut].get("role") == "tool"):
             cut += 1
         del self._history[:cut]
 
@@ -604,8 +617,19 @@ class Agent:
             # A previous extraction is still running; skip to avoid piling up.
             return
         try:
+            # agent 已被关闭（应用配置/关窗）→ 直接放弃。否则下面的
+            # _get_long_memory 会在 tools.shutdown() **之后**重建
+            # LongTermMemory（GraphMemoryStore 懒加载 ~137MB ONNX +
+            # lancedb.connect），而这个新实例再也没有人负责回收。
+            if getattr(self, "_closed", False):
+                return
             from .graph_memory import extract_facts_via_llm
             extract_llm = self._get_extract_llm()
+            if extract_llm is None:
+                # 拿不到专用 client（锁被占 / 构造失败 / 已关闭）：绝不降级到
+                # self.llm —— 那会让守护线程与主线程的流式请求共用连接池。
+                self._log("[memory] 本轮跳过事实抽取（专用 LLM 客户端不可用）")
+                return
             data = extract_facts_via_llm(extract_llm, conversation)
 
             entities = data.get("entities", [])
@@ -616,6 +640,9 @@ class Agent:
 
             from .tools.memory import _get_long_memory
             lm = _get_long_memory(self.tools, self.config)
+            if lm is None:
+                self._log("[memory] 本轮跳过事实持久化（长期记忆已释放）")
+                return
             g = lm.graph
             added = 0
             # 收集本次抽取到的所有 observation（实体观察），同时用于
@@ -668,9 +695,17 @@ class Agent:
         # 但这里绝不能阻塞等锁：抽取线程会**在整个 LLM 调用期间**持有这把锁
         # （见 _extract_facts_sync），阻塞等待会让 agent 线程卡住一个完整
         # 请求（最长 read timeout）才发出确认弹窗——与「不延迟弹窗」的意图
-        # 正好相反。因此取不到锁就直接复用 self.llm 走本次调用。
+        # 正好相反。
+        #
+        # 取不到锁 / 构造失败时**绝不能退回 self.llm**：那正是本函数存在的
+        # 理由所要避免的情形（守护线程与 agent 主线程的流式请求共用同一个
+        # httpx.Client —— 连接池竞争会让两边的流交错损坏）。此时返回 None，
+        # 由调用方放弃本次抽取（事实抽取是 best-effort，丢一次远好于污染
+        # 正在进行的对话）。
+        if getattr(self, "_closed", False):
+            return None
         if not self._fact_extract_lock.acquire(blocking=False):
-            return self.llm
+            return None
         try:
             cached = getattr(self, "_extract_llm", None)
             if cached is not None:
@@ -688,11 +723,11 @@ class Agent:
                     repetition_penalty=self.llm.repetition_penalty,
                 )
                 return self._extract_llm
-            except Exception:  # pragma: no cover — best-effort
-                pass
+            except Exception as e:  # pragma: no cover — best-effort
+                logger.warning("[memory] 抽取专用 LLM 客户端创建失败: %s", e)
         finally:
             self._fact_extract_lock.release()
-        return self.llm
+        return None
 
     def _append_daily_facts(self, facts: List[str]) -> None:
         """Append auto-extracted facts to work memory under today's bucket.
@@ -785,9 +820,9 @@ class Agent:
             # 协作式取消：每轮迭代开始时检查。旧实现只在 confirm/ask_user 里
             # 检查 _cancelled——若模型接下来调用的都是无需确认的工具，取消
             # 根本不生效，会一直跑满 max_iterations。
-            if self.callbacks.is_cancelled():
+            if self._safe_is_cancelled():
                 self._log("[agent] 收到取消请求，终止本轮对话")
-                self.callbacks.on_finished()
+                self._safe_callback("on_finished")
                 return final_content
 
             # --- Proactive context shrink: if estimated prompt size exceeds
@@ -839,7 +874,7 @@ class Agent:
                 ):
                     # 流式期间也轮询取消（bool 检查，代价可忽略），否则长回复
                     # 期间点「终止对话」要等整个回复生成完才生效。
-                    if self.callbacks.is_cancelled():
+                    if self._safe_is_cancelled():
                         self._log("[agent] 取消：中断流式读取")
                         cancelled_mid_stream = True
                         break
@@ -874,8 +909,12 @@ class Agent:
                         gen_elapsed = max(now - ttfb, 1e-6)
                         if live_est_tokens > 0:
                             live_speed = live_est_tokens / gen_elapsed
-                            self.callbacks.on_token_speed(
-                                self._total_tokens + live_est_tokens, live_speed
+                            # 必须隔离：这个裸调用位于外层 try 内，一次 UI 异常
+                            # 会被当成「LLM 流错误」上报，并把本轮已产出的全部
+                            # 内容丢掉（assistant 消息还没写入历史）。
+                            self._safe_callback(
+                                "on_token_speed",
+                                self._total_tokens + live_est_tokens, live_speed,
                             )
                         last_speed_emit = now
             except Exception as e:
@@ -909,13 +948,13 @@ class Agent:
                 # on_error 也要隔离：它一旦抛出，下面的 on_finished 就永远
                 # 不会执行，UI 会一直停在忙碌状态（没有任何报错可见）。
                 self._safe_callback("on_error", err_str)
-                self.callbacks.on_finished()
+                self._safe_callback("on_finished")
                 return final_content or ""
 
             if cancelled_mid_stream:
                 # 流式期间被取消：不把半截回复当完整回答记入历史（UI 已展示了
                 # 内容）。直接结束本轮；用户下一条消息会以干净的状态开始。
-                self.callbacks.on_finished()
+                self._safe_callback("on_finished")
                 return final_content
 
             if not seen_done and (content_buf or reasoning_buf):
@@ -979,7 +1018,7 @@ class Agent:
                 self._total_tokens += api_total + extra_reasoning_tokens
 
             if usage:
-                self.callbacks.on_usage(usage)
+                self._safe_callback("on_usage", usage)
             # Final speed: use ONLY the completion token count (output tokens)
             # divided by generation-only time (excludes TTFB).
             #
@@ -997,7 +1036,7 @@ class Agent:
             else:
                 speed_tokens = completion_tokens + extra_reasoning_tokens
             speed = (speed_tokens / gen_elapsed) if speed_tokens else 0.0
-            self.callbacks.on_token_speed(self._total_tokens, speed)
+            self._safe_callback("on_token_speed", self._total_tokens, speed)
             self._log(
                 f"[iter {iteration}] <- {len(''.join(content_buf))} content chars, "
                 f"{len(reasoning_text)} reasoning chars (~{reasoning_tokens} tok), "
@@ -1038,7 +1077,7 @@ class Agent:
                 # daemon thread so the user gets their reply immediately
                 # without waiting for the extraction LLM call.
                 self._maybe_extract_facts_async(final_content)
-                self.callbacks.on_finished()
+                self._safe_callback("on_finished")
                 return final_content
 
             # execute each tool call
@@ -1051,7 +1090,7 @@ class Agent:
                 # tool_call 补一条合成 tool 消息——assistant_msg 里的
                 # tool_calls 已经写入历史，缺少对应的 tool 结果会导致下一轮
                 # 请求被 OpenAI 兼容 API 以 HTTP 400 拒绝（悬挂 tool_calls）。
-                if self.callbacks.is_cancelled():
+                if self._safe_is_cancelled():
                     self._log(f"[tool] {name} 已因用户取消而跳过")
                     from .tools import ToolResult
                     try:
@@ -1084,7 +1123,7 @@ class Agent:
                     break
 
         self._log("[agent] max iterations reached, stopping.")
-        self.callbacks.on_finished()
+        self._safe_callback("on_finished")
         return final_content
 
     def _run_one_tool_call(self, tc: Dict[str, Any]):
@@ -1489,6 +1528,26 @@ class Agent:
 
     def _log(self, line: str) -> None:
         self._safe_callback("on_log", line)
+
+    def _safe_is_cancelled(self) -> bool:
+        """取消标志查询的隔离版本。
+
+        取消状态由 Qt 侧的回调提供（控件可能已销毁 → RuntimeError）。裸调用
+        ``is_cancelled()`` 的异常会穿出 ``run()``：已写入历史的
+        assistant(tool_calls) 拿不到配对的 tool 消息，下一轮请求被 API 400
+        拒绝。查询失败时保守地返回 True（已取消）会让正常对话被误终止，因此
+        这里返回 False —— 继续执行，由下一个检查点再确认。
+        """
+        fn = getattr(self.callbacks, "is_cancelled", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception as e:
+            if self._callback_errors < 3:
+                self._callback_errors += 1
+                logger.warning("[agent] is_cancelled() 回调异常（按未取消处理）: %s", e)
+            return False
 
     def _safe_callback(self, method: str, *args) -> None:
         """调用 UI 回调并隔离其异常。

@@ -230,11 +230,16 @@ def _extract_pdf(path: Path) -> str:
                     continue
 
             with _OCR_SEMAPHORE:
-                # 双重检查：可能在等信号量期间其它 worker 已判定不可用
+                # 信号量等待期间本 worker 的 ocr_engine 局部变量不可能被其它
+                # 线程改动（旧实现的「双重检查」对此恒为假，是误导性死代码）；
+                # 真正会在等待期间变化的是进程级 _get_ocr_engine() 的失败状态，
+                # 它在拿不到引擎时返回 None，因此这里对 **获取结果** 复查即可。
                 if ocr_engine is None:
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
-                    continue
+                    ocr_engine = _get_ocr_engine()
+                    if ocr_engine is None:
+                        ocr_unavailable = True
+                        ocr_skipped_count += 1
+                        continue
                 pix = page.get_pixmap(dpi=200)
                 try:
                     img_bytes = pix.tobytes("png")

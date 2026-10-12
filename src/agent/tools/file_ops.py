@@ -177,7 +177,12 @@ class FileModifyTool(_FileTool):
             return ToolResult(False, error=f"File does not exist: {path}")
         # 全文读入内存做替换，必须设上限：读 + 替换副本 ≈ 2~3 倍文件体积，
         # 一个几百 MB 的日志就能把内存打满。超限时给出明确指引而不是 OOM。
-        size = os.path.getsize(full)
+        try:
+            size = os.path.getsize(full)
+        except OSError as e:
+            # getsize 在 isfile 之后仍可能失败（文件被并发删除）——放进 try
+            # 给出可读错误，而不是裸 FileNotFoundError 冒泡到 registry 兜底。
+            return ToolResult(False, error=f"Stat failed: {e}")
         if size > _MAX_MODIFY_BYTES:
             return ToolResult(
                 False,
@@ -187,7 +192,15 @@ class FileModifyTool(_FileTool):
             )
         try:
             with open(full, "r", encoding="utf-8") as f:
-                text = f.read()
+                # TOCTOU 防护：getsize 检查之后文件仍可被追加到任意大，只在
+                # 检查点卡一次上限等于不设防。多读一个字符，超限即拒绝。
+                text = f.read(_MAX_MODIFY_BYTES + 1)
+            if len(text.encode("utf-8", errors="ignore")) > _MAX_MODIFY_BYTES:
+                return ToolResult(
+                    False,
+                    error=f"File too large for file_modify (>{_MAX_MODIFY_BYTES} "
+                          f"bytes); use file_write to rewrite it or shell_run instead",
+                )
         except UnicodeDecodeError:
             # 二进制文件替换文本没有意义，且旧实现在这里抛未捕获的
             # UnicodeDecodeError，被 registry 兜底成难懂的裸异常。

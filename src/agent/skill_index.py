@@ -41,6 +41,8 @@ _INDEX_FILENAME = "_index.json"
 _SKILL_META_FILENAME = "skill.json"
 _DEFAULT_ENTRY = "prompt.md"
 _SCAN_INTERVAL = 300  # seconds between automatic scans (5 min)
+# entry 文件读取上限（字符）：内容会原样进入模型上下文。
+_MAX_ENTRY_CHARS = 200_000
 
 # Fields we read from skill.json
 _REQUIRED_FIELDS = {"name"}
@@ -249,10 +251,23 @@ class SkillIndex:
                 meta = json.load(f)
             if not isinstance(meta, dict):
                 return None
-            name = meta.get("name", "").strip()
+            # 类型归一：手工编辑的 skill.json 里 "name": 123 / "keywords": 123 /
+            # tags 里混非字符串元素，都会让下游在 strip()/lower()/迭代处抛
+            # AttributeError/TypeError——而这里只捕获 OSError/JSONDecodeError，
+            # 异常会冒泡出 scan() → search() 整个失败，且 _index 来不及更新，
+            # 之后每次 search 都重新扫描、重新失败（全部技能永久不可用）。
+            raw_name = meta.get("name", "")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
             if not name:
                 return None
             entry = meta.get("entry", _DEFAULT_ENTRY)
+            if not isinstance(entry, str) or not entry:
+                entry = _DEFAULT_ENTRY
+            elif os.path.isabs(entry) or ".." in entry.split("/"):
+                # 绝对路径 / 越界路径会让 os.path.join 丢弃 skill_dir 指向
+                # skills 目录外的文件。
+                logger.warning("skill_index: skill '%s' has unsafe entry path: %s", dirname, entry)
+                return None
             # Verify the entry file exists
             entry_path = os.path.join(skill_dir, entry)
             if not os.path.isfile(entry_path):
@@ -264,11 +279,19 @@ class SkillIndex:
                         dirname, entry,
                     )
                     return None
+
+            def _str_list(key: str) -> List[str]:
+                raw = meta.get(key, [])
+                if not isinstance(raw, list):
+                    return []
+                return [str(x) for x in raw if isinstance(x, (str, int, float))]
+
+            description = meta.get("description", "")
             return {
                 "name": name,
-                "description": meta.get("description", ""),
-                "keywords": [k.lower() for k in meta.get("keywords", [])],
-                "tags": meta.get("tags", []),
+                "description": description if isinstance(description, str) else str(description),
+                "keywords": [k.lower() for k in _str_list("keywords")],
+                "tags": _str_list("tags"),
                 "path": dirname,
                 "entry": entry,
             }
@@ -352,7 +375,14 @@ class SkillIndex:
             return None
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
-                return f.read()
+                # 上限读取：内容会原样进模型上下文，一个误放进 skills 目录的
+                # 大文件会被整个读进内存并撑爆上下文。
+                text = f.read(_MAX_ENTRY_CHARS + 1)
+            if len(text) > _MAX_ENTRY_CHARS:
+                text = text[:_MAX_ENTRY_CHARS] + (
+                    f"\n… [文件过大，已截断到 {_MAX_ENTRY_CHARS} 字符]"
+                )
+            return text
         except OSError as e:
             logger.warning("skill_index: failed to read %s: %s", abs_path, e)
             return None
