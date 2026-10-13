@@ -160,6 +160,70 @@ def _extract_pptx(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _pixmap_is_blank(pix) -> bool:
+    """检测渲染后的整页位图是否为纯色/近纯色（无有效内容）。
+
+    均匀采样至多 8192 字节取 min/max：极差 ≤ 12 视为近纯色。覆盖两类
+    场景：页面上只有纯色占位图/装饰条；扫描件里的空白纸页（整页白纸
+    带轻微压缩噪点）。这些页送 OCR 必然返回 "text detection result is
+    empty"，每页白白消耗 2-5 秒。极差阈值 12 足以容纳 JPEG/扫描噪点，
+    而任何含文字的页都有大量暗像素，极差远超此值。
+    """
+    samples = pix.samples
+    if not samples:
+        return True
+    step = max(1, len(samples) // 8192)
+    data = samples[::step]
+    return (max(data) - min(data)) <= 12
+
+
+def _ocr_normalize(img):
+    """归一化核心（可独立测试）：暗色主题自动反色 + 对比度拉伸。
+
+    RapidOCR 的 det/rec 模型在白底黑字、高对比度样本上训练，对两类页面
+    检测率骤降（真实电子书里「一大片页面检测不到文字」的根因）：
+      1. 暗色主题页（黑底白字/灰字）——模型几乎检不出任何文本框；
+      2. 低对比度/模糊文字页（低分辨率扫描放大、JPEG 压缩、浅灰字）——
+         文本框被当成背景。
+
+    管线（两步独立计算分位数——反色会反转明暗分布，若复用反色前的
+    p2/p98 做拉伸，暗主题页的 p98 仍落在黑底范围，拉伸会把背景噪声
+    放大十余倍、文字被噪声海淹没）：
+      a) 自动反色：页面整体偏暗（p50 < 100 且 p95 < 160，即 95% 像素都
+         是暗色调，符合「深色背景 + 少量浅色文字」的特征）时反色为白底
+         深字。插图占比大的正常页 p95 会远超 160，不会误触发。
+      b) 对比度拉伸：用**当前图像**的 p2-p98 分位线性映射到 [0, 255]，
+         恢复低对比度页面的文字-背景差异。极小极差（< 8，纯色/噪点页）
+         跳过，避免放大噪点。
+    """
+    import numpy as np
+
+    p50, p95 = np.percentile(img, (50, 95))
+    if p50 < 100 and p95 < 160:
+        img = 255 - img
+    p2, p98 = np.percentile(img, (2, 98))
+    if p98 - p2 > 8:
+        lo, hi = p2, p98
+        img = np.clip((img.astype(np.float32) - lo) * 255.0 / (hi - lo),
+                      0, 255).astype(np.uint8)
+    return img
+
+
+def _ocr_preprocess(pix):
+    """OCR 输入预处理：解码 pixmap → _ocr_normalize 归一化。
+
+    返回 ndarray（不编码 PNG）：RapidOCR 接受 ndarray 输入，省掉 PNG
+    编码 + 引擎内部解码两步开销。
+    """
+    import numpy as np
+
+    img = np.frombuffer(pix.samples, dtype=np.uint8)
+    if pix.n != 1:  # 防御：非灰度渲染时按行内多通道扁平处理
+        img = img.reshape(-1, pix.n).mean(axis=1).astype(np.uint8)
+    img = img.reshape(pix.height, pix.width)
+    return _ocr_normalize(img)
+
+
 def _extract_pdf(path: Path) -> str:
     """Extract text from PDF. Auto-detects text vs image-based pages.
 
@@ -240,15 +304,23 @@ def _extract_pdf(path: Path) -> str:
                         ocr_unavailable = True
                         ocr_skipped_count += 1
                         continue
-                pix = page.get_pixmap(dpi=200)
+                # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
+                # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
+                pix = page.get_pixmap(dpi=200, colorspace=fitz.csGRAY)
                 try:
-                    img_bytes = pix.tobytes("png")
+                    if _pixmap_is_blank(pix):
+                        # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
+                        # 空白纸页）：OCR 检测必然为空，直接跳过，省下每页
+                        # 2-5 秒的 OCR（真实日志中单文档可浪费 1 分钟以上）。
+                        blank_page_count += 1
+                        continue
+                    img = _ocr_preprocess(pix)
                 finally:
                     # Pixmap 持有整页 200dpi 位图（数 MB），显式释放避免
                     # 多页循环时峰值内存持续累积。
                     pix = None
 
-                ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+                ocr_text = _ocr_image_cached(ocr_engine, img, page_num + 1, path.name)
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -358,10 +430,14 @@ def release_ocr_engine() -> None:
             logger.info("RapidOCR engine released (memory reclaimed)")
 
 
-def _ocr_image_cached(engine, img_bytes: bytes, page_num: int, filename: str) -> str:
-    """Run OCR using a pre-loaded engine instance."""
+def _ocr_image_cached(engine, img, page_num: int, filename: str) -> str:
+    """Run OCR using a pre-loaded engine instance.
+
+    ``img`` 是归一化后的灰度 ndarray（见 _ocr_preprocess）；RapidOCR 的
+    LoadImage 对 ndarray 直接走 cv2 转换，无需再编码/解码。
+    """
     try:
-        result, _ = engine(img_bytes)
+        result, _ = engine(img)
         if not result:
             return ""
         lines = []
