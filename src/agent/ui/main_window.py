@@ -978,14 +978,24 @@ class MainWindow(QMainWindow):
         self.config.base_url = self.base_url_edit.text().strip()
         self.config.api_key = self.api_key_edit.text().strip()
         self.config.model = self.model_combo.currentText().strip()
-        try:
-            self.config.temperature = float(self.temp_edit.text().strip() or "0.7")
-        except ValueError:
-            self.config.temperature = 0.7
-        try:
-            self.config.max_tokens = int(self.max_tokens_edit.text().strip() or "32768")
-        except ValueError:
-            self.config.max_tokens = 32768
+        # 非法数值不能静默回退默认：旧实现 try/except 后直接覆盖，用户输入
+        # 任何垃圾（如全角数字、粘贴带了单位 "1.0s"）都会被悄悄换成默认值，
+        # 用户以为自己的设置已生效。回退时把对应输入框复位为实际生效值并在
+        # 状态栏点名，让回退可见。
+        invalid: list = []
+
+        def _num(widget, attr: str, default: float, cast, label: str) -> None:
+            raw = widget.text().strip()
+            try:
+                value = cast(raw) if raw else default
+            except ValueError:
+                value = default
+                widget.setText(str(default))
+                invalid.append(f"{label}={raw!r}")
+            setattr(self.config, attr, value)
+
+        _num(self.temp_edit, "temperature", 0.7, float, "温度")
+        _num(self.max_tokens_edit, "max_tokens", 32768, int, "最大Token")
         # Keep max_context_tokens in sync with max_tokens: the shrink threshold
         # should track the model's actual context window. If the user has
         # explicitly set a different max_context_tokens via config.json, only
@@ -993,26 +1003,17 @@ class MainWindow(QMainWindow):
         # 4096 budget that's now too small).
         if self.config.max_context_tokens < self.config.max_tokens:
             self.config.max_context_tokens = self.config.max_tokens
-        try:
-            self.config.top_p = float(self.top_p_edit.text().strip() or "0.95")
-        except ValueError:
-            self.config.top_p = 0.95
-        try:
-            self.config.min_p = float(self.min_p_edit.text().strip() or "0.05")
-        except ValueError:
-            self.config.min_p = 0.05
-        try:
-            self.config.top_k = int(self.top_k_edit.text().strip() or "20")
-        except ValueError:
-            self.config.top_k = 20
-        try:
-            self.config.repetition_penalty = float(self.repeat_penalty_edit.text().strip() or "1.0")
-        except ValueError:
-            self.config.repetition_penalty = 1.0
-        try:
-            self.config.request_timeout = float(self.timeout_edit.text().strip() or "120")
-        except ValueError:
-            self.config.request_timeout = 120.0
+        _num(self.top_p_edit, "top_p", 0.95, float, "top_p")
+        _num(self.min_p_edit, "min_p", 0.05, float, "min_p")
+        _num(self.top_k_edit, "top_k", 20, int, "top_k")
+        _num(self.repeat_penalty_edit, "repetition_penalty", 1.0, float, "重复惩罚")
+        _num(self.timeout_edit, "request_timeout", 120, float, "超时")
+        if invalid:
+            # 状态栏提示一次；不打断流程（回退值是安全的默认）。
+            self.status_label.setText(
+                f"⚠ 非法配置已回退默认值：{'、'.join(invalid)}（输入框已复位）"
+            )
+            self._append_log(f"[cfg] invalid values fell back to defaults: {'; '.join(invalid)}")
         ws = self.workspace_edit.text().strip()
         if ws:
             self.config.workspace = ws
@@ -1206,9 +1207,14 @@ class MainWindow(QMainWindow):
             return
 
         # Step 2: start sync
+        # pending 快照一次性消费：本方法只会由 deps worker（_on_sync_knowledge
+        # 启动）触发，但残留的旧值若不被清掉，后续路径读到的是过期意图。
         ws = getattr(self, "_pending_sync_ws", "")
         kb = getattr(self, "_pending_sync_kb", "")
         force = getattr(self, "_pending_sync_force", False)
+        self._pending_sync_ws = ""
+        self._pending_sync_kb = ""
+        self._pending_sync_force = False
         if not ws or not kb:
             self.sync_knowledge_btn.setEnabled(True)
             self.sync_knowledge_btn.setText("同步知识")
