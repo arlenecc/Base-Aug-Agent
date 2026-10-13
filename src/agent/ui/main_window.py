@@ -925,7 +925,8 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.config.temperature = 0.7
         try:
-            self.config.max_tokens = int(self.max_tokens_edit.text().strip() or "32768")
+            # 下限 1：负数/0 会让 LLM 请求直接被服务端拒绝，报错信息难懂。
+            self.config.max_tokens = max(1, int(self.max_tokens_edit.text().strip() or "32768"))
         except ValueError:
             self.config.max_tokens = 32768
         # Keep max_context_tokens in sync with max_tokens: the shrink threshold
@@ -952,7 +953,9 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.config.repetition_penalty = 1.0
         try:
-            self.config.request_timeout = float(self.timeout_edit.text().strip() or "120")
+            # 下限 1 秒：0/负数会让 httpx 在发请求前就超时，表现为所有对话
+            # 立刻失败且看不出原因。
+            self.config.request_timeout = max(1.0, float(self.timeout_edit.text().strip() or "120"))
         except ValueError:
             self.config.request_timeout = 120.0
         ws = self.workspace_edit.text().strip()
@@ -1425,6 +1428,10 @@ class MainWindow(QMainWindow):
             self.model_combo.setCurrentText(current)
         elif models:
             self.model_combo.setCurrentIndex(0)
+        elif current:
+            # 服务端返回空列表时保留用户已输入的模型名：editable combo 被
+            # clear() 后再 addItems([]) 会完全清空，用户得重新手输一遍。
+            self.model_combo.setEditText(current)
         self.status_label.setText(f"获取到 {len(models)} 个模型")
 
     def _on_fetch_failed(self, msg: str) -> None:

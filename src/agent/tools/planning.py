@@ -62,6 +62,15 @@ class TaskPlanTool(Tool):
             index: int = 0, status: str = "", note: str = "", step: str = "") -> ToolResult:
         workspace = self.config.workspace
 
+        def _bump() -> None:
+            # 计划会注入系统提示（agent._system_prompt），而该提示以 turn 为
+            # 粒度缓存。不 bump state_version 的话，同一次 run() 内刚创建/
+            # 更新的计划在后续迭代的请求里不可见。
+            try:
+                self.registry.bump_state_version()
+            except Exception:
+                pass
+
         if op == "create":
             if not goal.strip():
                 return ToolResult(False, error="op 'create' requires 'goal'")
@@ -70,6 +79,7 @@ class TaskPlanTool(Tool):
                 return ToolResult(False, error="op 'create' requires a non-empty 'steps' list")
             plan = TaskPlan(goal=goal, steps=[PlanStep(text=t) for t in texts])
             save_plan(workspace, plan)
+            _bump()
             return ToolResult(True, output="Plan created:\n" + render_plan(plan))
 
         if op == "update":
@@ -91,6 +101,7 @@ class TaskPlanTool(Tool):
             if note:
                 st.note = note
             save_plan(workspace, plan)
+            _bump()
             return ToolResult(True, output="Plan updated:\n" + render_plan(plan))
 
         if op == "add":
@@ -101,6 +112,7 @@ class TaskPlanTool(Tool):
                 return ToolResult(False, error="No active plan. Use op 'create' first.")
             plan.steps.append(PlanStep(text=step))
             save_plan(workspace, plan)
+            _bump()
             return ToolResult(True, output="Step added:\n" + render_plan(plan))
 
         if op == "get":
@@ -111,6 +123,7 @@ class TaskPlanTool(Tool):
 
         if op == "clear":
             clear_plan(workspace)
+            _bump()
             return ToolResult(True, output="Plan cleared.")
 
         return ToolResult(False, error=f"unknown op: {op}")

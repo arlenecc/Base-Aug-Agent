@@ -656,6 +656,11 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 90 | `code_run` 超时后孙进程持有管道 → pump 线程永久挂起 | 每次调用白等 4s，泄漏两个线程 + 两个 fd | 短宽限后从父进程侧关闭管道唤醒；单行长度也封顶 |
 | 91 | `web_scan` 可被诱导访问 `169.254.169.254` | SSRF 拿到云主机 IAM 凭据 | 拦截链路本地/云元数据地址（放行 127.0.0.0/8 不影响本地开发） |
 | 92 | `graph_memory` 批量抽取逐元素落盘 | ≤8 次整图 JSON 序列化 + 原子写盘换一批事实 | `batch_apply()` 一把锁改完内存、只落盘一次 |
+| 93 | `_system_prompt` 按 turn 缓存，`task_plan` 更新计划后缓存不失效 | 同一轮内规划变更后模型看不到最新计划，行为倒退 | `ToolRegistry` 加 `_state_version`，计划工具写操作 bump；提示词缓存键纳入版本号 |
+| 94 | `_tool_schema_tokens` 缓存命中时仍全量 `json.dumps` schema 算指纹 | 命中路径零收益，MCP 工具多时每轮白做几十 KB 序列化 ×2 | `ToolRegistry._schema_version` 递增计数器替代 md5 指纹，命中时零序列化 |
+| 95 | `code_run.run()` 内 `import builtins as _b` 未使用 | 死代码 | 删除 |
+| 96 | UI 配置面板 `max_tokens` / `request_timeout` 无下限校验 | 填 0/负数 → 每轮对话立刻失败且报错难排查 | 钳制下限（max_tokens ≥ 1、timeout ≥ 1s），非法输入回退默认值 |
+| 97 | 获取模型返回空列表时下拉框被清空 | 用户已手输的模型名丢失，需重新输入 | 空列表时保留当前文本 |
 
 ## 部署
 

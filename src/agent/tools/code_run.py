@@ -499,8 +499,6 @@ class CodeRunTool(Tool):
         self.registry = registry
 
     def run(self, code: str, timeout: Optional[float] = None) -> ToolResult:
-        import builtins as _b
-
         # Tolerate non-string `code` (some models emit a number or a list).
         # exec() requires str/bytes; coercing here avoids a confusing TypeError
         # that the model would have to debug blind.

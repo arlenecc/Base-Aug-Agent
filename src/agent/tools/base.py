@@ -79,6 +79,13 @@ class ToolRegistry:
         # agent 线程与 UI 线程可能并发首次调用。
         self._singleton_lock = threading.RLock()
         self._retriever_lock = self._singleton_lock
+        # 工具 schema 的版本号：工具表变动时递增，agent 侧据此避免每轮迭代
+        # 重复序列化整套 schema 来算 token 估算的指纹。
+        self._schema_version = 0
+        # 状态版本号：状态型工具（task_plan）改写了「会注入系统提示」的持久
+        # 数据后递增，agent 侧的 _system_prompt 缓存据此失效——否则同一次
+        # run() 内更新的计划在后续迭代里不可见。
+        self._state_version = 0
         self._register_defaults()
 
     # ------------------------------------------------------------------
@@ -434,6 +441,27 @@ class ToolRegistry:
     def _invalidate_schema_cache(self) -> None:
         """工具表变动后调用（默认工具注册/MCP 后台注册）。"""
         self._schemas_cache = None
+        self._schema_version += 1
+
+    @property
+    def schema_version(self) -> int:
+        """工具 schema 版本号（变动即递增），供 agent 侧做指纹缓存键。"""
+        return self._schema_version
+
+    @property
+    def state_version(self) -> int:
+        """注入系统提示的持久状态（任务计划等）的版本号。"""
+        return self._state_version
+
+    def bump_state_version(self) -> None:
+        """状态型工具改写了注入系统提示的数据后调用。
+
+        Agent 的 ``_system_prompt`` 以 turn 为粒度缓存；不 bump 的话，
+        同一次 ``run()`` 里 ``task_plan`` 刚创建/更新的计划在后续迭代的
+        请求里不可见（缓存返回旧提示），「每轮都能看到计划进度」的
+        设计意图就落空了。
+        """
+        self._state_version += 1
 
     # ------------------------------------------------------------------
     def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:

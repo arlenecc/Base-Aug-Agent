@@ -1,7 +1,6 @@
 """The agent: reasoning loop, tool dispatch, streaming, confirmation, skills."""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -215,8 +214,9 @@ class Agent:
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
         # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
         self._tool_schema_tokens_cache: Optional[int] = None
-        self._tool_schema_tokens_turn = -1
-        self._tool_schema_fingerprint: str = ""
+        self._tool_schema_version: int = -2  # -2 = 从未计算过
+        # _system_prompt 缓存附带的工具状态版本号（见 _system_prompt）。
+        self._cached_prompt_state = -2
         # UI 回调异常计数（见 _safe_callback）：只记录前几条，避免刷屏。
         self._callback_errors = 0
 
@@ -331,34 +331,36 @@ class Agent:
     def _tool_schema_tokens(self) -> int:
         """Cached token estimate of the tools schema (JSON sent every request).
 
-        缓存键是**工具集指纹**（工具名 + 参数 schema 的哈希），而不是历史长度：
+        缓存键是 **schema 版本号**（工具表变动即递增），而不是历史长度：
 
         * 旧实现以 ``len(self._history)`` 为键 —— 每追加一条消息键就失配，
           于是每轮迭代都要把整套 schema 重新 ``json.dumps`` 一遍再全量
           扫描字符（MCP 工具多时是数千 token 的纯浪费）。
-        * 反之，历史长度不变而工具集变化（动态注册/注销 MCP 工具）时缓存
-          又永不失效，估算失真。
+        * 中间版本用 schema 内容的 md5 指纹做键 —— 指纹本身也要每轮
+          ``json.dumps`` 一遍（缓存命中时同样跑），省了估算却没省序列化。
+          版本号由 ``ToolRegistry._invalidate_schema_cache()`` 维护，
+          工具表不变就完全跳过序列化。
+        * 反之，历史长度不变而工具集变化（动态注册/注销 MCP 工具）时
+          旧键又永不失效，估算失真。版本号两种场景都覆盖。
         """
+        try:
+            version = getattr(self.tools, "schema_version", -1) if self.tools else -1
+        except Exception:
+            version = -1
+        cached = self._tool_schema_tokens_cache
+        if cached is not None and self._tool_schema_version == version:
+            return cached
         try:
             schemas = self.tools.schemas() if self.tools else []
         except Exception:
             schemas = []
         try:
-            fingerprint = hashlib.md5(
-                json.dumps(schemas, ensure_ascii=False, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-        except Exception:
-            fingerprint = ""
-        cached = getattr(self, "_tool_schema_tokens_cache", None)
-        if cached is not None and self._tool_schema_fingerprint == fingerprint:
-            return cached
-        try:
-            text = json.dumps(schemas, ensure_ascii=False) if schemas else ""
+            text = json.dumps(schemas, ensure_ascii=False, sort_keys=True) if schemas else ""
             est = _estimate_tokens(text) if text else 0
         except Exception:
             est = 0
         self._tool_schema_tokens_cache = est
-        self._tool_schema_fingerprint = fingerprint
+        self._tool_schema_version = version
         return est
 
     def _should_shrink_context(self) -> bool:
@@ -1344,9 +1346,18 @@ class Agent:
         _estimate_history_tokens() and _build_messages() don't recompute it
         twice for the same turn.  Memory and skill match results are stable
         within one LLM call cycle.
+
+        缓存键还包含 registry 的 state_version：task_plan 这类状态型工具
+        会在同一次 run() 内改写注入系统提示的数据（任务计划），不把版本
+        计入键的话，后续迭代拿到的仍是旧提示——模型看不到自己刚写的计划。
         """
+        try:
+            state_ver = getattr(self.tools, "state_version", 0) if self.tools else 0
+        except Exception:
+            state_ver = 0
         if (hasattr(self, "_cached_prompt_turn")
                 and self._cached_prompt_turn == self._turn_idx
+                and self._cached_prompt_state == state_ver
                 and hasattr(self, "_cached_prompt")):
             return self._cached_prompt
 
@@ -1460,6 +1471,7 @@ class Agent:
             pass
 
         self._cached_prompt_turn = self._turn_idx
+        self._cached_prompt_state = state_ver
         self._cached_prompt = base
         return base
 
