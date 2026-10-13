@@ -135,8 +135,16 @@ def render_plan(plan: TaskPlan) -> str:
         if s.note:
             line += f" — {s.note}"
         lines.append(line)
-    lines.append(
-        "Keep this plan updated via the `task_plan` tool and work through "
-        "the steps in order."
-    )
+    if plan.steps and all(s.status == "done" for s in plan.steps):
+        # 全部步骤完成：给模型一个明确的收尾信号，避免陈旧计划一直挂在
+        # 每轮系统提示里（模型此前没有主动 clear 的提示，任务做完计划还在）。
+        lines.append(
+            "All steps are done. If the task is complete, call `task_plan` "
+            "with op='clear' to remove the plan."
+        )
+    else:
+        lines.append(
+            "Keep this plan updated via the `task_plan` tool and work through "
+            "the steps in order."
+        )
     return "\n".join(lines)

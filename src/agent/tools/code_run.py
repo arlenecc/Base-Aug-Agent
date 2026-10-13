@@ -7,8 +7,9 @@ loops from hanging the agent.
 
 **这不是安全边界**：限制只覆盖 ``builtins.open``。``pathlib.Path.write_text``、
 ``os.open``、``os.remove``、``shutil`` 等路径都能绕过它。真正的隔离需要在
-受限子进程里执行。因此 code_run 被标记为 destructive，每次执行都必须经用户
-确认（见 AgentCallbacks.confirm）—— 确认弹窗才是这里唯一的实际防线。
+受限子进程里执行。确认策略（见 should_confirm）：纯计算 / 工作区文件 IO /
+网络请求等直接执行；只有代码里出现 ``subprocess`` / ``os.system`` / ``ctypes``
+这类不受路径防护约束的逃逸调用时（它们可以间接修改系统），才需要用户确认。
 
 Timeout handling: Python threads cannot be forcefully killed, but we use a
 threading.Event-based cooperative cancellation to signal the worker thread
@@ -474,6 +475,32 @@ def _run_in_subprocess(code: str, timeout: float, ws: str) -> Optional[ToolResul
     return ToolResult(False, error=msg, output=out_s)
 
 
+# ---------------------------------------------------------------------------
+# 风险评估：code_run 的路径防护只覆盖「代码内」的文件写操作，os.system /
+# subprocess / ctypes 这类调用不受其约束，可以在系统任意位置执行命令——
+# 含这些逃逸调用的代码需要用户确认；其余代码直接执行。
+# ---------------------------------------------------------------------------
+
+_RISKY_CODE_PATTERNS = (
+    "subprocess",        # import subprocess / from subprocess import ...
+    "os.system",
+    "os.popen",
+    "os.exec",           # 覆盖 os.execv / os.execle 等
+    "os.spawn",          # 覆盖 os.spawnl / os.posix_spawn 等
+    "os.fork",
+    "pty.spawn",
+    "ctypes",            # 原生库调用可绕过一切 Python 层防护
+    "cffi",
+)
+
+
+def _is_risky_code(code: str) -> bool:
+    """判定一段 Python 代码是否需要用户确认（True = 弹确认框）。"""
+    if not code:
+        return False
+    return any(p in code for p in _RISKY_CODE_PATTERNS)
+
+
 class CodeRunTool(Tool):
     name = "code_run"
     description = (
@@ -493,6 +520,13 @@ class CodeRunTool(Tool):
 
     config: AgentConfig
     registry: ToolRegistry
+
+    def should_confirm(self, args) -> bool:
+        code = args.get("code") if isinstance(args, dict) else None
+        if not isinstance(code, str):
+            # 参数异常（缺 code / 非字符串）时保守确认。
+            return True
+        return _is_risky_code(code)
 
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config

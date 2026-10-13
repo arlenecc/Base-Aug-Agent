@@ -109,13 +109,14 @@ def test_agent_multi_step_tool_chain(config, recording_callbacks):
 
 
 # ---------------------------------------------------------------------------
-# confirmation policy: only system-affecting tools (code_run) ask; workspace
-# file ops do not.
+# confirmation policy: code_run/shell_run ask only when the command/code can
+# affect the system (escape hatch); pure computation and workspace file ops
+# run without a prompt.
 # ---------------------------------------------------------------------------
 
 def test_code_run_requires_confirmation(config, recording_callbacks):
     tc = [{"id": "c1", "function": {"name": "code_run",
-            "arguments": json.dumps({"code": "print('hi')"})}}]
+            "arguments": json.dumps({"code": "import subprocess; print('hi')"})}}]
     mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
                     [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})]])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
@@ -124,12 +125,12 @@ def test_code_run_requires_confirmation(config, recording_callbacks):
     agent.run("run code")
 
     assert len(recording_callbacks.confirms) == 1
-    assert recording_callbacks.tool_starts == [("code_run", {"code": "print('hi')"})]
+    assert recording_callbacks.tool_starts == [("code_run", {"code": "import subprocess; print('hi')"})]
 
 
 def test_code_run_aborted_when_user_declines(config, recording_callbacks):
     tc = [{"id": "c1", "function": {"name": "code_run",
-            "arguments": json.dumps({"code": "print('hi')"})}}]
+            "arguments": json.dumps({"code": "import subprocess; print('hi')"})}}]
     mock = MockLLM([
         [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
         # after refusal, model should still get a tool message saying denied, then answer
@@ -685,9 +686,9 @@ def test_shell_run_result_fed_back_to_model(config, recording_callbacks):
 
 
 def test_shell_run_requires_confirmation(config, recording_callbacks):
-    """shell_run is destructive — it must ask the user before executing."""
+    """shell_run asks only for risky commands — `sudo` always does."""
     tc = [{"id": "c1", "function": {"name": "shell_run",
-            "arguments": json.dumps({"command": "ls"})}}]
+            "arguments": json.dumps({"command": "sudo ls"})}}]
     mock = MockLLM([
         [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
         [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],

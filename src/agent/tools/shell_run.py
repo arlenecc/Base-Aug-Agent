@@ -2,18 +2,22 @@
 
 Runs the command with the workspace as cwd, captures stdout+stderr, and
 enforces a timeout so a hung command cannot block the agent indefinitely.
-Marked destructive because shell commands can affect the system arbitrarily;
-the agent's confirmation policy prompts the user before execution.
+
+确认策略：普通命令（ls、git、pip、构建脚本等）直接执行；仅当命令可能
+破坏系统、写入重要系统/配置文件或影响系统稳定性/安全性时（见
+_is_risky_command）才需要用户确认。
 """
 from __future__ import annotations
 
 import collections
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
+from typing import Any, Dict
 
 from ..config import AgentConfig
 from .base import Tool, ToolRegistry, ToolResult
@@ -38,11 +42,81 @@ _MAX_OUTPUT_CHARS = 200_000
 _TERM_GRACE_SECONDS = 3.0
 
 
+# ---------------------------------------------------------------------------
+# 风险评估：仅当命令可能破坏系统、写入重要系统/配置文件或影响系统稳定性/
+# 安全性时才需要用户确认；其余（ls、git、pip、构建脚本、工作区内 rm 等）
+# 直接执行。宁可对边界场景多确认一次，也不让普通命令反复打断用户。
+# ---------------------------------------------------------------------------
+
+# 命令段首词命中即确认：磁盘/引导/电源/内核/系统服务操作。
+_RISKY_HEADS = frozenset((
+    "mkfs", "fdisk", "gdisk", "diskutil",
+    "shutdown", "reboot", "halt", "poweroff",
+    "csrutil", "nvram", "kextload", "kextunload", "pmset", "launchctl",
+))
+
+# 系统目录前缀：凡「写入」这些位置（重定向 / tee / sed -i / rm 目标）即确认。
+_SYSTEM_DIRS = (
+    "/etc", "/usr", "/bin", "/sbin", "/System", "/Library",
+    "/private/etc", "/private/var", "/boot", "/opt", "/dev",
+)
+_SYS_DIR_ALT = "(" + "|".join(re.escape(d) for d in _SYSTEM_DIRS) + r")\b"
+
+# 提权：sudo 后面的子命令可改任意系统状态，一律确认。
+_RE_SUDO = re.compile(r"(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)\bsudo\b")
+# 远程代码执行：下载内容直接管道给 shell 解释。
+_RE_PIPE_SH = re.compile(r"\b(?:curl|wget)\b[^|;&]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b")
+# 写系统路径的两种形态：> / >> 重定向、tee 目标（sed -i 的场景较少见且
+# 通常伴随 tee/sudo，这里保持规则简单）。
+_RE_WRITE_SYS = re.compile(r"(?:>{1,2}\s*|\btee\s+(?:-\w+\s+)*)" + _SYS_DIR_ALT)
+
+
+def _rm_targets_outside(seg: str) -> bool:
+    """rm 的目标是否指向工作区之外（绝对路径 / home / 父目录逃逸）。
+
+    shell_run 的 cwd 是 workspace，纯相对路径（含工作区内 rm -rf build）
+    只影响工作区文件，不确认；绝对路径、~/$HOME、../ 一律确认。
+    """
+    for tok in seg.split():
+        if tok.startswith("-"):
+            continue
+        if tok == "~" or tok.startswith(("/", "~/", "$HOME", "../", "..\\")):
+            return True
+    return False
+
+
+def _is_risky_command(command: str) -> bool:
+    """判定一条 shell 命令是否需要用户确认（True = 弹确认框）。"""
+    if not command or not command.strip():
+        return False
+    text = command.strip()
+
+    if _RE_PIPE_SH.search(text):
+        return True
+    if _RE_WRITE_SYS.search(text):
+        return True
+    if _RE_SUDO.search(text):
+        return True
+
+    # 按命令段（| ; & 分隔）逐段检查首词与 rm 的目标。
+    for seg in re.split(r"[|;&]+", text):
+        words = seg.strip().split()
+        if not words:
+            continue
+        head = words[0]
+        if head in _RISKY_HEADS:
+            return True
+        if head == "rm" and _rm_targets_outside(seg.strip()):
+            return True
+    return False
+
+
 class ShellRunTool(Tool):
     name = "shell_run"
     description = (
         "Run a shell command in the workspace, return stdout+stderr. "
-        "For CLI tools, git, pip, build scripts, etc."
+        "For CLI tools, git, pip, build scripts, etc. "
+        "Destructive commands (system files, sudo, disk ops) ask for confirmation first."
     )
     destructive = True
     parameters = {
@@ -62,6 +136,13 @@ class ShellRunTool(Tool):
 
     config: AgentConfig
     registry: ToolRegistry
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        command = args.get("command")
+        if not isinstance(command, str):
+            # 参数异常（缺 command / 非字符串）时保守确认。
+            return True
+        return _is_risky_command(command)
 
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config

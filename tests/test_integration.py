@@ -78,9 +78,10 @@ def test_e2e_workspace_write_runs_without_confirmation(config, recording_callbac
     assert recording_callbacks.confirms == []  # workspace write needs no confirm
 
 
-def test_e2e_code_run_confirms(config, recording_callbacks):
-    """code_run can affect the system, so it must ask the user first."""
-    recording_callbacks._confirm_return = True
+def test_e2e_code_run_confirms_only_risky(config, recording_callbacks):
+    """Pure computation runs without a prompt; escape-hatch code (subprocess)
+    must ask the user first."""
+    # 纯计算：直接执行，不弹窗
     tc = [{"id": "c1", "function": {"name": "code_run",
             "arguments": json.dumps({"code": "print(2+2)"})}}]
     llm = _ScriptedLLM([
@@ -90,8 +91,22 @@ def test_e2e_code_run_confirms(config, recording_callbacks):
     agent = Agent(llm=llm, config=config, callbacks=recording_callbacks)
     agent.run("compute")
 
-    assert len(recording_callbacks.confirms) == 1
+    assert recording_callbacks.confirms == []
     assert "4" in recording_callbacks.tool_ends[0][1].output
+
+    # 逃逸调用（subprocess）：必须弹确认
+    recording_callbacks._confirm_return = True
+    tc2 = [{"id": "c2", "function": {"name": "code_run",
+            "arguments": json.dumps(
+                {"code": "import subprocess; subprocess.run(['echo', 'hi'])"})}}]
+    llm2 = _ScriptedLLM([
+        [_evt("done", tool_calls=tc2, usage={"total_tokens": 5})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent2 = Agent(llm=llm2, config=config, callbacks=recording_callbacks)
+    agent2.run("escape hatch")
+
+    assert len(recording_callbacks.confirms) == 1
 
 
 def test_e2e_skill_suggested_after_repeat(config, recording_callbacks):

@@ -661,6 +661,8 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 95 | `code_run.run()` 内 `import builtins as _b` 未使用 | 死代码 | 删除 |
 | 96 | UI 配置面板 `max_tokens` / `request_timeout` 无下限校验 | 填 0/负数 → 每轮对话立刻失败且报错难排查 | 钳制下限（max_tokens ≥ 1、timeout ≥ 1s），非法输入回退默认值 |
 | 97 | 获取模型返回空列表时下拉框被清空 | 用户已手输的模型名丢失，需重新输入 | 空列表时保留当前文本 |
+| 98 | code_run / shell_run 每次执行都弹确认 | 正常工作流（跑脚本、git、pip、装依赖）反复被打断 | 按内容风险评估：仅提权(sudo)、写系统目录(/etc 等)、磁盘/电源/内核操作、`curl\|sh`、工作区外 rm、代码含 subprocess/os.system/ctypes 逃逸调用时确认，其余直接执行 |
+| 99 | 任务全部完成后计划残留在系统提示 | 模型无明确收尾信号，陈旧计划一直注入每轮提示 | 计划全部 done 时 render_plan 追加 "All steps are done → clear" 信号；系统提示规则 1 明确「全部完成后调用 task_plan clear」 |
 
 ## 部署
 

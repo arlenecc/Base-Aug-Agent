@@ -88,6 +88,20 @@ def test_render_plan_contains_goal_and_statuses():
     assert "修复 bug" in text
     assert "[done]" in text and "定位问题" in text
     assert "[in_progress]" in text and "已改 2 处" in text
+    # 未全部完成时不应出现收尾信号
+    assert "All steps are done" not in text
+
+
+def test_render_plan_done_plan_signals_clear():
+    """全部步骤完成后，注入系统提示的计划必须带明确的收尾信号，
+    提示模型调用 task_plan(op='clear') 清除已完成计划。"""
+    plan = TaskPlan(goal="整理数据", steps=[
+        PlanStep(text="下载", status="done"),
+        PlanStep(text="清洗", status="done", note="已入库"),
+    ])
+    text = render_plan(plan)
+    assert "All steps are done" in text
+    assert "clear" in text
 
 
 # ---------------------------------------------------------------------------
