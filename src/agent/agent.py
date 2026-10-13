@@ -7,12 +7,18 @@ import re
 import threading
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from .config import AgentConfig
 from .llm_client import LLMClient, StreamEvent
 from .skills import SkillManager
-from .tools import ToolRegistry, parse_args
+from .tools import ToolRegistry, ToolResult, parse_args
+from .kernel import (
+    ContextBudget, ExitReason, KernelHooks, KernelLoop, KernelResult, Session,
+    l4_extract_json, l4_normalize,
+)
+from .kernel.compressor import DISTILL_PROMPT, DISTILL_SYSTEM
+from .tools.checkpoint import restore_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +46,7 @@ class AgentCallbacks:
     def on_usage(self, usage: Dict[str, int]) -> None: ...
     def on_token_speed(self, total_tokens: int, speed: float) -> None: ...
     def on_skill_suggested(self, skill) -> None: ...
+    def on_plan_updated(self, plan: Optional[Dict[str, Any]]) -> None: ...
     def on_error(self, message: str) -> None: ...
     def on_context_shrunk(self, summary: str, reason: str) -> None: ...
 
@@ -58,6 +65,32 @@ class AgentCallbacks:
 
 SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the user's task by reasoning, planning, and calling tools.
 
+## 交互协议（每轮必须遵守）
+回复正文里先输出一个 <summary>…</summary>（≤30 字的物理快照）：上一步结果产生的新信息 + 本次意图。
+它会被压缩进长期工作记忆，必须含真实信息，禁止空话。
+**若用户需求未完成，必须调用工具**，不要只用文字描述将要做什么。
+
+## 任务推进：先规划，再步步为营
+1. **开始前先规划**：接到非平凡任务时，第一件事是 `update_plan(op="create", goal=..., steps=[...])`，
+   把目标拆成 2~7 个**可验证**的步骤（每步能用一个工具调用判定完成与否）。一句话就能完成的任务不必规划。
+2. **每步先反思再动手**：每次工具结果回来后，先在 `<summary>` 里写清「这一步证实/推翻了什么」，
+   再决定下一步：是继续下一步、修正当前步骤的方法，还是回头改计划。不要重复同一个失败的调用。
+3. **及时更新计划**：完成一步就 `update_plan(op="patch", step_id=..., status="done", note="结论")`；
+   进行中标 `doing`；走不通标 `blocked`/`skipped` 并写明原因（blocked 前至少尝试 2 种不同方法）；发现遗漏用 `append`。
+   计划每轮都会回注给你的上下文，也是用户唯一能看到进度的地方——保持它准确。
+4. **没做完不许收尾**：计划里还有未完成步骤时，不要只给文字总结就结束。全部步骤终态化后才能输出最终答复。
+
+## 能力分层
+- `code_run` 是能力核心（可编程，什么都能做）；`shell_run` 是它对系统命令的延伸。组合二者覆盖任意操作。
+- `file_read` / `file_write` / `file_patch` 是高频文件操作的快捷方式。
+- `web_scan` / `web_execute_js` 用于浏览器。
+- `rag_search` / `rag_outline` / `rag_ingest`：本地知识库（可学习、可进化）。
+- `skill_semantic_search` / `skill_search` / `skill_load` / `skill_save`：外置经验与能力。
+- `memory_search` / `memory_graph` / `work_memory`：长期经验与短期草稿。
+- `update_working_checkpoint`：把非显然、后续必须知道的状态写进工作记忆（每轮自动回注）。
+- `update_plan`：任务级「目标 + 路径」的规划与进度更新（每轮自动回注；有计划时未完成步骤不得收尾）。
+- `start_long_term_update`：任务完成/检查点时触发经验蒸馏。
+
 Rules:
 1. Plan, then call tools. After each result, decide the next step.
 2. Prefer the least destructive path. Risky/irreversible actions need confirmation.
@@ -66,7 +99,7 @@ Rules:
 5. Complex task → `skill_semantic_search` first; if it finds nothing, try `skill_search` (they index different directories). Then `skill_load` and follow it. No match → proceed.
 6. User names a book/document → `rag_outline` for structure, then `rag_search` (with source) for details.
 7. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
-8. On tool ERROR: fix the arguments and retry. Two identical failures in a row → change approach or `ask_user`. Never loop on the same failing call.
+8. On tool ERROR: read the full error, fix the cause, and retry with a DIFFERENT approach (other tool / other arguments / a `code_run` diagnostic script). Never repeat an identical failing call. A failed step is NOT a reason to stop: recover automatically from the error and keep executing the remaining steps — never stop to ask the user whether to continue. Mark a step `blocked` only after ≥2 genuinely different methods have failed (state the reason in its note), then move on. `ask_user` is only for information you truly cannot obtain yourself.
 9. Reply concisely in plain text when done.
 
 Paths are relative to the workspace. Only `code_run`, `shell_run` and external MCP tools require confirmation."""
@@ -118,8 +151,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 # 系统提示动态注入段的上限。
-# 这些段不在上下文收缩（_shrink_context 只压 _history）的作用范围内，
-# 若不加限制会随会话时长单调膨胀，最终挤爆上下文窗口。
+# 这些段**不在五级压缩的作用范围内**（压缩只作用于 Session 的历史区）：
+# 若不加限制会随会话时长单调膨胀，最终挤爆 30k 预算。
 _MAX_INJECTED_FACTS = 20        # 当天事实最多注入条数
 _MAX_FACTS_CHARS = 2000         # 事实段总字符上限
 _MAX_FACT_CHARS = 120           # 单条事实字符上限
@@ -129,16 +162,6 @@ _MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
 # ---------------------------------------------------------------------------
 # Harness 调优参数
 # ---------------------------------------------------------------------------
-
-# 历史里较早的 tool 结果裁剪阈值（字符）。单条工具输出上限是 200K，历史保留
-# 50 条 —— 不裁剪的话每轮都要把几 MB 的旧输出整个重发给模型。只裁剪「已经
-# 过去若干条消息」的旧结果，最近的保持原样，模型需要完整内容可以重新调用。
-_MAX_HISTORY_TOOL_CHARS = 8_000
-_TOOL_TRIM_HEAD = 6_000
-_TOOL_TRIM_TAIL = 1_500
-# 末尾多少条消息不做裁剪（保护当前回合的工具结果）。
-_TOOL_TRIM_KEEP_RECENT = 6
-_TOOL_TRIM_MARKER = "…[历史工具输出已裁剪"
 
 # 并发执行的工具上限。模型一次返回多个互相独立的只读调用时（多个 file_read /
 # rag_search / web_scan），串行会让 wall time 变成 Σ，并发后是 max。
@@ -158,10 +181,133 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "memory_search",                              # 长期记忆语义检索
 })
 
-# LLM 调用失败重试：仅在「一个 chunk 都没收到」时重试（网络抖动、429/502、
-# 连接超时都发生在首字节之前，此时重试不会产生重复输出）。已经吐过内容的
-# 流中断后重试会把两段内容拼在一起，因此不重试。
-_LLM_RETRY_BASE_DELAY = 1.5
+
+
+# ---------------------------------------------------------------------------
+# 能力层：工具分发
+#
+# 内核在 ACT 态调用 dispatcher.dispatch(tool_calls)。确认、取消、并发这些
+# 「如何执行」的细节属于能力层，不属于控制流，因此放在这里而不是内核里。
+# ---------------------------------------------------------------------------
+
+
+class _ToolDispatcher:
+    """把内核的 ToolCall 列表变成 ToolResult 列表（顺序一致）。"""
+
+    def __init__(self, agent: "Agent"):
+        self.agent = agent
+        self._cache: Optional[List[Dict[str, Any]]] = None
+
+    def schemas(self) -> List[Dict[str, Any]]:
+        # 工具集在注册表构造后即固定；每轮重建纯属浪费（且会让
+        # 「schema 已缓存」的断言失效）。
+        if self._cache is None:
+            try:
+                self._cache = self.agent.tools.schemas()
+            except Exception:
+                self._cache = []
+        return self._cache
+
+    def dispatch(self, tool_calls: List["Any"]) -> List[ToolResult]:
+        agent = self.agent
+        results: Dict[int, ToolResult] = {}
+        parallel_jobs: List[Tuple[int, str, Dict[str, Any]]] = []
+
+        for idx, tc in enumerate(tool_calls):
+            name, args = tc.name, tc.args
+
+            # 内核解析参数失败 → 把原始串报回模型，而不是静默当 {}
+            if "__parse_error__" in args:
+                agent._log(f"[tool] {name} arg-parse error: {args['__parse_error__']}")
+                agent.callbacks.on_tool_start(name, {"_raw_arguments": args.get("__raw__", "")})
+                res = ToolResult(False, error=str(args["__parse_error__"]))
+                agent.callbacks.on_tool_end(name, res)
+                results[idx] = res
+                continue
+
+            if agent.callbacks.is_cancelled():
+                # 必须为每个 tool_call 补一条结果，否则下一轮因悬挂 tool_calls 被 API 400 拒绝。
+                agent._log(f"[tool] {name} 已因用户取消而跳过")
+                agent.callbacks.on_tool_start(name, args)
+                res = ToolResult(False, error="用户取消了对话，工具未执行")
+                agent.callbacks.on_tool_end(name, res)
+                results[idx] = res
+                continue
+
+            tool = agent.tools.get(name)
+            if tool is None:
+                agent.callbacks.on_tool_start(name, args)
+                res = agent.tools.execute(name, args)   # 返回 unknown tool 错误
+                agent.callbacks.on_tool_end(name, res)
+                results[idx] = res
+                continue
+
+            if tool.should_confirm(args):
+                confirm_msg = agent._confirm_message(name, args)
+                if not agent.callbacks.confirm(confirm_msg):
+                    agent._log(f"[tool] {name} DENIED by user")
+                    res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
+                    agent.callbacks.on_tool_end(name, res)
+                    results[idx] = res
+                    continue
+                agent.callbacks.on_tool_start(name, args)
+                res = agent._execute_tool(name, args)
+                agent._log_tool_result(name, res)
+                agent.callbacks.on_tool_end(name, res)
+                results[idx] = res
+                continue
+
+            if name in _PARALLEL_SAFE_TOOLS:
+                parallel_jobs.append((idx, name, args))
+                continue
+
+            agent.callbacks.on_tool_start(name, args)
+            res = agent._execute_tool(name, args)
+            agent._log_tool_result(name, res)
+            agent.callbacks.on_tool_end(name, res)
+            results[idx] = res
+
+        if parallel_jobs:
+            agent._run_parallel_tools(parallel_jobs, results)
+
+        return [
+            results.get(i) or ToolResult(False, error="工具未执行（harness 内部错误）")
+            for i in range(len(tool_calls))
+        ]
+
+
+# ---------------------------------------------------------------------------
+# 经验层：内核 hook → 记忆 / 技能（L4 蒸馏）
+# ---------------------------------------------------------------------------
+
+
+class _AgentKernelHooks(KernelHooks):
+    """把内核的 CONSOLIDATE / 终止边接到 base-agent 的经验系统。"""
+
+    def __init__(self, agent: "Agent"):
+        self.agent = agent
+
+    def consolidated(self, session: Session, reason: str) -> bool:
+        # 折叠已用尽仍超预算 → 用 LLM 摘要做最后兜底（旧 _shrink_context 的等价物）。
+        # 返回「是否真的缩小了上下文」：内核据此决定遇 context 错误后要不要重试
+        # ——没东西可压时重试同一个超长 prompt 是白费一次调用。
+        if reason == "fold-exhausted":
+            return bool(self.agent._shrink_session(reason))
+        return False
+
+    def finished(self, session: Session, text: str) -> None:
+        agent = self.agent
+        # 既有能力：异步抽取事实写知识图谱（不阻塞回复）
+        try:
+            agent._maybe_extract_facts_async(text)
+        except Exception as e:
+            agent._log(f"[kernel] fact extraction error: {e}")
+        # 新增能力：L4 经验蒸馏（模型显式调用 start_long_term_update，或长任务）
+        if agent.kernel.distill_requested or session.current_turn >= agent._distill_min_turns:
+            agent._distill_experience_async(session)
+
+    def failed(self, session: Session, err: str) -> None:
+        self.agent.callbacks.on_error(err)
 
 
 # ---------------------------------------------------------------------------
@@ -187,33 +333,49 @@ class Agent:
             skills_dir=os.path.join(config.workspace, ".agent", "skills"),
         )
         self.max_iterations = int(getattr(config, "max_iterations", 15))
+        # max_history / max_context_tokens / context_shrink_ratio 仍从 config 读取
+        # 以兼容既有配置与 UI；真正的上下文治理已由内核的五级压缩接管
+        # （30k 预算 + L3 折叠），这里只保留字段避免外部读写报错。
         self.max_history = int(getattr(config, "max_history", 50))
-        # Context shrink config: shrink proactively when estimated prompt size
-        # exceeds context_shrink_ratio * max_context_tokens, or reactively when
-        # the LLM API returns a context_length_exceeded-style error.
         self.max_context_tokens = int(getattr(config, "max_context_tokens", 32000))
         self.context_shrink_ratio = float(getattr(config, "context_shrink_ratio", 0.9))
-        # Cap shrink attempts per run() so a misconfigured LLM can't loop
-        # forever on summarize-then-retry.
-        self._max_shrinks_per_run = 3
-        # Number of recent messages to retain verbatim during a shrink; older
-        # messages are summarized. Tuned to keep the immediate task context
-        # (current user request + latest tool result + assistant reply) intact.
-        self._shrink_keep_recent = 6
-        self._history: List[Dict[str, Any]] = []
+        self._history: List[Dict[str, Any]] = []  # 兼容字段：历史所有权已在 Session
         self._total_tokens = 0
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
         self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
-        # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
-        self._tool_schema_tokens_cache: Optional[int] = None
-        self._tool_schema_tokens_turn = -1
         # schema 列表缓存：工具集在 ToolRegistry 构造完成后就不再变化（MCP 工具
         # 也是在 __init__ 里注册的），没必要每轮、每次迭代都重建一遍 dict。
         self._tools_schemas_cache: Optional[List[Dict[str, Any]]] = None
-        # LLM 首字节前失败的退避重试次数（见 run() 的流式重试）。
-        self._max_llm_retries = 2
+
+        # ---- 内核：历史交给 Session，能力交给 dispatcher，经验交给 hooks ----
+        # Agent 退化为门面：run() 只做「记录请求 → 委托内核 → 回调 UI」。
+        self._budget = ContextBudget(
+            int(getattr(config, "kernel_max_context_tokens", 30_000) or 30_000)
+        )
+        self.session = Session(
+            budget=self._budget,
+            raw_turns=int(getattr(config, "kernel_raw_turns", 2) or 2),
+            max_digest_lines=int(getattr(config, "kernel_max_digest_lines", 40) or 40),
+        )
+        # 工具通过 registry.session 读写工作记忆（update_working_checkpoint 等）
+        self.tools.session = self.session
+        self._last_user_text = ""
+        self._distill_min_turns = 6
+        self.dispatcher = _ToolDispatcher(self)
+        self.kernel = KernelLoop(
+            # 传 callable：UI「应用配置」会整体替换 agent.llm
+            llm=lambda: self.llm,
+            dispatcher=self.dispatcher,
+            callbacks=self.callbacks,
+            config=self.config,
+            system_prompt=self._system_prompt,
+            session=self.session,
+            hooks=_AgentKernelHooks(self),
+            log=self._log,
+            max_turns=int(getattr(config, "max_iterations", 15) or 15),
+        )
 
         # 事实抽取的防堆叠锁。必须用 RLock：_extract_facts_sync 持锁期间会调
         # _get_extract_llm()，后者也要 acquire 同一把锁（普通 Lock 会自锁死，
@@ -224,144 +386,55 @@ class Agent:
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
+        """清空会话状态（UI 的「清空对话」）。"""
         self._history = []
         self._total_tokens = 0
         self._tool_call_counter = 0
+        self.session.reset()
+        self.kernel._total_tokens = 0
+        self.kernel._last_consolidated_turn = -1
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
 
     def close(self) -> None:
-        """Release the dedicated fact-extraction LLM client's connection pool.
+        """Release the dedicated background LLM client's connection pool.
 
         ``self.llm`` is owned by the UI (which closes it separately); we only
         own ``_extract_llm`` (a lazily-built independent LLMClient created to
         avoid racing the agent's shared httpx.Client from the extraction thread).
+
+        关闭必须持锁：后台抽取/蒸馏线程可能正在用它，裸关会让它们半路炸掉
+        （并留下未归还的连接）。取不到锁说明有后台调用在跑，交给线程自己收尾。
         """
-        ext = getattr(self, "_extract_llm", None)
-        if ext is not None and ext is not self.llm:
-            try:
-                ext.close()
-            except Exception:
-                pass
-            self._extract_llm = None
+        lock = getattr(self, "_fact_extract_lock", None)
+        acquired = bool(lock and lock.acquire(blocking=False))
+        try:
+            self._close_extract_llm()
+        finally:
+            if acquired:
+                lock.release()
 
     def history(self) -> List[Dict[str, Any]]:
-        return list(self._history)
+        """当前可见历史的扁平视图（折叠区 + 原文窗口）。
 
-    def _trim_history(self) -> None:
-        """Evict oldest messages when history exceeds max_history.
-
-        Never leaves a dangling ``tool`` result message at the start —
-        it must follow an assistant message with matching ``tool_calls``.
+        历史的所有权在 ``Session``；这里只是给 UI / 测试一个只读快照。
         """
-        limit = self.max_history
-        if limit <= 0 or len(self._history) <= limit:
-            return
-        # Start with a simple slice, then skip any leading tool messages.
-        cut = len(self._history) - limit
-        while cut < len(self._history) and self._history[cut].get("role") == "tool":
-            cut += 1
-        del self._history[:cut]
+        return self.session.build_messages(self._system_prompt())
 
     # ------------------------------------------------------------------
     # Context-size estimation and shrink strategy
     # ------------------------------------------------------------------
 
-    def _msg_token_count(self, msg: Dict[str, Any]) -> int:
-        """Token count for a single message (role + content + tool_calls)."""
-        count = 4  # role + structural overhead per message
-        content = msg.get("content")
-        if isinstance(content, str):
-            count += _estimate_tokens(content)
-        elif content:
-            count += _estimate_tokens(json.dumps(content, ensure_ascii=False))
-        tcs = msg.get("tool_calls") or []
-        for tc in tcs:
-            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-            count += _estimate_tokens(fn.get("name", ""))
-            count += _estimate_tokens(fn.get("arguments", "") or "")
-        return count
-
-    def _estimate_history_tokens(self) -> int:
-        """Estimate the token count of the full prompt (system + history + tools).
-
-        Always does a full O(n) scan of _history. The history list is
-        typically short (<= max_history messages), so the cost is negligible
-        compared to the complexity of maintaining an incremental counter
-        that can get out of sync when _history is modified directly.
-
-        Tools must be counted: every request actually sends
-        ``tools=self.tools.schemas()``, and with many MCP tools the schema
-        alone can be several thousand tokens. Excluding it systematically
-        underestimates the prompt, so proactive shrink never triggers and the
-        only protection left is the (capped) reactive shrink after the API
-        already rejected the request.
-        """
-        system_tokens = _estimate_tokens(self._system_prompt())
-        history_tokens = sum(self._msg_token_count(msg) for msg in self._history)
-        tools_tokens = self._tool_schema_tokens()
-        return system_tokens + history_tokens + tools_tokens
-
     def _tools_schemas(self) -> List[Dict[str, Any]]:
-        """Cached tool schemas (sent with every request).
-
-        工具集在 ToolRegistry 构造完成后即固定，旧实现每次 LLM 调用都重建
-        一遍（每轮至少两次：chat_stream + _tool_schema_tokens），纯属浪费。
-        """
+        """Cached tool schemas（供测试观察 schema 是否缓存；内核实际走
+        ``_ToolDispatcher.schemas()``）。"""
         if self._tools_schemas_cache is None:
             try:
                 self._tools_schemas_cache = self.tools.schemas() if self.tools else []
             except Exception:
                 self._tools_schemas_cache = []
         return self._tools_schemas_cache
-
-    def _tool_schema_tokens(self) -> int:
-        """Cached token estimate of the tools schema (JSON sent every request)."""
-        cached = getattr(self, "_tool_schema_tokens_cache", None)
-        if cached is not None:
-            return cached
-        try:
-            schemas = self._tools_schemas()
-            text = json.dumps(schemas, ensure_ascii=False) if schemas else ""
-            est = _estimate_tokens(text) if text else 0
-        except Exception:
-            est = 0
-        self._tool_schema_tokens_cache = est
-        return est
-
-    def _trim_old_tool_outputs(self) -> None:
-        """裁剪历史中较早的 tool 结果，抑制上下文随轮次线性膨胀。
-
-        只处理「末尾 _TOOL_TRIM_KEEP_RECENT 条之外」的 tool 消息：当前回合的
-        工具输出必须完整保留。裁剪成 head+tail，而不是整条丢掉——模型至少还
-        看得到开头与结尾（错误/总结常在结尾）。已裁剪过的用标记识别，避免
-        反复截断。
-        """
-        if len(self._history) <= _TOOL_TRIM_KEEP_RECENT:
-            return
-        for msg in self._history[:-_TOOL_TRIM_KEEP_RECENT]:
-            if msg.get("role") != "tool":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or len(content) <= _MAX_HISTORY_TOOL_CHARS:
-                continue
-            if _TOOL_TRIM_MARKER in content:
-                continue
-            msg["content"] = (
-                content[:_TOOL_TRIM_HEAD]
-                + f"\n{_TOOL_TRIM_MARKER}：原 {len(content)} 字符；"
-                f"需要完整内容请重新调用该工具]\n"
-                + content[-_TOOL_TRIM_TAIL:]
-            )
-
-    def _should_shrink_context(self) -> bool:
-        """Return True if the estimated context size exceeds the shrink
-        threshold (context_shrink_ratio * max_context_tokens)."""
-        if self.max_context_tokens <= 0:
-            return False
-        threshold = int(self.max_context_tokens * self.context_shrink_ratio)
-        return self._estimate_history_tokens() > threshold
 
     @staticmethod
     def _is_context_too_long_error(err_str: str) -> bool:
@@ -379,172 +452,22 @@ class Agent:
             return True
         return False
 
-    def _shrink_context(self, reason: str) -> bool:
-        """Summarize older messages, replace them with a summary marker, and
-        append the summary (with timestamp) to workspace/memory.md for
-        long-term/time-based recall.
-
-        Keeps the most recent ``_shrink_keep_recent`` messages verbatim so the
-        agent still has the immediate task context (latest user request, tool
-        results, and assistant reply). Older messages are summarized via the
-        LLM and replaced with a single user-role summary message.
-
-        Returns True if a shrink actually happened, False if there wasn't
-        enough history to shrink (in which case the caller should not retry).
-        """
-        # Need at least keep_recent + a few older messages to make a summary
-        # worthwhile; otherwise we'd just keep what we have.
-        if len(self._history) <= self._shrink_keep_recent + 2:
-            self._log(
-                f"[context] shrink requested ({reason}) but history too small "
-                f"({len(self._history)} msgs) — skipping"
-            )
-            return False
-
-        old_messages = self._history[:-self._shrink_keep_recent]
-        recent_messages = self._history[-self._shrink_keep_recent:]
-
-        # Ensure recent_messages doesn't start with a dangling tool result.
-        # A tool message must follow an assistant message with matching
-        # tool_calls. If the slice boundary falls right after such an assistant
-        # message, the tool result at the start of recent_messages would have
-        # no preceding assistant — the API would reject the request. Pull the
-        # preceding assistant (and any earlier tool messages in the same turn)
-        # back from old_messages into recent_messages.
-        while recent_messages and recent_messages[0].get("role") == "tool":
-            if not old_messages:
-                break
-            recent_messages.insert(0, old_messages.pop())
-
-        transcript = self._format_messages_for_summary(old_messages)
-        summary_prompt = (
-            "把下面的对话压缩成要点摘要，只保留：\n"
-            "1. 用户的核心需求与当前目标\n"
-            "2. 已做的决定及原因\n"
-            "3. 已完成的步骤与结果（含工具关键输出）\n"
-            "4. 未完成的子任务与下一步\n"
-            "5. 具体路径、数值、标识符、配置值、偏好、URL\n"
-            "6. 错误/警告等需注意的事项\n\n"
-            "要求：只输出要点列表，不要前言或解释；不要复述对话；不要编造。"
-            "不重要的信息直接省略。\n\n"
-            f"对话历史:\n{transcript}"
-        )
-
-        try:
-            summary = self._summarize_via_llm(summary_prompt)
-        except Exception as e:
-            self._log(f"[context] summarize LLM call failed: {e}")
-            summary = ""
-
-        if not summary or not summary.strip():
-            # Fallback: build a minimal structural summary from messages so we
-            # don't lose tool results entirely when the LLM is unavailable.
-            summary = self._fallback_summary(old_messages)
-            if not summary:
-                summary = "(上下文收缩：旧消息已清理，无可用摘要)"
-
-        summary = summary.strip()
-
-        # Persist to memory.md with timestamp for long-term recall.
-        self._append_summary_to_memory(summary, reason)
-
-        # Replace old messages with a single user-role summary marker. Using
-        # role=user (not system) keeps it inside the conversation the model
-        # treats as dialogue rather than instructions, and ensures the very
-        # first history message is never a dangling tool result.
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        summary_msg = {
-            "role": "user",
-            "content": (
-                f"[上下文摘要 - {ts} - 触发原因: {reason}]\n"
-                f"{summary}\n"
-                f"[摘要结束，以下是后续对话]"
-            ),
-        }
-        self._history = [summary_msg] + list(recent_messages)
-        # Recompute incremental counter after shrink (cheaper than full O(n) scan
-        # on every turn, and only runs when context actually shrinks).
-        self._log(
-            f"[context] shrunk: removed {len(old_messages)} old msgs, "
-            f"kept {len(recent_messages)} recent + 1 summary marker "
-            f"(reason: {reason})"
-        )
-        try:
-            self.callbacks.on_context_shrunk(summary, reason)
-        except Exception:  # pragma: no cover - defensive
-            pass
-        return True
-
-    def _format_messages_for_summary(self, messages: List[Dict[str, Any]]) -> str:
-        """Render a list of history messages as a readable transcript for the
-        summarizer LLM. Truncates very long tool outputs to keep the
-        summarization prompt itself within budget."""
-        lines = []
-        for i, msg in enumerate(messages):
-            role = msg.get("role", "?")
-            content = msg.get("content")
-            if isinstance(content, str):
-                text = content
-            elif content is None:
-                text = ""
-            else:
-                text = json.dumps(content, ensure_ascii=False)
-            # Cap individual message text so the summarizer prompt stays bounded.
-            if len(text) > 2000:
-                text = text[:2000] + f"... [truncated, {len(text)} chars total]"
-            if role == "tool":
-                name = msg.get("name", "tool")
-                lines.append(f"[{i}] 工具 {name} 结果: {text}")
-            elif role == "assistant":
-                tcs = msg.get("tool_calls") or []
-                if tcs:
-                    tc_descs = []
-                    for tc in tcs:
-                        fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                        tc_descs.append(f"{fn.get('name','?')}({fn.get('arguments','')})")
-                    lines.append(f"[{i}] 助手(调用工具: {', '.join(tc_descs)}): {text}")
-                else:
-                    lines.append(f"[{i}] 助手: {text}")
-            elif role == "user":
-                lines.append(f"[{i}] 用户: {text}")
-            else:
-                lines.append(f"[{i}] {role}: {text}")
-        return "\n".join(lines)
-
-    def _fallback_summary(self, messages: List[Dict[str, Any]]) -> str:
-        """Build a minimal structural summary without calling the LLM.
-        Extracts user messages and tool names so the agent retains at least
-        a coarse trace of what happened."""
-        if not messages:
-            return ""
-        users = []
-        tools = []
-        for m in messages:
-            r = m.get("role")
-            if r == "user" and isinstance(m.get("content"), str):
-                users.append(m["content"][:200])
-            elif r == "assistant":
-                for tc in m.get("tool_calls") or []:
-                    fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                    if fn.get("name"):
-                        tools.append(fn["name"])
-        parts = []
-        if users:
-            parts.append("用户请求: " + " | ".join(users))
-        if tools:
-            parts.append("调用过的工具: " + ", ".join(tools))
-        return "; ".join(parts) if parts else ""
-
-    def _summarize_via_llm(self, prompt: str) -> str:
+    def _summarize_via_llm(self, prompt: str, system: str = "", llm: Any = None) -> str:
         """Call the LLM (non-interactive, no tools) to produce a summary.
-        Uses a low temperature for determinism. Reuses chat_stream so the
-        same client/transport is used."""
+
+        Uses a low temperature for determinism. ``llm`` lets background threads
+        pass the dedicated extraction client (``httpx.Client`` is not
+        thread-safe, so they must not share ``self.llm`` with the UI thread).
+        ``system`` lets callers swap the persona (摘要器 / 记忆提纯器).
+        """
+        client = llm or self.llm
         messages = [
-            {"role": "system", "content": "你是精确的对话摘要器，用中文输出要点列表，不加前言和解释。"},
+            {"role": "system",
+             "content": system or "你是精确的对话摘要器，用中文输出要点列表，不加前言和解释。"},
             {"role": "user", "content": prompt},
         ]
         out: List[str] = []
-        for ev in self.llm.chat_stream(messages, tools=None, temperature=0.2):
+        for ev in client.chat_stream(messages, tools=None, temperature=0.2):
             if ev.type == "content":
                 out.append(ev.content)
             elif ev.type == "done":
@@ -589,19 +512,21 @@ class Agent:
         closes the app right after a reply.
 
         We capture the *recent conversation window* on the main thread before
-        spawning the worker (the worker must not read self._history — by the
+        spawning the worker (the worker must not read the Session — by the
         time it runs, the main thread may have already started the next turn
-        and mutated/shrunk the list).  A multi-turn window (instead of just
+        and folded/mutated it).  A multi-turn window (instead of just
         the last exchange) lets the extractor resolve pronouns and project
         references ("这个项目用 X 吗") that a single isolated turn cannot.
         """
         # Collect the last few user/assistant exchanges for context.
         recent: List[str] = []
-        for msg in reversed(self._history):
-            role = msg.get("role")
-            content = (msg.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                recent.append(f"{'User' if role == 'user' else 'Assistant'}: {content}")
+        for t in reversed(self.session.turns):
+            if (t.prompt or "").strip():
+                recent.append(f"User: {t.prompt.strip()}")
+                if len(recent) >= 6:
+                    break
+            if (t.assistant_text or "").strip():
+                recent.append(f"Assistant: {t.assistant_text.strip()}")
                 if len(recent) >= 6:
                     break
         recent.reverse()
@@ -611,11 +536,7 @@ class Agent:
         # 「write and read back」这类单句指令）说明没有可抽取的持久事实，
         # 抽取只会浪费一次 LLM 调用。这与旧行为保持一致（user/assistant 均
         # 需 >= 20 字符才抽取）。
-        last_user = ""
-        for msg in reversed(self._history):
-            if msg.get("role") == "user" and msg.get("content"):
-                last_user = msg["content"].strip()
-                break
+        last_user = (self._last_user_text or "").strip()
         if len(last_user) < 20:
             return
         if len((assistant_reply or "").strip()) < 20:
@@ -652,6 +573,10 @@ class Agent:
         try:
             from .graph_memory import extract_facts_via_llm
             extract_llm = self._get_extract_llm()
+            if extract_llm is None:
+                # 拿不到专用客户端就跳过：绝不与 agent 线程共用 httpx.Client。
+                self._log("[memory] 跳过事实抽取（无可用专用客户端）")
+                return
             data = extract_facts_via_llm(extract_llm, conversation)
 
             entities = data.get("entities", [])
@@ -707,11 +632,14 @@ class Agent:
         For non-``LLMClient`` llm objects (test mocks, scripted LLMs) we return
         ``self.llm`` unchanged — those have no shared socket state.
         """
+        from .llm_client import LLMClient
+
+        # 「应用配置」换模型后必须重建：缓存的客户端仍指向旧 base_url/model。
+        cur_key = (getattr(self.llm, "base_url", None), getattr(self.llm, "model", None))
         cached = getattr(self, "_extract_llm", None)
-        if cached is not None:
+        if cached is not None and getattr(self, "_extract_llm_key", None) == cur_key:
             return cached
 
-        from .llm_client import LLMClient
         if not isinstance(self.llm, LLMClient):
             # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
             # socket state to race).
@@ -725,13 +653,24 @@ class Agent:
         # 但这里绝不能阻塞等锁：抽取线程会**在整个 LLM 调用期间**持有这把锁
         # （见 _extract_facts_sync），阻塞等待会让 agent 线程卡住一个完整
         # 请求（最长 read timeout）才发出确认弹窗——与「不延迟弹窗」的意图
-        # 正好相反。因此取不到锁就直接复用 self.llm 走本次调用。
+        # 正好相反。
+        #
+        # 取不到锁时返回 None（跳过本次抽取），**绝不**退回 self.llm ——
+        # 那正是本方法存在的意义：self.llm 的 httpx.Client 正被 agent 线程
+        # 流式使用，共用会直接踩连接池竞态。
         if not self._fact_extract_lock.acquire(blocking=False):
-            return self.llm
+            return None
         try:
+            # 锁内重查：key 变化时的旧客户端关闭也必须在锁内进行 —— 锁外关
+            # 会命中「后台抽取/蒸馏线程持锁正用该客户端做流式请求」的窗口，
+            # 把它正在跑的请求直接打断。能拿到锁就说明没有线程持有它整段
+            # 调用（RLock 跨线程互斥），此时关闭才是安全的。
             cached = getattr(self, "_extract_llm", None)
             if cached is not None:
-                return cached
+                if getattr(self, "_extract_llm_key", None) == cur_key:
+                    return cached
+                self._close_extract_llm()
+                self._extract_llm = None
             try:
                 self._extract_llm = LLMClient(
                     base_url=self.llm.base_url,
@@ -744,12 +683,25 @@ class Agent:
                     top_k=self.llm.top_k,
                     repetition_penalty=self.llm.repetition_penalty,
                 )
+                self._extract_llm_key = cur_key
                 return self._extract_llm
             except Exception:  # pragma: no cover — best-effort
                 pass
         finally:
             self._fact_extract_lock.release()
-        return self.llm
+        return None
+
+    def _close_extract_llm(self) -> None:
+        """关闭专用抽取客户端（换模型 / close() 时调用）。"""
+        client = getattr(self, "_extract_llm", None)
+        self._extract_llm = None
+        self._extract_llm_key = None
+        if client is None or client is self.llm:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _append_daily_facts(self, facts: List[str]) -> None:
         """Append auto-extracted facts to work memory under today's bucket.
@@ -812,11 +764,16 @@ class Agent:
 
     # ------------------------------------------------------------------
     def run(self, user_input: str) -> str:
-        """Process one user turn. Returns the final assistant content."""
+        """Process one user turn. Returns the final assistant content.
+
+        控制流已下沉到 ``kernel.KernelLoop``（三态自动机 + 五级压缩）。
+        这里只保留门面职责：记录请求、恢复工作记忆、同步上限、委托内核、回调 UI。
+        """
         self._turn_idx += 1
         # Invalidate per-turn cached prompt so it's rebuilt with current memory/skills.
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
+        self._last_user_text = user_input
         self._log(f"USER: {user_input}")
 
         # skill suggestion (固化) - non-blocking
@@ -827,407 +784,144 @@ class Agent:
         except Exception as e:  # pragma: no cover
             self._log(f"[skills] record_request error: {e}")
 
-        self._history.append({"role": "user", "content": user_input})
+        # 跨会话连续性：恢复上一次 persist 的工作检查点
+        restore_checkpoint(self.config, self.session)
 
-        self._trim_history()
+        # 任务边界：上一个计划已全部终态化 → 新请求应当重新规划。
+        # 不清的话旧计划会一直通过 anchor 回注，模型沿着过期计划走，也不再调用
+        # update_plan —— 表现为「计划面板停在第一次那幅，新任务没人监督」。
+        # 若还有未完成步骤则**保留**：用户说「继续」时要能接着干。
+        if (self.session.get_plan() is not None
+                and not self.session.plan_open_steps()):
+            self.session.clear_plan()
+            self._log("[plan] 上一任务已收尾，清空计划以便重新规划")
+        # 每轮同步一次面板：即使模型本轮没调 update_plan，用户看到的也是
+        # Session 的真实状态（而不是上一轮的残影）。
+        try:
+            self.callbacks.on_plan_updated(self.session.get_plan())
+        except Exception:  # pragma: no cover - defensive
+            pass
 
-        final_content = ""
-        # Use a manual iteration counter instead of `for i in range(...)` so
-        # context-shrink retries don't consume an iteration. A shrink is a
-        # recovery step, not a reasoning step, and shouldn't eat into the
-        # agent's reasoning budget.
-        iteration = 0
-        shrink_count = 0
-        while iteration < self.max_iterations:
-            # 协作式取消：每轮迭代开始时检查。旧实现只在 confirm/ask_user 里
-            # 检查 _cancelled——若模型接下来调用的都是无需确认的工具，取消
-            # 根本不生效，会一直跑满 max_iterations。
-            if self.callbacks.is_cancelled():
-                self._log("[agent] 收到取消请求，终止本轮对话")
-                self.callbacks.on_finished()
-                return final_content
+        # max_iterations 可能在构造后被 UI 改动 → 每轮同步进内核
+        self.kernel.max_turns = max(1, int(self.max_iterations or 15))
 
-            # --- Proactive context shrink: if estimated prompt size exceeds
-            # context_shrink_ratio * max_context_tokens, summarize older
-            # messages before calling the LLM. Avoids the round-trip of
-            # sending an over-large prompt and getting back an error.
-            if shrink_count < self._max_shrinks_per_run and self._should_shrink_context():
-                pct = int(self.context_shrink_ratio * 100)
-                shrunk = self._shrink_context(
-                    reason=f"主动收缩: 估计上下文已达 {pct}% 阈值"
-                )
-                if shrunk:
-                    shrink_count += 1
-                    continue  # re-evaluate; don't burn an iteration on shrink
+        result: KernelResult = self.kernel.run(user_input)
 
-            # 裁剪较早的 tool 输出（在发给模型之前），抑制历史随轮次膨胀。
-            self._trim_old_tool_outputs()
-
-            iteration += 1
-            messages = self._build_messages()
-            self._log(f"[iter {iteration}] -> LLM ({self.config.model})")
-
-            content_buf: List[str] = []
-            reasoning_buf: List[str] = []
-            tool_calls: List[Dict[str, Any]] = []
-            usage: Dict[str, int] = {}
-            t0 = time.time()
-            ttfb: Optional[float] = None  # time to first byte — set on first chunk
-            completion_tokens = 0
-            # Live token-speed every 0.3s during streaming.
-            # Start at None (not 0.0) so the first chunk doesn't immediately
-            # emit a misleading speed based on TTFB (which includes network
-            # latency + model prefill, not generation speed).
-            last_speed_emit: Optional[float] = None
-            seen_done = False
-            # 流式过程中用户点了「终止对话」→ 中断读取并直接结束本轮。
-            cancelled_mid_stream = False
-            # Incremental token estimate: instead of joining the full
-            # content_buf + reasoning_buf every 0.3s (O(N) join + O(N)
-            # char scan, where N grows linearly per turn — 10K chars means
-            # 10K iterations every 0.3s), we accumulate the token count
-            # chunk-by-chunk. Each _estimate_tokens call is O(chunk_len)
-            # which is tiny. The total is O(Σ chunk_len) = O(N) across the
-            # whole turn, versus O(N²/0.3) for the naive approach.
-            live_est_tokens = 0
-            attempt = 0
-
-            try:
-                while True:
-                    # 重试前必须清空上一轮的半截缓冲，否则两次尝试的内容会
-                    # 被拼成一条回复。
-                    content_buf = []
-                    reasoning_buf = []
-                    tool_calls = []
-                    usage = {}
-                    ttfb = None
-                    completion_tokens = 0
-                    last_speed_emit = None
-                    seen_done = False
-                    live_est_tokens = 0
-                    got_any_chunk = False
-                    try:
-                        for ev in self.llm.chat_stream(
-                            messages, tools=self._tools_schemas(),
-                            temperature=self.config.temperature,
-                        ):
-                            got_any_chunk = True
-                            # 流式期间也轮询取消（bool 检查，代价可忽略），否则
-                            # 长回复期间点「终止对话」要等整个回复生成完才生效。
-                            if self.callbacks.is_cancelled():
-                                self._log("[agent] 取消：中断流式读取")
-                                cancelled_mid_stream = True
-                                break
-                            if ev.type == "content":
-                                content_buf.append(ev.content)
-                                self.callbacks.on_content(ev.content)
-                                live_est_tokens += _estimate_tokens(ev.content)
-                            elif ev.type == "reasoning":
-                                reasoning_buf.append(ev.content)
-                                self.callbacks.on_reasoning(ev.content)
-                                live_est_tokens += _estimate_tokens(ev.content)
-                            elif ev.type == "done":
-                                seen_done = True
-                                tool_calls = ev.tool_calls
-                                usage = ev.usage
-                                # 网关可能返回 null → `or 0` 归一，避免后续算术抛
-                                # TypeError 并被误报成「LLM 流错误」。
-                                completion_tokens = usage.get("completion_tokens") or 0
-                                continue  # final speed is emitted below; skip live emit
-                            # Live token-speed every 0.3s during streaming.
-                            # First chunk: record TTFB but don't emit yet (we need
-                            # at least 0.3s of generation for a meaningful speed).
-                            now = time.time()
-                            if ttfb is None:
-                                ttfb = now
-                            if last_speed_emit is None:
-                                last_speed_emit = now
-                            elif now - last_speed_emit >= 0.3:
-                                # Use generation time (now - ttfb), not total time
-                                # (now - t0), to exclude TTFB from the speed calc.
-                                gen_elapsed = max(now - ttfb, 1e-6)
-                                if live_est_tokens > 0:
-                                    live_speed = live_est_tokens / gen_elapsed
-                                    self.callbacks.on_token_speed(
-                                        self._total_tokens + live_est_tokens, live_speed
-                                    )
-                                last_speed_emit = now
-                        break  # 收流完成（或被取消中断）→ 退出重试循环
-                    except Exception as e:
-                        # 只有「一个 chunk 都没收到」的失败才重试：网络抖动、
-                        # 429/502、连接超时都发生在首字节之前，此时重试不会
-                        # 产生重复输出。已经吐过内容的流中断后重试会把两段
-                        # 内容拼在一起，因此直接抛出。
-                        if got_any_chunk or attempt >= self._max_llm_retries:
-                            raise
-                        err_s = str(e)
-                        # 上下文过长交给下面的收缩逻辑处理（重试同一个超长
-                        # prompt 只会再失败一次）；4xx 是请求本身的问题
-                        # （参数/鉴权），重试同样没有意义。
-                        if self._is_context_too_long_error(err_s) or re.search(
-                            r"HTTP 4\d\d", err_s
-                        ):
-                            raise
-                        attempt += 1
-                        delay = _LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                        self._log(
-                            f"[agent] LLM 调用失败（尚未收到输出），{delay:.1f}s 后重试 "
-                            f"({attempt}/{self._max_llm_retries}): {e}"
-                        )
-                        if self.callbacks.is_cancelled():
-                            raise
-                        time.sleep(delay)
-            except Exception as e:
-                err_str = str(e)
-                # Friendly message for streaming read timeouts (the most common
-                # cause of "reply stops halfway and never resumes").
-                if not err_str:
-                    import httpx
-                    if isinstance(e, httpx.ReadTimeout):
-                        err_str = "模型响应超时（读取中断），请重试"
-                    elif isinstance(e, httpx.TimeoutException):
-                        err_str = "模型请求超时，请重试"
-                # --- Reactive context shrink: if the LLM rejected the prompt
-                # for being too long, shrink and retry the same iteration
-                # instead of failing the whole turn.
-                if (
-                    self._is_context_too_long_error(err_str)
-                    and shrink_count < self._max_shrinks_per_run
-                ):
-                    self._log(
-                        f"[context] LLM rejected prompt as too long: {err_str[:200]}; "
-                        f"shrinking and retrying (attempt {shrink_count + 1}/{self._max_shrinks_per_run})"
-                    )
-                    shrunk = self._shrink_context(reason="被动收缩: LLM context_length_exceeded")
-                    if shrunk:
-                        shrink_count += 1
-                        # Don't increment iteration — retry the same turn.
-                        iteration -= 1
-                        continue
-                self._log(f"[agent] LLM stream error: {err_str}")
-                self.callbacks.on_error(err_str)
-                self.callbacks.on_finished()
-                return final_content or ""
-
-            if cancelled_mid_stream:
-                # 流式期间被取消：不把半截回复当完整回答记入历史（UI 已展示了
-                # 内容）。直接结束本轮；用户下一条消息会以干净的状态开始。
-                self.callbacks.on_finished()
-                return final_content
-
-            if not seen_done and (content_buf or reasoning_buf or tool_calls):
-                # The stream ended without an explicit "done" event — likely a
-                # network cut or server-side truncation. Log so it's visible.
-                self._log("[agent] warning: LLM stream ended without 'done' event")
-
-            # Total elapsed time (includes TTFB, used for total turn timing)
-            elapsed = max(time.time() - t0, 1e-6)
-            # Generation-only elapsed (excludes TTFB, used for speed calc).
-            # If ttfb is None (no chunks arrived), fall back to elapsed.
-            gen_elapsed = max((time.time() - ttfb), 1e-6) if ttfb is not None else elapsed
-
-            # Determine reasoning token count for this turn.
-            # 1. If the API provides completion_tokens_details.reasoning_tokens,
-            #    trust that exact figure.
-            # 2. Otherwise estimate from the streamed reasoning text so that
-            #    reasoning-heavy models still show a realistic tok/s and the
-            #    running total reflects actual consumption.
-            details = usage.get("completion_tokens_details") or {}
-            api_reasoning_tokens = details.get("reasoning_tokens", 0) if isinstance(details, dict) else 0
-            reasoning_text = "".join(reasoning_buf)
-            estimated_reasoning_tokens = _estimate_tokens(reasoning_text)
-
-            if api_reasoning_tokens:
-                reasoning_tokens = api_reasoning_tokens
-                # API already includes reasoning in completion_tokens; don't add again
-                extra_reasoning_tokens = 0
-            else:
-                # API's completion_tokens may or may not include reasoning.
-                # If the API reported completion_tokens but we streamed a lot of
-                # reasoning text that wasn't counted, add our estimate on top.
-                reasoning_tokens = estimated_reasoning_tokens
-                extra_reasoning_tokens = estimated_reasoning_tokens
-
-            # Total tokens: use the API's total if it's non-zero and includes
-            # reasoning (i.e. api_reasoning_tokens > 0 or no reasoning text was
-            # streamed). Otherwise add our estimate on top.
-            # 部分网关/代理会返回 null 字段；用 `or 0` 归一，否则 `None > 0`
-            # 抛 TypeError，而这行在 try 保护之外会让整轮 run() 直接崩溃。
-            api_total = usage.get("total_tokens") or 0
-            if api_total > 0 and (api_reasoning_tokens or not reasoning_text):
-                # API total is trustworthy
-                self._total_tokens += api_total
-            else:
-                # API total is missing or doesn't include reasoning
-                self._total_tokens += api_total + extra_reasoning_tokens
-
-            if usage:
-                self.callbacks.on_usage(usage)
-            # Final speed: use ONLY the completion token count (output tokens)
-            # divided by generation-only time (excludes TTFB).
-            #
-            # BUG FIX: previously used `turn_tokens` which includes
-            # prompt_tokens (input).  Dividing total_tokens by generation
-            # time produced wildly inflated speeds (e.g. 8000 prompt + 300
-            # completion tokens / 20s = 415 t/s instead of 15 t/s).
-            #
-            # If the API provides reasoning_tokens separately and they're
-            # NOT included in completion_tokens, add them.  If they ARE
-            # included (api_reasoning_tokens > 0), completion_tokens already
-            # covers everything.
-            if api_reasoning_tokens:
-                speed_tokens = completion_tokens  # already includes reasoning
-            else:
-                speed_tokens = completion_tokens + extra_reasoning_tokens
-            speed = (speed_tokens / gen_elapsed) if speed_tokens else 0.0
-            self.callbacks.on_token_speed(self._total_tokens, speed)
-            self._log(
-                f"[iter {iteration}] <- {len(''.join(content_buf))} content chars, "
-                f"{len(reasoning_text)} reasoning chars (~{reasoning_tokens} tok), "
-                f"{len(tool_calls)} tool_calls, usage={usage}, "
-                f"{speed_tokens} completion_tok / {gen_elapsed:.2f}s = {speed:.1f} tok/s"
+        if result.reason is ExitReason.MAX_TURNS:
+            self._log("[agent] max turns reached, stopping.")
+            # 让下一轮知道上一轮是被轮次上限截断的：否则模型会以为任务已完成。
+            self.session.working["__truncated__"] = (
+                f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
+                f"任务可能尚未完成。请先总结已完成的进展，再询问用户是否继续。"
             )
-
-            assistant_msg: Dict[str, Any] = {"role": "assistant"}
-            if content_buf:
-                assistant_msg["content"] = "".join(content_buf)
-            else:
-                # OpenAI-compatible APIs require the `content` field to be present
-                # on assistant messages even when only tool_calls are emitted;
-                # omitting it triggers HTTP 400 on some servers. Use None (null)
-                # rather than "" so the model sees "no text reply", not "empty reply".
-                assistant_msg["content"] = None
-            if tool_calls:
-                # Ensure every tool_call has a non-empty id. Some local models
-                # omit it; without an id the tool result cannot be correlated
-                # back (tool_call_id must match), and the API may reject the
-                # request. We synthesize stable ids before recording history.
-                for idx, tc in enumerate(tool_calls):
-                    if not tc.get("id"):
-                        self._tool_call_counter += 1
-                        tc["id"] = f"call_{self._tool_call_counter}_{idx}"
-                assistant_msg["tool_calls"] = tool_calls
-            self._history.append(assistant_msg)
-            final_content = assistant_msg.get("content") or ""
-
-            if not tool_calls:
-                # no further action -> done
-                # Best-effort: extract facts from this conversation turn and
-                # persist them to the long-term knowledge graph.  Runs in a
-                # daemon thread so the user gets their reply immediately
-                # without waiting for the extraction LLM call.
-                self._maybe_extract_facts_async(final_content)
-                self.callbacks.on_finished()
-                return final_content
-
-            # --- 执行工具调用 ---
-            # 分两阶段：先顺序处理「需交互/已确定结果」的调用（取消、参数解析
-            # 失败、未知工具、需确认——确认必须与用户交互，不能并发）；再把
-            # 剩下互相独立、只读的调用并发执行（多工具回合的 wall time 从 Σ
-            # 降为 max）。历史始终按 tool_calls 原序写入。
-            from .tools import ToolResult
-
-            results: Dict[int, Any] = {}
-            parallel_jobs: List[Tuple[int, str, Dict[str, Any]]] = []
-
-            for idx, tc in enumerate(tool_calls):
-                fn = tc.get("function", {}) or {}
-                name = fn.get("name", "")
-                raw_args = fn.get("arguments", "")
-
-                # 协作式取消：终止后必须为剩余的每个 tool_call 补一条合成
-                # tool 消息——assistant_msg 里的 tool_calls 已写入历史，缺少
-                # 对应结果会让下一轮请求被 API 以 HTTP 400 拒绝（悬挂 tool_calls）。
-                if self.callbacks.is_cancelled():
-                    self._log(f"[tool] {name} 已因用户取消而跳过")
-                    try:
-                        skip_args = parse_args(raw_args)
-                    except ValueError:
-                        skip_args = {"_raw_arguments": raw_args}
-                    self.callbacks.on_tool_start(name, skip_args)
-                    res = ToolResult(False, error="用户取消了对话，工具未执行")
-                    self.callbacks.on_tool_end(name, res)
-                    results[idx] = res
-                    continue
-
-                # Parse arguments. Malformed JSON must be reported to the model
-                # as a parse error (not silently treated as {} which would
-                # surface as a confusing "missing required argument" later).
-                try:
-                    args = parse_args(raw_args)
-                except ValueError as e:
-                    self._log(f"[tool] {name} arg-parse error: {e}")
-                    # Notify UI of start (with raw args for visibility) before
-                    # reporting the failure, so the UI shows a complete cycle.
-                    self.callbacks.on_tool_start(name, {"_raw_arguments": raw_args})
-                    res = ToolResult(False, error=str(e))
-                    self.callbacks.on_tool_end(name, res)
-                    results[idx] = res
-                    continue
-
-                tool = self.tools.get(name)
-                needs_confirm = bool(tool and tool.should_confirm(args)) if tool else False
-                self._log(f"[tool] {name}({raw_args}) needs_confirm={needs_confirm}")
-
-                if tool is None:
-                    # Unknown tool: still notify UI of start for a complete cycle.
-                    self.callbacks.on_tool_start(name, args)
-                    res = self.tools.execute(name, args)  # returns unknown error
-                    self.callbacks.on_tool_end(name, res)
-                    results[idx] = res
-                    continue
-
-                if needs_confirm:
-                    confirm_msg = self._confirm_message(name, args)
-                    if not self.callbacks.confirm(confirm_msg):
-                        self._log(f"[tool] {name} DENIED by user")
-                        # Tool never actually started (user declined before
-                        # invocation); only report the denial result. The UI
-                        # intentionally does not receive on_tool_start here so
-                        # that "never started" semantics are preserved.
-                        res = ToolResult(False, error=f"User denied {name} ({confirm_msg})")
-                        self.callbacks.on_tool_end(name, res)
-                        results[idx] = res
-                        continue
-                    self.callbacks.on_tool_start(name, args)
-                    res = self._execute_tool(name, args)
-                    self._log_tool_result(name, res)
-                    self.callbacks.on_tool_end(name, res)
-                    results[idx] = res
-                    continue
-
-                if name in _PARALLEL_SAFE_TOOLS:
-                    parallel_jobs.append((idx, name, args))
-                    continue
-
-                self.callbacks.on_tool_start(name, args)
-                res = self._execute_tool(name, args)
-                self._log_tool_result(name, res)
-                self.callbacks.on_tool_end(name, res)
-                results[idx] = res
-
-            if parallel_jobs:
-                self._run_parallel_tools(parallel_jobs, results)
-
-            # 按 tool_calls 原序写入历史（并发执行不改变顺序）
-            for idx, tc in enumerate(tool_calls):
-                res = results.get(idx)
-                if res is None:  # pragma: no cover - defensive
-                    res = ToolResult(False, error="工具未执行（harness 内部错误）")
-                self._history.append(self._tool_message(tc, res))
-
-        self._log("[agent] max iterations reached, stopping.")
-        # 让下一轮知道上一轮是被迭代上限截断的：否则模型会以为任务已完成，
-        # 用户也会看到回复戛然而止却没有任何解释。
-        self._history.append({
-            "role": "user",
-            "content": (
-                f"[系统提示] 上一轮在达到最大迭代次数（{self.max_iterations}）后被中断，"
-                "任务可能尚未完成。请先总结已完成的进展，再询问用户是否继续。"
-            ),
-        })
         self.callbacks.on_finished()
-        return final_content
+        return result.text
+
+    # ------------------------------------------------------------------
+    # 兜底收缩：内核 L3 折叠用尽后仍未落回预算时的最后一道防线
+    # ------------------------------------------------------------------
+    def _shrink_session(self, reason: str) -> bool:
+        """把最老的原文轮交给 LLM 摘要，写进 memory.md 并折叠。
+
+        正常情况下五级压缩（尤其是 L2/L3）已经把历史压成常量，走不到这里。
+        保留它是因为单个巨型工具输出（如整本 PDF）仍可能一次性击穿预算。
+        """
+        session = self.session
+        if len(session.turns) <= 1:
+            return False
+
+        old = session.turns[:-1]
+        transcript = "\n".join(
+            f"{t.digest_line()}\n{(t.assistant_text or '')[:600]}"
+            + "".join(str(r.get("content", ""))[:400] for r in t.tool_results)
+            for t in old
+        )
+        summary_prompt = (
+            "把下面的对话压缩成要点摘要，只保留：\n"
+            "1. 用户的核心需求与当前目标\n2. 已做的决定及原因\n"
+            "3. 已完成的步骤与结果（含工具关键输出）\n4. 未完成的子任务与下一步\n"
+            "5. 具体路径、数值、标识符、配置值、偏好、URL\n6. 错误/警告等需注意的事项\n\n"
+            "要求：只输出要点列表，不要前言或解释；不要复述对话；不要编造。\n\n"
+            f"对话历史:\n{transcript}"
+        )
+        try:
+            summary = self._summarize_via_llm(summary_prompt)
+        except Exception as e:
+            self._log(f"[context] summarize LLM call failed: {e}")
+            summary = ""
+        if not summary.strip():
+            summary = "; ".join(t.digest_line() for t in old) or "(上下文收缩：旧轮已清理)"
+
+        self._append_summary_to_memory(summary.strip(), reason)
+        n = session.force_fold(len(old))
+        session.extra_digest.append(
+            f"[摘要 {datetime.now().strftime('%H:%M')}] {summary.strip()[:400]}"
+        )
+        self._log(f"[context] 兜底收缩：折叠 {n} 轮（reason: {reason}）")
+        try:
+            self.callbacks.on_context_shrunk(summary.strip(), reason)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return True
+
+    # ------------------------------------------------------------------
+    # L4：经验蒸馏（把本次任务沉淀成长期记忆 / 可复用技能）
+    # ------------------------------------------------------------------
+    def _distill_experience_async(self, session: Session) -> None:
+        """异步 L4 蒸馏：不阻塞用户看到回复。
+
+        产出三条去路，构成能力进化闭环：
+          facts/lessons → 知识图谱（``memory_search`` 可召回）
+          skill         → ``workspace/skills/<name>/SKILL.md``（自动进向量索引）
+        """
+        transcript = "\n".join(session.all_digest_lines()[-25:])
+        if not transcript.strip():
+            return
+
+        def _target() -> None:
+            # 与事实抽取共用同一把锁：长会话里 run() 可能连着触发多次蒸馏，
+            # 没有上限会同时跑 N 个 LLM 调用（也各自占一个连接池）。
+            if not self._fact_extract_lock.acquire(blocking=False):
+                self._log("[distill] 上一次抽取/蒸馏仍在进行，跳过本次")
+                return
+            try:
+                # httpx.Client 非线程安全 → 后台线程必须走独立的抽取客户端。
+                # 拿不到就放弃本次，绝不退回 self.llm。
+                llm = self._get_extract_llm()
+                if llm is None:
+                    self._log("[distill] 跳过（无可用专用客户端）")
+                    return
+                prompt = DISTILL_PROMPT.format(transcript=transcript[:4000])
+                raw = self._summarize_via_llm(prompt, system=DISTILL_SYSTEM, llm=llm)
+                data = l4_normalize(l4_extract_json(raw))
+                observations = list(data["facts"]) + list(data["lessons"])
+                if observations:
+                    from .tools.memory import _get_long_memory
+
+                    lm = _get_long_memory(self.tools, self.config)
+                    lm.graph.create_entity(
+                        "Experience", entity_type="distilled", observations=observations
+                    )
+                    self._log(f"[distill] 写入 {len(observations)} 条经验到知识图谱")
+                sk = data.get("skill") or {}
+                if sk.get("name") and sk.get("summary"):
+                    self.tools.execute(
+                        "skill_save",
+                        {
+                            "name": sk["name"],
+                            "description": sk["summary"],
+                            "when_to_use": sk.get("when_to_use", ""),
+                            "steps": sk.get("steps") or sk["summary"],
+                            "pitfalls": "; ".join(data["lessons"]),
+                        },
+                    )
+                    self._log(f"[distill] 固化技能 {sk['name']}")
+            except Exception as e:
+                self._log(f"[distill] error: {e}")
+            finally:
+                self._fact_extract_lock.release()
+
+        threading.Thread(target=_target, daemon=True, name="l4-distill").start()
 
     # ------------------------------------------------------------------
     # Tool execution helpers
@@ -1296,11 +990,6 @@ class Agent:
                 results[idx] = res
 
     # ------------------------------------------------------------------
-    def _build_messages(self) -> List[Dict[str, Any]]:
-        msgs: List[Dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
-        msgs.extend(self._history)
-        return msgs
-
     def _system_prompt(self) -> str:
         """Build the full system prompt: base + memory + matched skill.
 
@@ -1362,14 +1051,9 @@ class Agent:
             pass
         # inject matched skill prompt
         try:
-            # Find the latest user message — skills match user intents, not
-            # assistant/tool messages. self._history[-1] after the first turn
-            # is an assistant message whose content may be None.
-            user_text = ""
-            for msg in reversed(self._history):
-                if msg.get("role") == "user" and msg.get("content"):
-                    user_text = msg["content"]
-                    break
+            # 技能匹配的是用户意图：用本轮用户输入（历史所有权已在 Session，
+            # 这里不再扫描它）。
+            user_text = self._last_user_text
             matched = self.skills.match(user_text) if user_text else None
             if matched:
                 # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
@@ -1389,7 +1073,10 @@ class Agent:
         try:
             rag_engine = self.tools.get_rag_engine() if self.tools else None
             if rag_engine is not None:
-                status = rag_engine.status()
+                # status() 会连 LanceDB 并可能触发 lancedb 的惰性导入（冷启动
+                # 数秒）。它每轮都被调用一次，缓存起来——知识库状态本就以分钟级
+                # 变化，同步后由 reload_rag() 显式失效。
+                status = self._rag_status_cached(rag_engine)
                 chunks = status.get("chunks_stored", 0)
                 sources = status.get("sources", [])
                 if chunks > 0:
@@ -1416,14 +1103,27 @@ class Agent:
         self._cached_prompt = base
         return base
 
-    def _tool_message(self, tool_call: Dict[str, Any], result) -> Dict[str, Any]:
-        content = result.to_message() if hasattr(result, "to_message") else str(result)
-        return {
-            "role": "tool",
-            "tool_call_id": tool_call.get("id", ""),
-            "name": (tool_call.get("function") or {}).get("name", ""),
-            "content": content,
-        }
+    # ------------------------------------------------------------------
+    def invalidate_rag_status(self) -> None:
+        """丢弃知识库状态缓存（同步知识后调用）。"""
+        self._rag_status_cache = None
+
+    def reload_rag(self) -> None:
+        """知识库同步完成后刷新引擎句柄并失效状态缓存。"""
+        self.invalidate_rag_status()
+        if self.tools is not None:
+            self.tools.reload_rag()
+
+    def _rag_status_cached(self, engine: Any, ttl: float = 30.0) -> Optional[Dict[str, Any]]:
+        cache = getattr(self, "_rag_status_cache", None)
+        if isinstance(cache, tuple) and cache[1] is engine and (time.time() - cache[0]) < ttl:
+            return cache[2]
+        try:
+            status = engine.status()
+        except Exception:
+            return None
+        self._rag_status_cache = (time.time(), engine, status)
+        return status
 
     @staticmethod
     def _summarize_code(code: str) -> str:

@@ -103,17 +103,26 @@ def _extract_docx(path: Path) -> str:
     except ImportError:
         raise ImportError("python-docx is required for Word files. pip install python-docx")
 
+    # python-docx/openpyxl/python-pptx 都会持有打开的文件句柄（openpyxl
+    # 非 read_only 时还留着 zip 句柄），只靠 GC 回收在 4 worker × 数千文件
+    # 的同步里会累积句柄（Windows 上还会锁住文件，导致后续无法删除/覆盖）。
     doc = Document(str(path))
-    parts: List[str] = []
-    for para in doc.paragraphs:
-        if para.text.strip():
-            parts.append(para.text)
-    # Also extract tables
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            parts.append(" | ".join(cells))
-    return "\n\n".join(parts)
+    try:
+        parts: List[str] = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        # Also extract tables
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                parts.append(" | ".join(cells))
+        return "\n\n".join(parts)
+    finally:
+        try:
+            doc.part.package.stream.close()
+        except Exception:
+            pass
 
 
 def _extract_xlsx(path: Path) -> str:
@@ -123,15 +132,22 @@ def _extract_xlsx(path: Path) -> str:
         raise ImportError("openpyxl is required for Excel files. pip install openpyxl")
 
     wb = openpyxl.load_workbook(str(path), data_only=True)
-    parts: List[str] = []
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        parts.append(f"# Sheet: {sheet_name}")
-        for row in ws.iter_rows(values_only=True):
-            cells = [str(c) if c is not None else "" for c in row]
-            if any(c.strip() for c in cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    try:
+        parts: List[str] = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            parts.append(f"# Sheet: {sheet_name}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(c.strip() for c in cells):
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts)
+    finally:
+        # 关闭底层 zip 句柄（非 read_only 模式会一直持有）
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _extract_pptx(path: Path) -> str:
@@ -141,23 +157,29 @@ def _extract_pptx(path: Path) -> str:
         raise ImportError("python-pptx is required for PPT files. pip install python-pptx")
 
     prs = Presentation(str(path))
-    parts: List[str] = []
-    for i, slide in enumerate(prs.slides, 1):
-        slide_parts = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    t = para.text.strip()
-                    if t:
-                        slide_parts.append(t)
-            if shape.has_table:
-                table = shape.table
-                for row in table.rows:
-                    cells = [cell.text.strip() for cell in row.cells]
-                    slide_parts.append(" | ".join(cells))
-        if slide_parts:
-            parts.append(f"## Slide {i}\n\n" + "\n".join(slide_parts))
-    return "\n\n".join(parts)
+    try:
+        parts: List[str] = []
+        for i, slide in enumerate(prs.slides, 1):
+            slide_parts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            slide_parts.append(t)
+                if shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        cells = [cell.text.strip() for cell in row.cells]
+                        slide_parts.append(" | ".join(cells))
+            if slide_parts:
+                parts.append(f"## Slide {i}\n\n" + "\n".join(slide_parts))
+        return "\n\n".join(parts)
+    finally:
+        try:
+            prs.part.package.stream.close()
+        except Exception:
+            pass
 
 
 def _extract_pdf(path: Path) -> str:
@@ -429,26 +451,40 @@ def _extract_mobi(path: Path) -> str:
 
 def _extract_mobi_raw(path: Path) -> str:
     """Basic MOBI text extraction without external tools."""
+    # 只处理前 N MB：MOBI 常有几十 MB，整份读入 + 整份 decode + findall
+    # 物化会同时存在 3-4 份副本（latin-1 回退时再翻一倍）。
+    _MOBI_MAX_BYTES = 8 * 1024 * 1024
     with open(path, "rb") as f:
-        data = f.read()
+        data = f.read(_MOBI_MAX_BYTES)
 
     # Try to find text content in the raw bytes
     text_parts: List[str] = []
     # Look for UTF-8 text segments
     try:
         decoded = data.decode("utf-8", errors="ignore")
-        # Extract readable text blocks (sequences of printable chars)
-        blocks = re.findall(r'[\u4e00-\u9fff\u3000-\u303f\w\s.,!?;:()\[\]{}\'\"\-–—]{30,}', decoded)
-        text_parts.extend(blocks)
+        # finditer 边匹配边消费，避免把所有匹配块一次物化成列表
+        text_parts.extend(
+            m.group(0) for m in re.finditer(
+                r'[\u4e00-\u9fff\u3000-\u303f\w\s.,!?;:()\[\]{}\'\"\-–—]{30,}', decoded)
+        )
+        del decoded
     except Exception:
         pass
 
     # Also try Latin-1
+    # 注意 data 不能在 utf-8 分支里 del：utf-8 的 errors="ignore" 几乎不会抛
+    # 异常，但 text_parts 为空时 latin-1 回退需要原始字节。旧实现在 utf-8
+    # 分支 del data，回退触发 NameError 被 except 吞掉 → 非 utf-8 的 MOBI
+    # 静默返回空。这里用显式置 None 释放引用，回退分支判空跳过。
     if not text_parts:
+        if data is None:
+            return "\n\n".join(text_parts)
         try:
             decoded = data.decode("latin-1", errors="ignore")
-            blocks = re.findall(r'[\w\s.,!?;:()\[\]{}\'\"\-–—]{30,}', decoded)
-            text_parts.extend(blocks)
+            text_parts.extend(
+                m.group(0) for m in re.finditer(
+                    r'[\w\s.,!?;:()\[\]{}\'\"\-–—]{30,}', decoded)
+            )
         except Exception:
             pass
 
@@ -470,11 +506,15 @@ def _extract_csv(path: Path) -> str:
         except csv.Error:
             dialect = csv.excel  # default: comma-delimited
         reader = csv.reader(f, dialect)
-        rows = list(reader)
-    if not rows:
+        # 单次流式消费：旧实现 rows=list(reader) → lines=[...] → join，
+        # 三个全量副本同时存在（rows 与 lines 长期共存），200MB CSV 峰值 1GB+。
+        parts: List[str] = []
+        append = parts.append
+        for row in reader:
+            append(" | ".join(row))
+    if not parts:
         return ""
-    lines = [" | ".join(r) for r in rows]
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 
 def _extract_html(path: Path) -> str:

@@ -24,7 +24,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,10 @@ class GraphMemoryStore:
         self._embedding_model_name = embedding_model
         self._lock = threading.Lock()
         self._vec_lock = threading.Lock()  # protects vector-index lazy init
+        self._backfill_lock = threading.Lock()  # 回填判重 + 串行化（见 _ensure_vectors）
+        # _pending_index 的专用锁：抽取守护线程与工具线程会并发入队/取出，
+        # 旧实现无锁 swap+extend，极端交错下丢重试项 →「图里有、向量库没有」。
+        self._pending_lock = threading.Lock()
         self._entities: Dict[str, dict] = {}  # name → entity
         self._relations: List[dict] = []
         self._db = None
@@ -103,6 +107,12 @@ class GraphMemoryStore:
         # 向量索引只探测一次；lancedb/fastembed 缺失时不反复重试 connect+import。
         self._vec_tried = False
         self._backfilled = False
+        # 索引失败的 (entity, obs) 待重试队列：ONNX/LanceDB 瞬时失败不再造成
+        # 「JSON 图里有、向量库里没有」的永久检索缺口 —— 下次写入或检索时重试。
+        # 有上限：嵌入持续失败（模型下载不了）时队列只增不减，会把每条
+        # observation 的文本驻留内存。超限丢最旧并告警。
+        self._pending_index: List[Tuple[str, str]] = []
+        self._pending_index_max = 500
         self._load()
 
     # ------------------------------------------------------------------
@@ -182,12 +192,24 @@ class GraphMemoryStore:
                 # （并且每次都把同样那条 debug 日志刷出来）。
                 self._vec_tried = True
         # Backfill outside the lock (embedding is slow). Only once per instance.
+        #
+        # 两个坑都在这里：
+        #  1) 标志必须在**成功后**才置位。放在前面时，回填中途失败（模型下载
+        #     中断、某批 embedding 抛异常）也会被记成「已回填」，于是永远不
+        #     重试 → JSON 里有、向量库里没有的永久检索缺口。
+        #  2) 判重也必须在锁内，否则两个线程同时通过检查、各自回填一遍 →
+        #     同一条 observation 的重复向量行（memory_search 在并发白名单里，
+        #     首次调用极易并发进入）。
         if self._vec_ready and not getattr(self, "_backfilled", False):
-            self._backfilled = True
-            try:
-                self._backfill_vectors()
-            except Exception as e:
-                logger.debug("graph_memory: backfill failed: %s", e)
+            with self._backfill_lock:
+                if self._backfilled:
+                    return
+                try:
+                    self._backfill_vectors()
+                except Exception as e:
+                    logger.debug("graph_memory: backfill failed: %s", e)
+                    return          # 失败不置位 → 下次还会再试
+                self._backfilled = True
 
     def _backfill_vectors(self) -> None:
         """Index any observations present in the graph JSON but missing from
@@ -206,10 +228,21 @@ class GraphMemoryStore:
         existing_ids: set = set()
         if table is not None:
             try:
-                for r in table.to_arrow().to_pylist():
-                    existing_ids.add(r.get("id", ""))
+                # 列投影下推到存储层：表里有 768 维向量列，全表物化会把它们
+                # 全部读进内存（与 skill_retriever / vector_store 同一修法）。
+                rows = (
+                    table.search()
+                    .limit(max(table.count_rows(), 1))
+                    .select(["id"])
+                    .to_arrow()
+                    .to_pylist()
+                )
+                existing_ids = {r.get("id", "") for r in rows}
             except Exception:
-                existing_ids = set()
+                try:
+                    existing_ids = {r.get("id", "") for r in table.to_arrow().to_pylist()}
+                except Exception:
+                    existing_ids = set()
         # Collect missing (entity, observation) pairs.
         missing = [
             (name, obs)
@@ -252,53 +285,6 @@ class GraphMemoryStore:
             self._table = self._db.open_table("observations")
         return self._table
 
-    def _index_observation(self, entity_name: str, observation: str) -> None:
-        """Embed and upsert a single observation into LanceDB.
-
-        Called OUTSIDE self._lock — the embedding (ONNX C++ compute) and
-        LanceDB write can take 50-500ms each.  Holding the graph lock during
-        that time would block all JSON reads (snapshot, search fallback, etc.)
-        and freeze the UI if this runs on the agent thread.
-        """
-        self._ensure_vectors()
-        if not self._vec_ready:
-            return
-        try:
-            table = self._ensure_table()
-            oid = _hash(entity_name + "|" + observation)
-            # Observations are documents (retrieval targets), so embed with
-            # the document prefix — matching _semantic_search which embeds
-            # the query with the query prefix.
-            vec = _normalize_vector(self._ef.embed_documents([observation])[0])
-            record = {
-                "id": oid,
-                "entity": entity_name,
-                "text": observation,
-                "vector": vec,
-            }
-            if table is None:
-                with self._vec_lock:
-                    # Re-check under lock to avoid race with concurrent create
-                    table = self._table
-                    if table is None:
-                        self._table = self._db.create_table("observations", [record])
-                        return
-                    # Delete old record with same id if exists (upsert)
-                    try:
-                        table.delete(f"id = '{oid}'")
-                    except Exception:
-                        pass
-                    table.add([record])
-            else:
-                # Delete old record with same id if exists (upsert)
-                try:
-                    table.delete(f"id = '{oid}'")
-                except Exception:
-                    pass
-                table.add([record])
-        except Exception as e:
-            logger.debug("graph_memory: index_observation failed: %s", e)
-
     def _deindex_observations(self, entity_name: str) -> None:
         """Remove all vectors for an entity (e.g. after entity deletion)."""
         if not self._vec_ready:
@@ -307,11 +293,32 @@ class GraphMemoryStore:
             table = self._ensure_table()
             if table is None:
                 return
-            # Escape single quotes (SQL literal) — entity names come from
-            # the LLM and may contain them; otherwise the filter expression
-            # would be malformed or injectable.
-            safe = entity_name.replace("'", "''")
-            table.delete(f"entity = '{safe}'")
+            # JSON 里实体按 name.lower() 建键，但向量行的 entity 列存的是
+            # **创建时的原始大小写**。用 "postgres" 删以 "PostgreSQL" 建的
+            # 实体时，字面量过滤匹配不上 → JSON 删掉了、向量还在，已删实体
+            # 仍会被 search() 召回。这里先按归一化后的名字解析出实际存过的
+            # 所有拼写，再逐个删。
+            #
+            # 单引号仍要转义：实体名来自 LLM，不转义会让过滤表达式畸形或被注入。
+            target = (entity_name or "").strip().lower()
+            spellings = set()
+            try:
+                # 只投影 entity 列（同 _backfill_vectors：避免物化向量列）。
+                rows = (
+                    table.search()
+                    .limit(max(table.count_rows(), 1))
+                    .select(["entity"])
+                    .to_arrow()
+                    .to_pylist()
+                )
+                for r in rows:
+                    ent = str(r.get("entity") or "")
+                    if ent.strip().lower() == target:
+                        spellings.add(ent)
+            except Exception:
+                spellings = set()
+            for ent in (spellings or {entity_name}):
+                table.delete(f"entity = '{ent.replace(chr(39), chr(39) * 2)}'")
         except Exception:
             pass
 
@@ -333,6 +340,19 @@ class GraphMemoryStore:
         self._ensure_vectors()
         if not self._vec_ready:
             return
+        # 先重试上次失败的条目。必须按各自实体名分组重试 —— 直接并进当前
+        # batch 会把 A 实体的 observation 记到 B 实体名下。重试再失败会重新
+        # 入队（本方法的 except 分支），下次继续。
+        # 取出操作必须持 _pending_lock：与入队方（另一个线程的 except 分支）
+        # 无锁交错时会丢条目。
+        with self._pending_lock:
+            pending, self._pending_index = self._pending_index, []
+        if pending:
+            grouped: Dict[str, List[str]] = {}
+            for ent, obs in pending:
+                grouped.setdefault(ent, []).append(obs)
+            for ent, obs_list in grouped.items():
+                self._index_observations_batch(ent, obs_list)
         try:
             vecs = self._ef.embed_documents(observations)
             if len(vecs) != len(observations):
@@ -366,6 +386,16 @@ class GraphMemoryStore:
                 table.add(records)
         except Exception as e:
             logger.debug("graph_memory: index_observations_batch failed: %s", e)
+            # 入队待重试：下次写入或 search() 时补上，不留「图里有、向量库没有」的缺口。
+            # 持锁入队 + 有界：并发下不丢条目，嵌入持续失败也不会无限驻留文本。
+            with self._pending_lock:
+                self._pending_index.extend((entity_name, o) for o in observations)
+                if len(self._pending_index) > self._pending_index_max:
+                    dropped = len(self._pending_index) - self._pending_index_max
+                    del self._pending_index[:dropped]
+                    logger.warning(
+                        "graph_memory: pending index queue overflow, dropped %d oldest", dropped
+                    )
 
     # ------------------------------------------------------------------
     # CRUD: entities
@@ -415,9 +445,11 @@ class GraphMemoryStore:
                 r for r in self._relations
                 if r["source"].lower() != key and r["target"].lower() != key
             ]
-            self._deindex_observations(name)
             self._save()
-            return True
+        # 向量删除移到锁外：_deindex_observations 内部是全表物化 + 逐条 delete，
+        # 锁内执行会阻塞所有图读取（同 _index_observations_batch 的设计理由）。
+        self._deindex_observations(name)
+        return True
 
     def get_entity(self, name: str) -> Optional[dict]:
         key = _norm_name(name).lower()
@@ -517,8 +549,23 @@ class GraphMemoryStore:
             return []
         self._ensure_vectors()
         if self._vec_ready and self._ef is not None:
+            # 检索前先把积压的待重试条目补上 —— 语义检索不应因一次瞬时
+            # 失败而永远漏掉某条 observation。
+            with self._pending_lock:
+                has_pending = bool(self._pending_index)
+            if has_pending:
+                self._flush_pending_index()
             return self._semantic_search(query, top_k)
         return self._keyword_search(query, top_k)
+
+    def _flush_pending_index(self) -> None:
+        with self._pending_lock:
+            pending, self._pending_index = self._pending_index, []
+        grouped: Dict[str, List[str]] = {}
+        for ent, obs in pending:
+            grouped.setdefault(ent, []).append(obs)
+        for ent, obs_list in grouped.items():
+            self._index_observations_batch(ent, obs_list)
 
     def _semantic_search(self, query: str, top_k: int) -> List[dict]:
         try:
@@ -614,6 +661,11 @@ class GraphMemoryStore:
             except Exception:
                 pass
         self._table = None
+        # 必须一并清空待重试队列：此前嵌入失败入队的条目对应的 JSON 实体已删，
+        # clear 后任何一次 add/search 都会把它们写回新表 → 用户删掉的事实
+        # 又被语义检索召回（「删除复活」的向量库变体）。
+        with self._pending_lock:
+            self._pending_index.clear()
 
     def close(self) -> None:
         """Release resources.
@@ -640,6 +692,9 @@ class GraphMemoryStore:
         # 允许重新初始化：否则 close 后 _ensure_vectors 会提前返回，
         # 后续（重建的）store 永远拿不到向量能力。
         self._vec_tried = False
+        # 一并重置回填标志：close 复活的实例向量表重新打开，若 _backfilled
+        # 仍为 True，已有 JSON observation 不会再回填 → 语义检索静默残缺。
+        self._backfilled = False
 
 
 # ---------------------------------------------------------------------------
@@ -725,9 +780,38 @@ def extract_facts_via_llm(
         data = json.loads(raw)
         if not isinstance(data, dict):
             return {"entities": [], "relations": []}
-        data.setdefault("entities", [])
-        data.setdefault("relations", [])
-        return data
+        # 结构归一化：LLM 常把实体返成字符串、observations 混入非 str、relation
+        # 缺字段。旧实现只 setdefault 就返回，下游 ent.get()/o.strip() 抛
+        # AttributeError → 被 agent 的 except 吞掉，**整轮实体/关系全部丢弃**。
+        # 这里逐条容错（与 skills.py 的单条容错一致），坏条目跳过、好条目保留。
+        entities = []
+        for ent in data.get("entities", []):
+            if not isinstance(ent, dict):
+                continue
+            name = str(ent.get("name", "") or "").strip()
+            if not name:
+                continue
+            raw_obs = ent.get("observations", [])
+            if isinstance(raw_obs, str):
+                raw_obs = [raw_obs]
+            elif not isinstance(raw_obs, (list, tuple)):
+                raw_obs = []
+            obs = [str(o).strip() for o in raw_obs if o is not None and str(o).strip()]
+            entities.append({
+                "name": name,
+                "type": str(ent.get("type", "") or ""),
+                "observations": obs,
+            })
+        relations = []
+        for rel in data.get("relations", []):
+            if not isinstance(rel, dict):
+                continue
+            src = str(rel.get("source", "") or "").strip()
+            tgt = str(rel.get("target", "") or "").strip()
+            lbl = str(rel.get("label", "") or "").strip()
+            if src and tgt and lbl:
+                relations.append({"source": src, "target": tgt, "label": lbl})
+        return {"entities": entities, "relations": relations}
     except Exception as e:
         logger.debug("graph_memory: extract_facts failed: %s", e)
         return {"entities": [], "relations": []}

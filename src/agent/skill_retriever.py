@@ -351,17 +351,31 @@ class SkillScanner:
         self._skills: List[SkillMetadata] = []
         self._last_scan = 0.0
         self._last_mtime = 0.0
+        # _dir_mtime 的短 TTL 缓存：它是 O(目录数) 的全树 walk（只 stat 目录
+        # 与 SKILL.md），5 分钟扫描间隔内**每次检索**都会因 _should_scan 调它
+        # 一次、scan() 后再调一次 —— 技能树上千时每次查询都是几十上百个
+        # syscall。外部写入有 mark_stale() 显式标脏兜底，60s 的探测缓存不会
+        # 漏掉真实变更（最坏延迟 60s 被检索发现，可接受）。
+        self._mtime_cache: float = -1.0
+        self._mtime_cache_at: float = 0.0
+        self._mtime_cache_ttl: float = 60.0
 
-    def _dir_mtime(self) -> float:
+    def _dir_mtime(self, use_cache: bool = True) -> float:
         """Most recent mtime of any SKILL.md (plus its parent dirs).
 
         We deliberately stat only directories and ``SKILL.md`` files: walking
-        and stat-ing *every* file (the old behaviour) is O(files) syscalls, and
-        ``_should_scan()`` + ``scan()`` each called it — two full tree walks per
-        query on a skills tree that can hold thousands of directories.
+        and stat-ing *every* file (the old behaviour) is O(files) syscalls.
+        ``use_cache=True``（默认）在 TTL 内复用上次结果 —— 每次检索都会经过
+        _should_scan，无缓存时它就是一次全树 walk。
         """
+        now = time.time()
+        if use_cache and self._mtime_cache >= 0 and (
+            now - self._mtime_cache_at < self._mtime_cache_ttl
+        ):
+            return self._mtime_cache
         max_mtime = 0.0
         if not os.path.isdir(self._dir):
+            self._mtime_cache, self._mtime_cache_at = 0.0, now
             return 0.0
         try:
             for root, dirs, files in _walk_skill_dirs(self._dir):
@@ -381,6 +395,7 @@ class SkillScanner:
                         pass
         except OSError:
             pass
+        self._mtime_cache, self._mtime_cache_at = max_mtime, now
         return max_mtime
 
     def _should_scan(self) -> bool:
@@ -420,7 +435,9 @@ class SkillScanner:
                         skills.append(meta)
             self._skills = skills
             self._last_scan = time.time()
-            self._last_mtime = self._dir_mtime()
+            # 刚扫完整棵树，mtime 探测缓存必须刷新（扫描本身会改不了目录
+            # mtime，但缓存值可能已过期 → 下一次检索立刻再 walk 一遍全树）。
+            self._last_mtime = self._dir_mtime(use_cache=False)
             logger.info("skill_retriever: scanned %d skills from %s", len(skills), self._dir)
             return list(self._skills)
 
@@ -817,6 +834,17 @@ class SkillRetriever:
         self._scanner = SkillScanner(skills_dir)
         self._store = SkillVectorStore(db_path, embedding_function=embedding_function)
         self._skills_dir = skills_dir
+        # 索引同步必须在锁内完成：skill_semantic_search 在并发白名单里，
+        # 两个线程同时进 sync() 会读到同一份 existing、各写一份 → 重复行；
+        # 同时进 build() 则第二个会把第一个刚建好的表 drop 掉重算。
+        self._index_lock = threading.RLock()
+        # 外部（skill_save / UI）直接写了 SKILL.md：此时目录 mtime 可能还没
+        # 变到 _should_scan 能察觉，必须显式标脏，否则新技能永远进不了索引。
+        self._dirty = False
+
+    def mark_stale(self) -> None:
+        """外部写入技能目录后调用：强制下一次检索前重新同步索引。"""
+        self._dirty = True
 
     def ensure_indexed(self) -> None:
         """Sync the vector table against the skills directory (incremental).
@@ -824,20 +852,27 @@ class SkillRetriever:
         Idempotent + incremental:
           * table missing (first run) → full build;
           * table exists + directory unchanged → no-op (open table only);
-          * directory changed → ``sync()``: only add new skills, update
-            edited skills (fingerprint differs), and remove deleted skills —
-            never a full rebuild.
+          * directory changed or ``mark_stale()`` → ``sync()``: only add new
+            skills, update edited skills (fingerprint differs), and remove
+            deleted skills — never a full rebuild.
         """
-        table = self._store._get_table()
-        if table is None:
-            # First run: table missing → build.
-            skills = self._scanner.scan(force=True)
-            self._store.build(skills)
-            return
-        # Table exists: sync only if the directory changed.
-        if self._scanner._should_scan():
-            skills = self._scanner.scan(force=True)
-            self._store.sync(skills)
+        with self._index_lock:
+            table = self._store._get_table()
+            if table is None:
+                # First run: table missing → build.
+                skills = self._scanner.scan(force=True)
+                self._store.build(skills)
+                self._dirty = False
+                return
+            # 表已存在：目录变了、或被显式标脏时才同步。
+            #
+            # 注意不能只靠 _should_scan()：skill_save 写完 SKILL.md 后调用
+            # scan(force=True) 会把 _last_scan/_last_mtime 刷新掉，之后
+            # _should_scan() 恒为 False → 刚保存的技能永远不会被嵌入。
+            if self._dirty or self._scanner._should_scan():
+                skills = self._scanner.scan(force=True)
+                self._store.sync(skills)
+                self._dirty = False
 
     def retrieve(self, query: str, llm=None) -> Dict[str, Any]:
         """Hybrid retrieve for a query.
@@ -873,19 +908,29 @@ class SkillRetriever:
         # unified ``score``. If the skill already matched in the vector channel,
         # reuse that score; otherwise look it up via a vector search.
         bm25_by_dir = {r.get("dir", ""): r for r in bm25_results if r.get("dir")}
-        # 只为「仅 BM25 命中」的候选准备查询向量，并复用之——每个候选各跑
-        # 一次 embed_query 会重复做相同的 ONNX 前向（最多 3 次）。
+        # 只为「仅 BM25 命中」的候选准备查询向量并复用。embedding 失败时
+        # 短路：不再对每个候选重试注定失败的 ONNX 调用，BM25 命中本身已足以
+        # 保留候选，score 记 0 让其自然排到后面。
         query_vec = None
+        embed_dead = False
         for d, bm in bm25_by_dir.items():
             if d in merged:
                 merged[d]["bm25_score"] = bm["bm25_score"]
-            else:
+                continue
+            if embed_dead:
+                sim = 0.0
+            elif query_vec is None:
+                query_vec = self._embed_query_vector(query)
                 if query_vec is None:
-                    query_vec = self._embed_query_vector(query)
+                    embed_dead = True
+                    sim = 0.0
+                else:
+                    sim = self._lookup_similarity(query, d, qv=query_vec)
+            else:
                 sim = self._lookup_similarity(query, d, qv=query_vec)
-                merged[d] = dict(bm)
-                merged[d]["bm25_score"] = bm["bm25_score"]
-                merged[d]["score"] = sim
+            merged[d] = dict(bm)
+            merged[d]["bm25_score"] = bm["bm25_score"]
+            merged[d]["score"] = sim
 
         candidates = list(merged.values())
         # Filter by minimum similarity (vector similarity in [0,1]).
@@ -974,8 +1019,16 @@ class SkillRetriever:
             events = list(llm.chat_stream([{"role": "user", "content": prompt}]))
             answer = ""
             for ev in events:
-                if ev.get("type") == "content":
-                    answer += ev.get("content", "")
+                # StreamEvent 是 dataclass，不是 dict —— ev.get() 必然抛
+                # AttributeError，被下面的 except 吞掉，于是 _llm_pick 永远
+                # 返回 None。按属性访问，同时兼容 dict 形态的事件。
+                etype = getattr(ev, "type", None)
+                if etype is None and isinstance(ev, dict):
+                    etype = ev.get("type")
+                if etype != "content":
+                    continue
+                answer += getattr(ev, "content", None) or (
+                    ev.get("content", "") if isinstance(ev, dict) else "")
             answer = answer.strip()
         except Exception as e:
             logger.warning("skill_retriever: LLM pick failed: %s", e)

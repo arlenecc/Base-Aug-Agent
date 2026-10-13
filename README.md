@@ -2,18 +2,57 @@
 
 本地自主 Agent，基于 PyQt6 图形界面，支持 OpenAI 兼容的大语言模型，内置可插拔工具系统和本地 RAG 知识库。
 
+## 内核架构（三态自动机 + 五级信息压缩）
+
+底层控制流参照 GenericAgent 项目的内核（`agent_loop.py` / `agentmain.py` /
+`llmcore.py` / `ga.py`）重构：**内核只控制流**，
+历史交给 `Session`，能力交给 `code_run`/`shell_run`，经验交给 `memory`/`skills`。
+详见 [docs/KERNEL_REFACTOR.md](docs/KERNEL_REFACTOR.md)。
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │                                         │
+   ┌────────────┐   │ tool_calls         ┌────────────┐       │
+   │   THINK    │───┼───────────────────►│    ACT     │       │
+   │  (决策态)   │   │                    │  (执行态)   │       │
+   └─────┬──────┘   │                    └──────┬─────┘       │
+         │          │                           │             │
+         │ 无 tool  │                           │ next_prompt │
+         │          │                           ├─────────────┘
+         ▼          │                           │ 预算告罄 / 每 N 轮
+   ┌────────────┐   │                    ┌──────▼──────────┐
+   │   EXIT     │◄──┴────────────────────│   CONSOLIDATE   │
+   │  (终止态)   │   压缩完成 → 回 THINK    │   (沉淀态)      │
+   └────────────┘                        └─────────────────┘
+```
+
+**五级信息压缩**，把上下文硬性控制在 30k 以内：
+
+| 级 | 名称 | 时机 | 手段 | 上限 |
+|---|---|---|---|---|
+| L0 | 原始捕获 | 工具返回瞬间 | 硬上限 head+tail | 单条 ≤ 20K 字符 |
+| L1 | 工具级裁剪 | 注入本轮前 | 按 RAW 区余额 ÷ 并发数分配 `maxlen` | 单条 ≤ 6K 字符 |
+| L2 | 回合摘要 | 每轮结束 | 强制 `<summary>` ≤30 字物理快照 | 每轮 ≤ 30 字 |
+| L3 | 会话折叠 | 预算告罄 / 每 N 轮 | 旧轮 → 一行摘要（同类项合并） | 折叠区 ≤ 2.7k token |
+| L4 | 记忆蒸馏 | 任务完成 / 检查点 | 沉淀进工作记忆 → 知识图谱 → SKILL.md | 系统提示 ≤ 3.9k token |
+
+**30k 预算分配**：`SYS 3.9k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 6.3k`。
+关键不变量是 **L2+L3 让历史恒定 O(1)** —— 旧实现把整条历史每轮重发，
+上下文随轮次线性膨胀，只能靠超阈值后的被动摘要兜底。
+
 ## 功能特性
 
 - **多模型兼容** — 支持所有 OpenAI 兼容 API（OpenAI / DeepSeek / Qwen / 本地 vLLM 等）
 - **流式对话** — 实时显示推理过程（thinking trace）和生成内容，支持 token 速度实时统计（仅计输出 token，不含 prompt）；结构化 read 超时（流式 chunk 间隔上限 60s），本地模型生成中途卡住时自动报错而非永久卡死
-- **工具调用** — 内置 15 个工具（12 通用 + 3 RAG；`webexec_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
+- **工具调用** — 内置 21 个工具（原子 8 + 能力 12 + 1 个条件注册；另有 2 个原子命名别名，`webexec_js` / `web_execute_js` 仅在配置浏览器端点时注册），支持模型自主决策和工具链式调用
+- **内核控制流** — 三态自动机（THINK / ACT / CONSOLIDATE）+ 五级信息压缩，上下文硬性控制在 30k 以内
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
-- **上下文收缩** — 估计 prompt 达到 90% 上下文窗口时主动摘要旧消息；遇到 `context_length_exceeded` 错误时被动收缩重试；摘要持久化到 `workspace/memory.md`
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
-- **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性
+- **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→4 次、引用最近错误、明确禁止「停下来问用户是否继续」）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 2 次就把步骤标 `blocked` 会被守卫拦回
+- **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
@@ -114,26 +153,48 @@ python main.py
 
 ## 内置工具
 
+工具分三层：**原子工具**（对齐 GenericAgent 的 9 个）→ **能力工具**（base-agent 原有）→ **外部协议**（MCP）。
+
+### 第一层：原子工具
+
 | 工具 | 功能 | 需确认 |
 |------|------|--------|
+| `code_run` | 执行 Python 代码 —— **能力核心**，可编程覆盖任意操作 | ✅ |
 | `file_read` | 读取文件 | ❌ |
-| `file_write` | 写入文件 | ❌ |
-| `file_modify` | 修改文件（搜索替换） | ❌ |
-| `shell_run` | 执行 Shell 命令 | ✅ |
-| `code_run` | 执行 Python 代码 | ✅ |
+| `file_write` | 写入/追加文件 | ❌ |
+| `file_patch` | 精确替换唯一文本块（`file_modify` 的原子命名别名） | ❌ |
 | `web_scan` | 抓取网页内容 | ❌ |
-| `webexec_js` | 浏览器执行 JS（仅配置浏览器端点时注册） | ❌ |
-| `ask_user` | 向用户提问 | ❌ |
-| `work_memory` | 短期工作记忆（键值对 scratchpad） | ❌ |
+| `web_execute_js` | 浏览器执行 JS（`webexec_js` 的原子命名别名，需配置端点） | ❌ |
+| `update_working_checkpoint` | 短期工作记忆（每轮自动回注） | ❌ |
+| `ask_user` | 向用户提问（中断自动机） | ❌ |
+| `start_long_term_update` | 触发 L4 经验蒸馏 | ❌ |
+
+### 第二层：能力工具
+
+| 工具 | 功能 | 需确认 |
+|------|------|--------|
+| `shell_run` | 执行 Shell 命令 —— `code_run` 的系统侧延伸 | ✅ |
+| `work_memory` | 短期草稿（键值对 scratchpad） | ❌ |
 | `memory_graph` | 知识图谱 CRUD（实体/关系/观察） | ❌ |
 | `memory_search` | 长期记忆语义检索 | ❌ |
-| `skill_search` | 关键词搜索技能目录中的技能 | ❌ |
-| `skill_semantic_search` | 混合检索技能（SKILL.md 向量 + BM25，nomic-embed-text） | ❌ |
-| `skill_load` | 按路径加载技能完整指令（SKILL.md 或支持文件） | ❌ |
+| `skill_search` | 关键词搜索技能目录 | ❌ |
+| `skill_semantic_search` | 混合检索技能（SKILL.md 向量 + BM25） | ❌ |
+| `skill_load` | 加载技能完整指令 | ❌ |
+| `skill_save` | **能力进化**：把成功流程固化为 SKILL.md（自动进索引） | ❌ |
 | `rag_search` | 搜索本地知识库（支持按文档名定向检索） | ❌ |
 | `rag_outline` | 获取文档缩略版本（目录结构 + 章节标题） | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
 | `rag_ingest` | 增量索引知识库 | ❌ |
+
+### 能力进化闭环
+
+```
+任务成功
+  ├─ start_long_term_update → 蒸馏事实/偏好/坑 → memory_graph（经验）
+  ├─ skill_save             → 固化可复用流程 → workspace/skills/<name>/SKILL.md（能力）
+  └─ rag_ingest             → 外部语料灌入本地知识库（素材）
+下次同类任务 → skill_semantic_search 命中 → skill_load → 直接复用
+```
 
 ## 本地知识库 (RAG)
 
@@ -434,16 +495,34 @@ RAG 知识库和知识图谱记忆共用同一 FastEmbed ONNX 模型实例（进
 - **路径安全**：`skill_load` 对 `path` / `entry` 做 realpath 前缀检查，拒绝 `..` 等路径穿越
 - **创建技能**：`SkillManager.create_dir_skill(name, keywords, prompt, ...)` 自动生成目录结构并注册扁平记录
 
-## 上下文收缩
+## 上下文治理（30k 硬上限）
 
-Agent 在长对话中会自动管理上下文窗口，避免超出模型 token 限制：
+Agent 不再「超了才压」，而是**先分配后消费**：30k 预算按
+`SYS 3.9k / EARLIER 2.7k / RAW 12k / TOOLS 5.1k / RESERVE 6.3k` 切分，
+每一级压缩都在自己的配额内花钱。
 
-- **主动收缩**：当估计的 prompt 大小达到 `max_context_tokens × 90%` 时，自动摘要旧消息，保留最近 6 条消息（当前任务上下文）verbatim，旧消息压缩为单条摘要标记。Token 估算采用增量计数（O(1) 而非 O(N) 每次全量扫描），高频场景下性能更优。估算包含 **系统提示 + 历史 + tools schema**（工具多时 schema 可达数千 token，漏算会让主动收缩几乎不触发）。
-- **注入上限**：系统提示的动态注入段（当天事实、命中技能 prompt）**不在收缩范围内**，因此各自设上限（事实 ≤20 条/2000 字符，技能 prompt ≤1500 字符），否则长会话下系统提示会单调膨胀且无自愈路径。
-- **被动收缩**：遇到 LLM API 返回 `context_length_exceeded` 类错误时，自动收缩并重试同一轮（不消耗迭代次数），最多重试 3 次
-- **持久化**：摘要写入 `workspace/memory.md`（带时间戳和触发原因），支持长期/跨会话回溯
-- **摘要策略**：调用 LLM 生成要点摘要（用户需求、决策、已完成步骤、未完成子任务、关键路径/URL/数值）；LLM 不可用时回退到结构化摘要（用户请求 + 工具调用列表）
-- **悬挂消息修复**：收缩时确保历史不以悬挂 `tool` 消息开头（否则 API 拒绝请求），自动将对应的 `assistant(tool_calls)` 拉回保留段
+- **L1 工具级裁剪**：单条工具结果按「RAW 区余额 ÷ 并发调用数」动态算出 `maxlen`，
+  并发 4 个工具时每个自动只拿 1/4，不用改任何工具代码
+- **L2 回合摘要**：每轮强制 `<summary>` ≤30 字物理快照，替换掉整轮原文
+- **L3 会话折叠**：旧轮整轮折叠成一行摘要（连续相同动作用 `（N turns）` 塌缩）；
+  折叠以「整轮」为单位，因此**结构上不可能**产生悬挂 `tool` 消息
+- **L4 记忆蒸馏**：任务完成/检查点时异步沉淀进知识图谱与 SKILL.md
+- **兜底收缩**：单个巨型工具输出（如整本 PDF）仍可能一次性击穿预算 —— 此时才启用
+  LLM 摘要式收缩（旧的 `_shrink_context` 等价物），摘要持久化到 `workspace/memory.md`
+- **注入上限**：系统提示的动态注入段（当天事实、命中技能 prompt）**不在压缩范围内**，
+  因此各自设上限（事实 ≤20 条/2000 字符，技能 prompt ≤1500 字符）
+- **被动收缩**：遇到 LLM API 返回 `context_length_exceeded` 类错误时进入兜底收缩；
+  不重试同一个超长 prompt（重试只会再失败一次）
+
+相关配置（`config.json`，均有默认值）：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `kernel_max_context_tokens` | 30000 | 整个 prompt 的硬上限 |
+| `kernel_raw_turns` | 2 | 保留原文的最近轮数（调大更准、更贵） |
+| `kernel_consolidate_every` | 4 | 每多少轮进入一次 CONSOLIDATE |
+| `kernel_max_tool_chars` | 6000 | 单条工具结果的字符上限 |
+| `kernel_max_digest_lines` | 40 | 折叠摘要区保留的最大行数 |
 
 ## MCP 协议支持
 
@@ -467,7 +546,13 @@ Agent 在长对话中会自动管理上下文窗口，避免超出模型 token �
 
 ```
 src/agent/
-├── agent.py              # 核心 Agent 推理循环（含增量 token 计数、prompt 缓存、自动事实抽取）
+├── kernel/                  # 内核：只控制流
+│   ├── outcome.py           # 三态枚举 / StepOutcome / TurnRecord / 转移表
+│   ├── budget.py            # 30k 预算配额与核算
+│   ├── compressor.py        # L0–L4 五级压缩 + 蒸馏 prompt
+│   ├── session.py           # 历史托管：滚动折叠 + 工作记忆 + 锚点提示
+│   └── loop.py              # KernelLoop：三态自动机主循环
+├── agent.py              # 门面：保留 callbacks/skills/配置，把控制流委托给内核
 ├── config.py             # 配置管理
 ├── llm_client.py         # LLM 流式客户端
 ├── memory.py             # 工作记忆 / 长期记忆（知识图谱，节流写盘）
@@ -486,7 +571,8 @@ src/agent/
 │   ├── vector_store.py      # LanceDB 向量存储 + FastEmbed 嵌入 + BGE 重排序
 │   └── deps.py              # 依赖检查与自动安装
 ├── tools/
-│   ├── base.py           # 工具注册中心（MCP + RAG 生命周期管理）
+│   ├── base.py           # 工具注册中心 + AliasTool（MCP + RAG 生命周期管理）
+│   ├── checkpoint.py     # update_working_checkpoint / start_long_term_update
 │   ├── file_ops.py       # 文件读写工具
 │   ├── shell_run.py      # Shell 执行
 │   ├── code_run.py       # Python 代码执行（协作式取消 + 泄漏线程追踪）
@@ -513,9 +599,20 @@ pytest tests/ -v
 pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 ```
 
-测试覆盖：Agent 推理循环、工具调用、上下文收缩（主动/被动/悬挂消息修复）、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
+测试覆盖：Agent 推理循环、工具调用、LLM 客户端、RAG 全流程（端到端 + 集成 + manifest 增量同步 + 异常文件处理）、RAG 工具自主发现与调用、依赖检查、技能系统（意图匹配 + SkillIndex 索引/检索/路径安全 + SKILL.md 混合检索）、UI Bridge、内存存储、文档目录提取（Markdown 标题 + 纯文本启发式）等。
 
-近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**。当前共 382 个用例（含 UI 测试）。
+`tests/test_kernel.py` 覆盖内核专项：三态转移表、L0–L4 五级压缩原语、Session 折叠与
+「无悬挂 tool 消息」不变量、30k 预算配额、**长任务下 prompt 峰值不越过 30k**、
+9 个原子工具与能力工具的注册、`AliasTool` 委派、`update_working_checkpoint` /
+`start_long_term_update` / `skill_save` 的行为与路径穿越防护。
+
+近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**。
+
+内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
+
+失败自动恢复专项（`tests/test_failure_recovery.py`，11 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。
+
+当前共 502 个用例（489 通过；13 个 `test_rag_full_pipeline` 用例依赖 `python-pptx`，未安装该可选依赖时在 setup 阶段报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -598,13 +695,107 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 71 | tools schema 每轮、每次迭代都重建 | 工具集固定后的无谓开销 | 缓存 schema 列表与 token 估算 |
 | 72 | 迭代上限耗尽只写日志 | 回复戛然而止，模型以为任务已完成 | 追加一条 user 角色提示：先总结进展，再询问是否继续 |
 | 73 | 「流未收到 done 事件」日志连写两行 | 日志噪音 | 去重 |
-| 59 | `GraphMemoryStore.close()` 只置 None 从不 close | 每次「应用配置」泄漏一个 LanceDB 连接 | 显式 close + 重置 `_vec_tried` |
-| 60 | 工具层 RAG 引擎初始化在 try 之外 | 知识库不可用时**所有工具（文件/shell/web）一起失效** | 整段包 try，失败仅跳过 RAG 工具 |
-| 61 | `shell_run` 的 `timeout` 无上下限钳制 | 传 99999 → 阻塞 27h 且无法取消；传 0 → 立刻 kill | 钳制到 [1s, 600s] |
-| 62 | `web_scan` 流式失败 `except Exception` 静默重试 | 真实超时后重复请求（最坏 2×30s）、已读内容丢弃 | 仅 `AttributeError`（无 stream 实现）才回退 |
-| 63 | `_reranker_state` 打分失败后停在 `"done"` 而模型为 None | 状态机失真 | 同步置 `"failed"` |
-| 64 | 每 chunk 重复计算 `_hash_source` | 写入侧纯浪费（同批同源） | 批次内缓存 source→hash |
-| 65 | SYSTEM_PROMPT 含模型已知的协议说明与冗余反例 | 每轮浪费 ~100 tok | 精简；补充「语义检索 query 语言」与「工具报错重试」两条关键约束 |
+| 74 | `GraphMemoryStore.close()` 只置 None 从不 close | 每次「应用配置」泄漏一个 LanceDB 连接 | 显式 close + 重置 `_vec_tried` |
+| 75 | 工具层 RAG 引擎初始化在 try 之外 | 知识库不可用时**所有工具（文件/shell/web）一起失效** | 整段包 try，失败仅跳过 RAG 工具 |
+| 76 | `shell_run` 的 `timeout` 无上下限钳制 | 传 99999 → 阻塞 27h 且无法取消；传 0 → 立刻 kill | 钳制到 [1s, 600s] |
+| 77 | `web_scan` 流式失败 `except Exception` 静默重试 | 真实超时后重复请求（最坏 2×30s）、已读内容丢弃 | 仅 `AttributeError`（无 stream 实现）才回退 |
+| 78 | `_reranker_state` 打分失败后停在 `"done"` 而模型为 None | 状态机失真 | 同步置 `"failed"` |
+| 79 | 每 chunk 重复计算 `_hash_source` | 写入侧纯浪费（同批同源） | 批次内缓存 source→hash |
+| 80 | SYSTEM_PROMPT 含模型已知的协议说明与冗余反例 | 每轮浪费 ~100 tok | 精简；补充「语义检索 query 语言」与「工具报错重试」两条关键约束 |
+
+### 第七轮：内核重构（三态自动机）
+
+把 `agent.py` 的单体 400 行循环拆成「内核只控制流」的分层结构，详见
+[docs/KERNEL_REFACTOR.md](docs/KERNEL_REFACTOR.md)。`Agent` 退化为门面，
+历史交给 `Session`、能力交给 `code_run`/`shell_run`、经验交给 `memory`/`skills`。
+旧行为全部保留，`run()` 签名与 `AgentCallbacks` 不变。
+
+### 第八轮：内核实现复查
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 81 | `max_turns` 用**会话累计**轮次判定 | 累计 15 轮后 Agent **彻底不再调 LLM** | 改为「本次 run()」的轮次计数 |
+| 82 | reask 分支先回滚再写回 | 最终答复轮丢失，L4 蒸馏缺结论 | 不在回滚分支里 finish_turn |
+| 83 | 周期性 CONSOLIDATE 传 `force_fold(0)` | **完全空操作**，turns 单调增长 | 传 `consolidate_every` |
+| 84 | 预算漏算 `tool_calls` 参数 | 并发多工具静默突破 30k | 计入参数体 |
+| 85 | `system`/`tools` 超支不从 RAW 扣 | 30k 只是记账，不真正约束 | 超支转嫁 RAW |
+| 86 | `estimate_tokens` 密度过乐观 | 同上 | 收紧 3.0/1.5 字符/token |
+| 87 | 上下文超长被当致命错误 | 兜底收缩永远走不到 | 单独分类并触发兜底 |
+| 88 | 蒸馏线程无并发上限、退回共享 httpx | 并发蒸馏 + 非线程安全客户端 | 非阻塞锁 + 独立抽取客户端 |
+| 89 | `skill_save` 用 `scan(force=True)` | 保存的技能**永远进不了索引** | 改用 `mark_stale()` |
+| 90 | `code_run` 超时后不关缓冲区 | 泄漏线程往**真实** stdout 写 | 超时即 close，其下次写入自行退出 |
+| 91 | 删除的知识库文件被 Step 7 复活 | 日志打「已清理」但仍在索引里 | 清理一并删 Markdown 缓存 |
+| 92 | `content_hash` 只写不读 | `cp -p` / 解压导致**永久漏同步** | 判为「未修改」时再核一次源指纹 |
+| 93 | `_on_fetch_models` 覆盖运行中 QThread | Qt6 `qFatal` **进程 abort** | 加并发守卫 |
+| 94 | `closeEvent` 先 `terminate()` 再 `shutdown()` | **关窗口挂死** | 标记后跳过取锁的释放 |
+| 95 | 「终止对话」无兜底 | 阻塞在长工具时所有按钮永久禁用 | 30s 看门狗强制收尾 |
+| 96 | `_rebuild_agent` 失败留下半死 agent | MCP 全挂、httpx 已关 | 失败即清空引用 |
+| 97 | 流式每 chunk 两次全文档光标操作 | 100 tok/s 时 UI 明显卡顿 | 40ms 合并刷新（~25fps） |
+| 98 | 日志 handler 用模块级全局且不置空 | 多窗口误删、handler 常驻 | 用实例引用 + 置空 |
+| 99 | docx/xlsx/pptx 句柄不关闭 | 4 worker × 数千文件累积句柄 | `try/finally` 显式关闭 |
+| 100 | `skill_retriever._llm_pick` 用 `ev.get()` | LLM 择优是死代码 | 按 dataclass 属性访问 |
+
+### 第九轮：失败自动恢复 + 全量复查（bug / 泄漏 / 性能 / 体验）
+
+**失败自动恢复**（用户需求：计划中某项任务失败时，自动依据失败信息找方案解决并继续后续任务，而不是停下等用户输入「继续」）：
+
+- 失败感知反思门：本次 run 发生过失败时，提醒预算 2→4 次，且提醒引用最近一次失败的**具体错误**，明确要求「读完整错误 → 换方法重试 → 多种方法都不可行才标 blocked」，禁止停下来问用户是否继续
+- 原样重试检测：同名工具 + 相同参数再次失败 → 点名「禁止重复」，要求换参数/换工具/用 `code_run` 写诊断脚本
+- 连续失败提示：连续失败 ≥2 次 → 要求先诊断再换方案，同一思路只试一次
+- 防过早 blocked 守卫：失败尝试 <2 次就把步骤标 `blocked` → 提醒恢复 `doing` 再试（守卫有上限，模型坚持放弃时最终尊重）
+- 系统提示 rule 8 与 `update_plan` 描述同步强化；回归测试 `tests/test_failure_recovery.py`
+
+**复查修复**：
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 101 | MCP `stdin.write()` 无超时且持锁 | server 不读 stdin 时 agent 线程**无限期挂死** | 专用写线程 + 有界队列（满/超时抛 MCPError），写失败立刻唤醒全部等待者 |
+| 102 | RAG ingest 互斥锁是实例级 | UI 同步与 agent 的 `rag_ingest` 是两个 engine 实例，锁完全无效 | 模块级按 `rag_dir` 键控的跨实例锁 |
+| 103 | `graph.clear()` 不清待重试队列 | 用户删掉的事实被向量检索**复活** | `clear()` 一并清空 `_pending_index`（带锁） |
+| 104 | 事实抽取结果不校验内部结构 | 一个坏实体让**整轮抽取全部丢弃** | 逐条归一化：坏条目跳过、好条目保留 |
+| 105 | `memory_graph` 的 clear/delete 不弹确认 | 模型一次误调用清空长期记忆 | `should_confirm` 对破坏性 op 返回 True |
+| 106 | `observations` 传字符串被按字符迭代 | 生成几十条逐字符 observation 污染图谱 | 入口类型校验，明确报错 |
+| 107 | WorkMemory LRU 淘汰不传 `force` | 防抖窗口内的写入被**静默丢弃** | 淘汰路径 `flush(force=True)` |
+| 108 | `update_plan` patch 无 step_id 时污染 note | 第一步的结论被覆盖、目标步骤漏改 | 先筛目标集合再统一写入；只给 note 必须带 step_id |
+| 109 | patch 原地改 `get_plan()` 活字典 | 校验失败时计划半改 | 深拷贝后改，一次性 `set_plan` |
+| 110 | append 的 id 回退撞号 / create 强升 doing | patch 一次改中两步 / 显式状态被覆盖 | id 跳过已占用；仅全 pending 时提升 |
+| 111 | `skill_save` 临时文件名只含 pid | agent 线程与蒸馏线程并发写同一 tmp → 产物损坏 | `mkstemp` 唯一名 + finally 清理 |
+| 112 | `skill_search` list 无上限 | 技能多时撑爆上下文 | 截断 50 条 + 总数提示 |
+| 113 | checkpoint 无 session 时静默成功 | 模型以为已写入，实际什么都没存 | 显式返回失败 |
+| 114 | shell_run 取消后子进程继续跑 | 用户点终止后命令最长再跑 600s | 0.2s 粒度轮询取消标志，命中即杀进程组 |
+| 115 | shell_run reader join 后无条件 close 管道 | 孙进程持管道时 **close 永久挂死**工具线程 | 仅 reader 已结束时才关管道 |
+| 116 | shell_run 无条件对 pgid 发 SIGKILL | pgid 被 OS 回收复用时**误杀无关进程组** | 组主已退出时先信号 0 探测组是否仍存在 |
+| 117 | code_run 取消后线程跑满 timeout | 占 CPU 且 sys.stdout 被持续替换 | 轮询取消立即收尾 + PermissionError/SystemExit 统一带 traceback |
+| 118 | `ToolRegistry.shutdown()` 裸清单例 | 与懒初始化竞态 → 每次应用配置泄漏 ~137MB | 单例清空持 `_singleton_lock` |
+| 119 | skill embedding 失败回退 `None` | SkillVectorStore 悄悄自建第二个默认模型单例 | 显式回退默认模型单例 |
+| 120 | FastEmbed 懒加载无锁 | 首次并发各加载一份 ~137MB ONNX | 进程级加载锁 + 双重检查 |
+| 121 | FTS 建索引跨实例并发 | 写入侧与检索侧对同一张表并发 replace | 模块级建索引锁 + 「已存在」容错 |
+| 122 | reranker 后台加载/close 裸写共享状态 | 已 close 的实例「复活」持有 ~500MB 权重 | 状态写回/close 全部持 `_reranker_lock` 并复查 `_closed` |
+| 123 | documents 表 doc_id 用 basename | 不同子目录同名文件互相覆盖/误删 | doc_id 改用 `md_path`（唯一），兼容清理旧影子行 |
+| 124 | 语义切片负缓存 TTL 从未生效 | 离线时每个超长 section 各重试一次模型加载 | embed 真实失败记时间戳，同一 TTL 节流 |
+| 125 | MOBI latin-1 回退被 `del data` 废掉 | 非 utf-8 MOBI 静默返回空 | 不再提前释放字节，回退可用 |
+| 126 | 取消后仍执行 Step7 全量 digest 重刷 | 同步已取消还多跑几秒 | cancelled 时跳过 |
+| 127 | `delete_by_source` 恒返回 1 | 与 docstring 语义不符 | 前后 count 差值尽力统计 |
+| 128 | `rag_ingest` force 字符串 `"false"` 为真值 | 意外触发全量重建 | 严格布尔解析 |
+| 129 | file_write 现场翻转进程 umask | 非线程安全，窗口内他线程建文件权限 0666 | 导入期缓存 umask |
+| 130 | file_read 按字节数判截断 | 多字节 UTF-8（中文）被误判截断 | 按字符增量读取判定 |
+| 131 | 图谱回填/去重全表物化（含向量列） | 记忆量大时内存与耗时线性恶化 | 列投影下推到存储层 |
+| 132 | 图谱待重试队列无锁无上限 | 并发丢条目；嵌入持续失败时内存只增 | 专用锁 + 500 条上限 |
+| 133 | skill 目录 mtime 探测每次检索两次全树 walk | 千级技能树每次查询 O(目录数) syscall | 60s TTL 缓存（`mark_stale` 显式标脏兜底） |
+| 134 | config 字符串字段 `str()` 收敛垃圾值 | model 写成列表 → 存成 `"['x']"` | 非 str 回退默认 |
+| 135 | config.save 固定 tmp 名 | 并发保存互踩 | mkstemp 唯一名 + 失败清理 |
+| 136 | 强杀后流式状态残留 | **下一回合整条回复被吞**（用户看到空回复） | 回合开始统一复位 stripper/流式状态；强杀先 flush |
+| 137 | 强杀丢弃运行中 QThread 引用 | wait 超时时 sip 析构 → **qFatal 进程 abort** | 超时挂孤儿列表，closeEvent 再统一 wait |
+| 138 | `_worker_terminated` 永不复位 | 之后每次退出都跳过资源释放（泄漏 MCP/连接池） | `_rebuild_agent` 成功后复位 |
+| 139 | 连点「终止」重置看门狗倒计时 | 30s 强杀可被无限推迟 | 仅在未激活时 start |
+| 140 | 推理流逐 chunk 全视口重绘 | 推理模型 UI 明显卡顿 | 复用 40ms 合并刷新（与正文同节奏） |
+| 141 | 工具入参不截断 | 一次大 file_write 把 MB 级文本常驻 QTextDocument | 与 tool-end 一致截断 400 字符 |
+| 142 | 日志/流式输出无条件吸底 | 用户选中文本复制被反复打断、无法上翻 | 仅吸底时跟随；插入用临时光标不碰用户光标 |
+| 143 | `_on_finished` 忽略 wait 结果 | 与 137 同构的析构 abort 风险 | 超时挂孤儿列表 |
+| 144 | 计划面板跨线程读 Session | 渲染出半新半旧的中间态 | `render_plan_dict` 纯函数 + 信号快照渲染 |
+| 145 | busy 时按 Enter 静默丢弃 | 像输入框坏了 | 状态栏提示「正在运行中」 |
+| 146 | 清空对话无 busy 守卫、不清计数器 | 运行中清空破坏会话；token 计数残留 | 加守卫 + 复位计数 |
+| 147 | Ctrl+Enter 也发送、按键事件未 accept | 误发送；事件向父控件意外传播 | 仅裸 Enter 发送 + `e.accept()` |
 
 ## 部署
 

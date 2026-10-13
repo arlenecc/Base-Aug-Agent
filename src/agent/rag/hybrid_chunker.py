@@ -91,6 +91,44 @@ def hybrid_chunk_text(
 # structure-aware split
 # ---------------------------------------------------------------------------
 
+def _find_heading_starts(
+    text: str, ignore_fences: bool = False,
+) -> Optional[List[int]]:
+    """返回所有标题行的**绝对偏移**；遇到未闭合围栏时返回 ``None``。
+
+    ``ignore_fences=True`` 时不识别围栏，用于未闭合代码块的重扫回退。
+
+    Fenced code blocks (```` ``` ```` / ``~~``) are skipped: shell and Python
+    comments inside them start with ``#`` and would otherwise be mistaken for
+    Markdown headings, cutting code samples in half.  Only a fence of the same
+    kind can close a fence (`` ``` `` is not closed by ``~~~``).
+    """
+    heading_starts: List[int] = []
+    in_fence = False
+    fence_marker = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if not in_fence:
+            if not ignore_fences and (stripped.startswith("```") or stripped.startswith("~~~")):
+                in_fence = True
+                fence_marker = stripped[:3]
+                offset += len(line)
+                continue
+        else:
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            offset += len(line)
+            continue
+        if _HEADING_RE.match(line):
+            heading_starts.append(offset)
+        offset += len(line)
+    if in_fence:
+        return None      # 围栏未闭合
+    return heading_starts
+
+
 def _split_by_structure(text: str) -> List[str]:
     """Split text at heading boundaries, preserving each heading with its body.
 
@@ -104,28 +142,12 @@ def _split_by_structure(text: str) -> List[str]:
     """
     # Find heading positions, ignoring anything inside a fenced code block.
     # 记录的是「相对于整篇 text 的绝对偏移」，供下面切片使用。
-    heading_starts: List[int] = []
-    in_fence = False
-    fence_marker = ""
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        if not in_fence:
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                in_fence = True
-                fence_marker = stripped[:3]
-                offset += len(line)
-                continue
-        else:
-            # 只有同一种围栏才能闭合（``` 不能被 ~~~ 闭合，反之亦然）。
-            if stripped.startswith(fence_marker):
-                in_fence = False
-                fence_marker = ""
-            offset += len(line)
-            continue
-        if _HEADING_RE.match(line):
-            heading_starts.append(offset)
-        offset += len(line)
+    heading_starts = _find_heading_starts(text)
+    if heading_starts is None:
+        # 遇到**未闭合**的代码围栏：其后所有 # 标题都被当成代码内容忽略，
+        # 整篇文档会退化成 1 个 section，再对全文跑语义切分（慢且失去结构
+        # 保护）。此时忽略围栏重扫一次 —— 宁可切坏代码块，也别丢掉全部标题。
+        heading_starts = _find_heading_starts(text, ignore_fences=True)
 
     if not heading_starts:
         # No headings: fall back to blank-line paragraph groups.

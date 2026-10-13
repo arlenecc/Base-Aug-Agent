@@ -12,14 +12,18 @@ the graph to the agent:
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import os
 import threading
-from typing import Any, List
+from typing import Any, Dict, List
 
 from ..config import AgentConfig
 from ..memory import LongTermMemory, WorkMemory
 from .base import Tool, ToolRegistry, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -33,19 +37,34 @@ from .base import Tool, ToolRegistry, ToolResult
 # rebuilds (work memory data must persist across "应用配置" anyway).
 # ---------------------------------------------------------------------------
 
-_work_memory_by_path: dict = {}
+_work_memory_by_path: "collections.OrderedDict" = collections.OrderedDict()
 _work_memory_lock = threading.Lock()
+# 缓存上限：GUI 固定一个 workspace 时永远只命中第 1 条；但测试套件每个
+# 用例用唯一 tmp_path，无上限的缓存会把数百个 WorkMemory（各持一份 JSON
+# 内存副本）驻留整个进程生命周期。按最近使用淘汰，超限时把最久未用的那
+# 份先 flush 再丢弃（避免丢防抖窗口里的未落盘写入）。
+_WORK_MEMORY_CACHE_MAX = 8
 
 
 def _work_memory(config: AgentConfig) -> WorkMemory:
     path = os.path.join(config.workspace, ".agent", "work_memory.json")
     wm = _work_memory_by_path.get(path)
-    if wm is None:
-        with _work_memory_lock:
-            wm = _work_memory_by_path.get(path)
-            if wm is None:
-                wm = WorkMemory(path=path)
-                _work_memory_by_path[path] = wm
+    if wm is not None:
+        _work_memory_by_path.move_to_end(path)   # 最近使用
+        return wm
+    with _work_memory_lock:
+        wm = _work_memory_by_path.get(path)
+        if wm is None:
+            wm = WorkMemory(path=path)
+            _work_memory_by_path[path] = wm
+            if len(_work_memory_by_path) > _WORK_MEMORY_CACHE_MAX:
+                _old_path, old_wm = _work_memory_by_path.popitem(last=False)
+                try:
+                    # force=True：绕过 0.5s 防抖间隔，把窗口里的写入真正落盘
+                    # 再丢弃（旧实现漏传 force，淘汰即丢数据）。
+                    old_wm.flush(force=True)
+                except Exception:  # pragma: no cover - best-effort
+                    pass
     return wm
 
 
@@ -84,12 +103,12 @@ def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> LongTermM
 
 
 def _long_memory(config: AgentConfig) -> LongTermMemory:
-    """Standalone LongTermMemory for callers without a registry reference.
+    """Deprecated: creates an UNMANAGED LongTermMemory (caller must close()).
 
-    Creates a fresh instance — callers are responsible for calling close()
-    when done.  In the normal tool/agent path, use _get_long_memory() instead
-    so the singleton is reused and properly released on shutdown().
+    保留仅为兼容旧调用方；正常路径一律用 ``_get_long_memory``——单例才能被
+    ``ToolRegistry.shutdown()`` 回收（每个漏 close 的实例泄漏 ~137MB ONNX）。
     """
+    logger.warning("tools.memory._long_memory is deprecated; use _get_long_memory")
     emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
     return LongTermMemory(
         path=os.path.join(config.workspace, ".agent", "long_memory.json"),
@@ -195,6 +214,16 @@ class MemoryGraphTool(Tool):
         self.config = config
         self.registry = registry
 
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        """clear / delete_entity 破坏整个图谱或整块记忆，必须弹确认。
+
+        默认策略只看 ``destructive`` 类属性；这两个 op 与文件读写无关，
+        旧实现不弹确认，模型一次误调用（或幻觉参数）就清空长期记忆。
+        """
+        return str((args or {}).get("op", "")).strip().lower() in (
+            "clear", "delete_entity",
+        )
+
     def run(self, op: str, name: str = "", entity_type: str = "",
             observations: List[str] = None, source: str = "",
             target: str = "", label: str = "") -> ToolResult:
@@ -213,6 +242,17 @@ class MemoryGraphTool(Tool):
         if op == "add_observations":
             if not name or not observations:
                 return ToolResult(False, error="op 'add_observations' requires 'name' and 'observations'")
+            # observations 必须是字符串列表：模型传字符串时旧实现按字符迭代，
+            # 生成几十条逐字符 observation 污染图谱。
+            if isinstance(observations, str) or not isinstance(observations, (list, tuple)):
+                return ToolResult(
+                    False,
+                    error="'observations' must be a list of strings, "
+                          f"got {type(observations).__name__}",
+                )
+            observations = [str(o) for o in observations if o and str(o).strip()]
+            if not observations:
+                return ToolResult(False, error="'observations' has no non-empty entry")
             added = g.add_observations(name, observations)
             return ToolResult(True, output=f"added {added} observation(s)")
         if op == "create_relation":

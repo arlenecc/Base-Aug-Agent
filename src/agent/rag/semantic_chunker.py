@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import Any, List, Optional
+import time
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ def semantic_chunk_text(
         logger.debug("semantic chunking skipped: chonkie not installed")
         return None
 
+    ef = None
     try:
         ef = embedding_function or _shared_embedding_function()
         if ef is None:
@@ -114,7 +116,53 @@ def semantic_chunk_text(
         # to the recursive chunker.
         logger.warning("semantic chunking failed (%s), falling back to recursive: %s",
                        type(e).__name__, e)
+        # 嵌入失败大概率是模型加载/下载失败（离线、HF 不可达）。shared 单例
+        # 是惰性加载的——失败发生在 ef() 调用内部，_shared_embedding_function
+        # 的负缓存永远看不到。这里把失败时间戳记回去，让 60s TTL 真正节流，
+        # 否则离线时每个超长 section 都各自重试一次注定失败的模型加载。
+        _mark_shared_embed_failed(ef)
         return None
+
+
+class _SourceLocator:
+    """在原文中定位 chunk，缓存结果避免 O(N²) 全文档扫描。
+
+    ``_gap_between`` 旧实现每次都用 ``source.find(left)`` 从头扫，而
+    ``_apply_overlap`` 对**每个 chunk** 调一次 —— 总扫描量 ≈ Σ(chunk 偏移)
+    ≈ 文档长度²/2（5MB / 3000 chunk ≈ 7.5GB 字符扫描）。
+
+    这里加一个单调游标：merge / overlap 都按文档顺序处理 chunk，位置不会
+    回退，因此从游标附近起找即可，总扫描量降到 O(N)。游标 miss 时再退回
+    全量 find（chonkie 偶发重排 whitespace 的情况），结果进缓存复用。
+    """
+
+    __slots__ = ("source", "_next", "_cache")
+
+    def __init__(self, source: Optional[str]):
+        self.source = source
+        self._next = 0
+        self._cache: Dict[tuple, str] = {}
+
+    def gap(self, left: str, right: str) -> str:
+        if not self.source or not left or not right:
+            return "\n\n"
+        key = (left, right)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        # 游标附近起找（留一点回退余量，left 可能部分落在游标之前）
+        start = max(0, self._next - len(left) - 64)
+        i = self.source.find(left, start)
+        if i < 0:
+            i = self.source.find(left)
+        if i < 0:
+            self._cache[key] = "\n\n"
+            return "\n\n"
+        j = self.source.find(right, i + len(left))
+        gap = self.source[i + len(left):j] if j >= 0 else "\n\n"
+        self._cache[key] = gap
+        self._next = (j if j >= 0 else i) + len(right)
+        return gap
 
 
 def _gap_between(source: Optional[str], left: str, right: str) -> str:
@@ -129,15 +177,7 @@ def _gap_between(source: Optional[str], left: str, right: str) -> str:
     Falls back to ``"\\n\\n"`` when the pieces can't be located in ``source``
     (no source supplied, or the chunker re-wrote whitespace).
     """
-    if not source or not left or not right:
-        return "\n\n"
-    i = source.find(left)
-    if i < 0:
-        return "\n\n"
-    j = source.find(right, i + len(left))
-    if j < 0:
-        return "\n\n"
-    return source[i + len(left):j]
+    return _SourceLocator(source).gap(left, right)
 
 
 def _merge_to_target_size(
@@ -160,13 +200,14 @@ def _merge_to_target_size(
     if not chunks:
         return chunks
 
+    locator = _SourceLocator(source)
     merged: List[str] = []
     current = chunks[0]
 
     for nxt in chunks[1:]:
         if estimate_tokens(current) < min_chunk_size and \
                 estimate_tokens(current) + estimate_tokens(nxt) <= chunk_size:
-            current = current + _gap_between(source, current, nxt) + nxt
+            current = current + locator.gap(current, nxt) + nxt
         else:
             merged.append(current)
             current = nxt
@@ -201,6 +242,7 @@ def _apply_overlap(
     if overlap <= 0:
         return chunks
 
+    locator = _SourceLocator(source)
     result: List[str] = [chunks[0]]
     for i in range(1, len(chunks)):
         # Overlap is always derived from the *original* previous chunk (not the
@@ -208,7 +250,7 @@ def _apply_overlap(
         tail = _tail_by_tokens(chunks[i - 1], overlap)
         if tail:
             # 用源码里真实的间隔拼接，保证结果仍是原文的连续子串。
-            result.append(tail + _gap_between(source, tail, chunks[i]) + chunks[i])
+            result.append(tail + locator.gap(tail, chunks[i]) + chunks[i])
         else:
             result.append(chunks[i])
     return result
@@ -250,9 +292,27 @@ def _tail_by_tokens(text: str, max_tokens: int) -> str:
 
 _shared_ef = None
 _shared_ef_resolved = False
+_shared_ef_failed_at = 0.0
+# wrapper 已就绪但**真实 embed 调用**失败的时间戳：模型是惰性加载的，
+# 加载/下载失败发生在 ef() 调用内部而不是 get_or_create_embedding_function()
+# ——旧实现的负缓存 TTL 只覆盖后者，离线时每个超长 section 仍会各自重试
+# 一次注定失败的加载。真实失败在这里记时间戳，由同一 TTL 节流。
+_shared_ef_load_failed_at = 0.0
+# 失败负缓存 TTL：模型缺失/离线时加载会抛异常（甚至尝试下载 137MB），
+# 而语义切片路径对**每个超长 section** 都会调一次。无 TTL 会让每个 section
+# 都重新触发一次注定失败的加载，离线环境下反复卡住。
+_EF_NEGATIVE_TTL = 60.0
 
 
 _shared_ef_lock = threading.Lock()
+
+
+def _mark_shared_embed_failed(ef) -> None:
+    """记录 shared 单例的真实 embed 失败（TTL 内后续调用直接跳过）。"""
+    global _shared_ef_load_failed_at
+    if ef is not None and ef is _shared_ef:
+        with _shared_ef_lock:
+            _shared_ef_load_failed_at = time.monotonic()
 
 
 def _shared_embedding_function():
@@ -261,25 +321,48 @@ def _shared_embedding_function():
     Imported lazily to avoid a hard dependency on fastembed/vector_store for
     callers that never enable RAG.
 
-    失败结果不再永久缓存：旧实现先把 ``_shared_ef_resolved = True`` 置位再加载，
-    一旦首次加载失败（模型未下载、网络不通），本进程内语义切片就永久降级到递归
-    切片，即使后来网络恢复/模型下载完成也不会再试。同时加载过程加锁，避免多个
-    worker 线程并发触发多次模型加载。
+    失败结果**不永久缓存**（旧实现先置位再加载，首次失败会让本进程语义切片
+    永久降级，即使后来网络恢复也不重试），但也不是每次都重试 —— 用 60s TTL
+    的负缓存：既避免每个 section 反复触发注定失败的模型加载，又保证网络/
+    模型恢复后一分钟内自动恢复语义切片。加载过程加锁，防多 worker 并发加载。
     """
-    global _shared_ef, _shared_ef_resolved
-    if _shared_ef_resolved:
+    global _shared_ef, _shared_ef_resolved, _shared_ef_failed_at
+    if _shared_ef_resolved and _shared_ef is not None:
+        # wrapper 已就绪，但最近一次真实 embed 失败 → TTL 内跳过语义切片
+        # （模型加载/下载失败记在 _shared_ef_load_failed_at，见其定义处注释）。
+        if _shared_ef_load_failed_at and (
+            time.monotonic() - _shared_ef_load_failed_at < _EF_NEGATIVE_TTL
+        ):
+            return None
         return _shared_ef
+    if _shared_ef is None and _shared_ef_failed_at and (
+        time.monotonic() - _shared_ef_failed_at < _EF_NEGATIVE_TTL
+    ):
+        return None
     with _shared_ef_lock:
-        if _shared_ef_resolved:
+        if _shared_ef_resolved and _shared_ef is not None:
+            if _shared_ef_load_failed_at and (
+                time.monotonic() - _shared_ef_load_failed_at < _EF_NEGATIVE_TTL
+            ):
+                return None
             return _shared_ef
+        if _shared_ef is None and _shared_ef_failed_at and (
+            time.monotonic() - _shared_ef_failed_at < _EF_NEGATIVE_TTL
+        ):
+            return None
         try:
             from .vector_store import get_or_create_embedding_function
             _shared_ef = get_or_create_embedding_function()
-            # 只在成功时置位，失败时留给下次重试。
+            # 只在成功时置位，失败时留给下次重试（受 TTL 节流）。
             _shared_ef_resolved = _shared_ef is not None
+            if _shared_ef_resolved:
+                _shared_ef_failed_at = 0.0
+            else:
+                _shared_ef_failed_at = time.monotonic()
         except Exception as e:
             logger.debug("shared embedding function unavailable: %s", e)
             _shared_ef = None
+            _shared_ef_failed_at = time.monotonic()
     return _shared_ef
 
 

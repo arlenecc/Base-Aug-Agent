@@ -40,6 +40,8 @@ _INDEX_FILENAME = "_index.json"
 _SKILL_META_FILENAME = "skill.json"
 _DEFAULT_ENTRY = "prompt.md"
 _SCAN_INTERVAL = 300  # seconds between automatic scans (5 min)
+# 单文件读取上限（与 file_ops / shell_run 的 200K 级保持一致）
+_MAX_READ_CHARS = 200_000
 
 # Fields we read from skill.json
 _REQUIRED_FIELDS = {"name"}
@@ -335,8 +337,14 @@ class SkillIndex:
             logger.warning("skill_index: rejected unsafe path: %s/%s", skill_path, entry)
             return None
         try:
+            # 上限保护：技能目录里可能混进大语料/模型文件，无上限 f.read()
+            # 会把它整个读进内存再塞进模型上下文。
             with open(abs_path, "r", encoding="utf-8") as f:
-                return f.read()
+                text = f.read(_MAX_READ_CHARS + 1)
+            if len(text) > _MAX_READ_CHARS:
+                return text[:_MAX_READ_CHARS] + \
+                    f"\n… [文件过大，已截断至 {_MAX_READ_CHARS} 字符]"
+            return text
         except OSError as e:
             logger.warning("skill_index: failed to read %s: %s", abs_path, e)
             return None

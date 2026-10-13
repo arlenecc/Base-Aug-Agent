@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 import threading
 from typing import Optional
 
@@ -20,6 +22,33 @@ from .base import Tool, ToolRegistry, ToolResult
 
 
 _skill_index_lock = threading.Lock()
+
+# 单文件读取上限：技能目录里可能混进几百 MB 的语料/模型文件，
+# 无上限地 f.read() 会把它整个读进内存再塞进模型上下文。
+# 与其他工具保持一致（file_ops / shell_run / mcp 都是 200K 级）。
+_MAX_SKILL_FILE_CHARS = 200_000
+
+
+def _clamp_int(value, default: int, lo: int, hi: int) -> int:
+    """把模型传来的 top_k 之类归一化到 [lo, hi]。
+
+    ``int("abc")`` / ``int(None)`` 会抛异常，被外层兜底成一句没有上下文的
+    裸错误；这里统一吃掉，退化到默认值。
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(n, hi))
+
+
+def _read_text_capped(path: str, cap: int = _MAX_SKILL_FILE_CHARS) -> str:
+    """读取文本文件，超过 cap 时截断并标注（防止巨型技能文件打爆上下文）。"""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read(cap + 1)
+    if len(text) > cap:
+        return text[:cap] + f"\n… [文件过大，已截断至 {cap} 字符]"
+    return text
 
 
 def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
@@ -95,21 +124,29 @@ class SkillSearchTool(Tool):
 
     def run(self, op: str = "search", query: str = "", top_k: int = 5) -> ToolResult:
         idx = _get_skill_index(self.config, self.registry)
-        # 模型可能传 null/超限值：归一化后再用（同仓其他检索工具一致）。
+        # 模型可能传 null / 非数字 / 超限值：全部归一化后再用
+        # （int("abc") 会抛 ValueError，被外层兜底成难以理解的裸异常）。
         query = (query or "").strip()
-        top_k = max(1, min(int(top_k or 5), 20))
+        top_k = _clamp_int(top_k, 5, 1, 20)
         if op == "list":
             results = idx.list_all()
-            # Compact output: name + path + description (truncated)
+            # 必须设上限：技能目录可能积累数百个，全量塞进上下文会挤掉真正
+            # 要处理的内容（memory_graph list 限 200、rag_status 限 50，
+            # 此处保持一致并明确告知总数）。
+            _MAX_LIST = 50
             compact = [
                 {
                     "name": s["name"],
                     "path": s["path"],
                     "description": s.get("description", "")[:100],
                 }
-                for s in results
+                for s in results[:_MAX_LIST]
             ]
-            return ToolResult(True, output=json.dumps(compact, ensure_ascii=False))
+            out = json.dumps(compact, ensure_ascii=False)
+            if len(results) > _MAX_LIST:
+                out += (f"\n… (共 {len(results)} 个技能，仅显示前 {_MAX_LIST} 个；"
+                        f"用 op='search' + query 精确查找)")
+            return ToolResult(True, output=out)
         # Default: search
         if not query:
             return ToolResult(False, error="op 'search' requires 'query'")
@@ -150,8 +187,10 @@ class SkillSemanticSearchTool(Tool):
         self.registry = registry
 
     def run(self, query: str, top_k: int = 5) -> ToolResult:
-        if not query.strip():
+        if not (query or "").strip():
             return ToolResult(False, error="requires 'query'")
+        query = query.strip()
+        top_k = _clamp_int(top_k, 5, 1, 20)
         retriever = self.registry.get_skill_retriever()
         # 只做混合检索 + 阈值过滤；最终的「选哪个」由 agent（大模型）根据
         # 返回的 name+tags+description 自行判断，避免工具层再调一次 LLM。
@@ -186,6 +225,8 @@ class SkillLoadTool(Tool):
         "读取 skill 的完整指令内容。提供 'path'（来自 skill_search / "
         "skill_semantic_search 结果的 'dir' 字段），entry 默认 SKILL.md。"
         "也可读取 skill 目录下的其它支持文件（如 references/xxx.md）。"
+        "注意：skill 目录内的符号链接会被跟随（用户自建技能的既有行为），"
+        "因此可能读到 skills 目录之外的文件。"
     )
     parameters = {
         "type": "object",
@@ -241,8 +282,7 @@ class SkillLoadTool(Tool):
                         target = legacy
                 if os.path.isfile(target):
                     try:
-                        with open(target, "r", encoding="utf-8") as f:
-                            return ToolResult(True, output=f.read())
+                        return ToolResult(True, output=_read_text_capped(target))
                     except (OSError, UnicodeDecodeError) as e:
                         return ToolResult(False, error=f"read failed: {e}")
 
@@ -274,3 +314,133 @@ class SkillLoadTool(Tool):
         except Exception:
             return None
         return None
+
+
+# ---------------------------------------------------------------------------
+# 能力进化：把成功经验固化成外置技能
+# ---------------------------------------------------------------------------
+
+_SAFE_SKILL_NAME_RE = re.compile(r"[^a-z0-9\-]+")
+_MAX_SKILL_BODY = 8_000
+
+_SKILL_TEMPLATE = """---
+name: {name}
+description: {description}
+tags: [{tags}]
+---
+
+# {name}
+
+{description}
+
+## When to use
+
+{when_to_use}
+
+## Steps
+
+{steps}
+
+## Pitfalls
+
+{pitfalls}
+"""
+
+
+class SkillSaveTool(Tool):
+    """Freeze a procedure that just succeeded into a reusable SKILL.md.
+
+    这是「能力进化」的写入端：任务成功后把流程写成 ``<workspace>/skills/<name>/SKILL.md``，
+    ``SkillRetriever`` 下次扫描时会自动增量索引（按 fingerprint），于是后续同类任务
+    可以通过 ``skill_semantic_search`` / ``skill_search`` 直接召回并复用。
+    """
+
+    name = "skill_save"
+    description = (
+        "Freeze a procedure that succeeded in THIS session into a reusable skill "
+        "(writes <workspace>/skills/<name>/SKILL.md). It becomes discoverable by "
+        "skill_semantic_search/skill_search next time. "
+        "Only freeze verified, reusable procedures — not one-off tasks."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "kebab-case id, e.g. 'extract-pdf-tables'"},
+            "description": {"type": "string", "description": "One line: what it does (<=200 chars)"},
+            "when_to_use": {"type": "string", "description": "Trigger conditions (<=400 chars)"},
+            "steps": {"type": "string", "description": "Numbered steps that were verified to work"},
+            "pitfalls": {"type": "string", "description": "Gotchas / things that failed (optional)"},
+            "tags": {"type": "string", "description": "Comma-separated tags (optional)"},
+        },
+        "required": ["name", "description", "steps"],
+    }
+
+    config: AgentConfig
+    registry: ToolRegistry
+
+    def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
+        self.config = config
+        self.registry = registry
+
+    def run(self, name: str, description: str, steps: str,
+            when_to_use: str = "", pitfalls: str = "", tags: str = "") -> ToolResult:
+        slug = _SAFE_SKILL_NAME_RE.sub("-", (name or "").strip().lower()).strip("-")[:64]
+        if not slug:
+            return ToolResult(False, error="invalid skill name (need [a-z0-9-])")
+        if not (steps or "").strip():
+            return ToolResult(False, error="steps is required")
+
+        root = os.path.join(self.config.workspace, "skills")
+        # 双重防护：slug 已过滤掉非 [a-z0-9-]，再校验一次 realpath 前缀
+        target_dir = _resolve_within(root, slug)
+        if target_dir is None:
+            return ToolResult(False, error=f"refusing path outside skills dir: {slug!r}")
+
+        tag_list = [t.strip() for t in re.split(r"[,，]", tags or "") if t.strip()][:8]
+        body = _SKILL_TEMPLATE.format(
+            name=slug,
+            description=(description or "").strip().replace("\n", " ")[:200],
+            tags=", ".join(tag_list),
+            when_to_use=(when_to_use or "（未指定）").strip()[:400],
+            steps=(steps or "").strip()[:_MAX_SKILL_BODY],
+            pitfalls=(pitfalls or "（暂无）").strip()[:2000],
+        )
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            path = os.path.join(target_dir, "SKILL.md")
+            # 原子写：唯一临时文件 + replace，避免并发/中断留下半截文件。
+            # 旧实现用 `.SKILL.md.{pid}.tmp`：同一进程内 agent 线程的
+            # skill_save 与后台蒸馏线程的 skill_save 会写到**同一路径**，
+            # 内容交错产出损坏的 SKILL.md；写失败时 tmp 还不清理。
+            fd, tmp = tempfile.mkstemp(prefix=".SKILL.md.", suffix=".tmp",
+                                       dir=target_dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except BaseException:
+                # 失败路径必须清掉半成品 tmp（mkstemp 已创建文件）
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            return ToolResult(False, error=f"write failed: {e}")
+
+        # 让检索器下次调用前重新同步向量索引。
+        # 不能只靠目录 mtime：scan(force=True) 会把扫描时间戳刷新掉，
+        # 之后 _should_scan() 恒为 False，新技能永远不会被嵌入。
+        try:
+            retriever = self.registry.get_skill_retriever()
+            if retriever is not None:
+                retriever.mark_stale()
+        except Exception:
+            pass
+
+        return ToolResult(
+            True,
+            output=f"skill saved: {path}\n下次可用 skill_semantic_search 召回（索引会自动增量同步）。",
+        )

@@ -671,292 +671,176 @@ def test_is_context_too_long_error_detects_common_patterns():
     assert not Agent._is_context_too_long_error("invalid api key")
 
 
-def test_estimate_history_tokens_counts_content_and_tool_calls(config, recording_callbacks):
-    """_estimate_history_tokens must include both message content and
-    tool_call function names/arguments, since both count against the model's
-    context window."""
-    from agent.agent import Agent
-
-    agent = Agent(llm=MockLLM([]), config=config, callbacks=recording_callbacks)
-    base = agent._estimate_history_tokens()
-    # Add a long user message.
-    agent._history.append({"role": "user", "content": "x" * 400})
-    after_user = agent._estimate_history_tokens()
-    assert after_user > base
-    # Add an assistant message with a tool_call — its name and arguments
-    # must contribute additional tokens beyond just the role overhead.
-    agent._history.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": "c1",
-            "function": {"name": "code_run", "arguments": json.dumps({"code": "y" * 400})},
-        }],
-    })
-    after_tool = agent._estimate_history_tokens()
-    assert after_tool > after_user
+# ---------------------------------------------------------------------------
+# 内核：历史恒定（L2/L3）与 30k 预算
+#
+# 旧实现把整条 _history 每轮重发，大小是 O(轮次)，只能靠超阈值后的被动摘要
+# 兜底。内核改为「最近 K 轮原文 + 旧轮折叠成一行摘要」，历史恒定 O(1)。
+# ---------------------------------------------------------------------------
 
 
-def test_proactive_shrink_triggers_at_threshold(config, recording_callbacks):
-    """When estimated context size exceeds 90% of max_context_tokens, the
-    agent must proactively summarize older messages before calling the LLM."""
-    # Build a long history so the estimated tokens exceed the small budget.
-    long_text = "x" * 200
-    # Summary LLM call: returns a fixed summary; main call: short answer.
-    summary_script = [_evt("content", "用户想做任务A，已调用 code_run"), _evt("done", usage={})]
-    final_script = [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})]
-    mock = MockLLM([summary_script, final_script])
+def _loop_scripts(n, args=None, workspace=None):
+    """n 轮「调用 file_read」+ 1 轮最终答复。"""
+    args = args or {"path": "a.txt"}
+    tc = [{"id": "c1", "function": {"name": "file_read",
+                                    "arguments": json.dumps(args)}}]
+    scripts = [[_evt("done", tool_calls=tc, usage={"total_tokens": 5})] for _ in range(n)]
+    scripts.append([_evt("content", "done"), _evt("done", usage={"total_tokens": 5})])
+    return scripts
 
-    # Set a tiny budget so threshold triggers immediately.
-    config.max_context_tokens = 50  # tiny: any history will exceed 90% = 45
+
+def test_kernel_context_stays_bounded_across_many_turns(config, recording_callbacks):
+    """跑到第 N 轮时，发往 LLM 的 prompt 大小不再随轮次线性膨胀。"""
+    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
+        f.write("A" * 100)
+    mock = MockLLM(_loop_scripts(12))
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Pre-populate history with enough messages to be shrinkable (>keep_recent+2).
-    for i in range(10):
-        agent._history.append({"role": "user", "content": f"msg {i}: {long_text}"})
-        agent._history.append({"role": "assistant", "content": f"reply {i}: {long_text}"})
-    agent._history.append({"role": "user", "content": "final request"})
+    agent.max_iterations = 20
+    agent._distill_min_turns = 999  # 关掉异步蒸馏，避免后台线程抢占 mock 脚本
+    agent.run("loop")
 
-    agent.run("final request")
+    def size(call):
+        return sum(len(str(m.get("content") or "")) for m in call["messages"])
 
-    # on_context_shrunk must have fired with a reason mentioning 主动收缩.
-    assert len(recording_callbacks.context_shrinks) >= 1, (
-        f"expected proactive shrink event, got {recording_callbacks.context_shrinks}"
-    )
-    summary, reason = recording_callbacks.context_shrinks[0]
-    assert "主动收缩" in reason
-    assert summary  # non-empty
+    assert len(mock.calls) >= 10
+    early, late = size(mock.calls[2]), size(mock.calls[-1])
+    assert late < early * 2 + 3000, f"上下文未收敛: {early} -> {late}"
 
 
-def test_proactive_shrink_keeps_recent_messages(config, recording_callbacks):
-    """After a shrink, the most recent N messages must remain verbatim in
-    history so the agent retains immediate task context. The first history
-    message must be the summary marker (not a dangling tool result)."""
-    summary_script = [_evt("content", "summary of old convo"), _evt("done", usage={})]
-    final_script = [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})]
-    mock = MockLLM([summary_script, final_script])
-    config.max_context_tokens = 30
+def test_kernel_folds_old_turns_into_earlier_context(config, recording_callbacks):
+    """超出原文窗口的旧轮必须折叠进 <earlier_context>，不再占原文额度。"""
+    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
+        f.write("A" * 100)
+    mock = MockLLM(_loop_scripts(10))
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Pre-populate: 12 older messages + 1 final user request.
-    for i in range(12):
-        agent._history.append({"role": "user", "content": f"old msg {i} " + "y" * 100})
-    recent_user_msg = {"role": "user", "content": "current question"}
-    agent._history.append(recent_user_msg)
+    agent.max_iterations = 20
+    agent._distill_min_turns = 999  # 关掉异步蒸馏，避免后台线程抢占 mock 脚本
+    agent.run("loop")
 
-    agent.run("current question")
-
-    # The first history message must now be the summary marker.
-    assert agent._history[0]["role"] == "user"
-    assert "上下文摘要" in agent._history[0]["content"]
-    # The most recent user request must still be present verbatim somewhere
-    # in the kept tail of history.
-    contents = [m.get("content", "") for m in agent._history]
-    assert any("current question" in (c or "") for c in contents)
-    # And the very first history message is NOT a dangling tool result.
-    assert agent._history[0].get("role") != "tool"
+    msgs = mock.calls[-1]["messages"]
+    joined = "\n".join(str(m.get("content") or "") for m in msgs)
+    assert "<earlier_context>" in joined, "旧轮未折叠"
+    # 原文窗口只保留 kernel_raw_turns 个已完成轮
+    assistants = [m for m in msgs if m.get("role") == "assistant"]
+    assert len(assistants) <= int(config.kernel_raw_turns) + 1
 
 
-def test_shrink_no_dangling_tool_at_boundary(config, recording_callbacks):
-    """If the recent-messages slice starts with a tool result (because the
-    slice boundary falls right after the assistant that made the tool call),
-    the shrink must pull the preceding assistant back so the tool message
-    is not dangling. A dangling tool message (no preceding assistant with
-    matching tool_calls) causes the API to reject the request."""
-    summary_script = [_evt("content", "summary"), _evt("done", usage={})]
-    final_script = [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})]
-    mock = MockLLM([summary_script, final_script])
-    config.max_context_tokens = 30
+def test_kernel_never_emits_dangling_tool_message(config, recording_callbacks):
+    """任何 tool 消息都必须紧跟带 tool_calls 的 assistant —— 否则 API 400。
+
+    折叠以「整轮」为单位，因此这个不变量在结构上就成立，不依赖事后修复。
+    """
+    with open(os.path.join(config.workspace, "a.txt"), "w") as f:
+        f.write("A" * 100)
+    mock = MockLLM(_loop_scripts(8))
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Fill old history with large user messages to trigger shrink.
-    for i in range(10):
-        agent._history.append({"role": "user", "content": f"old {i} " + "x" * 100})
-    # Now craft recent messages so the slice boundary falls on a tool result.
-    # _shrink_keep_recent = 6. We place: assistant(tool_calls) + tool(result)
-    # right at the boundary so tool(result) would be the first of recent.
-    agent._history.append({"role": "user", "content": "do something"})
-    agent._history.append({
-        "role": "assistant", "content": None,
-        "tool_calls": [{"id": "call_1", "type": "function",
-                         "function": {"name": "file_read", "arguments": '{"path":"a.txt}'}}],
-    })
-    agent._history.append({
-        "role": "tool", "tool_call_id": "call_1", "name": "file_read",
-        "content": "file contents here",
-    })
-    # Pad the tail so the tool message lands at position -6 (start of recent).
-    for i in range(4):
-        agent._history.append({"role": "user", "content": f"tail {i}"})
+    agent.max_iterations = 20
+    agent._distill_min_turns = 999  # 关掉异步蒸馏，避免后台线程抢占 mock 脚本
+    agent.run("loop")
 
-    agent.run("final question")
-
-    # After shrink, the first message is the summary marker (user role).
-    assert agent._history[0]["role"] == "user"
-    assert "上下文摘要" in agent._history[0]["content"]
-    # No dangling tool message: every tool message must be preceded by an
-    # assistant message with tool_calls.
-    for i, msg in enumerate(agent._history):
-        if msg.get("role") == "tool":
-            assert i > 0, "tool message at position 0 is dangling"
-            prev = agent._history[i - 1]
-            assert prev.get("role") == "assistant", (
-                f"tool message at {i} preceded by {prev.get('role')}, not assistant"
+    for call in mock.calls:
+        msgs = call["messages"]
+        assert msgs[0].get("role") == "system", "首条必须是 system"
+        for i, m in enumerate(msgs):
+            if m.get("role") != "tool":
+                continue
+            assert i > 0, "tool 消息出现在位置 0"
+            prev = msgs[i - 1]
+            assert prev.get("role") == "assistant" and prev.get("tool_calls"), (
+                f"悬挂 tool 消息 @ {i}: 前置是 {prev.get('role')}"
             )
-            assert prev.get("tool_calls"), (
-                f"tool message at {i} has no matching tool_calls in preceding assistant"
-            )
+            ids = {tc["id"] for tc in prev["tool_calls"]}
+            assert m.get("tool_call_id") in ids
 
 
-def test_proactive_shrink_appends_to_memory_md(config, recording_callbacks):
-    """After a shrink, the summary must be appended to workspace/memory.md
-    with a timestamp header, for long-term/time-based recall."""
-    import os
-    summary_script = [_evt("content", "用户的关键需求是部署到生产环境"), _evt("done", usage={})]
-    final_script = [_evt("content", "done"), _evt("done", usage={"total_tokens": 5})]
-    mock = MockLLM([summary_script, final_script])
-    config.max_context_tokens = 40
+def test_kernel_budget_allocates_tool_output_by_parallelism():
+    """L1：单条工具输出的上限由「RAW 区余额 ÷ 并发数」推出，且不会为负。"""
+    from agent.kernel import ContextBudget
+
+    b = ContextBudget(30_000)
+    b.set_used("raw", 0)
+    assert b.remaining_for_tool(1, 100_000) == b.quota.raw * 3
+    assert b.remaining_for_tool(4, 100_000) < b.remaining_for_tool(1, 100_000)
+    assert b.remaining_for_tool(1, 2_000) == 2_000   # max_chars 钳制
+    # 已经超预算 → 只给最小可诊断额度，逼内核立刻折叠
+    b.set_used("raw", b.quota.raw + 100)
+    assert b.remaining_for_tool(1, 6_000) <= 600
+    assert b.raw_over
+
+
+def test_shrink_session_fallback_writes_memory_md(config, recording_callbacks):
+    """折叠用尽后的兜底收缩：LLM 摘要 + 落盘 memory.md + 通知 UI。"""
+    mock = MockLLM([[_evt("content", "用户的关键需求是部署到生产环境"),
+                     _evt("done", usage={})]])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    for i in range(10):
-        agent._history.append({"role": "user", "content": f"old {i} " + "z" * 80})
-    agent._history.append({"role": "user", "content": "go"})
+    for i in range(5):
+        rec = agent.session.start_turn(f"old {i}")
+        agent.session.finish_turn(rec, f"reply {i}", [], [], f"摘要{i}")
+    agent.session.start_turn("current")
 
-    agent.run("go")
+    assert agent._shrink_session("测试兜底收缩") is True
 
     memory_path = os.path.join(config.workspace, "memory.md")
-    assert os.path.exists(memory_path), "memory.md must be created after shrink"
+    assert os.path.exists(memory_path)
     with open(memory_path, encoding="utf-8") as f:
         content = f.read()
-    # Must contain a timestamped header.
-    assert "上下文摘要" in content
-    assert "触发原因" in content
-    # Must contain the LLM-produced summary text.
+    assert "上下文摘要" in content and "触发原因" in content
     assert "部署到生产环境" in content
-    # No leftover temp file.
     assert not os.path.exists(memory_path + ".tmp")
+    assert len(recording_callbacks.context_shrinks) == 1
 
 
-def test_reactive_shrink_on_context_length_error(config, recording_callbacks):
-    """If the LLM returns a context_length_exceeded error, the agent must
-    shrink the context and retry the same iteration (not fail the turn)."""
-    # First call raises a context-length error; second (post-shrink) call
-    # returns a summary; third is the actual retry that produces the answer.
-    # The summary call is a separate chat_stream invocation.
-    summary_script = [_evt("content", "summarized old context"), _evt("done", usage={})]
-    final_script = [_evt("content", "recovered"), _evt("done", usage={"total_tokens": 5})]
-
-    class ErrorThenRecoverLLM:
-        def __init__(self):
-            self.calls = []
-            self._scripts = iter([
-                RuntimeError("chat_stream failed: HTTP 400 context_length_exceeded"),
-                summary_script,
-                final_script,
-            ])
-
-        def chat_stream(self, messages, tools=None, temperature=0.7):
-            self.calls.append({"messages": messages})
-            nxt = next(self._scripts)
-            if isinstance(nxt, Exception):
-                raise nxt
-            return iter(nxt)
-
-    mock = ErrorThenRecoverLLM()
-    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Pre-populate enough history so shrink has something to work with.
-    for i in range(10):
-        agent._history.append({"role": "user", "content": f"old {i} " + "a" * 100})
-    agent._history.append({"role": "user", "content": "retry me"})
-
-    answer = agent.run("retry me")
-
-    # The turn must have recovered, not failed.
-    assert answer == "recovered"
-    # A shrink event must have fired (reactive, mentioning context_length_exceeded).
-    assert len(recording_callbacks.context_shrinks) >= 1
-    _, reason = recording_callbacks.context_shrinks[0]
-    assert "context_length_exceeded" in reason or "被动收缩" in reason
-    # on_error must NOT have been emitted (we recovered).
-    # (recording_callbacks has no on_error list, but the turn returned content,
-    # which itself proves the error path wasn't taken.)
-
-
-def test_reactive_shrink_max_attempts_cap(config, recording_callbacks):
-    """If the LLM keeps returning context_length_exceeded even after shrinking,
-    the agent must give up after _max_shrinks_per_run attempts and surface the
-    error, rather than looping forever."""
-    class AlwaysTooLongLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def chat_stream(self, messages, tools=None, temperature=0.7):
-            self.calls += 1
-            raise RuntimeError("context_length_exceeded")
-
-    mock = AlwaysTooLongLLM()
-    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    for i in range(20):
-        agent._history.append({"role": "user", "content": f"old {i} " + "b" * 100})
-    agent._history.append({"role": "user", "content": "stuck"})
-
-    # Must not hang; must return (empty final_content is OK).
-    agent.max_iterations = 5
-    agent.run("stuck")
-
-    # Should have attempted at most _max_shrinks_per_run shrinks before giving up.
-    assert len(recording_callbacks.context_shrinks) <= agent._max_shrinks_per_run
-
-
-def test_shrink_skipped_when_history_too_small(config, recording_callbacks):
-    """If history is too small to shrink (< keep_recent + 2 messages), the
-    shrink must be a no-op so we don't summarize the only context we have."""
-    mock = MockLLM([[_evt("content", "answer"), _evt("done", usage={"total_tokens": 5})]])
-    config.max_context_tokens = 10  # tiny, will trigger threshold
-    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Only 2 messages — too small to shrink.
-    agent._history.append({"role": "user", "content": "hi"})
-
-    agent.run("hi")
-
-    # No shrink should have fired.
+def test_shrink_session_skipped_when_too_small(config, recording_callbacks):
+    """只有一轮时不做兜底收缩——不能把唯一的上下文也摘要掉。"""
+    agent = Agent(llm=MockLLM([]), config=config, callbacks=recording_callbacks)
+    agent.session.start_turn("only")
+    assert agent._shrink_session("x") is False
     assert recording_callbacks.context_shrinks == []
 
 
-def test_fallback_summary_when_llm_unavailable(config, recording_callbacks):
-    """If the summarize LLM call itself fails (raises), the agent must fall
-    back to a structural summary (user messages + tool names) rather than
-    leaving the summary empty."""
-    class FailingSummarizerLLM:
-        def __init__(self):
-            self.calls = 0
+# ---------------------------------------------------------------------------
+# 五级压缩的原语
+# ---------------------------------------------------------------------------
 
-        def chat_stream(self, messages, tools=None, temperature=0.7):
-            self.calls += 1
-            # First call = summarize; raise. Second call = real reply.
-            if self.calls == 1:
-                raise RuntimeError("summarize endpoint down")
-            return iter([_evt("content", "recovered"), _evt("done", usage={"total_tokens": 5})])
 
-    mock = FailingSummarizerLLM()
-    config.max_context_tokens = 30
-    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
-    # Old messages with a user request and a tool_call.
-    agent._history.append({"role": "user", "content": "please deploy to staging"})
-    agent._history.append({
-        "role": "assistant", "content": None,
-        "tool_calls": [{"id": "c1", "function": {"name": "shell_run", "arguments": "{}"}}],
-    })
-    agent._history.append({"role": "tool", "tool_call_id": "c1", "name": "shell_run", "content": "ok"})
-    for i in range(8):
-        agent._history.append({"role": "user", "content": f"filler {i} " + "c" * 60})
-        agent._history.append({"role": "assistant", "content": f"r{i}"})
-    agent._history.append({"role": "user", "content": "go"})
+def test_l2_summary_prefers_summary_tag():
+    from agent.kernel import l2_summary
 
-    agent.run("go")
+    assert l2_summary("<summary>读取了 a.txt，下一步写文件</summary>") == \
+        "读取了 a.txt，下一步写文件"
+    # 没有 <summary> 时回退到首句，且永不返回空串
+    assert l2_summary("先读文件。再写文件。") == "先读文件。"
+    assert l2_summary("") == "（无文本输出）"
 
-    # The shrink must have fired, and the summary must mention the user request
-    # (extracted via the fallback path, not the LLM).
-    assert len(recording_callbacks.context_shrinks) == 1
-    summary, _ = recording_callbacks.context_shrinks[0]
-    assert "deploy to staging" in summary or "shell_run" in summary
 
+def test_l3_fold_merges_consecutive_repeats():
+    from agent.kernel import l3_fold
+
+    lines = ["[T1] a", "[T2] b", "[T2] b", "[T2] b", "[T3] c"]
+    out = l3_fold(lines)
+    assert "[T2] b（3 turns）" in out
+    assert out.count("[T2] b") == 1
+
+
+def test_l0_capture_hard_cap():
+    from agent.kernel import l0_capture
+
+    big = l0_capture("x" * 50_000, hard_cap=2_000)
+    assert len(big) <= 2_200
+    assert big.startswith("x") and big.endswith("x")
+
+
+def test_l4_normalize_is_total():
+    """提纯结果必须类型确定，任何脏输入都不能让下游炸掉。"""
+    from agent.kernel import l4_extract_json, l4_normalize
+
+    assert l4_normalize(l4_extract_json("")) == {"facts": [], "lessons": [],
+                                                 "skill": {"name": "", "summary": "",
+                                                           "when_to_use": "", "steps": ""}}
+    got = l4_normalize(l4_extract_json(
+        '```json\n{"facts": ["a"], "skill": {"name": "My Skill!", "summary": "s"}}\n```'))
+    assert got["facts"] == ["a"]
+    assert got["skill"]["name"] == "my-skill"   # 目录穿越防护
 
 # ---------------------------------------------------------------------------
 # RAG integration: agent discovers and calls rag_status / rag_search
@@ -1267,10 +1151,10 @@ def test_agent_cancel_skips_remaining_tools_and_keeps_history_consistent(
 
     names = [n for n, _ in recording_callbacks.tool_starts]
     assert names.count("file_read") == 2  # 第 1 个真执行，第 2 个跳过但也走了 start
-    # 历史一致性：assistant 的每个 tool_call 都有对应 tool 消息。
-    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
-    assert len(tool_msgs) == 2
-    assert "取消" in tool_msgs[1]["content"] or "取消" in (tool_msgs[1].get("content") or "")
+    # 历史一致性：assistant 的每个 tool_call 都有对应 tool 消息（否则 API 400）。
+    rec = next(t for t in agent.session.turns if t.tool_results)
+    assert len(rec.tool_results) == 2
+    assert "取消" in rec.tool_results[1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -1310,9 +1194,9 @@ class PartialThenFailLLM:
 
 def test_llm_retries_before_first_chunk(config, recording_callbacks, monkeypatch):
     """首字节前的失败（网络抖动/502）应退避重试，而不是整轮失败。"""
-    import agent.agent as agent_mod
+    import agent.kernel.loop as kloop
 
-    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr(kloop, "_LLM_RETRY_BASE_DELAY", 0.01)
     mock = FlakyLLM(1, [_evt("content", "ok"), _evt("done", usage={"total_tokens": 3})])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
 
@@ -1322,9 +1206,9 @@ def test_llm_retries_before_first_chunk(config, recording_callbacks, monkeypatch
 
 def test_llm_does_not_retry_after_partial_output(config, recording_callbacks, monkeypatch):
     """已经吐过内容的流中断后不能重试。"""
-    import agent.agent as agent_mod
+    import agent.kernel.loop as kloop
 
-    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr(kloop, "_LLM_RETRY_BASE_DELAY", 0.01)
     mock = PartialThenFailLLM()
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
 
@@ -1334,9 +1218,9 @@ def test_llm_does_not_retry_after_partial_output(config, recording_callbacks, mo
 
 def test_context_length_error_is_not_retried(config, recording_callbacks, monkeypatch):
     """上下文过长交给收缩逻辑处理，重试同一个超长 prompt 没有意义。"""
-    import agent.agent as agent_mod
+    import agent.kernel.loop as kloop
 
-    monkeypatch.setattr(agent_mod, "_LLM_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr(kloop, "_LLM_RETRY_BASE_DELAY", 0.01)
 
     class TooLongLLM:
         def __init__(self):
@@ -1392,16 +1276,19 @@ def test_independent_read_only_tools_run_in_parallel(config, recording_callbacks
     ])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
     agent.tools._tools["slow_read"] = SlowReadTool()
+    # 预热系统提示（首次 rag_engine.status() 会惰性导入 lancedb，冷启动数秒），
+    # 否则计时测的是冷导入而不是工具并发。
+    agent._system_prompt()
 
     t0 = time.time()
     agent.run("read both")
     elapsed = time.time() - t0
     assert elapsed < 0.75, f"串行执行了？两个 0.4s 的工具耗时 {elapsed:.2f}s"
 
-    # 历史顺序必须仍与 tool_calls 一致
-    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
-    assert [m["tool_call_id"] for m in tool_msgs] == ["c1", "c2"]
-    assert [m["content"] for m in tool_msgs] == ["R1", "R2"]
+    # 结果顺序必须仍与 tool_calls 一致（并发执行不改变顺序）
+    rec = next(t for t in agent.session.turns if t.tool_results)
+    assert [r["id"] for r in rec.tool_results] == ["c1", "c2"]
+    assert [r["content"] for r in rec.tool_results] == ["R1", "R2"]
 
 
 def test_cancel_during_tool_execution_returns_promptly(config, recording_callbacks, monkeypatch):
@@ -1422,29 +1309,39 @@ def test_cancel_during_tool_execution_returns_promptly(config, recording_callbac
     agent.run("read")
     elapsed = time.time() - t0
     assert elapsed < 0.35, f"取消后仍等了 {elapsed:.2f}s（工具本身要跑 0.4s）"
-    tool_msgs = [m for m in agent._history if m.get("role") == "tool"]
-    assert tool_msgs and "取消" in tool_msgs[0]["content"]
+    rec = next((t for t in agent.session.turns if t.tool_results), None)
+    assert rec and "取消" in rec.tool_results[0]["content"]
 
 
-def test_old_tool_outputs_are_trimmed(config, recording_callbacks, monkeypatch):
-    """历史里较早的超长 tool 输出必须被裁剪，否则上下文随轮次线性膨胀。"""
-    import agent.agent as agent_mod
+def test_large_tool_output_is_capped_before_feeding_model(config, recording_callbacks):
+    """单条 50K 的工具输出在注入下一轮之前必须被 L1 裁剪。
 
-    agent = Agent(llm=MockLLM([[_evt("content", "ok"), _evt("done", usage={})]]),
-                  config=config, callbacks=recording_callbacks)
-    big = "x" * 50_000
-    agent._history.append({"role": "tool", "tool_call_id": "c0", "name": "file_read",
-                           "content": big})
-    for i in range(8):
-        agent._history.append({"role": "user", "content": f"msg {i}"})
+    旧实现是「先入历史、超阈值后再回头裁」；内核在结果进上下文之前就按
+    RAW 区余额分配上限，因此单条输出永远不可能撑爆 30k 预算。
+    """
+    from agent.tools.base import Tool, ToolResult
 
-    agent.run("next")
+    class BigReadTool(Tool):
+        name = "big_read"
+        description = "returns a huge payload"
+        parameters = {"type": "object", "properties": {}}
 
-    trimmed = agent._history[0]["content"]
-    assert len(trimmed) < 12_000, f"未裁剪: {len(trimmed)}"
-    assert agent_mod._TOOL_TRIM_MARKER in trimmed
-    # 最近的 tool 输出不受影响
-    assert len(agent._history) > 1
+        def run(self, **kwargs):
+            return ToolResult(True, output="x" * 50_000)
+
+    tc = [{"id": "c1", "function": {"name": "big_read", "arguments": "{}"}}]
+    mock = MockLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 5})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 5})],
+    ])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.tools._tools["big_read"] = BigReadTool()
+
+    agent.run("read big")
+
+    tool_msgs = [m for m in mock.calls[1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs, "工具结果必须回灌给模型"
+    assert len(tool_msgs[0]["content"]) < 12_000, f"未裁剪: {len(tool_msgs[0]['content'])}"
 
 
 def test_max_iterations_leaves_continuation_hint(config, recording_callbacks):
@@ -1458,9 +1355,10 @@ def test_max_iterations_leaves_continuation_hint(config, recording_callbacks):
     agent.max_iterations = 1
 
     agent.run("read")
-    last = agent._history[-1]
-    assert last.get("role") == "user"
-    assert "最大迭代次数" in last["content"]
+    hint = agent.session.working.get("__truncated__", "")
+    assert "最大轮次上限" in hint
+    # 下一轮的锚点提示必须带上它，否则模型会以为任务已完成
+    assert "最大轮次上限" in agent.session.anchor_prompt()
 
 
 def test_tools_schemas_are_cached(config, recording_callbacks):

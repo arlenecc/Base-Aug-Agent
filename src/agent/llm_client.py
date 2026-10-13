@@ -33,6 +33,20 @@ class LLMError(RuntimeError):
     pass
 
 
+def _tool_call_index(tc: Dict[str, Any]) -> int:
+    """归一化 tool_call 的 ``index`` 为 int。
+
+    少数兼容服务把 index 发成字符串（或并发多工具时省略）。原样当 key 会让
+    两个后果二选一：同一次回复的多个 tool_call 因 key 不同而被合并进同一
+    slot，或末尾 ``sorted(tool_acc)`` 抛 ``TypeError: '<' not supported
+    between instances of 'str' and 'int'``。统一转 int，转不了按 0 归并。
+    """
+    try:
+        return int(tc.get("index") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class LLMClient:
     def __init__(
         self,
@@ -171,7 +185,7 @@ class LLMClient:
                     yield StreamEvent("content", content=ct)
 
                 for tc in delta.get("tool_calls", []) or []:
-                    idx = tc.get("index", 0)
+                    idx = _tool_call_index(tc)
                     slot = tool_acc.setdefault(idx, {"id": "", "type": "function",
                                                     "function": {"name": "", "arguments": ""}})
                     if tc.get("id"):
@@ -184,6 +198,7 @@ class LLMClient:
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
 
+        # sorted() 要求 key 可比：_tool_call_index 已保证全为 int。
         yield StreamEvent("done", tool_calls=[tool_acc[k] for k in sorted(tool_acc)], usage=final_usage)
 
     # ------------------------------------------------------------------

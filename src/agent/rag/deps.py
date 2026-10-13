@@ -549,6 +549,13 @@ def ensure_dependencies(
             if success:
                 report.installed_packages.extend(specs_to_install)
                 installed_anything = True
+                # docling 一旦初始化失败过（未安装 / 瞬时错误）就会被永久禁用，
+                # 装好之后必须清掉这个标志，否则本次进程再也不会用 docling。
+                try:
+                    from . import docling_parser
+                    docling_parser.reset_unavailable()
+                except Exception:
+                    pass
                 # Re-check to update the report
                 report = check_dependencies(kb_path, include_core=include_core)
                 # Preserve install info

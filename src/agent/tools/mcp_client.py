@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -24,6 +25,13 @@ _TOOL_CALL_TIMEOUT = 300.0
 # ——不设上限一次调用就能把窗口撑爆。与 file_read / shell_run 的 200K 策略
 # 保持一致，保留头部并明确标注截断。
 _MAX_TOOL_OUTPUT_CHARS = 200_000
+
+# 写入队列容量与入队超时。MCP server 若停止读取 stdin，管道缓冲区（64KB）
+# 写满后阻塞写会**无限期挂起** agent 线程（旧实现持 _write_lock 原地 write，
+# 卡死后所有后续 _call 全部排队等死）。改用专用写线程 + 有界队列后，最坏
+# 情况是入队超时后抛 MCPError，agent 线程永远不再被管道堵死。
+_WRITE_QUEUE_MAX = 64
+_WRITE_ENQUEUE_TIMEOUT = 10.0
 
 # ------------------------------------------------------------------
 # MCP JSON-RPC wire types
@@ -70,11 +78,13 @@ class MCPClient:
         self._process: Optional[subprocess.Popen] = None
         self._request_id = 0
         self._lock = threading.Lock()
-        # Separate lock for stdin writes. _lock guards _pending/_results/_request_id
-        # but is released while waiting on the response event — without a dedicated
-        # write lock, two concurrent _call()s could interleave bytes on the stdin
-        # pipe, corrupting JSON-RPC messages (>PIPE_BUF splits).
-        self._write_lock = threading.Lock()
+        # stdin 写入走专用线程 + 有界队列（见 _WRITE_QUEUE_MAX 注释）：持锁原地
+        # write 会被不读 stdin 的 server 堵死。单消费者线程天然保证消息不会
+        # 交错，因此不再需要写锁。
+        self._write_queue: "queue.Queue[Optional[str]]" = queue.Queue(
+            maxsize=_WRITE_QUEUE_MAX
+        )
+        self._writer_thread: Optional[threading.Thread] = None
         self._pending: Dict[int, threading.Event] = {}
         self._results: Dict[int, JSONRPCResponse] = {}
         self._reader_thread: Optional[threading.Thread] = None
@@ -125,6 +135,10 @@ class MCPClient:
             target=self._drain_stderr, daemon=True
         )
         self._stderr_thread.start()
+        self._writer_thread = threading.Thread(
+            target=self._write_loop, daemon=True, name=f"mcp-write-{self.name}"
+        )
+        self._writer_thread.start()
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
@@ -199,6 +213,17 @@ class MCPClient:
                 ev.set()
             self._pending.clear()
             self._results.clear()
+        # 写线程可能阻塞在 stdin.write()（server 不读、管道已满）或队列 get()。
+        # 先投递哨兵唤醒 get()，再 join；join 超时说明它卡在 write 里——那是
+        # daemon 线程，进程退出时随之回收，不会阻塞 shutdown。
+        try:
+            self._write_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        writer = self._writer_thread
+        self._writer_thread = None
+        if writer and writer.is_alive() and writer is not threading.current_thread():
+            writer.join(timeout=2)
         # Wait for reader threads to finish (they should exit once _running is
         # False and stdin is closed, causing readline() to return "").
         for t in (self._reader_thread, self._stderr_thread):
@@ -316,8 +341,12 @@ class MCPClient:
             raise
 
         if not ev.wait(timeout=timeout if timeout is not None else self.timeout):
+            # 读线程可能刚好在此刻拿到锁、写入 _results 并 set(ev)。只 pop
+            # pending 会把那条响应永久留在 _results 里（含完整响应体，
+            # _results 只在 stop() 才 clear）→ 每命中一次泄漏一条。
             with self._lock:
                 self._pending.pop(req_id, None)
+                self._results.pop(req_id, None)
             raise MCPError(f"MCP server '{self.name}': timeout waiting for '{method}'")
 
         with self._lock:
@@ -338,24 +367,44 @@ class MCPClient:
         self._send(json.dumps(msg))
 
     def _send(self, line: str) -> None:
-        """Write a single JSON-RPC message line to the subprocess stdin.
+        """Enqueue a single JSON-RPC message line for the writer thread.
 
-        Guarded by _write_lock so concurrent _call() invocations cannot
-        interleave bytes on the pipe (writes >PIPE_BUF are not atomic).
-
-        进程引用在锁内读取：stop() 会在锁内置 ``_process = None``，旧实现
-        在锁外判空、锁内解引用，与 stop() 竞态时抛 AttributeError 而不是
-        清晰的 MCPError。
+        旧实现在调用线程里持锁原地 ``stdin.write()``：server 停止读取 stdin 时，
+        管道缓冲区（64KB）写满后该调用**无限期阻塞**，并且因为持有写锁，所有
+        后续 _call() 全部排队等死——agent 线程彻底卡死。现在写入交给专用线程，
+        调用方只做有界入队；单消费者线程天然保证消息不会交错（旧写锁的存在
+        理由），最坏情况是入队超时后抛 MCPError。
         """
-        with self._write_lock:
+        if not self._running:
+            raise MCPError(f"MCP server '{self.name}': not running")
+        try:
+            self._write_queue.put(line, timeout=_WRITE_ENQUEUE_TIMEOUT)
+        except queue.Full:
+            raise MCPError(
+                f"MCP server '{self.name}': stdin write queue full "
+                f"(server not draining input?)"
+            )
+
+    def _write_loop(self) -> None:
+        """Dedicated stdin writer: the ONLY thread that writes to the pipe.
+
+        写失败（BrokenPipe/进程已死）时立刻唤醒所有等待中的 _call()——否则
+        他们要干等满超时（tools/call 是 300s）才知道请求根本没发出去。
+        """
+        while True:
+            line = self._write_queue.get()
+            if line is None:                      # stop() 的哨兵
+                return
             process = self._process
-            if not process or not process.stdin:
-                raise MCPError(f"MCP server '{self.name}': not running")
             try:
+                if process is None or not process.stdin:
+                    raise MCPError(f"MCP server '{self.name}': not running")
                 process.stdin.write(line + "\n")
                 process.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError) as e:
-                raise MCPError(f"MCP server '{self.name}': write failed: {e}")
+            except Exception as e:
+                logger.debug("MCP '%s' write failed: %s", self.name, e)
+                self._fail_pending("MCP server connection lost (stdin write failed)")
+                return
 
     def _drain_stderr(self) -> None:
         """Continuously read stderr to prevent buffer deadlock."""
@@ -409,15 +458,19 @@ class MCPClient:
             # Wake up any pending callers so they don't wait the full timeout.
             # Store an error response so _call() reports a clear message instead
             # of a generic "no response".
-            with self._lock:
-                self._running = False
-                for req_id, ev in self._pending.items():
-                    if req_id not in self._results:
-                        self._results[req_id] = JSONRPCResponse(
-                            id=req_id,
-                            error={"message": "MCP server connection closed", "code": -1},
-                        )
-                    ev.set()
+            self._fail_pending("MCP server connection closed")
+
+    def _fail_pending(self, reason: str) -> None:
+        """唤醒所有等待中的 _call()，让它们以明确错误失败而不是干等超时。"""
+        with self._lock:
+            self._running = False
+            for req_id, ev in self._pending.items():
+                if req_id not in self._results:
+                    self._results[req_id] = JSONRPCResponse(
+                        id=req_id,
+                        error={"message": reason, "code": -1},
+                    )
+                ev.set()
 
 
 # ------------------------------------------------------------------

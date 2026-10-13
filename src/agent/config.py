@@ -39,6 +39,20 @@ class AgentConfig:
     # exceeds this fraction of max_context_tokens.
     context_shrink_ratio: float = 0.9
 
+    # ---- 内核（三态自动机 + 五级压缩）----
+    # 硬上限：整个 prompt（系统提示 + 历史 + 工具 schema）的目标预算。
+    # 五级压缩的目标就是让它恒定落在这个数以内。
+    kernel_max_context_tokens: int = 30_000
+    # 保留「原文」（未折叠）的最近轮数。更早的轮次折叠成一行摘要（L3）。
+    # 这是历史从 O(轮次) 变 O(1) 的旋钮：调大 → 上下文更准但更贵。
+    kernel_raw_turns: int = 2
+    # 每多少轮进入一次 CONSOLIDATE（不消耗 LLM 决策的压缩态）。
+    kernel_consolidate_every: int = 4
+    # 单个工具结果注入上下文的字符上限（L1 裁剪后的目标值）。
+    kernel_max_tool_chars: int = 6_000
+    # L3 折叠摘要区保留的最大摘要行数。
+    kernel_max_digest_lines: int = 40
+
     # RAG settings
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
@@ -59,7 +73,10 @@ class AgentConfig:
     # 手工编辑过的 config.json 常出现 "32768"（字符串）或 32768.0（浮点），
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
     _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
-                   "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap")
+                   "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
+                   "kernel_max_context_tokens", "kernel_raw_turns",
+                   "kernel_consolidate_every", "kernel_max_tool_chars",
+                   "kernel_max_digest_lines")
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
@@ -84,7 +101,9 @@ class AgentConfig:
             if name in cls._FLOAT_FIELDS:
                 return float(value)
             if name in cls._STR_FIELDS:
-                return str(value)
+                # 只接受真正的字符串：手写 config.json 把 model 写成列表/字典
+                # 时，str() 会存成 "['x']" 这类垃圾值而不是回退默认。
+                return value if isinstance(value, str) else None
             if name in cls._BOOL_FIELDS:
                 # bool("false") 是 True——手工编辑配置时常见的 "false"/"no"/"0"
                 # 字符串会把用户显式的关闭悄悄变成打开。只接受明确的映射。
@@ -127,6 +146,12 @@ class AgentConfig:
         kwargs = {}
         for k, v in data.items():
             if k not in known:
+                # 手写 config.json 打错字段名（如 rag_chunk_size 写成
+                # rag_chunksize）时不该静默用默认值 —— 那会让「明明改了配置
+                # 却没生效」变成一道没有线索的题。
+                logger.warning(
+                    "config: ignoring unknown key %r (check for typos)", k
+                )
                 continue
             coerced = cls._coerce(k, v)
             if coerced is not None:
@@ -172,17 +197,27 @@ class AgentConfig:
 
     def save(self, path: str) -> None:
         import json
+        import tempfile
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         # 原子写：先写临时文件再 os.replace。旧实现直接 open(path, "w")，
         # 写一半崩溃（断电/强杀）会留下截断的 JSON，下次启动 load() 直接抛
         # JSONDecodeError 导致程序无法启动。
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        # tmp 名唯一：固定 `path + ".tmp"` 在两个线程同时保存时互相覆盖。
+        fd, tmp = tempfile.mkstemp(prefix=".config.", suffix=".tmp",
+                                   dir=os.path.dirname(path) or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.__dict__, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def ensure_workspace(self) -> str:
         os.makedirs(self.workspace, exist_ok=True)

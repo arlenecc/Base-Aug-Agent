@@ -5,6 +5,11 @@ blocked by a guarded builtins.open wrapper, while still allowing pip installs
 and network access (the whole point of code_run). A timeout prevents infinite
 loops from hanging the agent.
 
+写入护栏只是**提示性的**，不是沙箱：它只替换了命名空间里的 ``open``，
+``io.open`` / ``pathlib.Path.write_text`` / ``os.remove`` / ``shutil`` /
+``subprocess`` 都不受约束，``__import__`` 也可绕过。真正的隔离只能靠
+容器或独立进程。
+
 Timeout handling: Python threads cannot be forcefully killed, but we use a
 threading.Event-based cooperative cancellation to signal the worker thread
 to stop as soon as possible. For truly stuck code (infinite C extension loop),
@@ -59,6 +64,9 @@ class CodeRunTool(Tool):
     description = (
         "Execute Python code (multi-line). stdout/stderr captured. "
         "Can import and pip install packages, call APIs, write files in workspace. "
+        "This is the capability core: anything not covered by a dedicated tool can "
+        "be done here. For system commands / CLI tools prefer shell_run "
+        "(or call it from here via subprocess). "
         f"Killed after {int(_DEFAULT_TIMEOUT)}s unless overridden."
     )
     destructive = True
@@ -77,6 +85,12 @@ class CodeRunTool(Tool):
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+
+    def _cancel_checker(self):
+        """协作式取消探针（UI「终止对话」）。拿不到 callbacks 时恒 False。"""
+        cb = getattr(self.registry, "callbacks", None)
+        fn = getattr(cb, "is_cancelled", None)
+        return fn if callable(fn) else (lambda: False)
 
     def run(self, code: str, timeout: Optional[float] = None) -> ToolResult:
         import builtins as _b
@@ -180,7 +194,22 @@ class CodeRunTool(Tool):
         # daemon it won't block process exit.
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
-        t.join(timeout=timeout)
+        # 轮询式 join：旧实现一次性 join(timeout) 在用户点「终止对话」后仍要
+        # 跑满整个 timeout 才返回（harness 虽立刻合成失败结果，但这个线程
+        # 继续占 CPU、且 sys.stdout 仍被替换成 StringIO 直到 join 返回）。
+        # 0.2s 粒度轮询取消标志，命中立即收尾。
+        deadline = time.monotonic() + timeout
+        cancelled = False
+        while t.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=min(0.2, remaining))
+            if not t.is_alive():
+                break
+            if self._cancel_checker()():
+                cancelled = True
+                break
 
         # 无论是否超时都由主线程统一恢复进程级全局状态。恢复权**只**属于
         # 主线程：worker 不做任何恢复（见 _worker 注释），因此超时泄漏的
@@ -191,13 +220,54 @@ class CodeRunTool(Tool):
         except OSError as e:
             logger.warning("code_run: failed to restore process cwd/stdout: %s", e)
 
+        def _partial_output() -> str:
+            partial = ""
+            try:
+                partial = (out.getvalue() or "") + (
+                    ("\n[stderr]\n" + err.getvalue()) if err.getvalue() else "")
+            except Exception:
+                partial = ""
+            return partial
+
+        if cancelled:
+            # 与超时同法：先读出已产出的内容，再关缓冲区止住 stdout 污染
+            # （getvalue 在 close 之后会抛 ValueError，顺序不能反）。
+            partial = _partial_output()
+            _cancel_evt.set()
+            for buf in (out, err):
+                try:
+                    buf.close()
+                except Exception:
+                    pass
+            msg = "用户取消了对话，代码执行被中断"
+            if partial.strip():
+                msg += f"\n[取消前已产生的输出]\n{partial[-3000:]}"
+            return ToolResult(False, error=msg)
+
         if not result["done"]:
             # Thread is still running (infinite loop or slow code).
             # Signal cooperative cancellation so the worker can exit when
             # it next checks `_cancelled()`. Track the leaked thread.
             _cancel_evt.set()
-            # 泄漏线程此后只会继续往自己的 StringIO 写（不会再碰全局
-            # stdout/cwd），因此并发执行下一次 code_run 是安全的。
+            #
+            # 泄漏线程随后 print() 时会**动态**查找 sys.stdout，而上面主线程
+            # 已经把它恢复成真实 stdout —— 不处理的话它的输出会一直打到进程
+            # 真实 stdout（不受 _BoundedIO 截断、也不会进工具结果）。
+            #
+            # 这里把缓冲区读出来再 close()：泄漏线程的下一次写入会抛
+            # ValueError: I/O operation on closed file，从而自行退出（既止住
+            # stdout 污染，也顺带回收了线程与其命名空间）。
+            partial = ""
+            try:
+                partial = (out.getvalue() or "") + (
+                    ("\n[stderr]\n" + err.getvalue()) if err.getvalue() else "")
+            except Exception:
+                partial = ""
+            for buf in (out, err):
+                try:
+                    buf.close()
+                except Exception:
+                    pass
             with _leaked_threads_lock:
                 # Prune completed threads, then append the new one, capped.
                 _leaked_threads[:] = [lt for lt in _leaked_threads if lt.is_alive()]
@@ -211,10 +281,11 @@ class CodeRunTool(Tool):
                     "Stuck threads are cleaned up on process exit.",
                     leaked_count,
                 )
-            return ToolResult(
-                False,
-                error=f"Code execution timed out after {timeout:.0f}s",
-            )
+            msg = f"Code execution timed out after {timeout:.0f}s"
+            if partial.strip():
+                tail = partial[-3000:]
+                msg += f"\n[超时前已产生的输出]\n{tail}"
+            return ToolResult(False, error=msg)
 
         # Worker completed within timeout — check if the thread we just
         # joined is still in the leaked list and remove it.
@@ -224,13 +295,14 @@ class CodeRunTool(Tool):
 
         exc = result["exc"]
         if exc is not None:
-            if isinstance(exc, PermissionError):
-                return ToolResult(False, error=str(exc))
-            if isinstance(exc, SystemExit):
-                return ToolResult(False, error=str(exc))
-            # Reconstruct traceback from the exception for the model to debug.
+            # 统一带 traceback：PermissionError（写护栏拦截）/SystemExit 旧实现
+            # 只给裸字符串，模型看不到出错代码行，与其他异常类型不一致、难调试。
             tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
-            return ToolResult(False, error="".join(tb))
+            detail = "".join(tb)
+            if isinstance(exc, (PermissionError, SystemExit)):
+                # 护栏/退出类异常消息本身就是结论，放最前面再附栈。
+                return ToolResult(False, error=f"{exc}\n{detail}")
+            return ToolResult(False, error=detail)
 
         output = out.getvalue()
         if err.getvalue():

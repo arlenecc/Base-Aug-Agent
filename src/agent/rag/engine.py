@@ -51,6 +51,28 @@ _SENTINEL = object()
 
 
 # ---------------------------------------------------------------------------
+# ingest 互斥锁（跨实例，按 rag_dir 键控）
+#
+# UI 的 SyncKnowledgeWorker 与 agent 的 rag_ingest 工具各自持有**不同的**
+# RAGEngine 实例，但 workspace 相同 → rag_dir 相同 → 底层是同一份 LanceDB
+# 表与 manifest.json。实例级锁对这两条真实并发路径无效，因此锁提升到模块
+# 级并按 rag_dir 索引：同一工作区的任何两条 ingest 都真正互斥。
+# ---------------------------------------------------------------------------
+
+_INGEST_LOCKS: Dict[str, threading.Lock] = {}
+_INGEST_LOCKS_GUARD = threading.Lock()
+
+
+def _ingest_lock_for(rag_dir: str) -> threading.Lock:
+    with _INGEST_LOCKS_GUARD:
+        lock = _INGEST_LOCKS.get(rag_dir)
+        if lock is None:
+            lock = threading.Lock()
+            _INGEST_LOCKS[rag_dir] = lock
+        return lock
+
+
+# ---------------------------------------------------------------------------
 # Manifest — tracks which documents have been processed so incremental syncs
 # can skip unchanged files entirely (no chunk, no embed, no upsert).
 # ---------------------------------------------------------------------------
@@ -93,23 +115,68 @@ def _save_manifest(rag_dir: str, files: Dict[str, Dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
-def _file_signature(filepath: str) -> Dict[str, Any]:
+def _file_signature(filepath: str) -> Optional[Dict[str, Any]]:
     """Compute the lightweight signature of a file (no content read).
 
     Used to decide whether a file needs reprocessing without parsing it.
+    返回 None 表示 stat 失败（文件在扫描后被删 / 权限变化 / 网络挂载抖动）——
+    调用方应跳过该文件并计入 errors，而不是让整轮同步中断。
     """
-    st = os.stat(filepath)
+    try:
+        st = os.stat(filepath)
+    except OSError:
+        return None
     return {"mtime": st.st_mtime, "size": st.st_size}
 
 
 def _content_hash(text: str) -> str:
     """Stable hash of cleaned text content.
 
-    Used to detect content changes even when mtime/size are unchanged
-    (rare but possible). Also stored so manual manifest inspection is
-    traceable.
+    Stored in the manifest so manual inspection is traceable.  Note this is
+    the hash of the *parsed* text — too expensive to compute at scan time,
+    so change detection uses :func:`_source_fingerprint` (raw bytes) instead.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+# 超过这个体积就改用「头+中+尾」取样指纹：全量哈希要读整个文件，
+# 而指纹在「本来要跳过」的路径上逐文件调用 —— 10GB 知识库每次同步固定
+# 10GB 读盘，机械盘/网络盘上直接把同步拖到几分钟。
+_FULL_HASH_MAX_BYTES = 4 * 1024 * 1024
+_SAMPLE_BYTES = 64 * 1024
+
+
+def _source_fingerprint(path: str, size: Optional[int] = None) -> str:
+    """Cheap fingerprint of the **raw file bytes** (not the parsed text).
+
+    Only called when mtime+size already match, i.e. on the would-skip path.
+    Reading the bytes is orders of magnitude cheaper than re-parsing and
+    re-embedding, and it catches the `cp -p` / zip-extract / cloud-sync
+    rollback cases where mtime and size are preserved but content differs.
+
+    小文件（≤4MB）全量哈希；大文件取「头 + 中 + 尾」三段各 64KB。三段采样
+    已覆盖绝大多数「内容被换掉」的情形（改写头部/中部/尾部/追加），同时把
+    单文件读盘量从 size 降到固定 192KB。
+    """
+    try:
+        if size is None:
+            size = os.path.getsize(path)
+        h = hashlib.sha256()
+        h.update(str(size).encode())
+        with open(path, "rb") as f:
+            if size <= _FULL_HASH_MAX_BYTES:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            else:
+                h.update(f.read(_SAMPLE_BYTES))
+                mid = max(0, size // 2 - _SAMPLE_BYTES // 2)
+                f.seek(mid)
+                h.update(f.read(_SAMPLE_BYTES))
+                f.seek(max(0, size - _SAMPLE_BYTES))
+                h.update(f.read(_SAMPLE_BYTES))
+        return h.hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 def _escape_like(s: str) -> str:
@@ -187,6 +254,13 @@ class RAGEngine:
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出
+        # ingest 互斥：**跨实例**。UI 的 SyncKnowledgeWorker 与 agent 的
+        # rag_ingest 工具各自 new 一个 RAGEngine（workspace 相同 → rag_dir
+        # 相同 → 底层是同一份 LanceDB 表与 manifest 文件）。实例级锁对两条
+        # 真实并发路径完全无效：两路 ingest 会同时写同一张表、同时
+        # _save_manifest（temp+replace 后者覆盖），manifest 合并状态互相踩。
+        # 改用模块级、按 rag_dir 键控的锁才能真正互斥。
+        self._ingest_lock = _ingest_lock_for(self._rag_dir)
 
     # ------------------------------------------------------------------
     # properties
@@ -229,6 +303,27 @@ class RAGEngine:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
+        """Ingest entry point — mutually exclusive (see ``_ingest_lock``).
+
+        Returns:
+            统计 dict，或 ``{"error": ...}`` 表示本次请求被拒绝（已有同步在跑）。
+        """
+        if not self._ingest_lock.acquire(blocking=False):
+            # 不阻塞等待：UI 同步与 agent 的 rag_ingest 是两条独立线程，排队
+            # 等一次完整同步（可能几分钟）只会让调用方看起来卡死。
+            logger.info("RAG ingest: another sync is already running; ignoring request")
+            return {"error": "另一次同步正在进行，已忽略本次请求"}
+        try:
+            return self._ingest_locked(force, progress_callback, log_callback)
+        finally:
+            self._ingest_lock.release()
+
+    def _ingest_locked(
+        self,
+        force: bool = False,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
         """Run the ingestion pipeline on the knowledge base directory.
 
         增量同步：通过 manifest.json 记录每个已处理文档的签名（mtime+size）。
@@ -256,9 +351,17 @@ class RAGEngine:
             if args:
                 msg = msg % args
             if log_callback is not None:
-                log_callback(msg)
-            else:
-                logger.info(msg)
+                # 回调是调用方（UI / 测试）的代码，可能抛异常。_progress 系列
+                # 调用都包了 try/except，唯独这里没有 —— 一旦抛出，异常会穿出
+                # ingest()，finally 里的 _abort.set() 就不执行，4 个 worker
+                # 会永久阻塞在 q.put(timeout=2.0) 上，连同各自的切片内存一起
+                # 泄漏。日志失败绝不该拖垮整条同步。
+                try:
+                    log_callback(msg)
+                except Exception as e:  # pragma: no cover - 防御
+                    logger.warning("RAG log_callback error: %s", e)
+                return
+            logger.info(msg)
 
         if not self._knowledge_base or not os.path.isdir(self._knowledge_base):
             logger.warning("RAG ingest: knowledge base dir not found: %s", self._knowledge_base)
@@ -332,11 +435,28 @@ class RAGEngine:
         new_detail: List[str] = []
         for filepath in all_files:
             sig = _file_signature(filepath)
+            if sig is None:
+                # 扫描后文件消失/不可读：跳过并记账，别让整轮同步中断
+                # （旧实现裸 os.stat，一个文件就让 manifest 不写、清理不跑）。
+                msg = f"  ⚠ 跳过(无法读取): {os.path.basename(filepath)}"
+                _log(msg)
+                with stats_lock:
+                    stats["errors"].append(msg)
+                continue
             prev = manifest.get(filepath)
+            # mtime+size 未变时还要再看一眼内容指纹：只看 mtime+size 会
+            # **永久**漏同步 —— `cp -p` / `rsync -t` / 解压保留 mtime /
+            # git checkout / 云盘回滚都会造成「内容换了但 mtime+size 不变」；
+            # HFS+/SMB 挂载的 mtime 粒度只有 1~2 秒，同一秒内改一个字也识别
+            # 不出来。指纹只在「本来要跳过」时才读盘算，正常路径零额外开销。
+            # 旧记录没有 source_hash 时按旧逻辑判定（不影响已同步的库）。
+            prev_hash = (prev or {}).get("source_hash")
             if (not force
                     and prev is not None
                     and prev.get("mtime") == sig["mtime"]
-                    and prev.get("size") == sig["size"]):
+                    and prev.get("size") == sig["size"]
+                    and (not prev_hash
+                         or prev_hash == _source_fingerprint(filepath, sig["size"]))):
                 # Unchanged: carry over manifest entry, skip entirely.
                 new_manifest[filepath] = prev
                 with stats_lock:
@@ -662,8 +782,10 @@ class RAGEngine:
                     # 或用户中途取消，文件只入库了一部分，manifest 却已记录
                     # 完成——下次同步因 mtime/size 未变被跳过，内容永久缺失。
                     try:
+                        sig_now = _file_signature(filepath)
                         pending_manifest[filepath] = {
-                            **_file_signature(filepath),
+                            **sig_now,
+                            "source_hash": _source_fingerprint(filepath, sig_now["size"]),
                             "content_hash": c_hash,
                             "chunk_count": n_chunks,
                         }
@@ -767,12 +889,15 @@ class RAGEngine:
         # 这一步不依赖「文件是否修改」——即使所有文件都被增量跳过（未修改），
         # 也要扫描 markdown 缓存，为缺记录或旧格式（含废弃的「章节摘要」段、
         # 空目录）的文档重刷为纯目录结构，确保 rag_outline 始终返回正确结果。
-        try:
-            refreshed = self.ensure_digests_for_cached_documents(refresh_stale=True)
-            if refreshed:
-                _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
-        except Exception as e:
-            logger.warning("  目录结构补做/重刷失败: %s", e)
+        # 用户已取消时跳过：该步会全量重读/重建所有缓存 digest，同步都取消了
+        # 还多跑几秒（Step5 清理保留——它便宜且保证不残留已删文件的向量）。
+        if not cancelled:
+            try:
+                refreshed = self.ensure_digests_for_cached_documents(refresh_stale=True)
+                if refreshed:
+                    _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
+            except Exception as e:
+                logger.warning("  目录结构补做/重刷失败: %s", e)
 
         if cancelled:
             t_total = time.monotonic() - t_start
@@ -832,6 +957,18 @@ class RAGEngine:
             # 注意：documents 表的 doc_id 用 basename 生成（见 upsert_document），
             # 而向量表用完整路径，故此处需取 basename。
             store.delete_document(os.path.basename(source))
+            # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
+            # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
+            # 「有缓存文件、无 digest 记录」，于是用旧缓存重新生成一条 ——
+            # 表现是日志打了「🗑 已清理」，但 rag_outline 仍列出该文档，
+            # 且 rag/documents/ 下的 .md 永久堆积。
+            md_path = self._cache_md_path(source)
+            store.delete_document_by_md_path(md_path)
+            try:
+                if os.path.isfile(md_path):
+                    os.remove(md_path)
+            except OSError as e:
+                logger.warning("  ⚠ 删除 Markdown 缓存失败 %s: %s", md_path, e)
             new_manifest.pop(source, None)
             with stats_lock:
                 stats["files_deleted"] += 1
@@ -931,6 +1068,18 @@ class RAGEngine:
     # Meta-context + Targeted RAG (文档缩略版本)
     # ------------------------------------------------------------------
 
+    def _cache_md_path(self, source: str) -> str:
+        """源文件 → 它对应的 Markdown 缓存文件路径。
+
+        与 ingest 里的命名规则保持一致（``_safe_filename(rel) + ".md"``），
+        删除清理时才能定位到该删哪个缓存（此时源文件已不存在，只能算出来）。
+        """
+        try:
+            rel = os.path.relpath(source, self._knowledge_base)
+        except ValueError:      # 不同盘符（Windows）
+            rel = os.path.basename(source)
+        return os.path.join(self._markdown_dir, _safe_filename(rel) + ".md")
+
     def build_and_store_digest(
         self,
         doc_name: str,
@@ -998,26 +1147,47 @@ class RAGEngine:
             return 0
 
         store = self._get_store()
-        # 缓存目录下所有 .md 文件对应的 doc_name，以及当前 documents 表已有记录。
+        # 一次性快照 documents 表，在内存里建索引。
+        # 旧实现逐个文件调 get_document_by_md_path/get_document_digest ——
+        # 每次 build_and_store_digest 都会让 _documents_cache 失效，于是下一轮
+        # 迭代重新从磁盘全表加载：N 篇文档 = N 次全表物化 + O(N²) 次线性扫描
+        # （每行还要 abspath）。这里读一次，之后全部走内存 dict。
+        rows = store.all_document_rows()
+        by_md_path: Dict[str, Dict[str, Any]] = {}
+        by_doc_name: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            mp = r.get("md_path") or ""
+            if mp:
+                by_md_path[os.path.abspath(mp)] = r
+            dn = r.get("doc_name") or ""
+            if dn:
+                by_doc_name.setdefault(dn, r)
+
         created = 0
         for fn in sorted(os.listdir(self._markdown_dir)):
             if not fn.endswith(".md"):
                 continue
-            # 缓存文件名格式：{safe_base}_{md5[:12]}.md → 还原 doc_name。
-            stem = fn[:-3]  # 去掉 .md
-            # 剥离末尾的 _{12位hex}
-            doc_name = stem
-            if len(stem) > 13 and stem[-13] == "_":
-                suffix = stem[-12:]
-                if all(c in "0123456789abcdef" for c in suffix):
-                    doc_name = stem[:-13]
-
             md_path = os.path.join(self._markdown_dir, fn)
             try:
-                # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
-                # digest 记录已是最新——旧实现无条件全文读入 + build_digest，
-                # 大知识库下每次同步都白跑一遍全文 IO 和解析。
-                existing = store.get_document_digest(doc_name)
+                # 先用 md_path 精确匹配：缓存文件名经过清洗（空格/括号/中文
+                # 标点都被丢掉），从文件名反推 doc_name 必然失真，会把
+                # "Chapter 1.pdf" 认成 "Chapter1.pdf"，于是每轮同步都判定
+                # 缺记录并写入一条重复行。md_path 是入库时原样记录的。
+                existing = by_md_path.get(os.path.abspath(md_path))
+                doc_name = existing["doc_name"] if existing else ""
+                if existing is None:
+                    # 兜底：老缓存没有 md_path 记录时才退回按文件名猜。
+                    # 缓存文件名格式：{safe_base}_{md5[:12]}.md → 还原 doc_name。
+                    stem = fn[:-3]  # 去掉 .md
+                    doc_name = stem
+                    if len(stem) > 13 and stem[-13] == "_":
+                        suffix = stem[-12:]
+                        if all(c in "0123456789abcdef" for c in suffix):
+                            doc_name = stem[:-13]
+                    # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
+                    # digest 记录已是最新——旧实现无条件全文读入 + build_digest，
+                    # 大知识库下每次同步都白跑一遍全文 IO 和解析。
+                    existing = by_doc_name.get(doc_name)
                 if existing is not None:
                     if not refresh_stale:
                         continue
@@ -1031,7 +1201,7 @@ class RAGEngine:
                 # 记录存在但格式合法时只有内容真的变了才需要重写。
                 if existing is not None and digest == existing.get("digest", ""):
                     continue
-                self.build_and_store_digest(doc_name, markdown)
+                self.build_and_store_digest(doc_name, markdown, md_path=md_path)
                 created += 1
                 logger.info("  ├─ 补做/重刷缩略版本: %s (%d 字符)", doc_name, len(markdown))
             except Exception as e:
@@ -1087,6 +1257,16 @@ class RAGEngine:
         (e.g. after SyncKnowledgeWorker finishes) to avoid leaking ~600MB of
         C++ heap memory per instance.
         """
+        # 先请求取消并等待 ingest 的 worker 退出：worker 的 join(timeout=5) 超时
+        # 后 ingest 仍会返回，调用方（SyncKnowledgeWorker）紧接着就 close()。
+        # 不先撤 worker 的话，它们随后会对着已关闭的 LanceDB/ONNX 会话报错，
+        # 并把大文档的切片内存继续占着（线程是 daemon，不会阻止进程退出）。
+        if self._ingest_lock.acquire(blocking=False):
+            try:
+                self._cancelled.set()
+            finally:
+                self._ingest_lock.release()
+        self._cancelled.set()
         if self._store is not None:
             with self._store_lock:
                 if self._store is not None:

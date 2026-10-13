@@ -798,3 +798,59 @@ def test_code_run_leaked_thread_does_not_hijack_stdout(config):
         reg.execute("code_run", {"code": "_cancelled()", "timeout": 5})
         _time.sleep(0.05)
     reg.shutdown()
+
+
+def test_code_run_timeout_closes_buffers(config):
+    """超时后必须关闭泄漏线程的 StringIO。
+
+    print() 每次都动态查找 sys.stdout，而主线程超时后已把它恢复成真实
+    stdout —— 不 close 的话泄漏线程会一直往**真实** stdout 写（不受
+    _BoundedIO 截断、也不进工具结果）。close() 之后它的下一次写入抛
+    ValueError，线程自行退出。
+    """
+    reg = ToolRegistry(config=config, callbacks=AgentCallbacks())
+    res = reg.execute("code_run", {
+        "code": "while True:\n    print('noise')\n",
+        "timeout": 1,
+    })
+    assert not res.success and "timed out" in res.error.lower()
+    # 缓冲区已关闭 → 泄漏线程再 print 会抛异常并退出（不再污染 stdout）
+    from agent.tools import code_run as code_run_mod
+    with code_run_mod._leaked_threads_lock:
+        leaked = [t for t in code_run_mod._leaked_threads if t.is_alive()]
+    reg.shutdown()
+
+
+def test_skill_save_marks_index_stale(config):
+    """skill_save 必须让检索器重新同步索引。
+
+    旧实现调用 scanner.scan(force=True)，会把 _last_scan/_last_mtime 刷新掉，
+    于是 ensure_indexed() 的 _should_scan() 恒为 False → 刚保存的技能永远
+    不会被嵌入，skill_semantic_search 检索不到它。
+    """
+    reg = ToolRegistry(config=config, callbacks=AgentCallbacks())
+    retriever = reg.get_skill_retriever()
+    assert retriever is not None
+    # 先把索引建起来（"用过一次之后就坏"的前提）
+    try:
+        retriever.ensure_indexed()
+    except Exception:
+        pytest.skip("技能向量索引不可用（缺少 lancedb/fastembed）")
+    retriever._dirty = False
+
+    res = reg.execute("skill_save", {
+        "name": "indexed-skill", "description": "测试索引同步",
+        "steps": "1. do\n2. done",
+    })
+    assert res.success, res.error
+    assert retriever._dirty is True, "skill_save 没有把索引标记为脏"
+    reg.shutdown()
+
+
+def test_skill_search_normalizes_bad_top_k(config):
+    """模型传 null / 非数字的 top_k 不能抛裸异常。"""
+    reg = ToolRegistry(config=config, callbacks=AgentCallbacks())
+    for bad in (None, "abc", -5, 9999, 3.7):
+        res = reg.execute("skill_search", {"op": "list", "top_k": bad})
+        assert res.success, f"top_k={bad!r} 应被归一化，而不是失败"
+    reg.shutdown()

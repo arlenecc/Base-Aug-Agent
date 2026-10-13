@@ -277,9 +277,6 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     but without rescanning the substring on every step.
     """
     chunks: List[str] = []
-    # O(1) dedup instead of O(n) `in chunks`. 存哈希而非 chunk 全文：切片
-    # 本身已经是文档全文的副本，再去重集合里各存一份会让峰值内存翻倍。
-    seen: set = set()
     pos = 0  # character position
     text_len = len(text)
 
@@ -310,10 +307,10 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
 
         chunk = text[pos:end].strip()
         if chunk:
-            digest = hash(chunk)
-            if digest not in seen:
-                seen.add(digest)
-                chunks.append(chunk)
+            # 不再按内容去重：同一文档内的合法重复内容（每页页眉、重复的目录
+            # 行、表格分隔行）会被静默丢弃，等于永久丢失这些片段；而切片重复
+            # 对检索正确性没有影响（每条只是多占一行倒排/向量）。
+            chunks.append(chunk)
 
         if end >= text_len:
             break

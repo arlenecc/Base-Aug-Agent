@@ -97,7 +97,11 @@ class FastEmbedEmbeddingFunction:
         self._model = None  # lazy-init
 
     def _ensure_model(self):
-        if self._model is None:
+        if self._model is not None:
+            return
+        with _MODEL_LOAD_LOCK:
+            if self._model is not None:  # double-check：并发方可能刚加载完
+                return
             from fastembed import TextEmbedding
             logger.info("  🔧 正在加载嵌入模型: %s (首次加载, 约 130MB)...", self._model_name)
             import time as _time
@@ -118,10 +122,11 @@ class FastEmbedEmbeddingFunction:
                 # actionable for the user.
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", UserWarning)
-                    self._model = TextEmbedding(
+                    model = TextEmbedding(
                         model_name=self._model_name,
                         cache_dir=cache_dir,
                     )
+                self._model = model
             except Exception as e:
                 # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
                 # 下载 ONNX 模型文件（约 130MB），但网络无法访问 huggingface.co。
@@ -182,6 +187,13 @@ class FastEmbedEmbeddingFunction:
 _EF_SINGLETONS: Dict[str, "FastEmbedEmbeddingFunction"] = {}
 _EF_SINGLETONS_LOCK = threading.Lock()
 
+# 保护「检查表不存在 → create_table」的 check-then-act：两个 VectorStore 实例
+# 共享同一 persist_dir（如 SyncKnowledgeWorker 与 agent 引擎交叠）时，无锁会让
+# 第二个线程的 create_table 抛 "Table already exists"，该批次数据丢失。
+_TABLE_CREATE_LOCK = threading.Lock()
+# FTS 建索引的跨实例互斥（见 _ensure_fts_index 内注释）。
+_FTS_CREATE_LOCK = threading.Lock()
+
 
 def get_or_create_embedding_function(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
@@ -202,6 +214,14 @@ def get_or_create_embedding_function(
             ef = FastEmbedEmbeddingFunction(model_name=model_name)
             _EF_SINGLETONS[model_name] = ef
         return ef
+
+
+# 懒加载互斥：_ensure_model 的「if self._model is None → TextEmbedding(...)」
+# 之间无锁，ingest worker / 主线程 add_streaming / agent 检索 / graph_memory /
+# skill_retriever 首次并发调用会各自加载一份 ~137MB ONNX 模型（后写者覆盖
+# 实例属性，先加载那份纯泄漏）。加载完成前的 GIL 释放点（_time.sleep）正好
+# 放大这个窗口。进程级锁 + 双重检查。
+_MODEL_LOAD_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +300,10 @@ class VectorStore:
 
         logger.info("  连接 LanceDB: %s", self._persist_dir)
         self._db = lancedb.connect(self._persist_dir)
+        # 实例可以被 close() 之后重新初始化（_initialized 会被置回 False）。
+        # 不复位 _closed 的话，后台 reranker 加载线程一看到它就丢弃模型并
+        # return —— 重排对该实例永久失效，且没有任何日志。
+        self._closed = False
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -369,6 +393,30 @@ class VectorStore:
             self._table_checked = True
         return self._table
 
+    def _create_or_open_table(self, first_records: List[Dict[str, Any]]):
+        """竞态安全的建表：返回 ``(table, created)``。
+
+        锁内重查 —— 另一实例/线程可能已建好；竞争失败时打开已存在的表并返回
+        ``created=False``，让调用方改走 upsert 路径，而不是抛异常丢数据。
+        """
+        with _TABLE_CREATE_LOCK:
+            table = self._ensure_table()
+            if table is not None:
+                return table, False
+            try:
+                self._table = self._db.create_table(_TABLE_NAME, first_records)
+                self._table_checked = True
+                return self._table, True
+            except Exception as e:
+                if "exist" in str(e).lower():
+                    try:
+                        self._table = self._db.open_table(_TABLE_NAME)
+                        self._table_checked = True
+                        return self._table, False
+                    except Exception:
+                        pass
+                raise
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -409,10 +457,11 @@ class VectorStore:
 
         table = self._ensure_table()
 
+        created = False
         if table is None:
-            # First add: create table with all records
-            self._table = self._db.create_table(_TABLE_NAME, records)
-            self._table_checked = True
+            # First add: create table (race-safe — another instance may have won)
+            table, created = self._create_or_open_table(records)
+        if created:
             logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
             return len(records)
 
@@ -456,9 +505,12 @@ class VectorStore:
         return total
 
     def delete_by_source(self, source: str) -> int:
-        """删除指定 source 的全部记录。返回删除前的记录数（若可查）。
+        """删除指定 source 的全部记录。返回删除的记录数（无法统计时为 1/0）。
 
         用于 force 重新 ingest 时清理已从知识库中删除的文件对应的旧向量。
+        旧实现 docstring 声称返回删除前记录数，实际恒返回 1 —— 与语义不符。
+        LanceDB 的 delete 不返回行数，无法精确统计；用前后 count 差值尽力
+        估计（并发写入时可能不准），失败为 0。
         """
         self._ensure_initialized()
         table = self._ensure_table()
@@ -466,12 +518,22 @@ class VectorStore:
             return 0
         h = _hash_source(source)
         try:
+            try:
+                before = table.count_rows()
+            except Exception:
+                before = None
             table.delete(f"id LIKE '{h}_%'")
             # 向量删了，但 BM25 倒排索引里的 term 还在——必须失效索引，
             # 否则已删除文档的内容仍会被关键词检索召回并返回给 LLM。
             self._fts_ready = False
             logger.info("VectorStore: deleted records for source '%s'", source)
-            return 1
+            if before is None:
+                return 1
+            try:
+                after = table.count_rows()
+            except Exception:
+                return 1
+            return max(0, before - after)
         except Exception as e:
             logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
             return 0
@@ -525,11 +587,12 @@ class VectorStore:
         table = self._ensure_table()
         # 跟踪已删除过旧数据的 source，避免后续批次重复写入时新旧数据共存。
         sources_seen: set = set()
+        created = False
         if table is None:
-            # 首次：创建表（用第一批 records），无需删除旧数据。
-            self._table = self._db.create_table(_TABLE_NAME, first_records)
-            self._table_checked = True
-            table = self._table  # 更新局部变量，后续批次需要 table 引用
+            # 首次：创建表（用第一批 records），无需删除旧数据。竞态安全：
+            # 若另一实例已建好，created=False，改走下面的「已有表」删除+写入。
+            table, created = self._create_or_open_table(first_records)
+        if created:
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
             sources_seen = {r["source"] for r in first_records}
@@ -537,9 +600,11 @@ class VectorStore:
                 on_batch(len(first_records), total)
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
+                self._fts_ready = False
+                self._ensure_fts_index(self._table)
                 return total
         else:
-            # 已有表：先按 source 删除旧记录
+            # 已有表（或并发竞争后打开）：先按 source 删除旧记录
             existing_count = table.count_rows()
             sources_seen = {r["source"] for r in first_records}
             logger.info(
@@ -561,6 +626,7 @@ class VectorStore:
                     on_batch(len(first_records), total)
             except Exception as e:
                 logger.error("  向量库写入失败(首批): %s", e)
+                self._fts_ready = False
                 raise
             if exhausted:
                 logger.info("  └─ 向量化写入完成: 共 %d 个切片 (仅一批)", total)
@@ -579,6 +645,9 @@ class VectorStore:
             batch_buf.append(chunk)
             if len(batch_buf) >= batch_size:
                 if is_cancelled is not None and is_cancelled():
+                    # 已 delete 旧数据/写入部分新数据，BM25 索引却是旧快照：
+                    # 置失效让下次 search_fts 自愈重建，否则新数据在 BM25 通道静默不可见。
+                    self._fts_ready = False
                     return total
                 batch_num += 1
                 logger.info("  ├─ 向量化: 第 %d 批 (%d 切片) 正在嵌入...", batch_num, len(batch_buf))
@@ -601,12 +670,14 @@ class VectorStore:
                         on_batch(len(records), total)
                 except Exception as e:
                     logger.error("  向量库写入失败(第 %d 批): %s", batch_num, e)
+                    self._fts_ready = False
                     raise
                 chunk_idx += len(batch_buf)
                 batch_buf.clear()
         # 处理剩余
         if batch_buf:
             if is_cancelled is not None and is_cancelled():
+                self._fts_ready = False
                 return total
             batch_num += 1
             logger.info("  ├─ 向量化: 最后批次 (%d 切片) 正在嵌入...", len(batch_buf))
@@ -628,6 +699,7 @@ class VectorStore:
                     on_batch(len(records), total)
             except Exception as e:
                 logger.error("  向量库写入失败(最后批次): %s", e)
+                self._fts_ready = False
                 raise
 
         logger.info("  └─ 向量化写入完成: 共 %d 个切片 (%d 批次)", total, batch_num)
@@ -722,26 +794,45 @@ class VectorStore:
 
         # lancedb >= 0.37：create_index(config=FTS(...))（Tantivy 已移除）。
         # lancedb 0.25.x：create_fts_index(use_tantivy=False, ...)。
-        try:
-            from lancedb.index import FTS
-            table.create_index(
-                _FTS_COLUMN,
-                config=FTS(**fts_kwargs),
-                replace=True,
-            )
-        except TypeError:
-            # 0.25.x 的 create_index 无 config 参数，回退到 create_fts_index。
-            table.create_fts_index(
-                _FTS_COLUMN,
-                use_tantivy=False,
-                replace=True,
-                **fts_kwargs,
-            )
-        except Exception as e:
-            logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
-            self._fts_checked = True
-            self._fts_ready = False
-            return False
+        #
+        # 必须持**模块级**锁：写入侧（SyncKnowledgeWorker 的引擎实例）与检索
+        # 侧（agent 的引擎实例）是不同的 VectorStore 实例、同一张磁盘表，双方
+        # _fts_ready 都为 False 时会对同一张表并发 replace 建索引（同步中用户
+        # 同时检索即可触发），可能报错或索引不一致。建索引是低频操作，全局
+        # 锁没有吞吐影响。
+        with _FTS_CREATE_LOCK:
+            try:
+                from lancedb.index import FTS
+                table.create_index(
+                    _FTS_COLUMN,
+                    config=FTS(**fts_kwargs),
+                    replace=True,
+                )
+            except TypeError:
+                # 0.25.x 的 create_index 无 config 参数，回退到 create_fts_index。
+                try:
+                    table.create_fts_index(
+                        _FTS_COLUMN,
+                        use_tantivy=False,
+                        replace=True,
+                        **fts_kwargs,
+                    )
+                except Exception as e:
+                    logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
+                    self._fts_checked = True
+                    self._fts_ready = False
+                    return False
+            except Exception as e:
+                # 并发对方刚建好 → 本方报「已存在」类错误时按成功处理，
+                # 索引在磁盘上已可用，没必要回退纯向量检索。
+                msg = str(e).lower()
+                if "exist" in msg or "already" in msg:
+                    logger.debug("  BM25 索引已由并发方创建: %s", e)
+                else:
+                    logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
+                    self._fts_checked = True
+                    self._fts_ready = False
+                    return False
 
         self._fts_ready = True
         self._fts_checked = True
@@ -937,21 +1028,24 @@ class VectorStore:
                         self._rerank_model,
                         use_fp16=False,
                     )
-                    if getattr(self, "_closed", False):
-                        # close() 已经执行：不要再把 500MB 模型写回实例
-                        # （旧实现会让 close 之后的实例「复活」持有权重）。
-                        try:
+                    # 写回实例必须持 _reranker_lock 并在锁内复查 _closed：
+                    # 旧实现裸写 _reranker/_reranker_state，与 close() 的裸清
+                    # 交错时，已 close 的实例会「复活」持有 ~500MB 权重，且
+                    # state 变成 done 后下次还会再起加载线程。
+                    with self._reranker_lock:
+                        if getattr(self, "_closed", False):
+                            # close() 已经执行：不要再把 500MB 模型写回实例
+                            # （旧实现会让 close 之后的实例「复活」持有权重）。
                             del reranker
-                        except UnboundLocalError:
-                            pass
-                        return
-                    self._reranker = reranker
-                    self._reranker_state = "done"
+                            return
+                        self._reranker = reranker
+                        self._reranker_state = "done"
                     logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
                 except Exception as e:
                     logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
-                    self._reranker = None
-                    self._reranker_state = "failed"
+                    with self._reranker_lock:
+                        self._reranker = None
+                        self._reranker_state = "failed"
 
             # 先置 loading 再启动线程，并发的其他调用方看到 loading 即返回。
             self._reranker_state = "loading"
@@ -970,10 +1064,12 @@ class VectorStore:
                 )
         except Exception as e:
             logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
-            self._reranker = None
-            self._reranker_state = "failed"
+            with self._reranker_lock:
+                self._reranker = None
+                self._reranker_state = "failed"
 
-        return self._reranker if getattr(self, "_reranker_state", "idle") == "done" else None
+        with self._reranker_lock:
+            return self._reranker if getattr(self, "_reranker_state", "idle") == "done" else None
 
     def _rerank_fallback(
         self,
@@ -1185,6 +1281,10 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
+            # 新表上没有 FTS 索引；不置 False 的话 _ensure_fts_index() 会
+            # 直接返回 True，BM25 通道静默失效（与 close() 一致）。
+            self._fts_ready = False
+            self._fts_checked = False
             logger.info("VectorStore: cleared %d documents", count)
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
@@ -1223,6 +1323,8 @@ class VectorStore:
         # back to simply dropping the Python reference.
         # 先标记关闭：后台 reranker 加载线程完成时看到 _closed 就不再把模型
         # 写回本实例（否则 close 之后的实例会「复活」持有 ~500MB 权重）。
+        # 注意 _closed 必须在重新初始化时复位（见 _initialize_locked）：
+        # 该实例可以被复活重连，若标志一直为真，reranker 会对它永久失效。
         self._closed = True
         self._table = None
         self._db = None
@@ -1250,16 +1352,19 @@ class VectorStore:
         if hasattr(self, "_reranker"):
             # FlagReranker holds a transformers model with PyTorch tensors.
             # Try to move it to CPU and del before nulling, so CUDA/PyTorch
-            # resources are freed promptly.
-            reranker = self._reranker
-            try:
-                model = getattr(reranker, "model", None)
-                if model is not None and hasattr(model, "cpu"):
-                    model.cpu()
-            except Exception:
-                pass
-            self._reranker = None
-        self._reranker_state = "idle"
+            # resources are freed promptly. 必须持 _reranker_lock：与后台加载
+            # 线程的写回（同样持锁）互斥，否则 close 交错会把已清空的实例
+            # 「复活」持有 ~500MB 权重。
+            with self._reranker_lock:
+                reranker = self._reranker
+                try:
+                    model = getattr(reranker, "model", None)
+                    if model is not None and hasattr(model, "cpu"):
+                        model.cpu()
+                except Exception:
+                    pass
+                self._reranker = None
+                self._reranker_state = "idle"
         self._initialized = False
         self._table_checked = False
         # 表句柄已丢弃，重连后打开的是「另一张」表（可能被 clear()/迁移重建
@@ -1385,8 +1490,10 @@ class VectorStore:
     ) -> None:
         """Store or update a document's digest (缩略版本) + chapter list.
 
-        ``doc_id`` is a stable md5 of ``doc_name`` so re-ingesting the same
-        document overwrites the previous entry (upsert semantics).
+        ``doc_id`` is a stable md5 of ``md_path`` (falling back to ``doc_name``)
+        so re-ingesting the same document overwrites the previous entry (upsert
+        semantics).  Keying on the basename would collide for same-named files
+        in different subdirectories.
 
         The full markdown is **not** stored in this table: it already lives on
         disk in ``rag/documents/*.md`` (the ingest cache), and no consumer
@@ -1404,12 +1511,25 @@ class VectorStore:
         with self._documents_lock:
             # 已在锁内 → 用不重复加锁的版本，避免嵌套 acquire。
             table = self._ensure_documents_table_locked()
-            doc_id = _hash_source(doc_name)
+            # doc_id 用 md_path（每篇文档的缓存路径唯一）而不是 basename：
+            # 知识库里不同子目录的同名文件（a/report.pdf 与 b/report.pdf）
+            # basename 相同，旧实现它们的 doc_id 相同 → upsert 互相覆盖、
+            # delete 误删另一文件的元数据，rag_outline 可能返回错误文档的目录。
+            doc_id = _hash_source(md_path or doc_name)
 
             # Delete any previous entry (and the placeholder row), then add the new one.
             try:
                 table.delete(f"doc_id = '{doc_id}'")
                 table.delete("doc_id = ''")
+                # 兼容旧数据：历史版本 doc_id = hash(basename)，同名的旧行
+                # doc_id 不同、不会被上面删掉，会成为影子行（同名匹配时可能
+                # 返回过期 digest）。按 doc_name + md_path 不匹配清掉它们。
+                if md_path:
+                    safe_name = doc_name.replace("'", "''")
+                    safe_md = md_path.replace("'", "''")
+                    table.delete(
+                        f"doc_name = '{safe_name}' AND md_path != '{safe_md}'"
+                    )
             except Exception:
                 pass
             table.add([{
@@ -1444,8 +1564,20 @@ class VectorStore:
                 try:
                     rows = table.to_arrow(columns=cols).to_pylist()
                 except Exception:
-                    # 旧表没有 md_path 列 → 退化为全列读取（仍不含 markdown 之外的重列）。
-                    rows = table.to_arrow().to_pylist()
+                    # 旧表没有 md_path 列（lancedb 0.25 的 to_arrow 也不支持
+                    # columns 参数）→ 用存储层列裁剪，绝不能全表物化：
+                    # 旧 schema 里还有完整 markdown 列，全读 = 整份语料进内存。
+                    # 按 schema 实际存在的列投影（markdown 永不读取）。
+                    avail = [c for c in getattr(table.schema, "names", []) if c != "markdown"]
+                    pick = [c for c in cols if c in avail] or avail
+                    n = table.count_rows()
+                    rows = (
+                        table.search()
+                        .limit(max(n, 1))
+                        .select(pick)
+                        .to_arrow()
+                        .to_pylist()
+                    )
             except Exception as e:
                 logger.warning("读取文档元数据失败: %s", e)
                 return []
@@ -1495,6 +1627,16 @@ class VectorStore:
         rows = self._load_documents()
         return sorted({r.get("doc_name", "") for r in rows if r.get("doc_name")})
 
+    def all_document_rows(self) -> List[Dict[str, Any]]:
+        """返回 documents 表全部行的**浅拷贝**（按列读取，不含 markdown）。
+
+        供「按 md_path/doc_name 批量对账」的调用方一次性快照 —— 逐个调
+        ``get_document_by_md_path`` 会让每次写入失效缓存后重新全表加载，
+        大知识库下退化成 O(N) 次全表物化。浅拷贝避免调用方改到缓存。
+        """
+        self._ensure_initialized()
+        return [dict(r) for r in self._load_documents()]
+
     def delete_document(self, doc_name: str) -> None:
         """Remove a document's metadata entry."""
         self._ensure_initialized()
@@ -1508,6 +1650,48 @@ class VectorStore:
             except Exception as e:
                 logger.warning("删除文档元数据失败: %s", e)
             self._documents_cache = None
+
+    def get_document_by_md_path(self, md_path: str) -> Optional[Dict[str, Any]]:
+        """按 markdown 缓存路径精确查找文档元数据。
+
+        缓存文件名经过 ``_safe_filename`` 清洗（空格、括号、中文标点都被丢
+        掉），从文件名反推 doc_name 必然失真 —— 于是「Chapter 1.pdf」的缓存
+        被认成「Chapter1.pdf」，每轮同步都被判为缺记录并写入一条重复行。
+        ``md_path`` 是入库时原样记录的，用它匹配才可靠。
+        """
+        if not md_path:
+            return None
+        self._ensure_initialized()
+        target = os.path.abspath(md_path)
+        for r in self._load_documents():
+            stored = str(r.get("md_path") or "")
+            if stored and os.path.abspath(stored) == target:
+                return {
+                    "doc_name": r.get("doc_name", ""),
+                    "digest": r.get("digest", ""),
+                    "chapters": r.get("chapters", ""),
+                    "md_path": stored,
+                }
+        return None
+
+    def delete_document_by_md_path(self, md_path: str) -> bool:
+        """删除指定 markdown 缓存对应的元数据行。"""
+        if not md_path:
+            return False
+        self._ensure_initialized()
+        with self._documents_lock:
+            table = self._ensure_documents_table_locked()
+            if table is None:
+                return False
+            target = os.path.abspath(md_path)
+            safe = target.replace("'", "''")
+            try:
+                table.delete(f"md_path = '{safe}'")
+            except Exception as e:
+                logger.warning("按 md_path 删除文档元数据失败: %s", e)
+                return False
+            self._documents_cache = None
+            return True
 
 
 # ---------------------------------------------------------------------------

@@ -124,6 +124,7 @@ class _FakeStore:
         self.records = []
         self.deleted_sources = []
         self.deleted_documents = []
+        self.deleted_md_paths = []
         self._count = 0
 
     def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
@@ -142,6 +143,13 @@ class _FakeStore:
 
     def delete_document(self, doc_name):
         self.deleted_documents.append(doc_name)
+
+    def get_document_by_md_path(self, md_path):
+        return None
+
+    def delete_document_by_md_path(self, md_path):
+        self.deleted_md_paths.append(md_path)
+        return True
 
     def count(self):
         return self._count
@@ -275,6 +283,55 @@ def test_deleted_file_is_cleaned_up(tmp_path):
     # Manifest must no longer contain the deleted file
     manifest = _load_manifest(engine._rag_dir)
     assert deleted_source not in manifest
+
+
+def test_deleted_file_markdown_cache_is_removed(tmp_path):
+    """删除清理必须连 Markdown 缓存一起删。
+
+    旧实现只删向量和元数据，而紧接着的
+    ``ensure_digests_for_cached_documents`` 会发现「有缓存文件、无 digest
+    记录」，于是用旧缓存重新生成一条 —— 日志打了「🗑 已清理」，但
+    rag_outline 仍列出该文档，且 rag/documents/ 下的 .md 永久堆积。
+    """
+    store = _FakeStore()
+    engine, kb = _make_engine(tmp_path, store)
+    engine.ingest(force=False)
+
+    md_dir = engine.markdown_dir
+    cached = [f for f in os.listdir(md_dir) if f.endswith(".md")]
+    assert cached, "首次同步应生成 Markdown 缓存"
+
+    os.remove(str(kb / "a.txt"))
+    engine.ingest(force=False)
+
+    assert store.deleted_md_paths, "必须按 md_path 删除文档元数据"
+    remaining = [f for f in os.listdir(md_dir) if f.endswith(".md")]
+    assert "a.txt" not in " ".join(remaining)
+    # 缓存文件数必须减少，而不是「删了又被 Step 7 写回来」
+    assert len(remaining) == len(cached) - 1, (
+        f"缓存未被清理: {cached} -> {remaining}"
+    )
+
+
+def test_content_change_with_preserved_mtime_is_re_synced(tmp_path):
+    """mtime+size 都没变但内容变了（cp -p / 解压 / git checkout）必须重新同步。
+
+    只看 mtime+size 会**永久**漏同步：每次都被判为「未修改」而跳过。
+    """
+    store = _FakeStore()
+    engine, kb = _make_engine(tmp_path, store)
+    engine.ingest(force=False)
+    before = list(store.records)
+    assert before, "首次同步应写入切片"
+
+    target = kb / "a.txt"
+    old_stat = os.stat(target)
+    target.write_text("完全不同的新内容 " * 20, encoding="utf-8")
+    # 伪造「mtime 与 size 均未变」：内容换了，签名没变
+    os.utime(target, (old_stat.st_atime, old_stat.st_mtime))
+
+    stats = engine.ingest(force=False)
+    assert stats["files_extracted"] >= 1, "内容变了却被判为未修改而跳过"
 
 
 def test_manifest_survives_corruption(tmp_path):

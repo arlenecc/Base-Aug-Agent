@@ -52,6 +52,19 @@ def release_converter() -> None:
         _converter = None
 
 
+def reset_unavailable() -> None:
+    """清掉「docling 不可用」的永久禁用标志。
+
+    ``_converter_unavailable`` 在任何异常（不只是 ImportError）下都会被置位
+    且没有复位路径。典型后果：进程早期跑过一次 ingest（docling 未装 → 禁用），
+    随后依赖检查自动装上了 docling，之后的同步仍然全程回退到按格式解析
+    （PDF 表格/版面质量下降），且毫无提示。依赖装好后调用本函数即可恢复。
+    """
+    global _converter_unavailable
+    with _converter_lock:
+        _converter_unavailable = False
+
+
 def is_docling_available() -> bool:
     """Return True if docling can be imported."""
     global _converter_unavailable
@@ -91,8 +104,10 @@ def _get_converter():
             _converter_unavailable = True
             return None
         except Exception as e:
-            logger.warning("failed to init docling converter: %s", e)
-            _converter_unavailable = True
+            # 只在**缺失**时永久禁用。瞬时错误（模型下载中断、磁盘抖动、
+            # OOM）绝不能置位 —— 那会让本进程后续所有同步都静默降级到轻量
+            # 解析器，即使原因早已消失也不自愈。
+            logger.warning("failed to init docling converter (will retry): %s", e)
             return None
 
 

@@ -17,6 +17,15 @@ _MAX_READ_CHARS = 200_000
 # 本来就不可靠，模型应改用 file_write 重写或 shell 处理。
 _MAX_MODIFY_BYTES = 10 * 1024 * 1024
 
+# 进程 umask 在模块导入时读一次。旧实现每次新建文件都
+# ``mask = os.umask(0); os.umask(mask)``——这是进程级全局操作且非线程安全，
+# 窗口内其它线程建文件会得到 0666。导入期尚无并发，读一次缓存即可。
+try:
+    _PROC_UMASK = os.umask(0)
+    os.umask(_PROC_UMASK)
+except OSError:  # pragma: no cover - 极端平台
+    _PROC_UMASK = 0o022
+
 
 def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
     """Temp + os.replace 原子写。
@@ -34,13 +43,12 @@ def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=dir_name)
     try:
         try:
-            # 目标已存在 → 继承其权限；否则按 umask 得到常规 0644。
+            # 目标已存在 → 继承其权限；否则用导入期缓存的 umask 推导
+            # （不再现场 os.umask(0)：进程级全局操作，非线程安全）。
             try:
                 mode = os.stat(full).st_mode & 0o7777
             except OSError:
-                mask = os.umask(0)
-                os.umask(mask)
-                mode = 0o666 & ~mask
+                mode = 0o666 & ~_PROC_UMASK
             os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding=encoding) as f:
                 f.write(content)
@@ -101,11 +109,13 @@ class FileReadTool(_FileTool):
             return ToolResult(False, error=f"File does not exist: {path}")
         try:
             size = os.path.getsize(full)
-            truncated = size > _MAX_READ_CHARS
             with open(full, "r", encoding="utf-8") as f:
-                # 只读需要的部分，而不是把整个文件读进内存再截断。
-                data = f.read(_MAX_READ_CHARS) if truncated else f.read()
-            if truncated:
+                # 按**字符**读：多字节 UTF-8（中日韩）下字节数超上限不代表字符
+                # 数也超（旧实现误判截断：300KB 中文其实只有约 10 万字符）。
+                # 多读一个字符用于判定是否真的需要截断。
+                data = f.read(_MAX_READ_CHARS + 1)
+            if len(data) > _MAX_READ_CHARS:
+                data = data[:_MAX_READ_CHARS]
                 data += f"\n… [文件共 {size} 字节，仅显示前 {_MAX_READ_CHARS} 字符]"
             return ToolResult(True, output=data)
         except UnicodeDecodeError:

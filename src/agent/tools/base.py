@@ -19,9 +19,6 @@ class ToolResult:
     success: bool
     output: str = ""
     error: str = ""
-    # When requires_input is set, the agent should call callbacks.ask_user and
-    # feed the answer back (used by ask_user tool internally).
-    requires_input: bool = False
 
     def to_message(self) -> str:
         if self.success:
@@ -61,7 +58,44 @@ class Tool:
         }
 
 
+class AliasTool(Tool):
+    """同一实现的另一个名字。
+
+    用于把 base-agent 的原生工具名对齐 GenericAgent 的原子工具命名
+    （``file_modify`` → ``file_patch``、``webexec_js`` → ``web_execute_js``），
+    不复制任何实现。schema 与 target 完全一致，因此不会产生行为分叉。
+    """
+
+    def __init__(self, target_name: str, alias: str, description: str = ""):
+        self._target_name = target_name
+        self.name = alias
+        self.description = description or ""
+        self.destructive = False
+
+    def bind(self, config: "AgentConfig", registry: "ToolRegistry") -> None:
+        self.config = config
+        self.registry = registry
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        t = self.registry.get(self._target_name) if self.registry else None
+        return getattr(t, "parameters", {}) or {"type": "object", "properties": {}}
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        t = self.registry.get(self._target_name) if self.registry else None
+        return bool(t.should_confirm(args)) if t else False
+
+    def run(self, **kwargs) -> ToolResult:
+        if not self.registry:
+            return ToolResult(False, error=f"alias {self.name} not bound")
+        return self.registry.execute(self._target_name, kwargs)
+
+
 class ToolRegistry:
+    # run 的 Signature 缓存（按工具类）：工具集注册后固定，没必要每次
+    # execute() 都重新构造 Signature 对象。
+    _signature_cache: Dict[type, "inspect.Signature"] = {}
+
     def __init__(self, config: AgentConfig, callbacks: "Any"):
         self.config = config
         self.callbacks = callbacks
@@ -83,7 +117,9 @@ class ToolRegistry:
         from .web import WebScanTool, WebExecJsTool
         from .interact import AskUserTool
         from .memory import WorkMemoryTool, MemoryGraphTool, MemorySearchTool
-        from .skill_search import SkillSearchTool, SkillLoadTool, SkillSemanticSearchTool
+        from .skill_search import SkillSearchTool, SkillLoadTool, SkillSemanticSearchTool, SkillSaveTool
+        from .checkpoint import UpdateWorkingCheckpointTool, StartLongTermUpdateTool
+        from .plan import UpdatePlanTool
 
         tools_to_register = [
             FileReadTool(), FileWriteTool(), FileModifyTool(),
@@ -97,6 +133,12 @@ class ToolRegistry:
             SkillSearchTool(),
             SkillLoadTool(),
             SkillSemanticSearchTool(),
+            SkillSaveTool(),
+            # 沉淀态原子工具（对齐 GenericAgent）
+            UpdateWorkingCheckpointTool(),
+            StartLongTermUpdateTool(),
+            # 规划态原子工具：目标 + 路径的一等公民表示
+            UpdatePlanTool(),
         ]
 
         # webexec_js: only register when browser_endpoint is configured.
@@ -109,6 +151,20 @@ class ToolRegistry:
         for t in tools_to_register:
             t.bind(self.config, self)
             self._tools[t.name] = t
+
+        # 原子工具命名对齐 GenericAgent（同一实现，只是多一个入口名）
+        for target, alias, desc in (
+            ("file_modify", "file_patch",
+             "Replace a unique block of text (old) with new. old must match "
+             "exactly (whitespace/indentation). Use file_read first to get "
+             "current content."),
+            ("webexec_js", "web_execute_js",
+             "Execute JavaScript in the attached browser for full page control."),
+        ):
+            if target in self._tools and alias not in self._tools:
+                a = AliasTool(target, alias, desc)
+                a.bind(self.config, self)
+                self._tools[alias] = a
 
         # Register RAG tools
         self._register_rag_tools()
@@ -247,7 +303,28 @@ class ToolRegistry:
                 return retriever
             db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
             from ..skill_retriever import SkillRetriever
-            retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
+            from ..rag.vector_store import get_or_create_embedding_function
+            # 必须复用 RAG 配置里的 embedding 模型：SkillVectorStore 默认用
+            # DEFAULT_EMBEDDING_MODEL，用户改了模型就会额外驻留第二个
+            # FastEmbed 单例（各 ~137MB C++ 堆），且两侧索引不一致。
+            # 失败时显式回退到默认模型单例（与 SkillVectorStore 内部 _get_ef
+            # 的回退是同一个进程级单例），而不是传 None 让它悄悄自建。
+            model_name = (getattr(self.config, "rag_embedding_model", "") or "").strip()
+            try:
+                ef = get_or_create_embedding_function(model_name or None)
+            except Exception as e:
+                logger.warning(
+                    "skill embedding function init failed (%s); "
+                    "falling back to default model", e,
+                )
+                try:
+                    ef = get_or_create_embedding_function()
+                except Exception:
+                    ef = None
+            retriever = SkillRetriever(
+                skills_dir=skills_dir, db_path=db_path,
+                embedding_function=ef,
+            )
             cache[skills_dir] = retriever
             setattr(self, "_skill_retriever", retriever)
             return retriever
@@ -295,31 +372,44 @@ class ToolRegistry:
         # Release the singleton LongTermMemory's GraphMemoryStore (LanceDB +
         # FastEmbed ONNX model ~137MB).  Without this, each _rebuild_agent()
         # call leaks the model loaded for the knowledge graph.
+        #
+        # 必须持 _singleton_lock（RLock）：_get_long_memory / get_skill_retriever
+        # 的懒初始化也走这把锁。旧实现裸清属性，与 agent 线程的懒初始化竞态：
+        # shutdown 清空后紧跟着一次新建 → 新实例不在任何缓存里，永不被 close
+        # （每次「应用配置」泄漏 ~137MB ONNX + LanceDB 连接）。
         from .memory import _LONG_MEMORY_SINGLETON_ATTR
-        lm = getattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
-        if lm is not None:
-            try:
-                lm.close()
-            except Exception as e:
-                logger.warning("⚠ 长期记忆资源释放异常: %s", e)
-            setattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
-        # Release the SkillIndex singleton(s) (if any)
-        setattr(self, "_skill_index", None)
-        setattr(self, "_skill_index_cache", None)
-        # Release the SkillRetriever (LanceDB connection). Note: it shares the
-        # process-wide embedding function singleton, which we do NOT close here.
-        cache = getattr(self, "_skill_retriever_cache", None)
-        retrievers = list(cache.values()) if isinstance(cache, dict) else []
-        legacy = getattr(self, "_skill_retriever", None)
-        if legacy is not None and legacy not in retrievers:
-            retrievers.append(legacy)
-        for skill_retriever in retrievers:
-            try:
-                skill_retriever.close()
-            except Exception as e:
-                logger.warning("⚠ skill retriever 资源释放异常: %s", e)
-        setattr(self, "_skill_retriever", None)
-        setattr(self, "_skill_retriever_cache", None)
+        with self._singleton_lock:
+            lm = getattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
+            if lm is not None:
+                try:
+                    lm.close()
+                except Exception as e:
+                    logger.warning("⚠ 长期记忆资源释放异常: %s", e)
+                setattr(self, _LONG_MEMORY_SINGLETON_ATTR, None)
+            # Release the SkillIndex singleton(s) (if any)
+            setattr(self, "_skill_index", None)
+            setattr(self, "_skill_index_cache", None)
+            # Release the SkillRetriever (LanceDB connection). Note: it shares
+            # the process-wide embedding function singleton, which we do NOT
+            # close here.
+            cache = getattr(self, "_skill_retriever_cache", None)
+            retrievers = list(cache.values()) if isinstance(cache, dict) else []
+            legacy = getattr(self, "_skill_retriever", None)
+            if legacy is not None and legacy not in retrievers:
+                retrievers.append(legacy)
+            for skill_retriever in retrievers:
+                try:
+                    skill_retriever.close()
+                except Exception as e:
+                    logger.warning("⚠ skill retriever 资源释放异常: %s", e)
+            setattr(self, "_skill_retriever", None)
+            setattr(self, "_skill_retriever_cache", None)
+        # 清空工具表：RAG 引擎与 skill 检索器都已关闭，RagSearchTool /
+        # SkillSemanticSearchTool 等却仍持有对它们的引用。留着的话，shutdown
+        # 之后任何工具调用都会打到已关闭的 LanceDB/ONNX 会话上，报的却是
+        # 「client is closed」这种与根因无关的错误。清空后 get() 返回 None，
+        # execute() 给出明确的 "Unknown tool"。
+        self._tools.clear()
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
@@ -349,12 +439,12 @@ class ToolRegistry:
         # 工具内部代码出 bug（比如对 None 调 .strip()）时模型会收到"参数
         # 无效"，于是反复重试同样的调用而不是上报问题。
         try:
-            inspect.signature(tool.run).bind(**args)
+            self._signature_of(tool).bind(**args)
         except TypeError as e:
             return ToolResult(success=False, error=f"Invalid arguments for {name}: {e}")
 
         try:
-            return tool.run(**args)
+            result = tool.run(**args)
         except TypeError as e:
             # 签名已通过 → 这里的 TypeError 是工具内部缺陷，如实报告。
             logger.exception("tool %s raised TypeError internally (args=%r)", name, args)
@@ -365,6 +455,33 @@ class ToolRegistry:
             )
         except Exception as e:  # pragma: no cover - defensive
             return ToolResult(success=False, error=f"{type(e).__name__}: {e}")
+
+        if not isinstance(result, ToolResult):
+            # 自定义/第三方工具忘了返回 ToolResult（返回 None 或 str）时，
+            # 上层 `result.success` 会以 AttributeError 的形式炸开，且看不出
+            # 是哪个工具的锅。这里归一成明确的错误。
+            logger.error("tool %s returned %s instead of ToolResult",
+                         name, type(result).__name__)
+            return ToolResult(
+                success=False,
+                error=f"{name} returned {type(result).__name__} instead of ToolResult",
+            )
+        return result
+
+    @staticmethod
+    def _signature_of(tool: "Tool") -> "inspect.Signature":
+        """按工具类缓存 ``run`` 的 Signature。
+
+        ``inspect.signature()`` 每次调用都重新构造 Signature 对象（10-30µs，
+        对 AliasTool.parameters 这类 property 还有连带开销）。工具集在注册后
+        固定，按 ``type(tool)`` 缓存即可（实例级 run 未被逐实例改写）。
+        """
+        key = type(tool)
+        sig = ToolRegistry._signature_cache.get(key)
+        if sig is None:
+            sig = inspect.signature(tool.run)
+            ToolRegistry._signature_cache[key] = sig
+        return sig
 
 
 def parse_args(raw: str) -> Dict[str, Any]:

@@ -12,7 +12,7 @@ import os
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QKeyEvent
@@ -27,6 +27,7 @@ from ..agent import Agent, AgentCallbacks
 from ..config import AgentConfig
 from ..llm_client import LLMClient, LLMError
 from ..skills import Skill
+from ..kernel.session import render_plan_dict
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
 
@@ -60,6 +61,14 @@ _RAG_SUB_LOGGERS = tuple(
 # QSignalLogHandler 实例引用，保存在模块级别以便 closeEvent 清理。
 # _setup_log_bridge() 创建并赋值，closeEvent() 从 root logger 移除。
 _LOG_HANDLER: Optional[Any] = None
+
+# 「终止对话」看门狗：协作式取消在这个时长内没生效就强制结束线程。
+# 太长会让用户以为卡死，太短会在正常的长工具调用（如 30s 的 code_run）里误杀。
+_STOP_FORCE_AFTER_MS = 30_000
+
+# 流式文本的合并刷新间隔（ms）。~25fps —— 再低肉眼可见卡顿，再高则失去
+# 流式观感。目的是把每秒数百次 QTextDocument 操作压到每秒 25 次。
+_STREAM_FLUSH_MS = 40
 
 
 class QSignalLogHandler(logging.Handler, QObject):
@@ -163,6 +172,74 @@ def _sanitize_stream_text(text: str) -> str:
 # ===========================================================================
 
 
+class _SummaryStripper:
+    """把协议标签 ``<summary>…</summary>`` 从流式文本里剔掉。
+
+    协议要求模型在回复**开头**输出这个标签（L2 摘要的原料），但它是给内核
+    用的机器标记，不该出现在对话气泡里。流式场景下标签可能跨 chunk 到达，
+    因此用一个带 carry 的小状态机处理，并对末尾「可能是标签前缀」的片段
+    做保留，避免把 ``<summ`` 当成正文输出、下一 chunk 又来一个 ``ary>``。
+
+    标签**内部**的内容先缓存而不是立刻丢弃：若到回合结束标签始终没闭合
+    （模型没遵守协议），说明它根本不是标签，要把吞掉的内容还给用户——
+    直接丢弃会让整条回复凭空消失。
+    """
+
+    _OPEN = "<summary>"
+    _CLOSE = "</summary>"
+
+    def __init__(self) -> None:
+        self._inside = False
+        self._carry = ""
+        self._inside_buf: List[str] = []
+
+    def feed(self, text: str) -> str:
+        buf = self._carry + (text or "")
+        self._carry = ""
+        if not buf:
+            return ""
+        out: List[str] = []
+        i, n = 0, len(buf)
+        while i < n:
+            tag, tag_len = ((self._CLOSE, len(self._CLOSE)) if self._inside
+                            else (self._OPEN, len(self._OPEN)))
+            j = buf.find(tag, i)
+            if j < 0:
+                # 末尾几个字符可能是标签前缀，留到下一 chunk 再判
+                k = max(i, n - (tag_len - 1))
+                tail = buf[k:]
+                if tail and tag.startswith(tail):
+                    self._carry = tail
+                    rest = buf[i:k]
+                else:
+                    rest = buf[i:]
+                if self._inside:
+                    self._inside_buf.append(rest)   # 摘要正文：先存着
+                else:
+                    out.append(rest)                # 回复正文：直接输出
+                break
+            if self._inside:
+                self._inside_buf.append(buf[i:j])
+                self._inside = False
+                self._inside_buf = []               # 正常闭合 → 摘要正文丢弃
+            else:
+                out.append(buf[i:j])
+                self._inside = True
+            i = j + tag_len
+        return "".join(out)
+
+    def flush(self) -> str:
+        """收尾：标签始终没闭合时，把吞进去的内容还回去。"""
+        c, self._carry = self._carry, ""
+        if self._inside:
+            self._inside = False
+            rescued = "".join(self._inside_buf) + c
+            self._inside_buf = []
+            return rescued
+        self._inside_buf = []
+        return c
+
+
 class Bridge(QObject):
     content = pyqtSignal(str)
     reasoning = pyqtSignal(str)
@@ -172,6 +249,7 @@ class Bridge(QObject):
     usage = pyqtSignal(dict)
     speed = pyqtSignal(int, float)
     skill = pyqtSignal(object)
+    plan = pyqtSignal(object)
     finished = pyqtSignal()
     error = pyqtSignal(str)
     # blocking requests (worker -> UI)
@@ -211,6 +289,8 @@ class BridgeCallbacks(AgentCallbacks):
         self.bridge.speed.emit(total_tokens, speed)
     def on_skill_suggested(self, skill) -> None:
         self.bridge.skill.emit(skill)
+    def on_plan_updated(self, plan) -> None:
+        self.bridge.plan.emit(plan)
     def on_error(self, message: str) -> None:
         self.bridge.error.emit(message)
     def on_finished(self) -> None:
@@ -534,8 +614,13 @@ class SendEditor(QPlainTextEdit):
     send_requested = pyqtSignal()
 
     def keyPressEvent(self, e: QKeyEvent) -> None:  # type: ignore[override]
-        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (e.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+        # 只放行**裸** Enter/Return 发送：Ctrl+Enter / Meta+Enter 也走 super()
+        #（旧实现 Ctrl+Enter 同样触发发送，且未 accept 的事件会继续向父控件
+        # 传播，可能触发对话框默认按钮等意外行为）。
+        if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)):
             self.send_requested.emit()
+            e.accept()
             return
         super().keyPressEvent(e)
 
@@ -565,6 +650,19 @@ class MainWindow(QMainWindow):
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         self._busy = False
         self._total_tokens = 0
+        # 工作线程被 terminate() 强杀后置位：此后不能再走任何需要取锁的
+        # 资源释放（tools.shutdown 等）—— 被杀线程持有的锁永远不会被释放。
+        self._worker_terminated = False
+        # wait 超时的 QThread 孤儿：最后一个 Python 引用归零会触发 sip 析构
+        # → qFatal。保留引用到进程退出，closeEvent 时再统一 wait 一次。
+        self._orphan_workers: list = []
+        self._stop_watchdog: Optional[QTimer] = None
+        # 流式输出缓冲（配合 _stream_timer 合并刷新）
+        self._pending_content: List[str] = []
+        self._pending_reasoning: List[str] = []
+        self._stream_timer: Optional[QTimer] = None
+        # 协议标签剥离器（每个 assistant 回合重建）
+        self._summary_stripper = _SummaryStripper()
         # 日志轮询定时器：每 100ms 检查 sync_worker._log_buffer，
         # 把新日志追加到 log_view。绕过 Qt queued signal 机制，
         # 避免在 GIL 竞争下信号无法被主线程处理的问题。
@@ -759,6 +857,26 @@ class MainWindow(QMainWindow):
         send_row.addLayout(send_col)
         llay.addLayout(send_row)
 
+        # 执行计划（任务目标 + 步骤进度）。放在思考过程上方：它是用户判断
+        # 「Agent 在干什么、跑到哪了」的第一眼信息，比推理文本更该被看见。
+        plan_font = QFont("Menlo")
+        plan_font.setStyleHint(QFont.StyleHint.Monospace)
+        plan_header = QHBoxLayout()
+        plan_header.addWidget(QLabel("执行计划"))
+        self.plan_toggle_btn = QPushButton("收起")
+        self.plan_toggle_btn.setFixedWidth(60)
+        self.plan_toggle_btn.setCheckable(True)
+        plan_header.addStretch(1)
+        plan_header.addWidget(self.plan_toggle_btn)
+        llay.addLayout(plan_header)
+        self.plan_view = QPlainTextEdit()
+        self.plan_view.setReadOnly(True)
+        self.plan_view.setFont(plan_font)
+        self.plan_view.setMaximumBlockCount(300)
+        self.plan_view.setFixedHeight(132)
+        self.plan_view.setPlaceholderText("（尚无计划 — Agent 开始任务前会先规划）")
+        llay.addWidget(self.plan_view)
+
         # thinking
         think_header = QHBoxLayout()
         think_header.addWidget(QLabel("思考过程"))
@@ -831,6 +949,8 @@ class MainWindow(QMainWindow):
         b.usage.connect(self._on_usage)
         b.speed.connect(self._on_speed)
         b.skill.connect(self._on_skill_suggested)
+        b.plan.connect(self._on_plan_updated)
+        self.plan_toggle_btn.toggled.connect(self._on_plan_toggle)
         b.finished.connect(self._on_finished)
         b.error.connect(self._on_error)
         b.confirm_request.connect(self._on_confirm_request)
@@ -925,8 +1045,15 @@ class MainWindow(QMainWindow):
                 old_llm.close()
             except Exception:
                 pass
+        # 构造失败时必须把两个引用都清空：旧的 agent 已经被 tools.shutdown()
+        # （MCP 子进程已杀、RAG 引擎已关），旧的 llm 也 close() 了。若把引用
+        # 留着，用户照常点「发送」会得到一个半死的 agent —— MCP 工具全部
+        # Unknown tool、RAG 工具静默消失、LLM 调用抛
+        # "Cannot send a request, as the client has been closed."。
+        self._agent = None
+        self._llm = None
         try:
-            self._llm = LLMClient(
+            new_llm = LLMClient(
                 base_url=self.config.base_url, api_key=self.config.api_key,
                 model=self.config.model, timeout=self.config.request_timeout,
                 max_tokens=self.config.max_tokens,
@@ -935,10 +1062,18 @@ class MainWindow(QMainWindow):
                 top_k=self.config.top_k,
                 repetition_penalty=self.config.repetition_penalty,
             )
-            self._agent = Agent(llm=self._llm, config=self.config, callbacks=self._callbacks)
-            self._agent.max_iterations = self.config.max_iterations
+            new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
+            new_agent.max_iterations = self.config.max_iterations
         except Exception as e:
             self._on_error(f"无法创建 agent: {e}")
+            # 保持 None：_on_send 会给出明确提示，而不是用一个坏掉的 agent。
+            return
+        self._llm = new_llm
+        self._agent = new_agent
+        # 重建成功 → 强杀标志复位：旧实现一次强杀后该标志恒为 True，之后
+        # 每次退出都跳过 tools.shutdown()/agent.close()，泄漏 MCP 子进程与
+        # httpx 连接池（关闭路径被永久短路）。新 agent 是全新实例，锁无残留。
+        self._worker_terminated = False
 
     # ------------------------------------------------------------------
     # config actions
@@ -1136,7 +1271,9 @@ class MainWindow(QMainWindow):
             # LanceDB 表对象在打开时获取版本快照，同步后不重新打开会看到旧数据。
             if self._agent is not None:
                 try:
-                    self._agent.tools.reload_rag()
+                    # Agent.reload_rag 除了刷新引擎句柄，还会失效系统提示里的
+                    # 知识库状态缓存，否则同步后注入的仍是旧 chunks 数。
+                    self._agent.reload_rag()
                 except Exception as e:
                     logger.warning("UI: reload_rag after sync: %s", e)
             # 防御：stats 可能不是 dict（极端情况下为 None）
@@ -1259,6 +1396,14 @@ class MainWindow(QMainWindow):
         if not base_url:
             QMessageBox.warning(self, "缺少配置", "请先填写 Base URL")
             return
+        # 并发守卫：self._fetch_worker 是旧 QThread 唯一的 Python 强引用。
+        # 直接覆盖会让引用计数归零 → sip 立刻析构**仍在运行**的 C++ QThread，
+        # Qt6 下是 qFatal 级 abort（线程还阻塞在 30s 超时的 list_models 里）。
+        # 触发路径：点「获取模型」→ 发一条消息 → 该轮结束把 fetch_btn 重新
+        # enable → 再点一次。（sync/deps 都有 _is_worker_running 守卫。）
+        if self._is_worker_running(self._fetch_worker):
+            logger.warning("Fetch models already running, ignoring duplicate request")
+            return
         self.fetch_btn.setEnabled(False)
         self.status_label.setText("正在获取模型列表…")
         self.progress.setRange(0, 0)
@@ -1296,6 +1441,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_send(self) -> None:
         if self._busy:
+            # 旧实现静默丢弃：用户按了 Enter 却毫无反应，像「输入框坏了」。
+            self.status_label.setText("正在运行中…（等待当前回合结束）")
             return
         text = self.send_editor.toPlainText().strip()
         if not text:
@@ -1309,8 +1456,17 @@ class MainWindow(QMainWindow):
         self._append_user(text)
         self.send_editor.clear()
         self._busy = True
+        # 流式状态必须在每回合开始时统一复位：上一次「强制终止」可能发生在
+        # <summary> 已开未闭的时刻（_streaming_assistant/stripper 残留），
+        # 不复位的话下一回合的整条回复会被吞进 stripper 缓冲区——用户看到
+        # 空回复。比只在 _force_stop_agent 里复位更稳（它是兜底而非唯一入口）。
+        self._streaming_assistant = False
+        self._summary_stripper = _SummaryStripper()
         self._set_controls_busy(True)
         self.think_view.clear()
+        # 上一回合（尤其被强杀的）可能残留未落盘的缓冲
+        self._pending_content.clear()
+        self._pending_reasoning.clear()
         self.speed_label.setText("0.0 tok/s")
         self._callbacks.reset()
         self._worker = AgentWorker(self._agent, self._callbacks)
@@ -1325,6 +1481,57 @@ class MainWindow(QMainWindow):
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
         self._callbacks.cancel()
         self.status_label.setText("已请求终止对话（将在当前工具完成后生效）")
+        # 兜底：协作式取消只在工具边界生效，遇到不检查取消标志的阻塞点
+        # （MCP tools/call 的 300s 等待、长 shell 子进程）就永远不返回。
+        # 旧实现里 _busy 只在 _on_finished 复位 → 发送/清空/应用配置/同步
+        # 全部被禁用，只能杀进程。这里挂一个看门狗强制收尾。
+        if getattr(self, "_stop_watchdog", None) is None:
+            self._stop_watchdog = QTimer(self)
+            self._stop_watchdog.setSingleShot(True)
+            self._stop_watchdog.timeout.connect(self._force_stop_agent)
+        # 只在未激活时启动：QTimer.start() 会重置倒计时，连点「终止」可以把
+        # 30s 强杀无限推迟。
+        if not self._stop_watchdog.isActive():
+            self._stop_watchdog.start(_STOP_FORCE_AFTER_MS)
+
+    def _force_stop_agent(self) -> None:
+        """看门狗：协作式取消超时后强制结束工作线程并复位 UI。"""
+        if not self._busy:
+            return
+        worker = self._worker
+        if worker is not None and self._is_worker_running(worker):
+            logger.warning("UI: 终止请求超时，强制结束 agent 工作线程")
+            self._append_log("[ui] 终止请求超时，强制结束工作线程")
+            try:
+                worker.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                worker.terminate()
+                if worker.wait(1000):
+                    self._worker = None          # 确认已结束才放手引用
+                else:
+                    # wait 超时：线程仍在跑。丢掉最后一个 Python 引用会让
+                    # sip 析构 QThread → qFatal "Destroyed while thread is
+                    # still running"（MCP tools/call 300s 阻塞完全可能命中）。
+                    # 挂到孤儿列表保留引用，进程退出时再统一 wait。
+                    self._orphan_workers.append(worker)
+                    self._worker = None
+                    self._worker_terminated = True
+            except Exception as e:
+                logger.warning("UI: force stop error: %s", e)
+                self._orphan_workers.append(worker)
+                self._worker = None
+                self._worker_terminated = True
+        # 流式状态复位 + 缓冲落盘：强杀可能发生在 <summary> 已开未闭的时刻，
+        # 不复位的话下一回合整条回复会被吞进 stripper 缓冲区（空回复 bug）；
+        # 缓冲区里最后 ≤40ms 的文本不落盘会静默丢失。
+        self._flush_stream(final=True)
+        self._streaming_assistant = False
+        self._summary_stripper = _SummaryStripper()
+        self._busy = False
+        self._set_controls_busy(False)
+        self.status_label.setText("已强制终止（工具进程可能仍在后台运行）")
 
     def _on_stop_sync(self) -> None:
         """停止知识库同步：在当前文件处理完成后协作式取消。
@@ -1364,8 +1571,8 @@ class MainWindow(QMainWindow):
             else:
                 self.progress.setRange(0, 0)
                 self.status_label.setText(f"同步中 — {current}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("UI: _on_sync_progress error: %s", e)
 
     def _poll_sync_logs(self) -> None:
         """定时轮询 sync_worker._log_buffer，把新日志追加到 log_view。
@@ -1393,8 +1600,8 @@ class MainWindow(QMainWindow):
             cursor.movePosition(QTextCursor.MoveOperation.End)
             cursor.insertText("\n" + "\n".join(buf))
             self._scroll_to_bottom(self.log_view)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("UI: _poll_sync_logs error: %s", e)
 
     def _set_controls_busy(self, busy: bool) -> None:
         self.send_btn.setEnabled(not busy)
@@ -1417,46 +1624,113 @@ class MainWindow(QMainWindow):
         text = _sanitize_stream_text(text)
         if not text:
             return
+        # 协议标签 <summary>…</summary> 是给内核的机器标记，不显示给用户
+        text = self._summary_stripper.feed(text)
+        if not text:
+            return
         if not self._streaming_assistant:
             self._append_chat('<p><b class="a">助手</b>: </p>')
             self._streaming_assistant = True
-        # Always append at the document end: grab the widget cursor, move the
-        # *copy* to End, insert, then write it back so the widget's real cursor
-        # is at the end (otherwise ensureCursorVisible scrolls to the wrong place
-        # and a later drift could insert into the middle, overlapping text).
+            self._summary_stripper = _SummaryStripper()   # 新回合，重置标签状态
+        # 合并 chunk 再写入：100 tok/s 时逐块 insertText 会让 QTextDocument
+        # 每秒做数百次「取光标 → 移到末尾 → 插入 → 写回光标 → 滚到底」，
+        # 每次都触发一次全视口重绘。这里按 ~25fps 缓冲刷新。
+        self._pending_content.append(text)
+        if self._stream_timer is None:
+            self._stream_timer = QTimer(self)
+            self._stream_timer.setInterval(_STREAM_FLUSH_MS)
+            self._stream_timer.timeout.connect(self._flush_stream)
+        # 只在未运行时启动：QTimer.start() 会重置倒计时，若每个 chunk 都调
+        # 一次，chunk 间隔 < 40ms 时定时器永远不会到期 —— 表现为「流式输出
+        # 完全不渲染，最后一次性全部出现」。
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+
+    def _flush_stream(self, final: bool = False) -> None:
+        """把缓冲的流式文本一次性写入 chat_view。
+
+        ``final=True`` 表示回合结束：此时才把标签剥离器的残留吐出来
+        （模型漏写 ``</summary>`` 时那些字符已不可能是完整标签，应当显示）。
+        中途不能 flush —— 标签常跨多个 chunk 到达，提前吐会把 ``<summ``
+        这样的前缀当正文输出。
+        """
+        if final:
+            residue = self._summary_stripper.flush()
+            if residue:
+                self._pending_content.append(residue)
+        timer = getattr(self, "_stream_timer", None)
+        if timer is not None:
+            timer.stop()
+        # 推理流缓冲一并落盘（与正文同一个定时器节奏）
+        self._flush_reasoning()
+        buf = getattr(self, "_pending_content", None)
+        if not buf:
+            return
+        text = "".join(buf)
+        buf.clear()
+        # 先记录「用户是否在底部」：插入内容本身会把 value < maximum，事后
+        # 判断会把每个在底部的用户都误判成「已上翻」。
+        sb = self.chat_view.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 2
         cursor = self.chat_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         # 用 insertText 而非 insertHtml：HTML 的空白折叠规则会丢掉 chunk 之间的
         # 前导/后随空格（"Hello" + " World" 会被渲染成 "HelloWorld"）。
-        # insertText 保留原始空格，并把 \n 当作真实换行处理。
-        # 思考过程（_on_reasoning）也用 insertPlainText，所以一直显示正常。
+        # 临时光标插入，不 setTextCursor：后者会覆盖用户的光标与选区。
         cursor.insertText(text)
-        self.chat_view.setTextCursor(cursor)
-        self._scroll_to_bottom(self.chat_view)
+        self._scroll_to_bottom(self.chat_view, force=at_bottom)
 
     def _on_reasoning(self, text: str) -> None:
         text = _sanitize_stream_text(text)
         if not text:
             return
+        # 与正文同节奏合并刷新：推理模型每秒可达数百个 chunk，逐块
+        # 「取光标 → 移末尾 → insert → 写回 → 滚动」会让 think_view 每秒
+        # 做数百次全视口重绘。复用 _stream_timer，与 content 一起 flush。
+        self._pending_reasoning.append(text)
+        if self._stream_timer is None:
+            self._stream_timer = QTimer(self)
+            self._stream_timer.setInterval(_STREAM_FLUSH_MS)
+            self._stream_timer.timeout.connect(self._flush_stream)
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+
+    def _flush_reasoning(self) -> None:
+        buf = getattr(self, "_pending_reasoning", None)
+        if not buf:
+            return
+        text = "".join(buf)
+        buf.clear()
+        # 先记录「用户是否在底部」（插入会改变 maximum，事后判断失真）。
+        sb = self.think_view.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 2
         # Move the widget cursor to the end before inserting. Without this,
         # insertPlainText writes at whatever position the cursor happens to be
         # (e.g. after the user clicked the view to read earlier output), which
         # interleaves new text with existing lines -> overlap.
+        # 用**临时**光标插入：setTextCursor 会覆盖用户的光标与选区。
         cursor = self.think_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.think_view.setTextCursor(cursor)
-        self.think_view.insertPlainText(text)
-        self._scroll_to_bottom(self.think_view)
+        cursor.insertText(text)
+        self._scroll_to_bottom(self.think_view, force=at_bottom)
 
     def _on_tool_start(self, name: str, args: Any) -> None:
         import json as _json
+        # 工具行必须排在流式正文之后 —— 落盘缓冲，避免交错的换行顺序。
+        # 注意**非** final：标签剥离器的状态跨工具边界保留（<summary> 偶发
+        # 跨 chunk 到达时，final flush 会把 `<summ`/`ary>` 字面碎片当正文
+        # 吐进聊天区；回合开始/结束才复位 stripper，见 _on_send/_on_finished）。
+        self._flush_stream()
         self._streaming_assistant = False  # close any streaming assistant block
         try:
             pretty = _json.dumps(args, ensure_ascii=False)
         except Exception:
             pretty = str(args)
-        self._append_chat(f'<p class="t">🔧 <b>{self._escape(name)}</b>({self._escape(pretty)})…</p>')
-        self._append_log(f"[tool-start] {name} {pretty}")
+        # 截断入参：file_write / 大 grep 一次能把 MB 级 JSON 永久写进
+        # QTextDocument（无上限），聊天区和日志区一起膨胀。
+        shown = pretty if len(pretty) < 400 else pretty[:400] + " …"
+        self._append_chat(f'<p class="t">🔧 <b>{self._escape(name)}</b>({self._escape(shown)})…</p>')
+        self._append_log(f"[tool-start] {name} {shown}")
 
     def _on_tool_end(self, name: str, result: Any) -> None:
         out = result.to_message() if hasattr(result, "to_message") else str(result)
@@ -1492,6 +1766,32 @@ class MainWindow(QMainWindow):
         if skill.name == "_suggested":
             self._pending_skill = skill
 
+    def _on_plan_updated(self, plan) -> None:
+        """把计划快照渲染到计划面板。
+
+        只做纯文本渲染，不弹窗、不打断流式输出 —— 计划的价值在于「随时可
+        见」，而不是在每个步骤变更时抢用户的注意力。
+
+        必须用**信号携带的** plan 快照渲染（``render_plan_dict`` 纯函数）：
+        旧实现转手读 ``self._agent.session.render_plan()`` —— 工作线程的
+        update_plan 工具会原地改 step dict，跨线程读共享可变状态可能渲染出
+        半新半旧的中间态；且 agent 为 None 时会把面板错误清空。
+        """
+        try:
+            text = render_plan_dict(plan if isinstance(plan, dict) else None)
+        except Exception:
+            text = ""
+        if not text:
+            self.plan_view.clear()
+            return
+        self.plan_view.setPlainText(text)
+        self._scroll_to_bottom(self.plan_view)
+
+    def _on_plan_toggle(self, checked: bool) -> None:
+        """收起/展开计划面板（默认展开）。"""
+        self.plan_view.setVisible(not checked)
+        self.plan_toggle_btn.setText("展开" if checked else "收起")
+
     def _show_pending_skill_dialog(self) -> None:
         """Show the skill-suggestion dialog (called after _on_finished)."""
         skill = self._pending_skill
@@ -1518,6 +1818,13 @@ class MainWindow(QMainWindow):
     def _on_finished(self) -> None:
         if not self._busy:  # guard against double-call from _on_error + bridge.finished
             return
+        # 正常收尾 → 撤掉「终止」看门狗，否则它会在 30s 后把已经空闲的 UI
+        # 强行判成超时。
+        wd = getattr(self, "_stop_watchdog", None)
+        if wd is not None:
+            wd.stop()
+        # 收尾前把还没刷出去的流式文本落盘，否则最后几个 chunk 会丢。
+        self._flush_stream(final=True)
         self._busy = False
         self._streaming_assistant = False
         self._set_controls_busy(False)
@@ -1529,8 +1836,11 @@ class MainWindow(QMainWindow):
         # winding down, which Qt aborts as "destroyed while still running".
         worker = self._worker
         self._worker = None
-        if worker is not None:
-            worker.wait(2000)
+        if worker is not None and not worker.wait(2000):
+            # 极端情况：run() 已返回但 OS 线程仍在收尾。保留引用到进程退出
+            # （与 _force_stop_agent 同法），不冒 sip 析构运行中 QThread 的险。
+            logger.warning("UI: worker did not join in 2s; keeping reference")
+            self._orphan_workers.append(worker)
         # Now that streaming is done and the worker thread has joined, it's
         # safe to show the skill-suggestion modal dialog without blocking
         # the UI event loop during streaming.
@@ -1640,28 +1950,37 @@ class MainWindow(QMainWindow):
         self._scroll_to_bottom(self.log_view)
 
     @staticmethod
-    def _scroll_to_bottom(widget) -> None:
+    def _scroll_to_bottom(widget, force: bool = False) -> None:
         """Pin the widget's viewport to the bottom so the latest content is
         always visible.
 
-        ``ensureCursorVisible()`` alone only scrolls *just enough* to reveal the
-        cursor; if the user has scrolled up to read earlier output, that leaves
-        the view somewhere in the middle rather than at the very bottom. We move
-        the cursor to the document end, ask Qt to reveal it, and then explicitly
-        snap the vertical scrollbar to its maximum as a belt-and-suspenders
-        guarantee that the newest line is on screen.
+        直接把垂直滚动条置到最大值即可吸底 —— **绝不** ``setTextCursor(End)``：
+        旧实现「光标移到末尾 + ensureCursorVisible + 滚动条置底」三连里，前两步
+        会覆盖用户的光标与选区，用户正在选中文本准备复制时会被反复打断。
+        滚动条置底达到同样的视觉效果且零副作用。
+
+        默认只在**已经吸底**时跟随：用户上翻阅读时停止自动跟随，拉回底部
+        即恢复（与主流终端行为一致）。``force=True`` 供流式写入方使用：它们
+        在插入**前**记录的 at-bottom 状态（插入本身会抬高 maximum，事后判断
+        会把在底部的用户误判成上翻）。
         """
-        cursor = widget.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        widget.setTextCursor(cursor)
-        widget.ensureCursorVisible()
         sb = widget.verticalScrollBar()
+        if not force and sb.value() < sb.maximum() - 2:
+            return  # 用户正在上翻，不打断
         sb.setValue(sb.maximum())
 
     def _on_clear_chat(self) -> None:
+        if self._busy:
+            self.status_label.setText("正在运行中…（等待当前回合结束）")
+            return
         self.chat_view.clear()
         self.think_view.clear()
+        self.plan_view.clear()
         self._streaming_assistant = False
+        self._pending_content.clear()
+        self._pending_reasoning.clear()
+        self._total_tokens = 0
+        self.token_label.setText("总计 0 tokens")
         if self._agent is not None:
             self._agent.reset()
 
@@ -1710,6 +2029,12 @@ class MainWindow(QMainWindow):
                     logger.warning("UI: agent worker did not finish in 3s, terminating")
                     self._worker.terminate()
                     self._worker.wait(2000)
+                    # terminate() 不释放任何 Python/Qt 锁：被杀的线程可能正
+                    # 持有 ToolRegistry._retriever_lock / MCPClient._lock /
+                    # RAGEngine._store_lock。之后若再走 tools.shutdown() 会在
+                    # `with self._lock:` 处永久阻塞 → 关窗口挂死。
+                    # 因此标记一下，下面跳过所有需要取锁的释放动作。
+                    self._worker_terminated = True
             self._worker = None
         # --- FetchModelsWorker: a quick HTTP call, usually finishes fast.
         if self._fetch_worker is not None:
@@ -1749,8 +2074,20 @@ class MainWindow(QMainWindow):
                     self._deps_worker.terminate()
                     self._deps_worker.wait(1000)
             self._deps_worker = None
+        # --- 强杀残留的孤儿 worker：wait 超时保住的引用，退出前再等一次。
+        # 多数此时已经跑完（只是当时没等及）；还在跑的 daemon 线程随进程退出
+        # 由 OS 回收——但绝不能在这里丢引用（sip 析构运行中的 QThread → qFatal）。
+        for orphan in getattr(self, "_orphan_workers", []):
+            try:
+                orphan.wait(500)
+            except RuntimeError:
+                pass
+        self._orphan_workers = []
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
-        if self._agent is not None:
+        # 线程被 terminate() 强杀时，它可能正持有这些子系统内部的锁，此处
+        # 任何取锁操作都会永久阻塞 → 直接跳过，交给进程退出时由 OS 回收
+        # （MCP 子进程是 start_new_session，shell_run 子进程有 atexit 钩子）。
+        if self._agent is not None and not getattr(self, "_worker_terminated", False):
             try:
                 self._agent.tools.shutdown()
             except Exception as e:
@@ -1773,10 +2110,13 @@ class MainWindow(QMainWindow):
         # via its signal slot) keeps a C++ object reference alive after the widget
         # is destroyed. Any subsequent log call will emit message_received into
         # freed memory → RuntimeError.
-        if _LOG_HANDLER is not None:
+        # 用**本窗口自己的** handler，而不是模块级全局：若创建过第二个窗口
+        # （或窗口重建），先关的窗口会误删后建窗口的 handler。
+        handler = getattr(self, "_log_handler", None) or _LOG_HANDLER
+        if handler is not None:
             root = logging.getLogger()
             try:
-                root.removeHandler(_LOG_HANDLER)
+                root.removeHandler(handler)
             except Exception:
                 pass
             # Remove the handler from logging._handlerList IN-PLACE.
@@ -1797,14 +2137,18 @@ class MainWindow(QMainWindow):
             try:
                 _logging._handlerList[:] = [
                     wr for wr in _logging._handlerList
-                    if wr() is not _LOG_HANDLER
+                    if wr() is not handler
                 ]
             except Exception:
                 pass
             try:
-                _LOG_HANDLER.close()
+                handler.close()
             except Exception:
                 pass
+            # 模块级全局必须置空，否则 handler 及其 Qt 包装常驻进程。
+            if handler is _LOG_HANDLER:
+                globals()["_LOG_HANDLER"] = None
+            self._log_handler = None
         super().closeEvent(event)
 
 

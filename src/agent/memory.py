@@ -172,6 +172,15 @@ class WorkMemory:
     def clear(self) -> None:
         self._store.replace({})
 
+    def flush(self, force: bool = False) -> None:
+        """把防抖窗口里未落盘的写入立即写盘（淘汰缓存实例前调用）。
+
+        ``force=True`` 绕过 0.5s 防抖间隔——淘汰路径必须用 True，否则
+        刚 set() 的内容会被静默丢弃（旧实现没透传 force，注释里写的
+        「先落盘再丢弃」实际做不到）。
+        """
+        self._store.flush(force=force)
+
 
 class LongTermMemory:
     """Knowledge-graph long-term memory backed by GraphMemoryStore.

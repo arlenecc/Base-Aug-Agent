@@ -204,6 +204,14 @@ class RagIngestTool(Tool):
         pass
 
     def run(self, force: bool = False, **kwargs) -> ToolResult:
+        # 严格布尔解析：模型（或 JSON 序列化）可能把 force 传成字符串
+        # "false"/"0"——旧实现直接用，非空字符串都是真值 → 意外触发全量重建。
+        if isinstance(force, str):
+            force = force.strip().lower() in ("1", "true", "yes", "on")
+        elif force is None:
+            force = False
+        else:
+            force = bool(force)
         logger.info("📥 RAG 工具调用: rag_ingest(force=%s)", force)
         try:
             stats = self._engine.ingest(force=force)

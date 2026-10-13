@@ -18,6 +18,9 @@ from .base import Tool, ToolRegistry, ToolResult
 # 单次抓取最多读入的字节数。httpx 的非流式 get() 会把整个响应体读进内存，
 # 一个几 GB 的文件/流式接口就能把进程打满。
 _MAX_FETCH_BYTES = 8 * 1024 * 1024
+# 交给 BeautifulSoup 的字符上限：建完整 DOM 的内存峰值可达响应体的数十倍。
+# 上面只限制了下载量，解析量还得单独限一道。
+_MAX_PARSE_CHARS = 2 * 1024 * 1024
 
 
 def _read_capped(client, url: str) -> str:
@@ -117,14 +120,27 @@ class WebScanTool(Tool):
             return ToolResult(False, error=f"Only http/https URLs are supported: {url[:80]}")
         try:
             text = _read_capped(self._http, url)
+        except httpx.TimeoutException as e:
+            # 传输层错误透出 httpx 原文（如 "[Errno 61] Connection refused"）
+            # 对模型难以据此改参数。分类给出可操作提示。
+            return ToolResult(
+                False,
+                error=f"Request failed (network unreachable or timed out after 30s): "
+                      f"{type(e).__name__}: {e}. Check the URL/host and retry, "
+                      f"or use shell_run(curl) to diagnose connectivity.",
+            )
+        except httpx.HTTPError as e:
+            return ToolResult(False, error=f"Request failed: {type(e).__name__}: {e}")
         except Exception as e:
-            return ToolResult(False, error=f"Request failed: {e}")
+            return ToolResult(False, error=f"Request failed: {type(e).__name__}: {e}")
         if text.startswith("__HTTP_ERROR__"):
             return ToolResult(False, error=f"HTTP {text[len('__HTTP_ERROR__'):]}")
         if raw:
             return ToolResult(True, output=text[:20000])
         if BeautifulSoup is not None:
-            soup = BeautifulSoup(text, "html.parser")
+            # 建完整 DOM 的内存峰值可达响应体的数十倍、耗时数秒。
+            # _MAX_FETCH_BYTES 只限制了下载，这里再限制解析量。
+            soup = BeautifulSoup(text[:_MAX_PARSE_CHARS], "html.parser")
             for tag in soup(["script", "style", "noscript"]):
                 tag.decompose()
             content = soup.get_text(separator="\n")
