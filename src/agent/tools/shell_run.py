@@ -2,8 +2,10 @@
 
 Runs the command with the workspace as cwd, captures stdout+stderr, and
 enforces a timeout so a hung command cannot block the agent indefinitely.
-Marked destructive because shell commands can affect the system arbitrarily;
-the agent's confirmation policy prompts the user before execution.
+
+确认策略（tools/risk.py）：默认直接执行；仅 sudo/系统电源控制/进程杀伤/
+磁盘操作/管道下载执行/git push --force/写工作区之外路径才弹人工确认
+（`config.always_confirm_code=True` 可恢复逐次确认的旧行为）。
 """
 from __future__ import annotations
 
@@ -15,9 +17,11 @@ import signal
 import subprocess
 import threading
 import time
+from typing import Any, Dict
 
 from ..config import AgentConfig
 from .base import Tool, ToolRegistry, ToolResult
+from .risk import is_risky_command
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +73,20 @@ class ShellRunTool(Tool):
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        """风险分级确认（见 tools/risk.py 模块注释）。
+
+        旧实现 destructive=True 一律弹确认——shell_run 是 code_run 对系统
+        命令的延伸，高频调用把工作流切成碎片。改为静态风险分级：读系统
+        文件、工作区内写等直接执行；sudo/系统电源控制/进程杀伤/磁盘操作/
+        管道下载执行/git push --force/写工作区之外路径才弹确认。
+        `config.always_confirm_code=True` 可恢复旧的逐次确认行为。
+        """
+        if getattr(self.config, "always_confirm_code", False):
+            return True
+        return is_risky_command(str((args or {}).get("command", "")),
+                                self.config.workspace)
 
     def _cancel_checker(self):
         """协作式取消探针（UI「终止对话」）。拿不到 callbacks 时恒 False。"""

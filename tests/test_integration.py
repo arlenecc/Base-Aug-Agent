@@ -79,7 +79,8 @@ def test_e2e_workspace_write_runs_without_confirmation(config, recording_callbac
 
 
 def test_e2e_code_run_confirms(config, recording_callbacks):
-    """code_run can affect the system, so it must ask the user first."""
+    """破坏性 code_run 调用必须先弹确认（e2e 确认链路）。"""
+    config.always_confirm_code = True   # 本测试专测确认链路本身
     recording_callbacks._confirm_return = True
     tc = [{"id": "c1", "function": {"name": "code_run",
             "arguments": json.dumps({"code": "print(2+2)"})}}]

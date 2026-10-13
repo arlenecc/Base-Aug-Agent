@@ -18,6 +18,17 @@ def _evt(t, content="", tool_calls=None, usage=None):
     return StreamEvent(type=t, content=content, tool_calls=tool_calls or [], usage=usage or {})
 
 
+@pytest.fixture(autouse=True)
+def _legacy_confirm_policy(config):
+    """本文件的历史用例建立在「code_run/shell_run 每次都确认」的旧契约上。
+
+    新的确认策略（tools/risk.py）是风险分级的——良性代码直接执行。这里把
+    本模块的配置切回逐次确认，保持历史断言（confirms == 1 等）不变；
+    新策略的行为断言在 tests/test_confirm_policy.py。
+    """
+    config.always_confirm_code = True
+
+
 class MockLLM:
     """Replays a queue of canned event-lists, one per chat_stream call."""
 

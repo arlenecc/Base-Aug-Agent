@@ -26,10 +26,11 @@ import sys
 import threading
 import time
 import traceback
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..config import AgentConfig
 from .base import Tool, ToolRegistry, ToolResult
+from .risk import is_risky_code
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,20 @@ class CodeRunTool(Tool):
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+
+    def should_confirm(self, args: Dict[str, Any]) -> bool:
+        """风险分级确认（见 tools/risk.py 模块注释）。
+
+        code_run 是能力核心、几乎每轮都用，destructive=True 的一律确认把
+        工作流切成碎片。改为静态风险分级：sudo / 管道下载执行 /
+        git push --force / 破坏性调用（rmtree/remove/chmod/subprocess 等）
+        作用到工作区之外路径才弹确认；其余直接执行（写护栏仍会拦截工作区
+        外的 open 写入，超时与取消机制不变）。
+        """
+        if getattr(self.config, "always_confirm_code", False):
+            return True
+        return is_risky_code(str((args or {}).get("code", "")),
+                             self.config.workspace)
 
     def _cancel_checker(self):
         """协作式取消探针（UI「终止对话」）。拿不到 callbacks 时恒 False。"""

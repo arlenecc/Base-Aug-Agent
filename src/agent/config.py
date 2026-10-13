@@ -64,6 +64,11 @@ class AgentConfig:
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
 
+    # code_run / shell_run 的确认策略。默认 False = 风险分级（tools/risk.py）：
+    # 只读与工作区内操作直接执行，sudo/系统控制/写工作区外路径等才弹确认。
+    # True = 恢复旧的逐次确认行为。
+    always_confirm_code: bool = False
+
     # MCP servers – list of {name, command, args?, env?} dicts.
     # Example:
     #   [{"name": "filesystem", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}]
@@ -81,7 +86,7 @@ class AgentConfig:
                      "request_timeout", "context_shrink_ratio")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
                    "rag_embedding_model", "rag_rerank_model", "browser_endpoint")
-    _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
+    _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest", "always_confirm_code")
 
     @classmethod
     def _coerce(cls, name: str, value):

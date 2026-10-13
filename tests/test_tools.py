@@ -239,12 +239,16 @@ def test_shell_run_uses_workspace_cwd(config):
     assert os.path.abspath(config.workspace) in res.output or config.workspace in res.output
 
 
-def test_shell_run_is_destructive(config):
-    """shell_run can execute arbitrary system-affecting commands, so it must
-    require confirmation."""
+def test_shell_run_risk_graded_confirmation(config):
+    """shell_run 按风险分级确认（tools/risk.py）：良性命令直接执行，
+    sudo/系统控制/写工作区外路径才弹确认。"""
     reg = _reg(config)
     assert reg.get("shell_run").destructive is True
-    assert reg.get("shell_run").should_confirm({"command": "ls"}) is True
+    assert reg.get("shell_run").should_confirm({"command": "ls"}) is False
+    assert reg.get("shell_run").should_confirm({"command": "cat /etc/hosts"}) is False
+    assert reg.get("shell_run").should_confirm({"command": "sudo rm -rf /tmp/x"}) is True
+    assert reg.get("shell_run").should_confirm(
+        {"command": "echo x > /etc/hosts"}) is True
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +410,10 @@ def test_destructive_flags(config):
 
 def test_should_confirm_default_follows_destructive(config):
     reg = _reg(config)
-    assert reg.get("code_run").should_confirm({"code": "print(1)"}) is True
+    # code_run：良性代码直接执行（风险分级，见 tools/risk.py）
+    assert reg.get("code_run").should_confirm({"code": "print(1)"}) is False
+    assert reg.get("code_run").should_confirm(
+        {"code": "os.system('sudo x')"}) is True
     assert reg.get("file_write").should_confirm({"path": "a", "content": "b"}) is False
     assert reg.get("file_read").should_confirm({"path": "a"}) is False
 
