@@ -166,6 +166,11 @@ _MAX_DAILY_FACTS = 200          # 当天事实桶的持久化条数上限
 # 并发执行的工具上限。模型一次返回多个互相独立的只读调用时（多个 file_read /
 # rag_search / web_scan），串行会让 wall time 变成 Σ，并发后是 max。
 _MAX_PARALLEL_TOOLS = 8
+
+# 自动续跑段数上限（每段 = 一次完整内核 run）。MAX_TURNS 截断或「提前收尾但
+# 计划未完成」时自动续跑，替代旧的「停车等用户手动输入继续」。每段仍是完整
+# 的内核 run，取消/反思门/失败恢复全部生效；额度用尽才交回用户。
+_AUTO_CONTINUE_MAX = 2
 # 允许并发的工具白名单：纯只读、彼此无顺序依赖。写操作（file_write /
 # file_modify）即使 destructive=False（工作区锁定）也不能并发——两个写操作
 # 可能落在同一个文件上。
@@ -363,6 +368,9 @@ class Agent:
         self.tools.session = self.session
         self._last_user_text = ""
         self._distill_min_turns = 6
+        # 自动续跑开关（MAX_TURNS 截断 / 提前收尾但计划未完成时自动续跑，
+        # 替代「停车等用户手动输入继续」）。测试可置 False 关闭。
+        self._auto_continue = True
         self.dispatcher = _ToolDispatcher(self)
         self.kernel = KernelLoop(
             # 传 callable：UI「应用配置」会整体替换 agent.llm
@@ -790,11 +798,26 @@ class Agent:
         # 任务边界：上一个计划已全部终态化 → 新请求应当重新规划。
         # 不清的话旧计划会一直通过 anchor 回注，模型沿着过期计划走，也不再调用
         # update_plan —— 表现为「计划面板停在第一次那幅，新任务没人监督」。
-        # 若还有未完成步骤则**保留**：用户说「继续」时要能接着干。
+        # 若还有未完成步骤则**保留**（用户说「继续」时要能接着干），但必须注入
+        # 一次性 fork 提示：旧计划有 open 步骤时模型会静默沿用旧计划——上一任务
+        # 的卡住步骤会让**新任务**也顶着旧计划跑，表现为「新任务的计划与输入
+        # 无关」。提示强制模型显式判断：新任务 → create 替换；继续 → 接着做。
         if (self.session.get_plan() is not None
                 and not self.session.plan_open_steps()):
             self.session.clear_plan()
             self._log("[plan] 上一任务已收尾，清空计划以便重新规划")
+        elif self.session.get_plan() is not None:
+            open_ids = "; ".join(
+                f"{s.get('id')}.{s.get('title')}"
+                for s in self.session.plan_open_steps()[:5]
+            )
+            self.session.working["__plan_boundary__"] = (
+                f"上一个任务的计划还有未完成步骤：{open_ids}。请先判断本条消息的意图："
+                "若是一个**新任务**（与旧计划的目标无关），立即用 update_plan"
+                "(op=\"create\", goal=..., steps=[...]) 建立新计划替换旧计划，"
+                "不要沿用无关步骤；若是要求**继续**上一个任务，则从剩余步骤接着执行。"
+            )
+            self._log("[plan] 上一任务计划未收尾，已注入新任务/继续任务的判断提示")
         # 每轮同步一次面板：即使模型本轮没调 update_plan，用户看到的也是
         # Session 的真实状态（而不是上一轮的残影）。
         try:
@@ -807,15 +830,84 @@ class Agent:
 
         result: KernelResult = self.kernel.run(user_input)
 
-        if result.reason is ExitReason.MAX_TURNS:
-            self._log("[agent] max turns reached, stopping.")
-            # 让下一轮知道上一轮是被轮次上限截断的：否则模型会以为任务已完成。
-            self.session.working["__truncated__"] = (
-                f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
-                f"任务可能尚未完成。请先总结已完成的进展，再询问用户是否继续。"
+        # ---- 自动续跑：消灭「必须人工输入继续才能往下走」----
+        # 两类停车都不该甩回给用户：
+        #   1. MAX_TURNS：长任务在轮次上限处被硬截断；
+        #   2. DONE 但计划仍有未完成步骤（反思门提醒额度用尽）：模型反复给出
+        #      文字总结，而计划面板显示还有 open 步骤——用户看到的正是
+        #      「实际已完成却一直显示有未完成项，必须打继续」。
+        # 每段续跑都是完整的内核 run（轮次预算/反思门/取消/失败恢复全部生效，
+        # _finish_nudge 等记账也随 run 重置）；最多续 _AUTO_CONTINUE_MAX 段，
+        # 期间用户点「终止」立即停。额度用尽才真正交回用户。
+        segments = 0
+        while (segments < _AUTO_CONTINUE_MAX
+               and self._auto_continue
+               and result.reason in (ExitReason.MAX_TURNS, ExitReason.DONE)
+               and not self._cancelled()
+               and self._should_auto_continue(result)):
+            segments += 1
+            open_ids = "; ".join(
+                f"{s.get('id')}.{s.get('title')}"
+                for s in self.session.plan_open_steps()[:5]
             )
+            if result.reason is ExitReason.MAX_TURNS:
+                self._log(f"[agent] 达到轮次上限，自动续跑 {segments}/{_AUTO_CONTINUE_MAX}")
+                self.session.working["__truncated__"] = (
+                    f"[系统提示] 上一段在达到轮次上限（{self.max_iterations}）后被自动续跑。"
+                    "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
+                    "若全部步骤已完成，用 update_plan 收尾并给出最终答复。"
+                )
+                result = self.kernel.run(
+                    "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
+                    "请继续执行计划中的剩余步骤；不要询问用户是否继续。"
+                )
+            else:
+                self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
+                          f"{segments}/{_AUTO_CONTINUE_MAX}")
+                self.session.working["__plan_boundary__"] = (
+                    f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。"
+                    "若这些步骤的工作**实际已经完成**，立即用 update_plan"
+                    "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
+                    "然后给出最终答复；若尚未完成，继续执行；若确实不可行，"
+                    "标为 blocked/skipped 并写明原因后再给出最终答复。"
+                    "不要再次只给出文字总结就停止。"
+                )
+                result = self.kernel.run(
+                    "[System] 上一条回复被判定为提前收尾，已自动续跑。"
+                    "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。"
+                )
+        if result.reason is ExitReason.MAX_TURNS:
+            if segments:
+                # 续跑额度用尽仍被截断：如实告知用户，等待指示。
+                self._log("[agent] 轮次上限且自动续跑额度用尽，停车等待用户指示。")
+                self.session.working["__truncated__"] = (
+                    f"[系统提示] 任务已连续 {segments + 1} 段达到最大轮次上限"
+                    f"（每段 {self.max_iterations} 轮），已自动停止。"
+                    "请先总结已完成的进展与剩余工作，等待用户指示后再继续。"
+                )
+            else:
+                self._log("[agent] max turns reached, stopping.")
+                # 让下一轮知道上一轮是被截断的：否则模型会以为任务已完成。
+                self.session.working["__truncated__"] = (
+                    f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
+                    "任务可能尚未完成。请先总结已完成的进展，再继续执行剩余步骤。"
+                )
         self.callbacks.on_finished()
         return result.text
+
+    def _should_auto_continue(self, result: KernelResult) -> bool:
+        """判断是否值得自动续跑。"""
+        if result.reason is ExitReason.MAX_TURNS:
+            return True
+        if result.reason is ExitReason.DONE:
+            return bool(self.session.plan_open_steps())
+        return False
+
+    def _cancelled(self) -> bool:
+        try:
+            return bool(self.callbacks.is_cancelled())
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # 兜底收缩：内核 L3 折叠用尽后仍未落回预算时的最后一道防线

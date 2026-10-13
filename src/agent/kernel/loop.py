@@ -297,8 +297,11 @@ class KernelLoop:
                     else:
                         pending = (
                             f"[System] 计划中还有 {len(open_steps)} 个未完成步骤：{todo}。"
-                            "请继续执行下一步（调用相应工具）；若某步确实无法完成，先用 "
-                            "update_plan 把它标为 blocked/skipped 并写明原因，再给出总结。"
+                            "请继续执行下一步（调用相应工具）。注意：若某步的工作**实际已经"
+                            "完成**只是忘了更新状态，用 update_plan(op=\"patch\", "
+                            "step_id=..., status=\"done\", note=\"结论\") 收尾即可，"
+                            "不要为响应提醒而重复已完成的工作；若某步确实无法完成，"
+                            "把它标为 blocked/skipped 并写明原因。"
                         )
                     self.log(f"[kernel] 反思门：还有 {len(open_steps)} 步未完成，提醒继续")
                     continue

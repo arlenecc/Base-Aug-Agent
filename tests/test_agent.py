@@ -191,9 +191,12 @@ def test_agent_stops_after_max_iterations(config, recording_callbacks):
     mock = MockLLM([loop] * 100)
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
     agent.max_iterations = 3
+    agent._distill_min_turns = 999  # 隔离异步蒸馏线程（否则它会复用同一 mock）
     agent.run("loop")
 
-    assert len(mock.calls) <= 3
+    # 每段最多 max_iterations 轮；MAX_TURNS 触发自动续跑（上限 2 段），
+    # 总调用数有界 —— 不断言 ==3，只断言不会无限循环。
+    assert len(mock.calls) <= 3 * 3
 
 
 # ---------------------------------------------------------------------------
@@ -1353,6 +1356,7 @@ def test_max_iterations_leaves_continuation_hint(config, recording_callbacks):
     mock = MockLLM([[_evt("done", tool_calls=tc, usage={"total_tokens": 5})]])
     agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
     agent.max_iterations = 1
+    agent._auto_continue = False    # 本测试专测截断提示；自动续跑会消耗脚本
 
     agent.run("read")
     hint = agent.session.working.get("__truncated__", "")

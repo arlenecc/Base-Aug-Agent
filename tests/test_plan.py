@@ -406,7 +406,11 @@ def test_plan_resets_when_previous_task_finished(cfg):
 
 
 def test_plan_survives_when_previous_task_unfinished(cfg):
-    """有未完成步骤时保留计划 —— 用户说「继续」要能接着干。"""
+    """有未完成步骤时保留计划 —— 用户说「继续」要能接着干。
+
+    同时验证：run() 开始时注入一次性「新任务/继续任务」的 fork 提示
+    （`__plan_boundary__`），模型不再静默沿用旧计划。
+    """
     mock = MockLLM([
         [_evt("done", tool_calls=_plan_call("create", goal="任务A",
                                              steps=[{"title": "a"}, {"title": "b"}]),
@@ -420,10 +424,11 @@ def test_plan_survives_when_previous_task_unfinished(cfg):
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
     agent.max_iterations = 15
+    agent._auto_continue = False     # 本测试专测「停车等用户」的边界状态
     agent.run("任务A")
     assert [s["id"] for s in agent.session.plan_open_steps()] == ["2"]
 
-    # 「继续」：计划必须还在
+    # 「继续」：计划必须还在，且锚点里出现 fork 提示（新任务 → create 替换）
     mock2 = MockLLM([
         [_evt("done", tool_calls=_plan_call("patch", step_id="2", status="done",
                                             note="补做"), usage={"total_tokens": 1})],
@@ -434,6 +439,52 @@ def test_plan_survives_when_previous_task_unfinished(cfg):
     assert agent.session.get_plan() is not None
     assert agent.session.get_plan()["goal"] == "任务A"
     assert agent.session.plan_open_steps() == []
+    anchor = next(
+        (str(m.get("content") or "") for m in reversed(mock2.calls[0]["messages"])
+         if m.get("role") == "user"), "")
+    assert "新任务" in anchor and "create" in anchor, (
+        "计划有 open 步骤时，run() 必须注入新任务/继续任务的 fork 提示"
+    )
+
+
+def test_auto_continue_resumes_after_max_turns(cfg):
+    """轮次上限截断时自动续跑，不再要求用户手动输入「继续」。"""
+    tc = [{"id": "c1", "function": {"name": "file_write",
+                                    "arguments": json.dumps({"path": "x.txt", "content": "v"})}}]
+    mock = MockLLM([
+        # 第一段：3 轮工具调用耗尽 max_iterations=3 → MAX_TURNS
+        *([[_evt("done", tool_calls=tc, usage={"total_tokens": 1})]] * 3),
+        # 续跑段：完成任务
+        [_evt("content", "任务完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 3
+    out = agent.run("做多步任务")
+    assert out == "任务完成"
+    assert len(mock.calls) >= 4, "MAX_TURNS 后应自动续跑而不是停车"
+
+
+def test_auto_continue_finishes_premature_stop(cfg):
+    """「提前收尾但计划未完成」时自动续跑：模型在续跑段把步骤补上收尾。"""
+    mock = MockLLM([
+        [_evt("done", tool_calls=_plan_call("create", goal="g",
+                                            steps=[{"title": "a"}]),
+          usage={"total_tokens": 1})],
+        # 想直接文字收尾 → 反思门提醒 2 次仍不改（plan 有 open 步骤）
+        [_evt("content", "做完了"), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "真的做完了"), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "就这样"), _evt("done", usage={"total_tokens": 1})],
+        # 自动续跑段：按提示把步骤补成 done 后正常收尾
+        [_evt("done", tool_calls=_plan_call("patch", step_id="1", status="done",
+                                            note="补记"), usage={"total_tokens": 1})],
+        [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 15
+    out = agent.run("做任务")
+    assert out == "全部完成"
+    assert agent.session.plan_open_steps() == []
+    assert len(mock.calls) >= 6
 
 
 def test_run_start_notifies_plan_to_ui(cfg):

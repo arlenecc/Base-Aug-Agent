@@ -210,7 +210,14 @@ class UpdatePlanTool(Tool):
                     error="patch with only 'note' requires 'step_id'",
                 )
             if not targets:
-                return ToolResult(False, error=f"no step matched step_id={target!r}")
+                # 错误必须带上当前计划：模型最常见的失败就是记错 step_id
+                #（计划被 create 替换后 id 变了）。只报 "no step matched"
+                # 模型只能瞎猜重试；附上计划渲染它一次就能自纠。
+                return ToolResult(
+                    False,
+                    error=(f"no step matched step_id={target!r}; "
+                           f"current plan:\n{sess.render_plan()}"),
+                )
             for s in targets:
                 if new_status:
                     s["status"] = new_status

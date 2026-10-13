@@ -237,6 +237,13 @@ class Session:
         truncated = self.working.pop("__truncated__", None)
         if truncated:
             parts.append(f"[SYSTEM] {truncated}")
+        # 任务边界提示（agent.run 在「计划仍有未完成步骤 + 新的用户请求」时
+        # 注入）：一次性消费，模型必须在「新任务重建计划 / 继续旧任务」之间
+        # 显式判断。没有这个提示时，模型会静默沿用旧计划——表现为「新任务的
+        # 计划面板显示的是上一个任务的内容」。
+        boundary = self.working.pop("__plan_boundary__", None)
+        if boundary:
+            parts.append(f"[SYSTEM] {boundary}")
         facts = self.working.get("facts")
         if isinstance(facts, dict) and facts:
             parts.append(f"<facts>{compact_json(facts, 600)}</facts>")
