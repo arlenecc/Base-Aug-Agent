@@ -883,7 +883,8 @@ class Agent:
                 )
                 result = self.kernel.run(
                     "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
-                    "请继续执行计划中的剩余步骤；不要询问用户是否继续。"
+                    "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
+                    resume=True,
                 )
             else:
                 self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
@@ -899,7 +900,8 @@ class Agent:
                 )
                 result = self.kernel.run(
                     "[System] 上一条回复被判定为提前收尾，已自动续跑。"
-                    "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。"
+                    "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
+                    resume=True,
                 )
             carry = self.kernel.failure_snapshot()
         if result.reason is ExitReason.MAX_TURNS:

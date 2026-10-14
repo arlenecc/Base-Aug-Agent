@@ -39,7 +39,9 @@ class UpdatePlanTool(Tool):
     name = "update_plan"
     description = (
         "Manage the structured execution plan (goal + ordered steps). "
-        "Call op='create' ONCE before starting a non-trivial task, "
+        "Call op='create' ONCE BEFORE starting a non-trivial task — the plan "
+        "MUST be written into the execution plan before any actual tool call is "
+        "issued, so progress is tracked from step one; "
         "op='patch' to mark a step done/blocked with its conclusion, "
         "op='append' when you discover a missing step, op='clear' when finished. "
         "Mark a step 'blocked' only after at least 2 different methods have "

@@ -39,9 +39,30 @@ _CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_]*\n[\s\S]{50,}?```")
 _TAG_STRIP_RE = re.compile(r"<(thinking|think|summary)>[\s\S]*?</\1>", re.I)
 
 # ---- 规划门 / 反思门（防止「跑丢」与「半路停」）---------------------------
-# 任务开始后前几轮还没有计划时，每轮都提醒模型先规划。给 3 次机会：
-# 一直不规划就放行（可能是「帮我读个文件」这类一句话任务，强制规划反而烦人）。
-_PLAN_GATE_TURNS = 3
+# 规划门：任务开始后、还没干过实际活、且还没有计划时，每轮提醒先规划；一旦
+# 开始干实际活就停止（一句话任务如「读 a.txt」不被强制规划）。多步任务真正
+# 要执行前，ACT 态的「规划前置门」还会硬拦一次，强制先把计划写进 Session。
+_PLAN_GATE_TURNS = 3  # 历史常量/测试断言用；规划门现已持续化（见 THINK 态）
+# 补建提示上限：已开始执行但 plan 仍空时，最多提醒这么多次把计划补上（兜底，
+# 防止「首轮误执行」导致全程无 plan 可跟踪）。
+_PLAN_NUDGE_MAX = 3
+# 多步任务信号：用户输入命中这些模式时视为应强制先规划（硬拦截不豁免）。
+_MULTISTEP_HINT = re.compile(
+    r"(步骤|计划|规划|先做|先要|然后|接着|依次|分别|逐个|多个|多项|"
+    r"第[一二三四五六七八九十\d]+步|^\s*\d+[\.、\)]|一、|二、|首先|其次|最后|"
+    r"以下任务|分别做|依次做|分步)",
+    re.I | re.M,
+)
+# 多步任务却只在文本里「规划 + 声称开始」、既没把计划写入执行计划也没真正
+# 动手就想收尾时，反思门给出的强制纠正提示。
+_PLAN_FINISH_HINT = (
+    "[System] 你只是在回复文本里写出了计划、并声称「开始执行第一个任务」，"
+    "但既没有调用 update_plan 把计划写入执行计划（Session.working['plan'] 为空），"
+    "也没有发出任何实际工具调用——这等于什么都没做。\n"
+    "请立即：1) 用 update_plan(op='create', goal=..., steps=[...]) 把计划写入执行计划；"
+    "2) 紧接着发出第一步的实际工具调用并持续推进，直到计划完成。\n"
+    "禁止只在文本里描述计划——计划必须写进执行计划，每一步都必须真正调用工具。"
+)
 # 模型想收尾但计划里还有未完成步骤时的最大提醒次数。超过后尊重模型的决定，
 # 但在回复末尾附上未完成清单——用户必须知道任务其实没做完。
 _FINISH_NUDGE_MAX = 2
@@ -66,9 +87,10 @@ _BLOCK_NUDGE_MAX = 2
 
 _PLAN_GATE_HINT = (
     "\n[System] 开始执行前，先用 update_plan(op=\"create\", goal=..., steps=[...]) "
-    "把目标和路径规划成 2~7 个可验证的步骤；**紧接着就在同一轮或下一轮开始执行"
-    "第一步**（计划建好不等于任务开始，不要停下来问用户是否开始/是否继续）；"
-    "然后从第一步开始，每完成一步就用 "
+    "把目标和路径规划成 2~7 个可验证的步骤，并写入执行计划（Session.working['plan']）；"
+    "**计划建好之前不要先发实际工具调用**——先把目标与步骤登记为执行计划，"
+    "再**紧接着在同一轮或下一轮开始执行第一步**（计划建好不等于任务开始，"
+    "不要停下来问用户是否开始/是否继续）；然后从第一步开始，每完成一步就用 "
     "update_plan(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 更新进度。"
 )
 
@@ -155,6 +177,9 @@ class KernelLoop:
         # 本段是否真的动过手（调用过非 update_plan 的工具）。建完计划一次实际
         # 工具调用都没有就想收尾 = 「只规划不执行」，反思门必须多拦几次。
         self._did_work = False
+        # 补建提示计数：已开始执行但 plan 仍空时，最多提醒 _PLAN_NUDGE_MAX 次。
+        self._plan_nudged = 0
+        self._plan_finish_nudge = 0
         # 上层（Agent 自动续跑）注入的「上一段失败上下文」，run() 开始时消费一次。
         self._seed_failures: Optional[Dict[str, Any]] = None
 
@@ -178,7 +203,7 @@ class KernelLoop:
     # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
-    def run(self, user_input: str) -> KernelResult:
+    def run(self, user_input: str, resume: bool = False) -> KernelResult:
         session = self.session
         self.state = KernelState.THINK
         self._empty_retry = 0
@@ -192,6 +217,12 @@ class KernelLoop:
         self._step_fails = 0
         self._block_nudge = 0
         self._did_work = False
+        self._plan_nudged = 0
+        self._plan_finish_nudge = 0
+        # 续跑段（Agent 自动续跑）跳过「规划前置门」：续跑由系统提示驱动，
+        # 其 user_input 含「步骤 / 继续执行」等多步信号，不应被当成用户发起的
+        # 多步任务而强制先建计划——否则会把续跑段的正常收尾也卡掉。
+        self._resume = resume
         # 续跑段：把上一段的失败上下文带进来（见 seed_failures / failure_snapshot）。
         # 不这么做的话，新段 _failed_total=0 → 反思门退回默认 2 次预算，且提醒里
         # **不再有任何错误信息** —— 模型在续跑段完全不知道上一段卡在哪，只能
@@ -247,11 +278,11 @@ class KernelLoop:
 
             # ---- THINK ----
             self.state = KernelState.THINK
-            # 规划门：任务已开始但还没有计划时，提醒先规划再动手。
-            # 只在前几轮施加，之后放行——一句话任务（「读一下 a.txt」）强制
-            # 规划只会添乱。
-            if (session.get_plan() is None
-                    and self._turns_used < _PLAN_GATE_TURNS):
+            # 规划门：还没干过实际活、且还没有计划时，持续提醒先规划再动手。
+            # 一旦开始干实际活（调过非 update_plan 的工具）就停止——一句话任务
+            # （「读一下 a.txt」）不会被强制规划。多步任务真正要执行前，ACT 态
+            # 的「规划前置门」还会硬拦一次（见下）。
+            if session.get_plan() is None and not self._did_work:
                 pending = (pending or "") + _PLAN_GATE_HINT
             user_text = session.anchor_prompt(extra=pending)
             rec = session.start_turn(user_text)
@@ -299,6 +330,19 @@ class KernelLoop:
                 # 了，实际步骤没走完。提醒有限次，超过后尊重决定但在回复里附上
                 # 未完成清单（用户必须知道任务并没完成）。
                 open_steps = session.plan_open_steps()
+                # 多步任务却连执行计划都没写、也没真正动手就想收尾 —— 这正是
+                # 「思考里显示计划 + 声称开始第一个任务，然后就停住、什么也没干」
+                # 的失败模式。先拦：必须先把计划写入执行计划并立即发第一步工具。
+                if (session.get_plan() is None
+                        and _MULTISTEP_HINT.search(user_input or "")
+                        and not self._did_work
+                        and self._plan_finish_nudge < _FINISH_NUDGE_PLAN_MAX
+                        and not self._resume):
+                    self._plan_finish_nudge += 1
+                    self._rollback_turn(session)
+                    pending = _PLAN_FINISH_HINT
+                    self.log("[kernel] 反思门：多步任务未写计划也未动手，强制要求先 create 并开工")
+                    continue
                 # 预算分三档。「停下来问用户是否继续」在两种情况下尤其不该放行：
                 #   1. 发生过失败 → 应依据错误信息自动恢复（最宽）；
                 #   2. 计划建好了但本段一次实际工具调用都没有 → 只是把计划念了
@@ -401,6 +445,36 @@ class KernelLoop:
             # ---- ACT ----
             self.state = next_state(KernelState.THINK, "has_calls")
             tool_calls = resp.tool_calls
+
+            # ---- 规划前置门：先于执行 ----
+            # 多步任务必须先 update_plan(create) 写入执行计划，再逐步执行；否则
+            # 后续没有 plan 可跟踪（anchor_prompt 不回注、UI 面板空、反思门对
+            # open_steps 无效）。软提示（规划门）之外这里硬拦一次：从未建过计划、
+            # 也还没干过实际活，却要发出非 update_plan 的实际工具调用 → 回退该轮
+            # 并强制先规划。本批若已含 update_plan 调用则放行（让 dispatch 先建计划）。
+            # 首轮 + 简短无多步信号的指令视为简单任务，放行（读文件/问答这类
+            # 一句话任务不该被卡住）。
+            has_actual = any(tc.name != "update_plan" for tc in tool_calls)
+            has_plan_op = any(tc.name == "update_plan" for tc in tool_calls)
+            if (session.get_plan() is None
+                    and not self._did_work
+                    and has_actual and not has_plan_op
+                    and not self._resume):
+                simple = (self._turns_used <= 1
+                          and len(user_input or "") <= 60
+                          and not _MULTISTEP_HINT.search(user_input or ""))
+                if not simple:
+                    self._rollback_turn(session)
+                    pending = (
+                        "[System] 你准备执行实际工具，但还没有执行计划（Session 中 plan 为空）。"
+                        "请先用 update_plan(op='create', goal='一句话目标', steps=[...]) 把目标与 "
+                        "2~7 个可验证步骤规划好；创建后工具结果会指示『立即开始第一步』，"
+                        "不要停下来问用户是否开始。计划每轮回注，是后续多步任务跟踪的依据，"
+                        "必须先于执行写入。"
+                    )
+                    self.log("[kernel] 规划前置门：拦截首次执行，要求先 update_plan(create)")
+                    continue
+
             try:
                 raw_results = self.dispatcher.dispatch(tool_calls)
             except Exception as e:
@@ -442,6 +516,18 @@ class KernelLoop:
             # 信息自动换方案，并防住原样重试与「未充分尝试就 blocked」。
             parts.extend(self._recovery_hints(tool_calls, raw_results, batch,
                                               step_fails_before))
+            # 补建提示：已开始执行但 plan 仍空 → 提醒补建计划（兜底）。
+            # 防止「首轮误执行」导致全程无 plan 可跟踪；最多提醒 _PLAN_NUDGE_MAX 次。
+            if (self._did_work and session.get_plan() is None
+                    and self._plan_nudged < _PLAN_NUDGE_MAX):
+                self._plan_nudged += 1
+                parts.append(
+                    "[System] 你已经开始执行但 Session 中还没有执行计划（plan 为空）——"
+                    "后续多步任务将没有进度可跟踪。请立即用 update_plan(op='create', "
+                    "goal=..., steps=[...]) 把目标和已完成/待做步骤登记为计划；"
+                    "之后每完成一步用 update_plan(op='patch', step_id=..., "
+                    "status='done', note='结论') 更新进度。计划每轮回注，是跟踪推进的依据。"
+                )
             pending = "\n".join(parts)
             self.state = next_state(KernelState.ACT, "continue")
         else:

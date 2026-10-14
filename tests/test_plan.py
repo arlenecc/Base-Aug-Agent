@@ -507,7 +507,9 @@ def test_auto_continue_resumes_after_max_turns(cfg):
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
     agent.max_iterations = 3
-    out = agent.run("做多步任务")
+    # 简单任务指令（无多步信号）以绕过「规划前置门」；本测试只验证
+    # MAX_TURNS 截断后自动续跑，不验证规划行为。
+    out = agent.run("写 x.txt")
     assert out == "任务完成"
     assert len(mock.calls) >= 4, "MAX_TURNS 后应自动续跑而不是停车"
 
@@ -548,3 +550,102 @@ def test_run_start_notifies_plan_to_ui(cfg):
     agent.run("你好")
     assert seen, "run() 开始时应至少同步一次计划状态"
     assert seen[-1] is None      # 没有计划 → 面板清空
+
+
+# ---------------------------------------------------------------------------
+# 规划前置门：先于执行（先写执行计划，再逐步执行）
+# ---------------------------------------------------------------------------
+
+def test_plan_before_act_gate_blocks_first_execution_without_plan(cfg):
+    """多步任务指令下，首次实际工具调用必须先有 plan，否则被回退并要求先规划。"""
+    mock = MockLLM([
+        # 第 1 轮：直接发实际工具（无 plan）→ 应被规划前置门拦下
+        [_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}), usage={"total_tokens": 1})],
+        # 第 2 轮：被拦后先建计划
+        [_evt("done", tool_calls=_tc("update_plan", {
+            "op": "create", "goal": "读并概括",
+            "steps": [{"title": "读 a.txt"}, {"title": "写概括"}],
+        }), usage={"total_tokens": 1})],
+        # 第 3 轮：真正开工
+        [_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}), usage={"total_tokens": 1})],
+        [_evt("content", "完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    with open(os.path.join(cfg.workspace, "a.txt"), "w") as f:
+        f.write("A")
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 20
+    agent.kernel.run("依次读 a.txt 并概括")     # 含多步信号「依次」→ 不豁免
+
+    # 被拦后会多消耗一轮（先规划再执行），所以至少 3 次 LLM 调用
+    assert len(mock.calls) >= 3
+    # 第 2 轮（被拦后那轮）锚点必须点名「先规划再执行」
+    nudge = _last_user_prompt(mock, 1)
+    assert "执行计划" in nudge, "规划前置门必须要求先写入执行计划"
+    assert "先于执行" in nudge or "update_plan" in nudge
+    # 最终计划确实被建立
+    assert agent.session.get_plan() is not None
+
+
+def test_simple_task_is_exempt_from_plan_gate(cfg):
+    """一条短的一句话指令（无多步信号）不应被规划前置门卡住。"""
+    mock = MockLLM([
+        [_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}), usage={"total_tokens": 1})],
+        [_evt("content", "读完了"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    with open(os.path.join(cfg.workspace, "a.txt"), "w") as f:
+        f.write("A")
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    out = agent.kernel.run("读 a.txt")
+    # 没有被拦：一轮就执行完（无需先绕去建计划）
+    assert len(mock.calls) == 2
+    assert agent.session.get_plan() is None     # 简单任务本就不必有计划
+    assert "读完了" in out.text
+
+
+def test_plan_nudge_after_accidental_first_execution(cfg):
+    """首轮误执行（plan 仍空）后，后续轮必须收到「补建计划」提示。"""
+    mock = MockLLM([
+        # 第 1 轮：短指令下误发实际工具（简单任务豁免 → 放行，did_work=True, plan 空）
+        [_evt("done", tool_calls=_tc("file_write", {"path": "a.txt", "content": "x"}),
+              usage={"total_tokens": 1})],
+        # 第 2 轮：纯文字收尾 → 但上一轮已开工却无 plan，应收到补建提示
+        [_evt("content", "做完了"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    out = agent.kernel.run("写个文件")
+    nudge = _last_user_prompt(mock, 1)
+    assert "已经开始执行但" in nudge and "执行计划" in nudge, (
+        "首轮误执行后必须提醒补建计划，否则全程无 plan 可跟踪"
+    )
+    assert agent.session.get_plan() is None
+
+
+def test_multistep_task_cannot_end_with_only_text_plan(cfg):
+    """多步任务：模型只在文本里写计划 + 声称开始、不发工具也不写计划就想收尾，
+    必须被反思门拦下，强制先把计划写入执行计划并立即开工（不能只在文本里规划）。"""
+    mock = MockLLM([
+        # 第 1 轮：纯文本「计划 + 开始第一个任务」——没调工具、没写计划
+        [_evt("content", "计划：1) 读 a.txt 2) 概括。现在开始执行第一个任务。")],
+        # 第 2 轮：被拦后，正确做法——先把计划写入执行计划
+        [_evt("done", tool_calls=_tc("update_plan", {
+            "op": "create", "goal": "读并概括",
+            "steps": [{"title": "读 a.txt"}, {"title": "概括"}],
+        }), usage={"total_tokens": 1})],
+        # 第 3 轮：真正开工
+        [_evt("done", tool_calls=_tc("file_read", {"path": "a.txt"}), usage={"total_tokens": 1})],
+        [_evt("content", "完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    with open(os.path.join(cfg.workspace, "a.txt"), "w") as f:
+        f.write("A")
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 20
+    out = agent.kernel.run("依次读 a.txt 并概括")     # 含多步信号「依次」
+    # 被拦后会多消耗一轮（先写计划再执行），所以至少 3 次 LLM 调用
+    assert len(mock.calls) >= 3
+    # 第 2 轮（被拦后那轮）锚点必须点名「写入执行计划」并调用 update_plan
+    nudge = _last_user_prompt(mock, 1)
+    assert "执行计划" in nudge, "必须要求把计划写入执行计划，而非只在文本里规划"
+    assert "update_plan" in nudge
+    # 最终计划确实被建立（不再只是文本里的计划）
+    assert agent.session.get_plan() is not None
+
