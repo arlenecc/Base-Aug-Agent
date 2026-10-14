@@ -669,6 +669,10 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 103 | deps.py 依赖清单漏登记 chonkie / FlagEmbedding（docling 有动态检查） | 缺失时不检查、不自动安装也不提示，语义分块/重排序静默退化 | check_dependencies 增加两项可选检查；DepSpec 新增 `auto_install` 字段——chonkie 轻量随同步自动安装，FlagEmbedding（~2GB 含 PyTorch）仅提示手动安装，避免 2GB 下载被静默触发 |
 | 104 | onnxruntime 无版本下限：fastembed 可能拉到旧版，旧版 wheel 无 CoreMLExecutionProvider | CoreML EP 静默回退 CPU EP | check_dependencies 增加 onnxruntime>=1.31 版本下限检查（低于则进 missing_required 由 ensure_rag_deps 自动升级），版本号解析失败不误报 |
 | 105 | 重排序依赖 FlagEmbedding（连带 PyTorch ~2GB），模型 pytorch_model.bin ~1.1GB | 依赖链重、冷启动慢、与 transformers 版本兼容问题多（XLMRobertaTokenizer API 断裂等） | 改用 fastembed TextCrossEncoder（ONNX，复用嵌入同一条 fastembed/onnxruntime 栈）：模型换成官方 INT8 量化版 bge-reranker-v2-m3-int8（~570MB，中文精排优于 base）；fastembed 返回原始 logit，vector_store 侧 sigmoid 归一化保持 [0,1] 阈值语义；预下载改为 `TextCrossEncoder(lazy_load=True)` 幂等下载，缓存判定迁移到 fastembed 缓存目录；torch 兼容性探测段删除。pyproject 移除 FlagEmbedding/transformers，fastembed>=0.6 |
+| 106 | shell_run 确认策略误报与逃逸：`2>/dev/null`、`>/dev/stderr` 等丢弃输出惯用法被当成「写 /dev 设备」高频弹确认；`rm "$HOME/x"`、`rm '/etc/passwd'` 引号包裹的逃逸路径绕过确认直接执行；`dd of=/dev/disk0`（写盘目标在 of= 参数，不走重定向）完全漏检 | 每条普通命令都可能打断用户；引号包裹的危险 rm 与 dd 写盘不受控 | 写系统路径正则对 /dev 里的 null/stdin/stdout/stderr/tty 加负向前瞻白名单；`_rm_targets_outside` 对 token 剥引号后再判逃逸；新增 `_RE_DD_WRITE` 检测 `of=/dev/*`（豁免 /dev/null）。回归：/dev 白名单不确认、引号逃逸与 dd 写盘确认、真写 /dev/disk0 仍确认 |
+| 107 | config 不迁移 FlagEmbedding 时代的旧默认重排序模型 `bge-reranker-base`（fp32 ~1.1GB） | 旧配置用户继续拉 1.1GB fp32 模型（INT8 版 570MB 且中文更强） | `_migrate` 沿用 max_tokens=4096 迁移先例，旧默认值重写为 bge-reranker-v2-m3-int8；显式配置的其他模型名不动 |
+| 108 | deps 预下载触发条件用 `report.reranker_model_missing`（pip 安装**前**判定） | fastembed 刚被 Step 1 从旧版升级的场景，模型下载被跳过、延迟一轮同步 | Step 3 改为安装完成后实时判定（`_is_importable("fastembed") and not _is_reranker_cached()`） |
+| 109 | UI 配置面板 temperature / top_p / min_p / top_k / repetition_penalty 无范围钳制 | 输错（负数、超范围）被服务端直接拒绝，所有对话失败且报错难懂 | 与 max_tokens/request_timeout 同策略：temperature∈[0,2]、top_p∈(0,1]、min_p∈[0,1)、top_k≥0、repetition_penalty∈[1,2]，超范围值钳到边界 |
 
 ## 部署
 

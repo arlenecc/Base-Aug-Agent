@@ -127,6 +127,27 @@ def test_migrate_persisted_after_save(tmp_path):
     assert cfg2.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
 
 
+def test_migrate_legacy_rerank_model(tmp_path):
+    """FlagEmbedding 时代的旧默认 bge-reranker-base（fp32 1.1GB）迁移到
+    fastembed 的 INT8 版；其他显式配置的模型名保持不动。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "base_url": "http://x",
+        "rag_rerank_model": "BAAI/bge-reranker-base",
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
+
+    # 显式配置的其他模型名（如 fp32 官方版）不是旧默认值，不迁移
+    p2 = tmp_path / "c2.json"
+    p2.write_text(json.dumps({
+        "base_url": "http://x",
+        "rag_rerank_model": "BAAI/bge-reranker-v2-m3",
+    }))
+    cfg2 = AgentConfig.load(str(p2))
+    assert cfg2.rag_rerank_model == "BAAI/bge-reranker-v2-m3"
+
+
 def test_migrate_bumps_small_max_tokens(tmp_path):
     """Older configs saved max_tokens=4096 (the old LLMClient default). Migration
     must bump any sub-8192 value to the current default (32768) so users

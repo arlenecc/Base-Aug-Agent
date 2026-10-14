@@ -921,7 +921,8 @@ class MainWindow(QMainWindow):
         self.config.api_key = self.api_key_edit.text().strip()
         self.config.model = self.model_combo.currentText().strip()
         try:
-            self.config.temperature = float(self.temp_edit.text().strip() or "0.7")
+            # 范围钳制 [0, 2]：负数/超范围的值会被服务端直接拒绝，报错难懂。
+            self.config.temperature = max(0.0, min(2.0, float(self.temp_edit.text().strip() or "0.7")))
         except ValueError:
             self.config.temperature = 0.7
         try:
@@ -937,19 +938,23 @@ class MainWindow(QMainWindow):
         if self.config.max_context_tokens < self.config.max_tokens:
             self.config.max_context_tokens = self.config.max_tokens
         try:
-            self.config.top_p = float(self.top_p_edit.text().strip() or "0.95")
+            # top_p ∈ (0, 1]：0 会导致无候选 token 可选，>1 被服务端拒绝。
+            self.config.top_p = max(0.0001, min(1.0, float(self.top_p_edit.text().strip() or "0.95")))
         except ValueError:
             self.config.top_p = 0.95
         try:
-            self.config.min_p = float(self.min_p_edit.text().strip() or "0.05")
+            # min_p ∈ [0, 1)：负数无意义且会被拒绝。
+            self.config.min_p = max(0.0, min(0.999, float(self.min_p_edit.text().strip() or "0.05")))
         except ValueError:
             self.config.min_p = 0.05
         try:
-            self.config.top_k = int(self.top_k_edit.text().strip() or "20")
+            # top_k >= 0：负数会让采样逻辑崩溃或被服务端拒绝。
+            self.config.top_k = max(0, int(self.top_k_edit.text().strip() or "20"))
         except ValueError:
             self.config.top_k = 20
         try:
-            self.config.repetition_penalty = float(self.repeat_penalty_edit.text().strip() or "1.0")
+            # repetition_penalty >= 1：小于 1 会反向惩罚（越重复越鼓励），>2 输出退化。
+            self.config.repetition_penalty = max(1.0, min(2.0, float(self.repeat_penalty_edit.text().strip() or "1.0")))
         except ValueError:
             self.config.repetition_penalty = 1.0
         try:

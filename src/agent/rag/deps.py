@@ -651,7 +651,10 @@ def ensure_dependencies(
             report.install_errors.append(f"嵌入模型下载失败: {msg}")
 
     # ---- Step 3: Pre-download reranker model (optional, non-blocking) ----
-    if report.reranker_model_missing:
+    # 不依赖 report.reranker_model_missing：它是在 pip 安装**之前**判定的，
+    # fastembed 刚被 Step 1 从旧版升级上来的场景里该标志会被跳过，模型下载
+    # 就要延迟到下一轮同步。这里用安装完成后的实时状态重新判定。
+    if _is_importable("fastembed") and not _is_reranker_cached():
         global _RERANKER_DOWNLOAD_FAILED_AT
         recent_failure = (
             _RERANKER_DOWNLOAD_FAILED_AT is not None

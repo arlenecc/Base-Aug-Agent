@@ -56,16 +56,26 @@ _RISKY_HEADS = frozenset((
 ))
 
 # 系统目录前缀：凡「写入」这些位置（重定向 / tee / sed -i / rm 目标）即确认。
+# /dev 里的 null/stdin/stdout/stderr/tty 是丢弃输出/标准流惯例（2>/dev/null
+# 每条命令都在用），不算写系统设备。
 _SYSTEM_DIRS = (
     "/etc", "/usr", "/bin", "/sbin", "/System", "/Library",
     "/private/etc", "/private/var", "/boot", "/opt", "/dev",
 )
-_SYS_DIR_ALT = "(" + "|".join(re.escape(d) for d in _SYSTEM_DIRS) + r")\b"
+_SYS_DIR_ALT = (
+    "(" + "|".join(
+        re.escape(d) if not d.startswith("/dev") else d + r"(?!/(?:null|std(?:in|out|err)|tty)\b)"
+        for d in _SYSTEM_DIRS
+    ) + r")\b"
+)
 
 # 提权：sudo 后面的子命令可改任意系统状态，一律确认。
 _RE_SUDO = re.compile(r"(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)\bsudo\b")
 # 远程代码执行：下载内容直接管道给 shell 解释。
 _RE_PIPE_SH = re.compile(r"\b(?:curl|wget)\b[^|;&]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b")
+# dd 的写目标在 of= 参数里（不走重定向），写任何 /dev 设备都是盘级破坏
+# （of=/dev/null 只是丢弃输出，豁免）。
+_RE_DD_WRITE = re.compile(r"\bdd\b[^|;&]*\bof=\s*\S*/dev/(?!null\b)")
 # 写系统路径的两种形态：> / >> 重定向、tee 目标（sed -i 的场景较少见且
 # 通常伴随 tee/sudo，这里保持规则简单）。
 _RE_WRITE_SYS = re.compile(r"(?:>{1,2}\s*|\btee\s+(?:-\w+\s+)*)" + _SYS_DIR_ALT)
@@ -79,6 +89,12 @@ def _rm_targets_outside(seg: str) -> bool:
     """
     for tok in seg.split():
         if tok.startswith("-"):
+            continue
+        # 模型输出常带 shell 引号：rm "$HOME/x"、rm '/etc/passwd'——不剥引号
+        # 这些 token 以 " 或 ' 开头，绝对路径/逃逸检测全部失效，引号包着的
+        # 危险 rm 会绕过确认直接执行。
+        tok = tok.strip("\"'")
+        if not tok:
             continue
         if tok == "~" or tok.startswith(("/", "~/", "$HOME", "../", "..\\")):
             return True
@@ -94,6 +110,8 @@ def _is_risky_command(command: str) -> bool:
     if _RE_PIPE_SH.search(text):
         return True
     if _RE_WRITE_SYS.search(text):
+        return True
+    if _RE_DD_WRITE.search(text):
         return True
     if _RE_SUDO.search(text):
         return True

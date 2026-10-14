@@ -176,6 +176,12 @@ class AgentConfig:
         # Same 768-dim embeddings, 4x smaller download, same quality.
         elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+        # 重排序已迁移到 fastembed ONNX 栈：旧默认 bge-reranker-base 是
+        # FlagEmbedding 时代的 fp32 全量模型（~1.1GB），默认值统一升级到
+        # 官方 INT8 版（~570MB，中文精排更强）。仅重写旧默认值——手工显式
+        # 配置的其他模型名不动。沿用 max_tokens=4096 的迁移先例。
+        if self.rag_rerank_model == "BAAI/bge-reranker-base":
+            self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently
