@@ -668,6 +668,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 102 | OCR 走 rapidocr-onnxruntime 1.x（CPU EP），未利用 Apple Silicon 的 ANE/GPU | 检测 arm64 macOS 后仍纯 CPU 推理 | 优先 import rapidocr 3.x（模型目录与 docling 共享、懒加载），Apple Silicon 上传 `EngineConfig.onnxruntime.use_coreml: True` 启用 CoreML EP（MLComputeUnits=ALL），失败自动回退 CPU EP；OCR 依赖检测改为 3.x/1.x 任一可用。基准实测 1.5x 加速、输出与 CPU EP 完全一致 |
 | 103 | deps.py 依赖清单漏登记 chonkie / FlagEmbedding（docling 有动态检查） | 缺失时不检查、不自动安装也不提示，语义分块/重排序静默退化 | check_dependencies 增加两项可选检查；DepSpec 新增 `auto_install` 字段——chonkie 轻量随同步自动安装，FlagEmbedding（~2GB 含 PyTorch）仅提示手动安装，避免 2GB 下载被静默触发 |
 | 104 | onnxruntime 无版本下限：fastembed 可能拉到旧版，旧版 wheel 无 CoreMLExecutionProvider | CoreML EP 静默回退 CPU EP | check_dependencies 增加 onnxruntime>=1.31 版本下限检查（低于则进 missing_required 由 ensure_rag_deps 自动升级），版本号解析失败不误报 |
+| 105 | 重排序依赖 FlagEmbedding（连带 PyTorch ~2GB），模型 pytorch_model.bin ~1.1GB | 依赖链重、冷启动慢、与 transformers 版本兼容问题多（XLMRobertaTokenizer API 断裂等） | 改用 fastembed TextCrossEncoder（ONNX，复用嵌入同一条 fastembed/onnxruntime 栈）：模型换成官方 INT8 量化版 bge-reranker-v2-m3-int8（~570MB，中文精排优于 base）；fastembed 返回原始 logit，vector_store 侧 sigmoid 归一化保持 [0,1] 阈值语义；预下载改为 `TextCrossEncoder(lazy_load=True)` 幂等下载，缓存判定迁移到 fastembed 缓存目录；torch 兼容性探测段删除。pyproject 移除 FlagEmbedding/transformers，fastembed>=0.6 |
 
 ## 部署
 

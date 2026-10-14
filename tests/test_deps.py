@@ -76,11 +76,63 @@ class TestCheckDependencies:
         report = check_dependencies(str(tmp_path), include_core=False)
         # .txt requires no external deps
         assert len(report.missing_required) == 0
-        # 可选增强包（chonkie/FlagEmbedding，与知识库内容无关）缺失时会在
-        # missing_optional 提示，属预期；但不得出现按扩展名检查的依赖。
+        # 可选增强包（chonkie，与知识库内容无关）缺失时会在 missing_optional
+        # 提示，属预期；但不得出现按扩展名检查的依赖。
         ext_related = {"python-docx", "openpyxl", "python-pptx", "PyMuPDF",
                        "ebooklib", "beautifulsoup4", "docling"}
         assert not any(d.pip_spec in ext_related for d in report.missing_optional)
+
+    def test_fastembed_version_floor(self, tmp_path, monkeypatch):
+        (tmp_path / "notes.txt").write_text("x")
+        import src.agent.rag.deps as deps_mod
+
+        fake_fe = types.ModuleType("fastembed")
+        fake_fe.__version__ = "0.5.0"
+        monkeypatch.setattr(
+            deps_mod, "_is_importable",
+            lambda name: name == "fastembed")
+        monkeypatch.setitem(sys.modules, "fastembed", fake_fe)
+
+        # 过旧版本（无 TextCrossEncoder）→ 进 missing_required（自动升级）
+        report = check_dependencies(str(tmp_path), include_core=False)
+        assert any(d.pip_spec == "fastembed>=0.6"
+                   for d in report.missing_required)
+        # fastembed 过旧时不再检查模型缓存（reranker_model_missing 置 False）
+        assert report.reranker_model_missing is False
+
+        # 版本满足 → 不报
+        fake_fe.__version__ = "0.9.0"
+        report2 = check_dependencies(str(tmp_path), include_core=False)
+        assert not any(d.pip_spec == "fastembed>=0.6"
+                       for d in report2.missing_required)
+
+    def test_reranker_cached_detection(self, tmp_path, monkeypatch):
+        """_is_reranker_cached 只认 fastembed 缓存里的真实权重文件。"""
+        import src.agent.rag.deps as deps_mod
+
+        def _fake_cache(_name):
+            return str(tmp_path)
+
+        # 测试环境未装 fastembed：mock 完整的导入链
+        # fastembed → fastembed.common → fastembed.common.utils
+        fake_utils = types.ModuleType("fastembed.common.utils")
+        fake_utils.define_cache_dir = _fake_cache
+        monkeypatch.setitem(sys.modules, "fastembed", types.ModuleType("fastembed"))
+        monkeypatch.setitem(sys.modules, "fastembed.common", types.ModuleType("fastembed.common"))
+        monkeypatch.setitem(sys.modules, "fastembed.common.utils", fake_utils)
+
+        snap = (tmp_path / "models--onnx-community--bge-reranker-v2-m3-ONNX"
+                / "snapshots" / "abc123" / "onnx")
+        snap.mkdir(parents=True)
+
+        # 只有 config/tokenizer（中断下载）→ 不算已缓存
+        (snap / "config.json").write_text("{}")
+        (snap / "tokenizer.json").write_text("{}")
+        assert deps_mod._is_reranker_cached() is False
+
+        # 权重文件就位 → 已缓存
+        (snap / "model_int8.onnx").write_bytes(b"\x00" * 8)
+        assert deps_mod._is_reranker_cached() is True
 
     def test_onnxruntime_version_floor(self, tmp_path, monkeypatch):
         (tmp_path / "notes.txt").write_text("x")

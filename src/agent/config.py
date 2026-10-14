@@ -44,7 +44,7 @@ class AgentConfig:
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
-    rag_rerank_model: str = "BAAI/bge-reranker-base"  # bge-reranker for precise scoring
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # fastembed ONNX reranker
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
 

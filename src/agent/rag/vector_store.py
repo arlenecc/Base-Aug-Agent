@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 # Using the -Q variant: model_quantized.onnx (~137MB) instead of model.onnx (~548MB).
 # Same 768-dim embeddings, same quality, 4x smaller download.
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
-DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
+# 重排序走 fastembed TextCrossEncoder（ONNX，无 PyTorch 依赖）。选官方 INT8
+# 量化版：~570MB（fp32 全量 2.3GB 的一半不到），且 v2-m3 的多语种/中文精排
+# 能力优于 bge-reranker-base。旧配置里的 bge-reranker-base 仍被 fastembed
+# 支持（fp32 onnx ~1.1GB），无需迁移。
+DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
 _TABLE_NAME = "knowledge_base"
 
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
@@ -1051,9 +1055,9 @@ class VectorStore:
             # 距离排序，加载完成后的调用自然能拿到模型。
             return None
 
-        # 状态转换必须串行：torch 探测 + import FlagEmbedding 可耗时数秒，
+        # 状态转换必须串行：import fastembed + 校验模型缓存可耗时数秒，
         # 旧实现从「读到 idle」到「写入 loading」之间没有任何锁，两个并发
-        # 调用方都会各自起一个加载线程——各加载一份 ~500MB 模型，后写者覆盖
+        # 调用方都会各自起一个加载线程——各加载一份数百 MB 模型，后写者覆盖
         # 前者，先建的那份成为纯泄漏。
         with self._reranker_lock:
             state = getattr(self, "_reranker_state", "idle")
@@ -1062,54 +1066,34 @@ class VectorStore:
             if state in ("failed", "loading"):
                 return None
 
-            # torch/numpy 兼容性探测：FlagEmbedding 依赖 torch，而某些旧版 torch
-            # （如 macOS Intel 上最高可装的 2.2.2）与 numpy 2.x 不兼容，调用
-            # ``tensor.numpy()`` 会抛 ``Numpy is not available``，导致重排序崩溃。
-            # 这里不凭 numpy 版本号猜测，而是真正执行一次 tensor→numpy 转换来
-            # 验证 torch 与 numpy 是否兼容，避免误伤 numpy 2.x + 新版 torch 的
-            # 正常组合（如 arm64 上的 torch 2.13 + numpy 2.5 是完全兼容的）。
             try:
-                import torch as _torch
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
+            except ImportError:
                 try:
-                    _torch.tensor([1.0, 2.0]).numpy()
-                except Exception as _e:
-                    import numpy as _np
+                    # fastembed 0.6–0.8 在顶层导出 TextCrossEncoder，0.9 起移入子模块。
+                    from fastembed import TextCrossEncoder  # type: ignore[no-redef]
+                except ImportError:
                     logger.warning(
-                        "  ⚠ BGE Reranker 不可用: torch %s 与 numpy %s 不兼容 "
-                        "（tensor.numpy() 失败: %s）。重排序回退到向量距离排序。"
-                        "如需启用，请升级 torch 或降级 numpy 到 1.26.x。",
-                        getattr(_torch, "__version__", "?"),
-                        getattr(_np, "__version__", "?"),
-                        _e,
+                        "  ⚠ fastembed 未安装或版本过旧, 重排序功能不可用. "
+                        "pip install 'fastembed>=0.6'"
                     )
                     self._reranker = None
                     self._reranker_state = "failed"
                     return None
-            except ImportError:
-                pass  # torch 缺失时交由后续 import FlagEmbedding 报错处理
 
-            try:
-                from FlagEmbedding import FlagReranker
-            except ImportError:
-                logger.warning(
-                    "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
-                )
-                self._reranker = None
-                self._reranker_state = "failed"
-                return None
-
-            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
+            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, ~570MB INT8)...", self._rerank_model)
             import time as _time
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
             def _load():
                 try:
-                    reranker = FlagReranker(
-                        self._rerank_model,
-                        use_fp16=False,
-                    )
+                    # 走默认 CPU EP。不启用 CoreML EP：cross-encoder 输入是
+                    # 变长 (query, doc) 序列，attention 的动态 shape 在 CoreML
+                    # 上频繁 fallback 反而更慢；INT8 权重在 CPU EP 上有原生
+                    # int8 算子加速。
+                    reranker = TextCrossEncoder(self._rerank_model)
                     if getattr(self, "_closed", False):
-                        # close() 已经执行：不要再把 500MB 模型写回实例
+                        # close() 已经执行：不要再把数百 MB 模型写回实例
                         # （旧实现会让 close 之后的实例「复活」持有权重）。
                         try:
                             del reranker
@@ -1208,22 +1192,24 @@ class VectorStore:
         if reranker is None:
             return self._rerank_fallback(candidates, top_k)
 
-        # Build pairs for reranker
+        # Build (query, doc) pairs for the cross-encoder.
         logger.info("  ├─ BGE Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
-        pairs = [[query, c["text"]] for c in candidates]
+        texts = [c["text"] for c in candidates]
         try:
-            # normalize=True applies sigmoid so scores land in [0, 1].
-            scores = reranker.compute_score(pairs, normalize=True)
+            # fastembed 的 rerank() 返回模型原始 logit（未过 sigmoid）；
+            # 手动 sigmoid 归一化到 [0,1]，保持与旧 FlagReranker
+            # compute_score(normalize=True) 相同的分数语义——下游
+            # min_similarity 阈值过滤依赖这个 [0,1] 区间。
+            raw_scores = reranker.rerank(query, texts, batch_size=16)
+            scores = [_logit_to_score(s) for s in raw_scores]
         except Exception as e:
-            # FlagEmbedding 与 transformers 5.x 存在 API 不兼容（如
-            # XLMRobertaTokenizer 缺少 prepare_for_model），打分失败时回退到
-            # 向量距离排序，避免整个检索流程崩溃。
+            # 模型/输入异常（超长序列截断失败等）时回退到向量距离排序，
+            # 避免整个检索流程崩溃。必须同步置 failed，否则
+            # _reranker_state 长期停在 "done" 而打分持续失败（状态机失真）。
+            # 加锁写：与 _get_reranker 的状态读写并发属于数据竞争。
             logger.warning(
                 "  ⚠ BGE Reranker 打分失败, 回退到向量距离排序: %s", e,
             )
-            # 标记不可用，后续直接走回退分支。必须同步置 failed，否则
-            # _reranker_state 长期停在 "done" 而模型为 None（状态机失真）。
-            # 加锁写：与 _get_reranker 的状态读写并发属于数据竞争。
             with self._reranker_lock:
                 self._reranker = None
                 self._reranker_state = "failed"
@@ -1417,8 +1403,8 @@ class VectorStore:
         After close(), the VectorStore cannot be used; create a new instance to
         access the same data (LanceDB persists to disk, so data survives).
 
-        Important: FastEmbed's ONNX Runtime InferenceSession and FlagReranker
-        hold significant C++ heap memory (~130MB + ~500MB). Python's GC may not
+        Important: FastEmbed's embedding and reranker ONNX Runtime sessions
+        hold significant C++ heap memory (~130MB + ~570MB). Python's GC may not
         reclaim these promptly when the Python object is dropped — explicitly
         nulling the references here ensures the C++ destructors run as soon
         as possible, which is critical when SyncKnowledgeWorker creates a fresh
@@ -1468,14 +1454,13 @@ class VectorStore:
                     pass
             self._ef = None
         if hasattr(self, "_reranker"):
-            # FlagReranker holds a transformers model with PyTorch tensors.
-            # Try to move it to CPU and del before nulling, so CUDA/PyTorch
-            # resources are freed promptly.
+            # TextCrossEncoder 底层是 onnxruntime InferenceSession（纯 ONNX，
+            # 无 PyTorch/transformers 权重），Python 对象置 None 后 C++ 侧
+            # session 随析构释放，无需 CPU 迁移步骤。
             reranker = self._reranker
             try:
-                model = getattr(reranker, "model", None)
-                if model is not None and hasattr(model, "cpu"):
-                    model.cpu()
+                # fastembed 旧版实例带 .model 子对象；统一丢弃引用即可。
+                _ = getattr(reranker, "model", None)
             except Exception:
                 pass
             self._reranker = None
@@ -1799,3 +1784,20 @@ def _normalize(vec: List[float]) -> List[float]:
     if norm == 0:
         return vec
     return [x / norm for x in vec]
+
+
+def _logit_to_score(logit: float) -> float:
+    """Map a cross-encoder raw logit to a [0, 1] relevance score via sigmoid.
+
+    fastembed 的 TextCrossEncoder.rerank() 返回模型原始 logit（单调，但无界）。
+    与旧 FlagReranker.compute_score(normalize=True) 一致地过 sigmoid，下游
+    min_similarity 阈值（0.7）才能维持原有语义。分段计算避免 exp 溢出。
+    """
+    try:
+        logit = float(logit)
+    except (TypeError, ValueError):
+        return 0.0
+    if logit >= 0:
+        return 1.0 / (1.0 + math.exp(-logit))
+    e = math.exp(logit)
+    return e / (1.0 + e)
