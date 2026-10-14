@@ -38,9 +38,14 @@ rag = [
     "docling>=2.0.0",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
+    # CoreML EP（Apple Silicon OCR/推理加速）需要官方 wheel 内置的
+    # CoreMLExecutionProvider；旧版 wheel 没有，运行时 deps 检查也会强制此下限。
+    "onnxruntime>=1.31",
 ]
-# PDF OCR (optional, heavy dependency ~500MB)
-ocr = ["rapidocr-onnxruntime>=1.0.0"]
+# PDF OCR (optional, heavy dependency ~500MB)。
+# rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
+# 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
+ocr = ["rapidocr>=3.10"]
 # All optional features
 #all = ["base-agent[test,rag,ocr]"]
 
