@@ -109,14 +109,18 @@ def test_failed_step_is_not_a_reason_to_stop(cfg):
     assert "未完成步骤" not in out.text
     assert agent.session.plan_open_steps() == []
     # 第 4 次调用的锚点（被拦后的提醒）必须：引用失败细节 + 要求自动恢复、
-    # 明确不许停下来问用户。
+    # 明确不许停下来问用户 + 列出已试过且失败的方案（避免原地打转）。
     nudge = _last_user_prompt(mock, 3)
     assert "a.txt" in nudge, "提醒应引用失败细节"
-    assert "自动解决" in nudge or "不要停" in nudge, "提醒应要求自动恢复而非停下"
+    assert ("禁止停下来" in nudge or "自动解决" in nudge), "提醒应要求自动恢复而非停下"
+    assert "已试过且失败" in nudge, "提醒应列出已失败方案，逼模型换没试过的路"
 
 
 def test_failure_widens_nudge_budget(cfg):
-    """有失败发生时反思门预算放宽（4 次 vs 默认 2 次）——不会早早收尾。"""
+    """有失败发生时反思门预算放宽（8 次 vs 默认 2 次）——不会早早收尾。"""
+    from agent.kernel.loop import _FINISH_NUDGE_FAIL_MAX, _FINISH_NUDGE_MAX
+
+    give_up = [_evt("content", "放弃"), _evt("done", usage={"total_tokens": 1})]
     mock = MockLLM([
         [_evt("done", tool_calls=_plan("create", goal="g",
                                        steps=[{"title": "a"}, {"title": "b"}]),
@@ -124,29 +128,36 @@ def test_failure_widens_nudge_budget(cfg):
         # 一次失败
         [_evt("done", tool_calls=_tc("file_read", {"path": "missing.txt"}),
               usage={"total_tokens": 1})],
-        # 之后连续 5 次只想文字收尾：前 4 次应被拦，第 5 次才被放行
-        [_evt("content", "放弃"), _evt("done", usage={"total_tokens": 1})],
-        [_evt("content", "还是放弃"), _evt("done", usage={"total_tokens": 1})],
-        [_evt("content", "真放弃了"), _evt("done", usage={"total_tokens": 1})],
-        [_evt("content", "再次放弃"), _evt("done", usage={"total_tokens": 1})],
+        # 之后连续 N 次只想文字收尾：前 _FINISH_NUDGE_FAIL_MAX 次应被拦，
+        # 第 N+1 次才被放行
+        *([give_up] * _FINISH_NUDGE_FAIL_MAX),
         [_evt("content", "最终答复"), _evt("done", usage={"total_tokens": 1})],
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
-    agent.max_iterations = 15
+    agent.max_iterations = 30
     out = agent.kernel.run("做任务")
 
-    # 1 create + 1 fail + 5 text = 7 次调用；前 4 次 text 被拦回
-    assert len(mock.calls) == 7
+    # 1 create + 1 fail + (FAIL_MAX 次被拦 + 1 次放行)
+    assert len(mock.calls) == 2 + _FINISH_NUDGE_FAIL_MAX + 1
+    assert _FINISH_NUDGE_FAIL_MAX > _FINISH_NUDGE_MAX, "失败时预算必须更宽"
     # 放行时仍必须告知用户任务未完成
     assert "未完成步骤" in out.text
 
 
 def test_no_failure_keeps_default_budget(cfg):
-    """无失败时预算仍是默认 2 次（回归：不能把普通任务卡死）。"""
+    """无失败、且已经动过手时预算仍是默认 2 次（回归：不能把普通任务卡死）。
+
+    注意「建完计划一次工具都没调用」走的是更宽的 PLAN 档（见 test_plan.py 的
+    test_plan_created_but_not_started_is_pushed_to_execute）——那里多拦几次是对的，
+    本用例验证的是**已经干过活**之后不要过度纠缠。
+    """
     mock = MockLLM([
         [_evt("done", tool_calls=_plan("create", goal="g",
                                        steps=[{"title": "a"}, {"title": "b"}]),
           usage={"total_tokens": 1})],
+        # 真正动过手 → 走默认档
+        [_evt("done", tool_calls=_tc("file_write", {"path": "a.txt", "content": "x"}),
+              usage={"total_tokens": 1})],
         [_evt("content", "我做完了"), _evt("done", usage={"total_tokens": 1})],
         [_evt("content", "真的做完了"), _evt("done", usage={"total_tokens": 1})],
         [_evt("content", "就这样吧"), _evt("done", usage={"total_tokens": 1})],
@@ -155,7 +166,7 @@ def test_no_failure_keeps_default_budget(cfg):
     agent.max_iterations = 15
     out = agent.kernel.run("做任务")
 
-    assert len(mock.calls) == 4      # 第 3 次 text 即被放行
+    assert len(mock.calls) == 5      # 1 create + 1 work + (2 次被拦 + 1 次放行)
     assert "未完成步骤" in out.text
 
 
@@ -297,23 +308,28 @@ def test_block_without_any_failure_is_challenged(cfg):
 
 
 def test_block_allowed_after_enough_failures(cfg):
-    """失败次数足够（≥2）后才标记 blocked → 守卫放行，不横加干涉。"""
-    mock = MockLLM([
+    """失败次数足够（≥ _MIN_ATTEMPTS_BEFORE_BLOCK）后才标记 blocked → 守卫放行。"""
+    from agent.kernel.loop import _MIN_ATTEMPTS_BEFORE_BLOCK
+
+    script = [
         [_evt("done", tool_calls=_plan("create", goal="g", steps=[{"title": "a"}]),
               usage={"total_tokens": 1})],
-        [_evt("done", tool_calls=_tc("file_read", {"path": "x.txt"}),
-              usage={"total_tokens": 1})],
-        [_evt("done", tool_calls=_tc("file_read", {"path": "y.txt"}),
-              usage={"total_tokens": 1})],
-        # 两次失败后才标记 blocked → 应被尊重
+    ]
+    # 先攒够「充分尝试」的失败次数
+    for i in range(_MIN_ATTEMPTS_BEFORE_BLOCK):
+        script.append([_evt("done", tool_calls=_tc("file_read", {"path": f"f{i}.txt"}),
+                            usage={"total_tokens": 1})])
+    script.append(
         [_evt("done", tool_calls=_plan("patch", step_id="1", status="blocked",
-                                       note="两种方法都失败"), usage={"total_tokens": 1})],
-        [_evt("content", "此路不通"), _evt("done", usage={"total_tokens": 1})],
-    ])
+                                       note="多种方法都失败"), usage={"total_tokens": 1})])
+    script.append([_evt("content", "此路不通"), _evt("done", usage={"total_tokens": 1})])
+
+    mock = MockLLM(script)
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
     out = agent.kernel.run("做任务")
 
-    guard = _last_user_prompt(mock, 3)
+    # 守卫提醒落在 patch 之后那一轮的锚点上（= 最后一次调用）
+    guard = _last_user_prompt(mock, len(script) - 1)
     assert "尝试不够" not in guard, "充分尝试后标记 blocked 不应被拦"
     assert out.text == "此路不通"
     plan = agent.session.get_plan()
@@ -340,3 +356,94 @@ def test_block_nudge_is_bounded(cfg):
     # 第 5 次调用（最后一次 blocked 之后）不应再带守卫提醒
     assert "尝试不够" not in _last_user_prompt(mock, 4)
     assert out.text == "放弃"
+
+
+# ---------------------------------------------------------------------------
+# 5. 首次失败就必须换方案（不是原样重发 / 不是停下向用户报告）
+# ---------------------------------------------------------------------------
+
+def test_first_failure_demands_a_new_approach(cfg):
+    """第一次失败也要给出「换方法」指令，而不是等连续失败 2 次才提示。
+
+    回归：旧实现只在 `_fail_streak >= 2` 时才提示，首次失败后模型最常见的
+    反应是原样重发、或把错误念一遍给用户听然后停下。
+    """
+    mock = MockLLM([
+        [_evt("done", tool_calls=_tc("file_read", {"path": "x.txt"}),
+              usage={"total_tokens": 1})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.kernel.run("读文件")
+
+    hint = _last_user_prompt(mock, 1)
+    assert "File does not exist: x.txt" in hint, "必须带上真实错误信息"
+    assert "换一种方法" in hint or "换工具" in hint, "必须要求换方案"
+    assert "不要原样重发" in hint, "必须禁止原样重试"
+    assert "不要停下来向用户报告失败" in hint, "必须禁止停车"
+
+
+# ---------------------------------------------------------------------------
+# 6. 失败上下文跨「自动续跑段」保留
+# ---------------------------------------------------------------------------
+
+def test_failure_snapshot_carries_into_next_segment(cfg):
+    """续跑段必须知道上一段卡在哪：否则它既拿不到错误信息，也拿不到失败感知
+    的反思门预算 —— 表现为「续跑之后不再针对报错找办法，而是原地打转后停住」。
+    """
+    mock = MockLLM([
+        [_evt("done", tool_calls=_tc("file_read", {"path": "x.txt"}),
+              usage={"total_tokens": 1})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    k = agent.kernel
+    k.run("读文件")
+
+    snap = k.failure_snapshot()
+    assert snap["failed_total"] == 1
+    assert snap["last_fail"] is not None and snap["last_fail"][0] == "file_read"
+    assert snap["fail_sigs"], "失败签名必须一起带走（原样重试检测靠它）"
+
+    # 续跑段：本段没有任何新失败，但 seeded 的失败计数必须还在
+    mock2 = MockLLM([
+        [_evt("content", "继续"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent.llm = mock2
+    k.seed_failures(snap)
+    k.run("继续")
+    assert k._failed_total >= 1, "续跑段丢失了上一段的失败上下文"
+    assert k._last_fail is not None and k._last_fail[0] == "file_read"
+
+
+def test_auto_continue_segment_sees_the_previous_error(cfg):
+    """端到端：第一段失败后被轮次上限截断，续跑段的锚点必须带上该错误。"""
+    mock = MockLLM([
+        # --- 第一段（max_iterations=3）---
+        [_evt("done", tool_calls=_plan("create", goal="读完并总结",
+                                       steps=[{"title": "读文件"}, {"title": "写总结"}]),
+              usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=_tc("file_read", {"path": "x.txt"}),
+              usage={"total_tokens": 1})],          # 失败
+        [_evt("content", "我卡住了"), _evt("done", usage={"total_tokens": 1})],
+        # --- 续跑段：锚点应含上一段的错误 ---
+        [_evt("done", tool_calls=_tc("file_write", {"path": "x.txt", "content": "hi"}),
+              usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=_plan("patch", step_id="1", status="done", note="已读"),
+              usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=_plan("patch", step_id="2", status="done", note="已写"),
+              usage={"total_tokens": 1})],
+        # --- 第三段：收尾 ---
+        [_evt("content", "全部完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 3
+    out = agent.run("读完并总结")
+
+    assert out == "全部完成"
+    seg2_first = _last_user_prompt(mock, 3)
+    assert "file_read" in seg2_first, (
+        "续跑段的锚点必须引用上一段失败的工具与错误"
+    )
+    assert "File does not exist: x.txt" in seg2_first
+    assert agent.session.plan_open_steps() == []

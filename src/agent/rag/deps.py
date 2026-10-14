@@ -48,6 +48,11 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
         # OCR is conditional: only required when the PDF actually has image pages.
         # check_dependencies() will upgrade it to required if image pages are detected.
         DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别", required=False),
+        # OCR image pre-processing (adaptive DPI + scale normalisation + CLAHE +
+        # sharpen) needs cv2. Missing → ocr_engine falls back to the raw bitmap,
+        # so this stays optional rather than blocking every PDF sync.
+        # headless build: no GUI/system-lib dependency (runs on servers/CI too).
+        DepSpec("cv2", "opencv-python-headless", "OCR 图像预处理（归一化/增强，提质提速）", required=False),
     ],
     ".epub": [
         DepSpec("ebooklib", "ebooklib", "EPUB 电子书解析"),
@@ -70,6 +75,16 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
 RAG_CORE_DEPS: List[DepSpec] = [
     DepSpec("lancedb", "lancedb", "向量数据库"),
     DepSpec("fastembed", "fastembed", "嵌入模型 (ONNX Runtime)"),
+]
+
+# Optional but recommended enhancements — missing → graceful fallback (no sync block).
+# Always checked so they get auto-installed on first sync and silently skipped if
+# install fails.  (chonkie: semantic chunking; FlagEmbedding: BGE reranker.)
+SEMANTIC_CHUNK_DEPS: List[DepSpec] = [
+    DepSpec("chonkie", "chonkie", "语义分块 (chonkie SemanticChunker)", required=False),
+]
+RERANKER_DEPS: List[DepSpec] = [
+    DepSpec("FlagEmbedding", "FlagEmbedding", "重排序推理 (BGE reranker)", required=False),
 ]
 
 # Embedding model info for pre-download
@@ -139,6 +154,10 @@ class DependencyReport:
     installed_packages: List[str] = field(default_factory=list)
     install_errors: List[str] = field(default_factory=list)
 
+    # Non-blocking suggestions (e.g. upgrade onnxruntime on Apple Silicon for
+    # CoreML EP). Not installed automatically, not blocking.
+    suggestions: List[str] = field(default_factory=list)
+
     @property
     def all_missing(self) -> List[DepSpec]:
         return self.missing_required + self.missing_optional
@@ -183,6 +202,10 @@ class DependencyReport:
             lines.append("安装失败：")
             for err in self.install_errors:
                 lines.append(f"  ❌ {err}")
+        if self.suggestions:
+            lines.append("优化建议（非必须，不影响使用）：")
+            for s in self.suggestions:
+                lines.append(f"  💡 {s}")
         if not lines:
             lines.append("所有依赖已就绪（Python 包 + 嵌入模型 + OCR 引擎）。")
         return "\n".join(lines)
@@ -370,6 +393,9 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
     deps_to_check: List[DepSpec] = []
     if include_core:
         deps_to_check.extend(RAG_CORE_DEPS)
+        # 可选增强：纳入检查 + 自动安装，但缺失不阻塞同步（都有回退路径）。
+        deps_to_check.extend(SEMANTIC_CHUNK_DEPS)
+        deps_to_check.extend(RERANKER_DEPS)
     for ext in exts:
         if ext in EXTENSION_DEPS:
             deps_to_check.extend(EXTENSION_DEPS[ext])
@@ -421,6 +447,25 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
 
     # ---- Reranker model (optional, only warn) ----
     report.reranker_model_missing = not _is_reranker_cached()
+
+    # ---- Apple Silicon: CoreML EP needs onnxruntime >= 1.31.0 ----
+    # Non-blocking suggestion only — we do NOT force-upgrade an existing
+    # onnxruntime (that could break fastembed/rapidocr in the user's env).
+    # ocr_engine already refuses CoreML when the version is too old; this
+    # surfaces the upgrade command so the user can opt in.
+    try:
+        from .ocr_engine import is_apple_silicon, ort_version
+        if is_apple_silicon():
+            ov = ort_version()
+            if ov is not None and ov < (1, 31, 0):
+                report.suggestions.append(
+                    "Apple Silicon 上启用 OCR 的 CoreML EP 加速（CPU+GPU+ANE）需要 "
+                    f"onnxruntime>={'.'.join(str(x) for x in (1, 31, 0))}"
+                    f"（当前 {'.'.join(str(x) for x in ov)}）。可运行："
+                    "pip install -U 'onnxruntime>=1.31.0'"
+                )
+    except Exception:
+        pass
 
     # Log summary
     if report.has_missing or report.embedding_model_missing:

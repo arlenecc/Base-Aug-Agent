@@ -230,22 +230,70 @@ def test_reflection_gate_blocks_premature_finish(cfg):
 
 
 def test_reflection_gate_gives_up_after_max_and_warns_user(cfg):
-    """提醒次数用尽后尊重模型，但回复必须附上未完成清单。"""
+    """提醒次数用尽后尊重模型，但回复必须附上未完成清单。
+
+    本用例是「只建了计划、一次实际工具都没调用」→ 走 PLAN 档预算（6 次）。
+    """
+    from agent.kernel.loop import _FINISH_NUDGE_PLAN_MAX
+
+    give_up = [_evt("content", "我做完了"), _evt("done", usage={"total_tokens": 1})]
     mock = MockLLM([
         [_evt("done", tool_calls=_tc("update_plan", {
             "op": "create", "goal": "g", "steps": [{"title": "a"}, {"title": "b"}],
         }), usage={"total_tokens": 1})],
-        # 连续 3 次只想文字收尾
-        [_evt("content", "我做完了"), _evt("done", usage={"total_tokens": 1})],
-        [_evt("content", "真的做完了"), _evt("done", usage={"total_tokens": 1})],
+        *([give_up] * _FINISH_NUDGE_PLAN_MAX),
         [_evt("content", "就这样吧"), _evt("done", usage={"total_tokens": 1})],
     ])
     agent = Agent(llm=mock, config=cfg, callbacks=Noop())
-    agent.max_iterations = 15
+    agent.max_iterations = 30
     out = agent.kernel.run("做任务")
 
     assert "未完成步骤" in out.text
     assert "a" in out.text and "b" in out.text
+
+
+def test_plan_created_but_not_started_is_pushed_to_execute(cfg):
+    """回归：建完计划就只输出文字 → 必须被拦并要求「立即执行 Now 那一步」。
+
+    修复前无失败时反思门只有 2 次预算，模型建完计划把计划复述一遍就放行，
+    用户看到的正是不执行、必须手动说「继续/开始」。
+    """
+    from agent.kernel.loop import _FINISH_NUDGE_MAX, _FINISH_NUDGE_PLAN_MAX
+
+    assert _FINISH_NUDGE_PLAN_MAX > _FINISH_NUDGE_MAX, "计划未开工时预算必须更宽"
+    mock = MockLLM([
+        [_evt("done", tool_calls=_tc("update_plan", {
+            "op": "create", "goal": "写脚本", "steps": [{"title": "写脚本"}],
+        }), usage={"total_tokens": 1})],
+        # 连续 3 次只把计划念一遍 → 旧实现第 3 次就放行
+        [_evt("content", "计划已创建：1.写脚本"), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "接下来我会开始执行"), _evt("done", usage={"total_tokens": 1})],
+        [_evt("content", "马上开始第一步"), _evt("done", usage={"total_tokens": 1})],
+        # 真正开工
+        [_evt("done", tool_calls=_tc("file_write", {"path": "a.py", "content": "x"}),
+              usage={"total_tokens": 1})],
+        [_evt("done", tool_calls=_tc("update_plan", {"op": "patch", "step_id": "1",
+                                                     "status": "done", "note": "ok"}),
+              usage={"total_tokens": 1})],
+        [_evt("content", "完成"), _evt("done", usage={"total_tokens": 1})],
+    ])
+    agent = Agent(llm=mock, config=cfg, callbacks=Noop())
+    agent.max_iterations = 30
+    agent._auto_continue = False
+    out = agent.kernel.run("写个脚本")
+
+    # 第 3 次纯文字仍被拦（没有被放行）
+    nudge = _last_user_prompt(mock, 3)
+    assert "一次工具都没调用" in nudge, "提醒必须点破「只规划没执行」"
+    assert "立即开始执行" in nudge and "写脚本" in nudge, "提醒必须点名 Now 那一步"
+    assert out.text == "完成"
+
+
+def _last_user_prompt(mock, call_idx):
+    """第 call_idx 次 LLM 调用的最后一条 user 消息（= 本轮锚点）。"""
+    msgs = mock.calls[call_idx]["messages"]
+    users = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+    return users[-1] if users else ""
 
 
 def test_finish_allowed_when_all_steps_terminal(cfg):
@@ -470,6 +518,9 @@ def test_auto_continue_finishes_premature_stop(cfg):
         [_evt("done", tool_calls=_plan_call("create", goal="g",
                                             steps=[{"title": "a"}]),
           usage={"total_tokens": 1})],
+        # 先真正动过手（否则走「只规划不执行」的 6 次预算，不会触发续跑）
+        [_evt("done", tool_calls=_tc("file_write", {"path": "a.txt", "content": "x"}),
+              usage={"total_tokens": 1})],
         # 想直接文字收尾 → 反思门提醒 2 次仍不改（plan 有 open 步骤）
         [_evt("content", "做完了"), _evt("done", usage={"total_tokens": 1})],
         [_evt("content", "真的做完了"), _evt("done", usage={"total_tokens": 1})],

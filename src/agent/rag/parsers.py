@@ -27,6 +27,20 @@ _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
 
+# AgentConfig（可选注入）。未提供时按「全部开启」处理 —— config 的默认值
+# 本身就是 True，不注入不会改变行为；注入后 UI 的开关才生效。
+_OCR_CONFIG = None
+
+
+def set_ocr_config(config) -> None:
+    """让解析层感知 AgentConfig（决定是否启用 CoreML EP / 预处理）。
+
+    引擎是进程级单例且可能已被创建，所以这里只影响**后续**创建的引擎；
+    调用方若需要立刻生效，应先 :func:`release_ocr_engine`。
+    """
+    global _OCR_CONFIG
+    _OCR_CONFIG = config
+
 # ---------------------------------------------------------------------------
 # Format → extension mapping
 # ---------------------------------------------------------------------------
@@ -213,6 +227,30 @@ def _extract_pdf(path: Path) -> str:
         ocr_engine = None       # lazy-init, 复用同一个引擎实例
         ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
 
+        # OCR 图像预处理（自适应 DPI + 尺寸归一化 + CLAHE + 锐化）：默认开启，
+        # 可由 AgentConfig.rag_ocr_preprocess 关闭。放在循环外只解析一次，
+        # 且导入失败（缺 cv2/numpy）时降级为原始的固定 200dpi + 裸位图。
+        def _fallback_dpi(_page) -> int:
+            return 200
+
+        render_dpi_for_page = _fallback_dpi
+        decode_image = None
+        preprocess_for_ocr = None
+        preprocess_enabled = bool(getattr(_OCR_CONFIG, "rag_ocr_preprocess", True))
+        if preprocess_enabled:
+            try:
+                from .ocr_engine import (
+                    decode_image as _decode,
+                    preprocess_for_ocr as _preprocess,
+                    render_dpi_for_page as _dpi,
+                )
+                decode_image, preprocess_for_ocr, render_dpi_for_page = (
+                    _decode, _preprocess, _dpi,
+                )
+            except Exception as e:  # pragma: no cover - 缺少 cv2/numpy
+                logger.debug("OCR 预处理不可用，回退原始位图: %s", e)
+                preprocess_enabled = False
+
         # 统计各类型页面数量，用于最终日志
         text_page_count = 0
         image_page_count = 0
@@ -257,15 +295,27 @@ def _extract_pdf(path: Path) -> str:
                     ocr_unavailable = True
                     ocr_skipped_count += 1
                     continue
-                pix = page.get_pixmap(dpi=200)
+                # 自适应 DPI：页面物理尺寸差异很大（A4 / letter / 裁剪的小图），
+                # 固定 200dpi 会让检测器看到完全不同的字形大小。先按页面尺寸
+                # 解出「短边落在目标像素」的 DPI，再做归一化。
+                dpi = render_dpi_for_page(page)
+                pix = page.get_pixmap(dpi=dpi)
                 try:
                     img_bytes = pix.tobytes("png")
                 finally:
-                    # Pixmap 持有整页 200dpi 位图（数 MB），显式释放避免
-                    # 多页循环时峰值内存持续累积。
+                    # Pixmap 持有整页位图（数 MB），显式释放避免多页循环时
+                    # 峰值内存持续累积。
                     pix = None
 
-                ocr_text = _ocr_image_cached(ocr_engine, img_bytes, page_num + 1, path.name)
+                image_for_ocr = img_bytes
+                if preprocess_enabled:
+                    decoded = decode_image(img_bytes)
+                    if decoded is not None:
+                        image_for_ocr = preprocess_for_ocr(decoded)
+                    # 解码/预处理失败 → 把原始 PNG bytes 交给引擎（旧路径）
+
+                ocr_text = _ocr_image_cached(ocr_engine, image_for_ocr,
+                                             page_num + 1, path.name)
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -334,6 +384,9 @@ def _get_ocr_engine():
     (~500MB) — without this, 4 workers loading 4 instances would OOM. The
     _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
     invoked by one thread at a time.
+
+    引擎构造交给 :mod:`agent.rag.ocr_engine`：Apple Silicon 上会注入 CoreML EP
+    （CPU+GPU+ANE），非 Apple 平台或 onnxruntime 过旧时自动回退默认 EP。
     """
     global _OCR_ENGINE
     if _OCR_ENGINE is not None:
@@ -342,8 +395,14 @@ def _get_ocr_engine():
         if _OCR_ENGINE is not None:
             return _OCR_ENGINE
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            _OCR_ENGINE = RapidOCR()
+            from .ocr_engine import create_ocr_engine, coreml_reason
+            use_coreml = bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True))
+            if not use_coreml:
+                logger.info("OCR: CoreML EP 按配置关闭")
+            else:
+                _, reason = coreml_reason()
+                logger.info("OCR: CoreML EP 检测 — %s", reason)
+            _OCR_ENGINE = create_ocr_engine(use_coreml=use_coreml)
             logger.info("RapidOCR engine loaded (global singleton)")
             return _OCR_ENGINE
         except ImportError:
@@ -375,10 +434,14 @@ def release_ocr_engine() -> None:
             logger.info("RapidOCR engine released (memory reclaimed)")
 
 
-def _ocr_image_cached(engine, img_bytes: bytes, page_num: int, filename: str) -> str:
-    """Run OCR using a pre-loaded engine instance."""
+def _ocr_image_cached(engine, image, page_num: int, filename: str) -> str:
+    """Run OCR using a pre-loaded engine instance.
+
+    ``image`` 可以是 PNG bytes（旧路径）或已预处理的 BGR ndarray——RapidOCR
+    的 LoadImage 两者都接受，ndarray 走零拷贝路径，省掉一次编解码往返。
+    """
     try:
-        result, _ = engine(img_bytes)
+        result, _ = engine(image)
         if not result:
             return ""
         lines = []

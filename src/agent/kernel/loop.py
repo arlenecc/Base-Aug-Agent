@@ -45,20 +45,30 @@ _PLAN_GATE_TURNS = 3
 # 模型想收尾但计划里还有未完成步骤时的最大提醒次数。超过后尊重模型的决定，
 # 但在回复末尾附上未完成清单——用户必须知道任务其实没做完。
 _FINISH_NUDGE_MAX = 2
-# 发生过失败时放宽反思门预算：用户明确要求「步骤失败后自动恢复并继续」，
-# 此时模型停下来问「是否继续」正是要防的行为——多提醒几次换来自动恢复，
-# 比早早收尾、让用户手动打「继续」更符合预期。
-_FINISH_NUDGE_FAIL_MAX = 4
+# 发生过失败时大幅放宽预算：模型在失败后想用文字收尾 = 「停车等用户打继续」，
+# 正是要防的行为。一次提醒的成本就是一轮 LLM，而停车的代价是用户被迫手动
+# 介入，因此给到 8 次而不是 4 次。每次提醒都会附上最近一次错误**和已经试过
+# 且失败的方案清单**，所以第 n 次提醒不是第 1 次的复读。
+_FINISH_NUDGE_FAIL_MAX = 8
+# 「计划建好了但一步都还没干」时的预算。模型建完计划后最常见的行为就是把
+# 计划念一遍然后收尾——此时没有失败可引用，但「本段一次实际工具调用都没发
+# 生」本身就是最强的不该停车信号。默认 2 次会让它第 3 次就放行，正是用户
+# 看到的「规划完不执行，得手动说继续」。
+_FINISH_NUDGE_PLAN_MAX = 6
 # 失败调用签名保留数（识别「原样重试」：同名工具 + 相同参数再次失败）
 _MAX_FAIL_SIGS = 8
-# 把步骤标记 blocked 前至少要有多少次失败尝试（步骤边界 = 上次 update_plan）
-_MIN_ATTEMPTS_BEFORE_BLOCK = 2
+# 把步骤标记 blocked 前至少要有多少次失败尝试（步骤边界 = 上次 update_plan）。
+# 3 次 = 要求「至少 3 种不同方法都失败」才允许放弃一步，与系统提示 rule 8
+# 和反思门提醒里的措辞保持一致。
+_MIN_ATTEMPTS_BEFORE_BLOCK = 3
 # 「未充分尝试就标记 blocked」的提醒上限（防无限循环）
 _BLOCK_NUDGE_MAX = 2
 
 _PLAN_GATE_HINT = (
     "\n[System] 开始执行前，先用 update_plan(op=\"create\", goal=..., steps=[...]) "
-    "把目标和路径规划成 2~7 个可验证的步骤；然后从第一步开始，每完成一步就用 "
+    "把目标和路径规划成 2~7 个可验证的步骤；**紧接着就在同一轮或下一轮开始执行"
+    "第一步**（计划建好不等于任务开始，不要停下来问用户是否开始/是否继续）；"
+    "然后从第一步开始，每完成一步就用 "
     "update_plan(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 更新进度。"
 )
 
@@ -142,6 +152,11 @@ class KernelLoop:
         self._fail_sigs: List[str] = []          # 近期失败调用签名（原样重试检测）
         self._step_fails = 0         # 上次 update_plan 之后的失败数 ≈ 当前步骤的尝试次数
         self._block_nudge = 0        # 「未充分尝试就 blocked」已提醒次数
+        # 本段是否真的动过手（调用过非 update_plan 的工具）。建完计划一次实际
+        # 工具调用都没有就想收尾 = 「只规划不执行」，反思门必须多拦几次。
+        self._did_work = False
+        # 上层（Agent 自动续跑）注入的「上一段失败上下文」，run() 开始时消费一次。
+        self._seed_failures: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # 注入的能力：工具 schema
@@ -176,6 +191,18 @@ class KernelLoop:
         self._fail_sigs = []
         self._step_fails = 0
         self._block_nudge = 0
+        self._did_work = False
+        # 续跑段：把上一段的失败上下文带进来（见 seed_failures / failure_snapshot）。
+        # 不这么做的话，新段 _failed_total=0 → 反思门退回默认 2 次预算，且提醒里
+        # **不再有任何错误信息** —— 模型在续跑段完全不知道上一段卡在哪，只能
+        # 瞎试或再次停车。这正是「失败后就停住、等人提醒」在多段续跑下的放大器。
+        seed = self._seed_failures
+        self._seed_failures = None
+        if seed:
+            self._failed_total = int(seed.get("failed_total", 0) or 0)
+            self._last_fail = seed.get("last_fail") or None
+            self._fail_sigs = list(seed.get("fail_sigs") or [])[-_MAX_FAIL_SIGS:]
+            self._fail_streak = int(seed.get("fail_streak", 0) or 0)
         # max_turns 是「本次 run() 的轮次上限」，不是「整个会话的累计轮次」。
         # Session.turn_index 跨 run() 单调递增（它就是历史编号），拿它当循环
         # 上界会让 Agent 在累计 N 轮之后彻底不再调用 LLM。
@@ -272,10 +299,16 @@ class KernelLoop:
                 # 了，实际步骤没走完。提醒有限次，超过后尊重决定但在回复里附上
                 # 未完成清单（用户必须知道任务并没完成）。
                 open_steps = session.plan_open_steps()
-                # 失败发生过时放宽预算：此时「停下来问用户是否继续」正是要防的
-                # 行为，模型应当依据失败信息自动恢复并继续后续步骤。
-                nudge_budget = (_FINISH_NUDGE_FAIL_MAX if self._failed_total
-                                else _FINISH_NUDGE_MAX)
+                # 预算分三档。「停下来问用户是否继续」在两种情况下尤其不该放行：
+                #   1. 发生过失败 → 应依据错误信息自动恢复（最宽）；
+                #   2. 计划建好了但本段一次实际工具调用都没有 → 只是把计划念了
+                #      一遍就收尾，正是「规划完不执行，必须手动说继续」的成因。
+                if self._failed_total:
+                    nudge_budget = _FINISH_NUDGE_FAIL_MAX
+                elif not self._did_work:
+                    nudge_budget = _FINISH_NUDGE_PLAN_MAX
+                else:
+                    nudge_budget = _FINISH_NUDGE_MAX
                 if open_steps and self._finish_nudge < nudge_budget:
                     self._finish_nudge += 1
                     todo = "; ".join(
@@ -285,14 +318,42 @@ class KernelLoop:
                     if self._failed_total and self._last_fail:
                         # 失败感知的提醒：把最近一次失败摆到模型眼前，并要求
                         # 「依据失败信息自动解决」而不是停下来等用户发话。
+                        # 关键信息有三块：最近的错误、已经试过且失败的方案、
+                        # 以及「第 n 次提醒」——模型必须知道自己在原地打转。
                         fname, ferr = self._last_fail
+                        tried = self._tried_approaches()
+                        tried_txt = f"\n已试过且失败的方案（不要再走）：{tried}。" if tried else ""
                         pending = (
                             f"[System] 计划中还有 {len(open_steps)} 个未完成步骤：{todo}。"
-                            f"且此前有工具调用失败（最近：{fname} → {ferr[:160]}）。"
-                            "不要停下来、不要问用户是否继续——请依据失败信息自动解决："
-                            "1) 读完整错误定位原因 2) 换方法重试（不同工具/不同参数，"
-                            "或用 code_run 写诊断脚本）3) 多种方法都不可行时才把该步标记 "
-                            "blocked 并写明原因，再继续后续步骤。请现在调用工具继续执行。"
+                            f"此前有工具调用失败（共 {self._failed_total} 次，"
+                            f"最近：{fname} → {ferr[:200]}）。{tried_txt}\n"
+                            f"这是第 {self._finish_nudge} 次提醒。"
+                            "禁止停下来、禁止问用户「是否继续」、禁止只输出文字总结——"
+                            "你必须**调用工具**往下推进：\n"
+                            "1) 读完整错误，判定属于参数错误 / 路径不存在 / 权限 / "
+                            "依赖缺失 / 语法错误 / 网络不可达 中的哪一类；\n"
+                            "2) 针对该原因换一种**没试过**的方法（换工具、换参数、"
+                            "或用 code_run 写最小诊断脚本先验证假设）；\n"
+                            "3) 至少尝试 3 种不同方法都确认不可行，才把该步标记 "
+                            "blocked 并在 note 写明原因，然后继续后续步骤。\n"
+                            "现在就调用工具。"
+                        )
+                    elif not self._did_work:
+                        # 「只规划不执行」专用提醒：计划建好了，但本段一次实际
+                        # 工具调用都没有。此时模型只是把计划复述了一遍——必须
+                        # 点名让它执行 Now 那一步，而不是泛泛地说「继续」。
+                        now = next(
+                            (f"{s.get('id')}.{s.get('title')}" for s in open_steps
+                             if s.get("status") == "doing"),
+                            f"{open_steps[0].get('id')}.{open_steps[0].get('title')}",
+                        )
+                        pending = (
+                            f"[System] 计划已建立，但你还**一次工具都没调用**——"
+                            f"只把计划写出来不算开始执行。这是第 {self._finish_nudge} 次提醒。\n"
+                            f"现在立即开始执行当前步骤（Now）：{now}。\n"
+                            "要求：下一轮必须包含**工具调用**（读文件 / 执行命令 / "
+                            "检索 / 写代码等实际动作），不要只描述你打算做什么，"
+                            "不要停下来问用户是否开始或是否继续。"
                         )
                     else:
                         pending = (
@@ -350,6 +411,9 @@ class KernelLoop:
             # 把它重置之前，被「未充分尝试就 blocked」的守卫读走。
             step_fails_before = self._step_fails
             batch = self._track_failures(tool_calls, raw_results)
+            # 建计划本身不算「开工」：只调 update_plan 就收尾 = 只规划不执行。
+            if any(tc.name != "update_plan" for tc in tool_calls):
+                self._did_work = True
 
             outcomes = self._to_outcomes(tool_calls, raw_results)
             tool_results = [
@@ -396,7 +460,8 @@ class KernelLoop:
                 todo = "; ".join(f"{s.get('id')}.{s.get('title')}" for s in left[:8])
                 final_text = (final_text or "") + (
                     f"\n\n---\n⚠ 计划中仍有 {len(left)} 个未完成步骤：{todo}"
-                    "（可回复「继续」让我接着做，或用 update_plan 调整计划。）"
+                    "（内核已多次要求继续执行仍未完成。若某步其实已做完，用 "
+                    "update_plan 补标 done；若确实不可行，标 blocked 并写明原因。）"
                 )
 
         try:
@@ -624,6 +689,44 @@ class KernelLoop:
             args = str(tc.args)
         return f"{tc.name}::{args[:500]}"
 
+    def failure_snapshot(self) -> Dict[str, Any]:
+        """导出失败上下文，供上层在「自动续跑」的段之间传递。
+
+        段与段之间内核记账会被 run() 重置，失败信息随之中断——续跑段就不知道
+        上一段卡在哪。上层把本快照用 ``seed_failures`` 注入下一段即可续上。
+        """
+        return {
+            "failed_total": self._failed_total,
+            "last_fail": self._last_fail,
+            "fail_sigs": list(self._fail_sigs)[-_MAX_FAIL_SIGS:],
+            "fail_streak": self._fail_streak,
+        }
+
+    def seed_failures(self, snapshot: Optional[Dict[str, Any]]) -> None:
+        """把上一段的失败上下文带进下一段 run()（自动续跑用）。
+
+        只影响 ``_failed_total / _last_fail / _fail_sigs / _fail_streak``：
+        续跑段因此仍享有失败感知的反思门预算，且提醒里能引用上一段的真实错误。
+        """
+        self._seed_failures = dict(snapshot) if snapshot else None
+
+    def _tried_approaches(self, limit: int = 5) -> str:
+        """把近期失败过的调用压成「已试过且失败」的清单（提醒里点名排除）。
+
+        模型反复停车的一大原因是它不知道自己已经试过什么，于是把同一个思路
+        再讲一遍。把签名里已失败的工具/参数摆出来，它才能挑一个**没试过**的路。
+        """
+        seen: List[str] = []
+        for sig in self._fail_sigs:
+            name, _, args = sig.partition("::")
+            if not name:
+                continue
+            short = args[:60].replace("\n", " ")
+            item = f"{name}({short})" if short else name
+            if item not in seen:
+                seen.append(item)
+        return "； ".join(seen[-limit:])
+
     def _track_failures(self, tool_calls: List[ToolCall],
                         raw_results: List[Any]) -> Dict[str, Any]:
         """ACT 态失败记账：连续失败、失败签名、当前步骤的失败次数。
@@ -679,19 +782,35 @@ class KernelLoop:
             )
         elif self._fail_streak >= 2:
             name, err = self._last_fail or ("", "")
+            tried = self._tried_approaches()
             hints.append(
                 f"[System] 已连续失败 {self._fail_streak} 次"
-                f"（最近：{name} → {err[:160]}）。不要停下来问用户是否继续——"
-                "请依据错误信息自动修复：先读完整错误定位原因，再换一种方法重试"
-                "（不同工具/不同参数/先用 code_run 诊断）。同一思路只试一次。"
+                f"（最近：{name} → {err[:200]}）。"
+                f"已试过且失败的方案：{tried or '（无记录）'}。\n"
+                "不要停下来问用户是否继续——请依据错误信息自动修复：先读完整错误"
+                "定位原因，再换一种**没试过**的方法重试（不同工具/不同参数/先用 "
+                "code_run 写最小诊断脚本验证假设）。同一思路只允许试一次。"
+            )
+        elif batch["failed"]:
+            # 首次失败也必须是「换方案」而不是「原样重发 / 停下报告」。
+            # 旧实现只在连续失败 ≥2 次时才提示，第一次失败后模型最常见的反应
+            # 就是原样重试或把错误念一遍给用户听。
+            name, err = batch["failed"][0]
+            hints.append(
+                f"[System] 工具 `{name}` 调用失败：{err[:200]}。\n"
+                "请**先完整读完错误**，判定是参数错误 / 路径不存在 / 权限 / "
+                "依赖缺失 / 语法错误 / 网络不可达 中的哪一类，然后换一种方法达成"
+                "同一步骤的目标（换工具、换参数，或先用 code_run 写最小诊断脚本"
+                "验证假设）。不要原样重发同一个调用，不要停下来向用户报告失败——"
+                "失败是给你定位用的信号，不是停车的理由。"
             )
         if self._premature_block(tool_calls, raw_results, step_fails_before):
             hints.append(
                 f"[System] 步骤刚被标记 blocked，但本步骤至今只失败了 "
                 f"{step_fails_before} 次——尝试不够。请先用 update_plan 把它恢复 "
-                "doing，再依据上面的错误信息换方案重试（至少 2 种不同方法）；"
-                "只有多种方法都确认不可行后，才标记 blocked 并写明原因，然后继续"
-                "后续步骤。不要向用户确认「是否继续」。"
+                "doing，再依据上面的错误信息换**没试过**的方案重试（至少 3 种"
+                "不同方法）；只有多种方法都确认不可行后，才标记 blocked 并写明"
+                "原因，然后继续后续步骤。不要向用户确认「是否继续」。"
             )
         return hints
 

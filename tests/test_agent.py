@@ -9,7 +9,7 @@ from typing import Iterator, List
 
 import pytest
 
-from agent.agent import Agent
+from agent.agent import Agent, _AUTO_CONTINUE_MAX
 from agent.config import AgentConfig
 from agent.llm_client import LLMClient, StreamEvent
 
@@ -205,9 +205,9 @@ def test_agent_stops_after_max_iterations(config, recording_callbacks):
     agent._distill_min_turns = 999  # 隔离异步蒸馏线程（否则它会复用同一 mock）
     agent.run("loop")
 
-    # 每段最多 max_iterations 轮；MAX_TURNS 触发自动续跑（上限 2 段），
-    # 总调用数有界 —— 不断言 ==3，只断言不会无限循环。
-    assert len(mock.calls) <= 3 * 3
+    # 每段最多 max_iterations 轮；MAX_TURNS 触发自动续跑（上限 _AUTO_CONTINUE_MAX
+    # 段），总调用数有界 —— 不断言 ==3，只断言不会无限循环。
+    assert len(mock.calls) <= 3 * (_AUTO_CONTINUE_MAX + 1)
 
 
 # ---------------------------------------------------------------------------

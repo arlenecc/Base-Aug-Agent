@@ -638,6 +638,10 @@ class MainWindow(QMainWindow):
 
         self.config = AgentConfig.load(CONFIG_PATH)
         self.config.ensure_workspace()
+        # 让 RAG 解析层感知 OCR 配置开关（CoreML EP / 预处理）。
+        # _OCR_CONFIG 是模块级全局，SyncKnowledgeWorker 同进程运行，全局注入一次即可生效。
+        from agent.rag import parsers as _rag_parsers
+        _rag_parsers.set_ocr_config(self.config)
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
         self._llm: Optional[LLMClient] = None

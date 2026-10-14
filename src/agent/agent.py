@@ -73,10 +73,12 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete the us
 ## 任务推进：先规划，再步步为营
 1. **开始前先规划**：接到非平凡任务时，第一件事是 `update_plan(op="create", goal=..., steps=[...])`，
    把目标拆成 2~7 个**可验证**的步骤（每步能用一个工具调用判定完成与否）。一句话就能完成的任务不必规划。
+   **规划完立即开工**：建好计划只是起点，不是交付物——紧接着就必须开始执行第一步（调用工具），
+   绝不能把计划复述一遍就停下来等用户说「开始/继续」。
 2. **每步先反思再动手**：每次工具结果回来后，先在 `<summary>` 里写清「这一步证实/推翻了什么」，
    再决定下一步：是继续下一步、修正当前步骤的方法，还是回头改计划。不要重复同一个失败的调用。
 3. **及时更新计划**：完成一步就 `update_plan(op="patch", step_id=..., status="done", note="结论")`；
-   进行中标 `doing`；走不通标 `blocked`/`skipped` 并写明原因（blocked 前至少尝试 2 种不同方法）；发现遗漏用 `append`。
+   进行中标 `doing`；走不通标 `blocked`/`skipped` 并写明原因（blocked 前至少尝试 3 种不同方法）；发现遗漏用 `append`。
    计划每轮都会回注给你的上下文，也是用户唯一能看到进度的地方——保持它准确。
 4. **没做完不许收尾**：计划里还有未完成步骤时，不要只给文字总结就结束。全部步骤终态化后才能输出最终答复。
 
@@ -99,7 +101,7 @@ Rules:
 5. Complex task → `skill_semantic_search` first; if it finds nothing, try `skill_search` (they index different directories). Then `skill_load` and follow it. No match → proceed.
 6. User names a book/document → `rag_outline` for structure, then `rag_search` (with source) for details.
 7. Semantic search queries (`memory_search`/`skill_semantic_search`/`rag_search`): use the user's own natural-language phrasing. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
-8. On tool ERROR: read the full error, fix the cause, and retry with a DIFFERENT approach (other tool / other arguments / a `code_run` diagnostic script). Never repeat an identical failing call. A failed step is NOT a reason to stop: recover automatically from the error and keep executing the remaining steps — never stop to ask the user whether to continue. Mark a step `blocked` only after ≥2 genuinely different methods have failed (state the reason in its note), then move on. `ask_user` is only for information you truly cannot obtain yourself.
+8. On tool ERROR — the error is a SIGNAL, not a stop sign. You MUST recover on your own and keep going: (a) read the FULL error and classify it (bad arguments / path missing / permission / missing dependency / syntax / network); (b) retry with a DIFFERENT method that you have NOT tried yet — another tool, different arguments, or a minimal `code_run` diagnostic script to test your hypothesis first; (c) repeat (b) until the step succeeds. Never repeat an identical failing call, never dump the error back to the user, and NEVER stop to ask "should I continue?" — a failure pauses nothing. Only after ≥3 genuinely different methods have failed may you mark the step `blocked` with the reason in its note, and then you MUST move on to the remaining steps. `ask_user` is only for information you truly cannot obtain yourself — never for permission to continue.
 9. Reply concisely in plain text when done.
 
 Paths are relative to the workspace. Only `code_run`, `shell_run` and external MCP tools require confirmation."""
@@ -170,7 +172,11 @@ _MAX_PARALLEL_TOOLS = 8
 # 自动续跑段数上限（每段 = 一次完整内核 run）。MAX_TURNS 截断或「提前收尾但
 # 计划未完成」时自动续跑，替代旧的「停车等用户手动输入继续」。每段仍是完整
 # 的内核 run，取消/反思门/失败恢复全部生效；额度用尽才交回用户。
-_AUTO_CONTINUE_MAX = 2
+#
+# 4 段 × max_iterations(默认 15) = 最多 60 轮，长任务基本能自己跑完。段与段
+# 之间通过 seed_failures 传递失败上下文，所以续跑段不是「从零重试」，而是
+# 接着上一段的错误继续找方案。
+_AUTO_CONTINUE_MAX = 4
 # 允许并发的工具白名单：纯只读、彼此无顺序依赖。写操作（file_write /
 # file_modify）即使 destructive=False（工作区锁定）也不能并发——两个写操作
 # 可能落在同一个文件上。
@@ -829,6 +835,8 @@ class Agent:
         self.kernel.max_turns = max(1, int(self.max_iterations or 15))
 
         result: KernelResult = self.kernel.run(user_input)
+        # 首段的失败上下文：续跑段要靠它接着上一段的错误找方案。
+        carry: Optional[Dict[str, Any]] = self.kernel.failure_snapshot()
 
         # ---- 自动续跑：消灭「必须人工输入继续才能往下走」----
         # 两类停车都不该甩回给用户：
@@ -846,16 +854,32 @@ class Agent:
                and not self._cancelled()
                and self._should_auto_continue(result)):
             segments += 1
+            # 把上一段的失败上下文带进本段：否则 run() 重置记账后，续跑段既不
+            # 知道上一段卡在哪，也拿不到失败感知的反思门预算 —— 表现为「续跑
+            # 之后就不再针对报错找办法，而是原地打转然后停住」。
+            if carry:
+                self.kernel.seed_failures(carry)
             open_ids = "; ".join(
                 f"{s.get('id')}.{s.get('title')}"
                 for s in self.session.plan_open_steps()[:5]
             )
+            # 失败信息必须跟着续跑一起走（两条续跑路径都要）：续跑段最需要的
+            # 就是「上一段卡在哪」，否则它只能从头瞎试、然后再次停住。
+            fail_txt = ""
+            if carry and carry.get("last_fail"):
+                fname, ferr = carry["last_fail"]
+                fail_txt = (
+                    f"\n上一段最后一次失败：`{fname}` → {ferr[:200]}。"
+                    "请先读完整错误定位原因，再换一种**没试过**的方法"
+                    "（换工具 / 换参数 / 用 code_run 写最小诊断脚本验证假设）。"
+                    "不要原样重试，也不要只回答文字。"
+                )
             if result.reason is ExitReason.MAX_TURNS:
                 self._log(f"[agent] 达到轮次上限，自动续跑 {segments}/{_AUTO_CONTINUE_MAX}")
                 self.session.working["__truncated__"] = (
                     f"[系统提示] 上一段在达到轮次上限（{self.max_iterations}）后被自动续跑。"
                     "请先用一句话总结当前进展，然后**立即继续执行**计划中的剩余步骤；"
-                    "若全部步骤已完成，用 update_plan 收尾并给出最终答复。"
+                    f"若全部步骤已完成，用 update_plan 收尾并给出最终答复。{fail_txt}"
                 )
                 result = self.kernel.run(
                     "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
@@ -865,17 +889,19 @@ class Agent:
                 self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
                           f"{segments}/{_AUTO_CONTINUE_MAX}")
                 self.session.working["__plan_boundary__"] = (
-                    f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。"
+                    f"你上一条回复被判为提前收尾，但计划中仍有未完成步骤：{open_ids}。{fail_txt}\n"
                     "若这些步骤的工作**实际已经完成**，立即用 update_plan"
                     "(op=\"patch\", step_id=..., status=\"done\", note=\"结论\") 逐一收尾，"
-                    "然后给出最终答复；若尚未完成，继续执行；若确实不可行，"
-                    "标为 blocked/skipped 并写明原因后再给出最终答复。"
+                    "然后给出最终答复；若尚未完成，继续执行；"
+                    "只有至少 3 种不同方法都确认不可行，才标为 blocked/skipped "
+                    "并写明原因后再给出最终答复。"
                     "不要再次只给出文字总结就停止。"
                 )
                 result = self.kernel.run(
                     "[System] 上一条回复被判定为提前收尾，已自动续跑。"
                     "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。"
                 )
+            carry = self.kernel.failure_snapshot()
         if result.reason is ExitReason.MAX_TURNS:
             if segments:
                 # 续跑额度用尽仍被截断：如实告知用户，等待指示。

@@ -1,0 +1,174 @@
+"""Tests for OCR engine construction (CoreML EP injection) and pre-processing.
+
+These avoid invoking the real RapidOCR model load / real cv2 resize so they
+run on any platform (including CI on Intel x86).  The CoreML EP *injection*
+mechanism (monkey-patching RapidOCR's OrtInferSession EP list) is exercised
+directly against the real class method.
+"""
+import sys
+from unittest import mock
+
+import pytest
+
+sys.path.insert(0, "src")
+
+from agent.rag import ocr_engine as oe  # noqa: E402
+
+
+class _Run:
+    """Stand-in for subprocess.CompletedProcess (real attribute, not class attr)."""
+
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+class _FakeSession:
+    """Minimal stand-in for rapidocr's OrtInferSession (no real model load)."""
+
+    def _check_cuda(self):
+        return False
+
+    def _check_dml(self):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# CoreML EP injection mechanism
+# ---------------------------------------------------------------------------
+
+
+def test_patch_injects_coreml_ep_first():
+    cls = oe._ort_infer_session_class()
+    assert cls is not None, "rapidocr OrtInferSession 类未找到"
+    try:
+        ok = oe._patch_coreml_ep(cls)
+        assert ok, "patch 未生效"
+        ep_list = cls._get_ep_list(_FakeSession())
+        assert ep_list[0][0] == oe._COREML_EP, "CoreML 必须排在最前"
+        assert any(name == oe._CPU_EP for name, _ in ep_list), "CPU 必须保留作回退"
+    finally:
+        oe._unpatch_coreml_ep(cls)
+        ep_list2 = cls._get_ep_list(_FakeSession())
+        assert ep_list2[0][0] != oe._COREML_EP, "unpatch 后必须恢复原始 EP 列表"
+
+
+def test_create_ocr_engine_injects_coreml_on_apple_silicon(monkeypatch):
+    """Apple Silicon + ort>=1.31 → 引擎构造时 CoreML EP 被注入到 EP 列表。"""
+    monkeypatch.setattr(oe, "_apple_silicon_cache", True)
+    monkeypatch.setattr(oe, "ort_version", lambda: (1, 31, 0))
+
+    captured = {}
+
+    class FakeRapidOCR:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR)
+    cls = oe._ort_infer_session_class()
+    oe._patch_coreml_ep(cls)  # 模拟注入
+    try:
+        eng = oe.create_ocr_engine(use_coreml=True)
+        assert isinstance(eng, FakeRapidOCR)
+        # det_limit_side_len 应被我们放大（默认 736 → 1024），提升小字识别
+        assert captured.get("det_limit_side_len") == oe._DET_LIMIT_SIDE_LEN
+        assert oe._DET_LIMIT_SIDE_LEN > 736
+    finally:
+        oe._unpatch_coreml_ep(cls)
+
+
+def test_create_ocr_engine_no_coreml_when_disabled(monkeypatch):
+    """use_coreml=False → 不注入、不报错，且仍带 det_limit_side_len 参数。"""
+    captured = {}
+
+    class FakeRapidOCR:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR)
+    cls = oe._ort_infer_session_class()
+    was_patched = getattr(cls._get_ep_list, "_coreml_patched", False)
+    eng = oe.create_ocr_engine(use_coreml=False)
+    assert isinstance(eng, FakeRapidOCR)
+    assert captured.get("det_limit_side_len") == oe._DET_LIMIT_SIDE_LEN
+    # 关闭时不得注入 CoreML 到全局类
+    assert getattr(cls._get_ep_list, "_coreml_patched", False) == was_patched
+
+
+def test_coreml_reason_refuses_on_non_apple():
+    usable, reason = oe.coreml_reason()
+    # 在 CI / Intel 机器上应直接拒绝（不要求 onnxruntime 版本）
+    if not oe.is_apple_silicon():
+        assert usable is False
+        assert "Apple" in reason or "非" in reason
+
+
+# ---------------------------------------------------------------------------
+# Apple Silicon detection
+# ---------------------------------------------------------------------------
+
+
+def test_is_apple_silicon_current():
+    # 原生 arm64 → True
+    with mock.patch.object(oe.platform, "system", return_value="Darwin"), \
+         mock.patch.object(oe.platform, "machine", return_value="arm64"):
+        assert oe._detect_apple_silicon() is True
+
+    # Rosetta：machine 报 x86_64，但 sysctl 真实 CPU 是 Apple M1
+    with mock.patch.object(oe.platform, "system", return_value="Darwin"), \
+         mock.patch.object(oe.platform, "machine", return_value="x86_64"), \
+         mock.patch.object(oe.subprocess, "run", return_value=_Run("Apple M1")):
+        assert oe._detect_apple_silicon() is True
+
+    # 真 Intel：sysctl 不含 Apple
+    with mock.patch.object(oe.platform, "system", return_value="Darwin"), \
+         mock.patch.object(oe.platform, "machine", return_value="x86_64"), \
+         mock.patch.object(oe.subprocess, "run", return_value=_Run("Intel(R) Core(TM) i5")):
+        assert oe._detect_apple_silicon() is False
+
+    # 非 Darwin
+    with mock.patch.object(oe.platform, "system", return_value="Linux"):
+        assert oe._detect_apple_silicon() is False
+
+
+# ---------------------------------------------------------------------------
+# Pre-processing robustness (best-effort; must never raise)
+# ---------------------------------------------------------------------------
+
+
+def test_preprocess_returns_input_on_none():
+    assert oe.preprocess_for_ocr(None) is None
+
+
+def test_preprocess_safe_on_arbitrary_input():
+    # 任意非图像输入不得抛错，原样返回
+    obj = "not an image"
+    assert oe.preprocess_for_ocr(obj) is obj
+
+
+def test_preprocess_handles_2d_and_4ch():
+    import numpy as np
+    gray = np.zeros((10, 10), dtype=np.uint8)
+    rgba = np.zeros((10, 10, 4), dtype=np.uint8)
+    # 这些路径在 cv2 可用时走转换；cv2 损坏时走降级返回原图——都不应抛错
+    r1 = oe.preprocess_for_ocr(gray)
+    r2 = oe.preprocess_for_ocr(rgba)
+    assert r1 is not None
+    assert r2 is not None
+
+
+def test_render_dpi_clamped(monkeypatch):
+    """render_dpi_for_page 必须落在 [150, 400]。"""
+
+    class Rect:
+        def __init__(self, w, h):
+            self.width, self.height = w, h
+
+    class Page:
+        rect = Rect(72, 72)  # 1x1 inch → 目标 1600dpi，应被 clamp 到 400
+
+    assert oe.render_dpi_for_page(Page()) == 400
+
+    class Tiny:
+        rect = Rect(72 * 100, 72 * 100)  # 100 inch 短边 → 16 dpi，应被 clamp 到 150
+
+    assert oe.render_dpi_for_page(Tiny()) == 150

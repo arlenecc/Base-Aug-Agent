@@ -126,6 +126,10 @@ class UpdatePlanTool(Tool):
             raw_n = len(steps) if isinstance(steps, list) else 1
             if raw_n > len(plan["steps"]):
                 out += f"\n⚠ 步骤数超过上限 {len(plan['steps'])}，多出的 {raw_n - len(plan['steps'])} 步被丢弃"
+            # 建计划不等于开工：模型最常见的失败模式是 create 完就把计划复述
+            # 一遍然后收尾，等用户说「开始/继续」。这里直接在工具结果里下达
+            # 开工指令，让它在同一条消息里就看到「下一步该干什么」。
+            out += "\n▶ 现在立即开始执行第 1 步（调用相应工具），不要停下来询问是否开始。"
             return ToolResult(True, output=f"{out}\n{sess.render_plan()}")
 
         if op == "append":

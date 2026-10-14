@@ -49,9 +49,10 @@
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
-- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
+- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FlagEmbedding（BGE 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
+- **OCR 加速与预处理** — 图片型 PDF 的 RapidOCR 在 **Apple M 系列 Mac** 上自动启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 CLAHE 对比度增强 + 锐化**预处理，提升小字与低对比扫描件的识别率。两者均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
-- **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→4 次、引用最近错误、明确禁止「停下来问用户是否继续」）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 2 次就把步骤标 `blocked` 会被守卫拦回
+- **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
 - **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
@@ -111,7 +112,7 @@ pip install -e ".[all]"
 |------|---------|---------|
 | 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
 | RAG | `pip install -e ".[rag]"` | lancedb, fastembed, FlagEmbedding, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
-| OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别） |
+| OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别）+ opencv-python-headless（图像预处理归一化/增强） |
 | 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
 | 全部 | `pip install -e ".[all]"` | 以上所有 |
 
@@ -318,11 +319,13 @@ python main.py
 | Word | `.docx`, `.doc` | docling（回退 `python-docx`） |
 | Excel | `.xlsx`, `.xls` | docling（回退 `openpyxl`） |
 | PowerPoint | `.pptx`, `.ppt` | docling（回退 `python-pptx`） |
-| PDF | `.pdf` | docling（图片型/纯扫描走 `rapidocr-onnxruntime`） |
+| PDF | `.pdf` | docling（图片型/纯扫描走 `rapidocr-onnxruntime` + `opencv-python-headless` 预处理） |
 | EPUB | `.epub` | docling（回退 `ebooklib`） |
 | MOBI/AZW | `.mobi`, `.azw3` | calibre（可选） |
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
 | HTML | `.html`, `.htm` | `beautifulsoup4` |
+
+**OCR 优化（图片型 PDF）**：扫描/图片型 PDF 经由 RapidOCR（onnxruntime）识别。在 **Apple M 系列 Mac** 上，检测到 CPU 为 Apple M 且 `onnxruntime≥1.31` 时引擎自动启用 **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+ANE 神经网络引擎），相比纯 CPU 推理显著加速；低于 1.31 或 Intel/非 Apple 平台则回退默认 EP。识别前对每页做**图像预处理与归一化**：按页面物理尺寸自适应 DPI 渲染、短边放大到目标像素、灰度 + CLAHE 对比度增强 + 锐化，提升小字与低对比扫描件的识别率。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭。
 
 ### Hybrid 智能分片
 
@@ -349,7 +352,9 @@ Markdown 文本
 2. 对照依赖表检查所需 Python 包是否已安装
 3. 缺失的依赖自动 `pip install`（含版本约束）
 4. 核心依赖（`lancedb`、`fastembed`）也会一并检查
-5. 安装完成后自动开始同步
+5. 可选增强依赖（chonkie 语义分块、FlagEmbedding BGE 重排序、opencv-python-headless OCR 预处理）纳入检查与自动安装，缺失不阻塞同步（均有回退路径）
+6. Apple M 系列 Mac 上若 `onnxruntime` 低于 1.31（CoreML EP 加速 OCR 所需），给出升级建议命令（不强制升级，避免破坏现有环境）
+7. 安装完成后自动开始同步
 
 若自动安装失败（如网络问题），会弹出提示列出需手动安装的包。
 
@@ -610,7 +615,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
-失败自动恢复专项（`tests/test_failure_recovery.py`，11 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。
+失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。
 
 当前共 543 个用例（530 通过；13 个 `test_rag_full_pipeline` 用例依赖 `python-pptx`，未安装该可选依赖时在 setup 阶段报环境错误，不影响其余测试）。
 
@@ -739,7 +744,9 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 **失败自动恢复**（用户需求：计划中某项任务失败时，自动依据失败信息找方案解决并继续后续任务，而不是停下等用户输入「继续」）：
 
-- 失败感知反思门：本次 run 发生过失败时，提醒预算 2→4 次，且提醒引用最近一次失败的**具体错误**，明确要求「读完整错误 → 换方法重试 → 多种方法都不可行才标 blocked」，禁止停下来问用户是否继续
+- 失败感知反思门：本次 run 发生过失败时，提醒预算 2→8 次，且提醒引用最近一次失败的**具体错误**与**已试过且失败的方案清单**，明确要求「读完整错误 → 换没试过的方法 → 至少 3 种方法都失败才标 blocked」，禁止停下来问用户是否继续
+- 「只规划不执行」门：建完计划但本段一次实际工具调用都没有就想收尾时，预算走 6 次（默认档仍是 2 次），且提醒点名「你还一次工具都没调用」+ 直指 Now 那一步。`update_plan(op="create")` 的结果里也会直接下达「▶ 现在立即开始执行第 1 步」。修复前这类场景第 3 次文字就被放行，正是「规划完不执行、必须手动说继续」的成因
+- 首次失败即干预：第一次失败就要求判定错误类别（参数/路径/权限/依赖/语法/网络）并换方法，禁止原样重发、禁止把错误念给用户听（旧实现要等连续失败 2 次才提示）
 - 原样重试检测：同名工具 + 相同参数再次失败 → 点名「禁止重复」，要求换参数/换工具/用 `code_run` 写诊断脚本
 - 连续失败提示：连续失败 ≥2 次 → 要求先诊断再换方案，同一思路只试一次
 - 防过早 blocked 守卫：失败尝试 <2 次就把步骤标 `blocked` → 提醒恢复 `doing` 再试（守卫有上限，模型坚持放弃时最终尊重）
@@ -749,8 +756,12 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 - 自动续跑：两类停车不再甩回给用户——① MAX_TURNS 截断（长任务跑满轮次上限）；
   ② 模型提前收尾但计划仍有未完成步骤（反思门提醒额度用尽）。每段续跑都是
-  完整的内核 run（取消/反思门/预算全部生效），最多续 2 段，额度用尽才交回用户
-  （`agent._auto_continue` 可关闭）
+  完整的内核 run（取消/反思门/预算全部生效），最多续 4 段（默认每段 15 轮 →
+  合计最多 75 轮），额度用尽才交回用户（`agent._auto_continue` 可关闭）
+- 失败上下文跨段传递：续跑段通过 `kernel.seed_failures(snapshot)` 接住上一段的
+  `_failed_total / _last_fail / _fail_sigs`，因此续跑段仍享有失败感知的反思门预算，
+  且续跑首轮的锚点会带上「上一段最后一次失败：工具 → 错误」。修复前续跑段记账被
+  重置，模型不知道上一段卡在哪，只能瞎试后再次停住
 - 反思门提醒补全出口：明确告诉模型「若该步骤的工作**实际已完成**，用
   `update_plan(op=patch, status=done)` 收尾即可，不要为响应提醒而重复已完成的工作」
   ——修复「实际都做完了但面板一直显示有未完成项，反复要求打继续」

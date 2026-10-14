@@ -19,7 +19,9 @@ def _fake_rapidocr_module():
     class _FakeRapidOCR:
         instances = 0
 
-        def __init__(self):
+        # RapidOCR accepts config kwargs (create_ocr_engine passes
+        # det_limit_side_len / det_limit_type).
+        def __init__(self, **kwargs):
             _FakeRapidOCR.instances += 1
 
         def __call__(self, *args, **kwargs):
