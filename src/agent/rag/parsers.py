@@ -382,6 +382,15 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _is_apple_silicon() -> bool:
+    """当前是否为 Apple Silicon（M 系列）Mac。
+
+    arm64 macOS 即 Apple Silicon；Intel Mac 返回 False，继续用 CPU EP。
+    """
+    import platform
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
 def _get_ocr_engine():
     """Lazy-load RapidOCR engine as a global singleton.
 
@@ -389,6 +398,12 @@ def _get_ocr_engine():
     (~500MB) — without this, 4 workers loading 4 instances would OOM. The
     _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
     invoked by one thread at a time.
+
+    引擎选择：优先 rapidocr 3.x（支持 CoreML EP、模型目录与 docling 共享、
+    懒加载省内存），未安装再回退旧版 rapidocr-onnxruntime 1.x（CPU EP）。
+    Apple Silicon（M 系列）上 3.x 启用 onnxruntime 的 CoreML EP（ANE+GPU
+    推理，实测比 CPU EP 快约 1.5 倍且输出一致）；CoreML 初始化失败自动
+    回退 CPU EP。
     """
     global _OCR_ENGINE
     if _OCR_ENGINE is not None:
@@ -397,14 +412,40 @@ def _get_ocr_engine():
         if _OCR_ENGINE is not None:
             return _OCR_ENGINE
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            _OCR_ENGINE = RapidOCR()
-            logger.info("RapidOCR engine loaded (global singleton)")
+            params = None
+            try:
+                from rapidocr import RapidOCR  # 3.x
+                if _is_apple_silicon():
+                    params = {"EngineConfig.onnxruntime.use_coreml": True}
+            except ImportError:
+                from rapidocr_onnxruntime import RapidOCR  # 1.x 回退
+            if params:
+                try:
+                    _OCR_ENGINE = RapidOCR(params=params)
+                except Exception as e:
+                    logger.info(
+                        "RapidOCR CoreML EP init failed (%s); using CPU EP",
+                        type(e).__name__)
+                    _OCR_ENGINE = RapidOCR()
+            else:
+                _OCR_ENGINE = RapidOCR()
+            # 预热一次（空图）：提前加载模型并探测实际生效的 EP。
+            # 模型本来马上就会被用到，预热同时消除首页 OCR 的加载延迟。
+            try:
+                import numpy as np
+                _OCR_ENGINE(np.full((64, 64), 255, dtype=np.uint8))
+                inner = getattr(getattr(_OCR_ENGINE, "text_det", None),
+                                "session", None)
+                inner = getattr(inner, "session", inner)
+                logger.info("RapidOCR engine loaded, EP: %s",
+                            inner.get_providers())
+            except Exception:
+                logger.info("RapidOCR engine loaded (global singleton)")
             return _OCR_ENGINE
         except ImportError:
             logger.warning(
-                "rapidocr-onnxruntime is required for OCR on image-based PDFs. "
-                "pip install rapidocr-onnxruntime"
+                "rapidocr is required for OCR on image-based PDFs. "
+                "pip install rapidocr"
             )
             return None
         except Exception as e:
@@ -435,13 +476,20 @@ def _ocr_image_cached(engine, img, page_num: int, filename: str) -> str:
 
     ``img`` 是归一化后的灰度 ndarray（见 _ocr_preprocess）；RapidOCR 的
     LoadImage 对 ndarray 直接走 cv2 转换，无需再编码/解码。
+    兼容两代 API 的返回：3.x 返回 RapidOCROutput（行文本在 .txts）；
+    1.x 返回 (result, elapse)，result 是 [box, text, score] 列表。
     """
     try:
-        result, _ = engine(img)
-        if not result:
+        out = engine(img)
+        if isinstance(out, tuple):
+            out = out[0]
+        txts = getattr(out, "txts", None)
+        if txts is not None:
+            return "\n".join(t for t in txts if t and t.strip())
+        if not out:
             return ""
         lines = []
-        for item in result:
+        for item in out:
             text = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else str(item)
             if text.strip():
                 lines.append(text)

@@ -2,7 +2,7 @@
 
 Covers three layers:
 1. Python packages (lancedb, fastembed, PyMuPDF, python-docx, etc.)
-2. OCR engine (rapidocr-onnxruntime) — auto-detected if PDF has image pages
+2. OCR engine (rapidocr) — auto-detected if PDF has image pages
 3. Embedding model (nomic-ai/nomic-embed-text-v1.5) — pre-downloaded from HF
 
 Runs before every sync so users never hit missing-dependency errors mid-ingest.
@@ -38,6 +38,9 @@ class DepSpec:
     pip_spec: str          # pip install spec (e.g., "python-docx", "numpy<2.0")
     label: str             # human-readable label
     required: bool = True  # if False, only warn (e.g., OCR is optional unless needed)
+    # False = 缺失时只在 summary 提示手动安装，ensure_rag_deps 不自动 pip 装
+    # （用于体积巨大的可选包，如 FlagEmbedding 会拉 ~2GB 的 PyTorch）。
+    auto_install: bool = True
 
 
 # Map each file extension to its required dependencies.
@@ -50,9 +53,9 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".ppt":  [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
     ".pdf":  [
         DepSpec("fitz", "PyMuPDF", "PDF 文字解析"),
-        # OCR is conditional: only required when the PDF actually has image pages.
-        # check_dependencies() will upgrade it to required if image pages are detected.
-        DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别", required=False),
+        # OCR 引擎（rapidocr 3.x 或旧版 rapidocr-onnxruntime 1.x，任一即可）
+        # 不在静态表里：只有知识库真的包含图片版 PDF 时才检查/提示，
+        # 见 check_dependencies() 的 ocr_installed 动态逻辑。
     ],
     ".epub": [
         DepSpec("ebooklib", "ebooklib", "EPUB 电子书解析"),
@@ -175,7 +178,7 @@ class DependencyReport:
 
         if self.has_image_pdf and not self.ocr_installed:
             lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
-            lines.append("  - rapidocr-onnxruntime (pip install rapidocr-onnxruntime)")
+            lines.append("  - rapidocr (pip install rapidocr)")
         if self.missing_optional:
             lines.append("缺少可选依赖（部分功能受限）：")
             for d in self.missing_optional:
@@ -399,14 +402,17 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
         has_images = _pdf_has_image_pages(kb_path)
         report.has_image_pdf = has_images
         # Check if OCR is installed
-        report.ocr_installed = _is_importable("rapidocr_onnxruntime")
+        # 新版 rapidocr (3.x) 与旧版 rapidocr-onnxruntime (1.x) 任一可用即可，
+        # 引擎选择见 parsers._get_ocr_engine。
+        report.ocr_installed = (_is_importable("rapidocr")
+                                or _is_importable("rapidocr_onnxruntime"))
         if has_images and not report.ocr_installed:
             # Move OCR from optional to required.
             # 必须同时从 missing_optional 里移除：否则同一个 pip_spec 会同时
             # 出现在「缺失必需」和「缺失可选」里 → pip 装两遍、summary 里
             # 重复列出同一项。按 pip_spec 去重（DepSpec 是 dataclass，值相等
             # 即可比较，但这里显式按 pip_spec 匹配更稳）。
-            ocr_spec = DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别")
+            ocr_spec = DepSpec("rapidocr", "rapidocr", "图片型 PDF OCR 识别")
             report.missing_optional = [
                 d for d in report.missing_optional if d.pip_spec != ocr_spec.pip_spec
             ]
@@ -417,8 +423,48 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
     if exts & {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".epub"}:
         if not _is_importable("docling"):
             report.missing_optional.append(
-                DepSpec("docling", "docling", "统一文档解析引擎 docling（可选，未安装时回退按格式解析）")
+                DepSpec("docling", "docling",
+                        "统一文档解析引擎 docling（可选，未安装时回退按格式解析）",
+                        required=False)
             )
+
+    # ---- chonkie: optional semantic chunking (falls back to recursive chunker) ----
+    # 依赖轻量，缺失时随同步自动安装。
+    if not _is_importable("chonkie"):
+        report.missing_optional.append(
+            DepSpec("chonkie", "chonkie",
+                    "语义分块 chonkie（可选，未安装时回退递归分块）",
+                    required=False)
+        )
+
+    # ---- onnxruntime 版本下限：CoreML EP 需要 >= 1.31 ----
+    # Apple Silicon 上的 OCR 推理加速（parsers._get_ocr_engine）依赖官方
+    # wheel 内置的 CoreMLExecutionProvider；旧版本会静默回退 CPU EP。
+    # fastembed 会拉 onnxruntime，但可能拉到旧版——这里强制版本下限，
+    # 缺失/过旧都进 missing_required，由 ensure_rag_deps 自动升级。
+    if _is_importable("onnxruntime"):
+        try:
+            import onnxruntime as _ort
+            _ort_ver = tuple(int(p) for p in _ort.__version__.split(".")[:2])
+            if _ort_ver < (1, 31):
+                report.missing_required.append(
+                    DepSpec("onnxruntime", "onnxruntime>=1.31",
+                            f"onnxruntime {_ort.__version__} 过旧"
+                            f"（CoreML EP 加速需要 >= 1.31）")
+                )
+        except (ValueError, AttributeError):
+            pass  # 版本号解析失败（如 dev 构建）时不误报
+
+    # ---- FlagEmbedding: optional reranker (falls back to distance ranking) ----
+    # 会拉 PyTorch（~2GB），不自动安装，仅在 summary 提示手动安装。
+    # 与 reranker_model_missing（模型权重）相互独立——包没装时模型必然
+    # 也没有，但包装了模型可能还没下载。
+    if not _is_importable("FlagEmbedding"):
+        report.missing_optional.append(
+            DepSpec("FlagEmbedding", "FlagEmbedding",
+                    "重排序 FlagEmbedding（可选，~2GB 含 PyTorch，未安装时按向量距离排序）",
+                    required=False, auto_install=False)
+        )
 
     # ---- Embedding model ----
     if include_core:
@@ -539,9 +585,18 @@ def ensure_dependencies(
     if report.has_missing:
         specs_to_install: List[str] = []
         for dep in report.missing_required:
-            specs_to_install.append(dep.pip_spec)
+            if dep.auto_install:
+                specs_to_install.append(dep.pip_spec)
         for dep in report.missing_optional:
-            specs_to_install.append(dep.pip_spec)
+            if dep.auto_install:
+                specs_to_install.append(dep.pip_spec)
+        skipped = [
+            d.pip_spec for d in (report.missing_required + report.missing_optional)
+            if not d.auto_install
+        ]
+        if skipped:
+            logger.info("RAG deps: skipping auto-install of %s (manual install only)",
+                        ", ".join(skipped))
 
         if specs_to_install:
             logger.info("RAG deps: auto-installing %d packages: %s",

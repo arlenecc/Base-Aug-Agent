@@ -665,6 +665,9 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 99 | 任务全部完成后计划残留在系统提示 | 模型无明确收尾信号，陈旧计划一直注入每轮提示 | 计划全部 done 时 render_plan 追加 "All steps are done → clear" 信号；系统提示规则 1 明确「全部完成后调用 task_plan clear」 |
 | 100 | 渲染后无有效内容的图片页仍送 OCR（纯色占位图、扫描件空白纸页） | RapidOCR 对每页检测 2-5 秒后返回空，单文档可累计浪费 1 分钟以上 | 渲染后采样位图极差 ≤ 12 即判近纯色页，跳过 OCR 计入 blank（含噪点扫描页，实测 4 场景验证） |
 | 101 | 图片页 OCR 零预处理：暗色主题（黑底白字）/低对比度模糊文字页 det 大面积检不出 | 电子书「一大片页面检测不到文字」 | 灰度渲染 + `_ocr_normalize` 归一化（暗页自动反色 + p2-p98 对比度拉伸），分位数在反色后重算（否则噪声被放大十余倍淹没文字）；直接传 ndarray 省 PNG 编解码。真实引擎实测 6 场景：暗主题/模糊/浅灰页检出恢复或改善，正常页无回归 |
+| 102 | OCR 走 rapidocr-onnxruntime 1.x（CPU EP），未利用 Apple Silicon 的 ANE/GPU | 检测 arm64 macOS 后仍纯 CPU 推理 | 优先 import rapidocr 3.x（模型目录与 docling 共享、懒加载），Apple Silicon 上传 `EngineConfig.onnxruntime.use_coreml: True` 启用 CoreML EP（MLComputeUnits=ALL），失败自动回退 CPU EP；OCR 依赖检测改为 3.x/1.x 任一可用。基准实测 1.5x 加速、输出与 CPU EP 完全一致 |
+| 103 | deps.py 依赖清单漏登记 chonkie / FlagEmbedding（docling 有动态检查） | 缺失时不检查、不自动安装也不提示，语义分块/重排序静默退化 | check_dependencies 增加两项可选检查；DepSpec 新增 `auto_install` 字段——chonkie 轻量随同步自动安装，FlagEmbedding（~2GB 含 PyTorch）仅提示手动安装，避免 2GB 下载被静默触发 |
+| 104 | onnxruntime 无版本下限：fastembed 可能拉到旧版，旧版 wheel 无 CoreMLExecutionProvider | CoreML EP 静默回退 CPU EP | check_dependencies 增加 onnxruntime>=1.31 版本下限检查（低于则进 missing_required 由 ensure_rag_deps 自动升级），版本号解析失败不误报 |
 
 ## 部署
 

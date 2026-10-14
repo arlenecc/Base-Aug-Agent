@@ -1,6 +1,8 @@
 """Tests for the RAG dependency check and auto-install module."""
 import os
+import sys
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
@@ -74,7 +76,33 @@ class TestCheckDependencies:
         report = check_dependencies(str(tmp_path), include_core=False)
         # .txt requires no external deps
         assert len(report.missing_required) == 0
-        assert len(report.missing_optional) == 0
+        # 可选增强包（chonkie/FlagEmbedding，与知识库内容无关）缺失时会在
+        # missing_optional 提示，属预期；但不得出现按扩展名检查的依赖。
+        ext_related = {"python-docx", "openpyxl", "python-pptx", "PyMuPDF",
+                       "ebooklib", "beautifulsoup4", "docling"}
+        assert not any(d.pip_spec in ext_related for d in report.missing_optional)
+
+    def test_onnxruntime_version_floor(self, tmp_path, monkeypatch):
+        (tmp_path / "notes.txt").write_text("x")
+        import src.agent.rag.deps as deps_mod
+
+        fake_ort = types.ModuleType("onnxruntime")
+        fake_ort.__version__ = "1.20.0"
+        monkeypatch.setattr(
+            deps_mod, "_is_importable",
+            lambda name: name == "onnxruntime")
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+        # 过旧版本 → 进 missing_required（自动升级）
+        report = check_dependencies(str(tmp_path), include_core=False)
+        assert any(d.pip_spec == "onnxruntime>=1.31"
+                   for d in report.missing_required)
+
+        # 版本满足 → 不报
+        fake_ort.__version__ = "1.31.2"
+        report2 = check_dependencies(str(tmp_path), include_core=False)
+        assert not any(d.pip_spec == "onnxruntime>=1.31"
+                       for d in report2.missing_required)
 
     def test_check_epub_finds_ebooklib(self, tmp_path):
         (tmp_path / "book.epub").write_text("x")
@@ -105,12 +133,13 @@ class TestCheckDependencies:
     def test_check_ocr_is_optional(self, tmp_path):
         (tmp_path / "doc.pdf").write_text("x")
         report = check_dependencies(str(tmp_path), include_core=False)
-        ocr_deps = [d for d in report.missing_optional if d.import_name == "rapidocr_onnxruntime"]
-        if not _is_importable("rapidocr_onnxruntime"):
-            assert len(ocr_deps) == 1
-            assert not ocr_deps[0].required
-        else:
-            assert len(ocr_deps) == 0
+        # OCR 依赖不再静态列出：仅在知识库真的包含图片版 PDF 时才检查
+        # （假 PDF 无图页，不触发），因此任何情况下都不应出现在缺失列表里。
+        ocr_missing = [
+            d for d in report.all_missing
+            if d.import_name in ("rapidocr", "rapidocr_onnxruntime")
+        ]
+        assert len(ocr_missing) == 0
 
     def test_check_multiple_formats(self, tmp_path):
         (tmp_path / "doc.pdf").write_text("x")
@@ -205,10 +234,14 @@ class TestExtensionDeps:
             assert ext in EXTENSION_DEPS, f"Extension {ext} missing from EXTENSION_DEPS"
 
     def test_pdf_has_ocr_as_optional(self):
+        # OCR 引擎依赖改为动态检查（仅当知识库含图片版 PDF 时），不再
+        # 静态挂在 EXTENSION_DEPS[".pdf"] 下。
         pdf_deps = EXTENSION_DEPS[".pdf"]
-        ocr_deps = [d for d in pdf_deps if d.import_name == "rapidocr_onnxruntime"]
-        assert len(ocr_deps) == 1
-        assert not ocr_deps[0].required
+        ocr_deps = [
+            d for d in pdf_deps
+            if d.import_name in ("rapidocr", "rapidocr_onnxruntime")
+        ]
+        assert len(ocr_deps) == 0
 
     def test_pdf_has_fitz_as_required(self):
         pdf_deps = EXTENSION_DEPS[".pdf"]
