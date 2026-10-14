@@ -1009,6 +1009,17 @@ class MainWindow(QMainWindow):
 
         _num(self.temp_edit, "temperature", 0.7, float, "温度")
         _num(self.max_tokens_edit, "max_tokens", 32768, int, "最大Token")
+        # 钳制：0/负值在下游都有破坏性 —— request_timeout=0 会让 httpx 立即
+        # 超时（所有请求必失败）、temperature 为负被多数 API 拒绝。钳到合法
+        # 下限并记录到 invalid 列表（与非法值回退共用状态栏提示）。
+        if self.config.request_timeout <= 0:
+            self.config.request_timeout = 120.0
+            self.timeout_edit.setText("120.0")
+            invalid.append("超时≤0 → 120")
+        if self.config.temperature < 0:
+            self.config.temperature = 0.0
+            self.temp_edit.setText("0.0")
+            invalid.append("温度<0 → 0")
         # Keep max_context_tokens in sync with max_tokens: the shrink threshold
         # should track the model's actual context window. If the user has
         # explicitly set a different max_context_tokens via config.json, only

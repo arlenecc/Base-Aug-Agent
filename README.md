@@ -634,9 +634,9 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
-失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。
+失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。
 
-当前共 543 个用例（530 通过；13 个 `test_rag_full_pipeline` 用例依赖 `python-pptx`，未安装该可选依赖时在 setup 阶段报环境错误，不影响其余测试）。
+当前共 547 个用例（不含 RAG e2e 的快速集 497 例全部通过；`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`，未安装该可选依赖时在 setup 阶段报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -840,6 +840,20 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 145 | busy 时按 Enter 静默丢弃 | 像输入框坏了 | 状态栏提示「正在运行中」 |
 | 146 | 清空对话无 busy 守卫、不清计数器 | 运行中清空破坏会话；token 计数残留 | 加守卫 + 复位计数 |
 | 147 | Ctrl+Enter 也发送、按键事件未 accept | 误发送；事件向父控件意外传播 | 仅裸 Enter 发送 + `e.accept()` |
+
+### 第十一轮：全量代码重审（正确性 / 泄漏 / 进程稳定性）
+
+对全部 45 个源文件逐文件重审，详见 [软件设计文档 §13](docs/软件设计文档.md)：
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 148 | `_BoundedIO.write` 截断快速路径绕过 closed 检查 | close 后 write 仍返回 0 → code_run 超时/取消的泄漏线程**永不退出**，往真实 stdout 无限刷屏，解释器退出时持 stdout 锁 → `Fatal Python error` 进程 abort（pytest exit=134） | write 在任何快速路径前显式检查 `self.closed` |
+| 149 | code_run 超时/取消路径先恢复全局 stdout 再 close 缓冲 | 泄漏线程的 print 动态查找到真实流，永远碰不到已关闭缓冲（与 148 叠加导致自杀机制整体失效） | 超时/取消路径 close 后延迟 50ms 恢复全局流（泄漏线程撞 ValueError 退出）；正常完成路径仍立即恢复 |
+| 150 | 50ms 恢复窗口内新一场 code_run 把上一场已关闭缓冲当外部流恢复 | 全局 stdout 被永久钉死在死流上 | 模块级真实流缓存 + 快照识别 stale；延迟恢复仅在全局流仍指向本场缓冲时动手 |
+| 151 | `engine._chunk_iter` 把 `stats["errors"]` 列表覆盖成 int（且不持锁） | 文件在同步中被删 → 收尾 `len(errors)` TypeError，**整轮已成功的同步以异常告终** | 持 `stats_lock` append 错误记录，与其他错误路径同构 |
+| 152 | `_work_memory` 的 `move_to_end` 在锁外调用 | 与锁内 `popitem` 并发修改 OrderedDict → RuntimeError / 条目错乱 | 命中/新建/淘汰三者同锁 |
+| 153 | code_run 护栏对非 str/PathLike 的 `open()` 参数走 `realpath("")`（=cwd） | 绕过前缀检查后炸出与根因无关的底层 TypeError，模型无法自纠 | 明确报 `open() expects a path (str/PathLike)` |
+| 154 | UI 不校验 `request_timeout ≤ 0` / `temperature < 0` | timeout=0 → httpx 立即超时，所有请求必失败且无提示 | 钳到合法下限 + 复位输入框 + 状态栏点名 |
 
 ### 第十轮：全量复查（安全 / 泄漏 / 正确性 / 性能 / 体验）
 

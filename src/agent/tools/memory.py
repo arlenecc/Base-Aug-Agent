@@ -48,23 +48,24 @@ _WORK_MEMORY_CACHE_MAX = 8
 
 def _work_memory(config: AgentConfig) -> WorkMemory:
     path = os.path.join(config.workspace, ".agent", "work_memory.json")
-    wm = _work_memory_by_path.get(path)
-    if wm is not None:
-        _work_memory_by_path.move_to_end(path)   # 最近使用
-        return wm
+    # move_to_end 与锁内的 popitem 同为 OrderedDict 变更操作，必须同锁：
+    # 旧实现在锁外 move_to_end，与另一个线程的淘汰路径并发修改 →
+    # RuntimeError（dict changed size during iteration 一类）或条目错乱。
     with _work_memory_lock:
         wm = _work_memory_by_path.get(path)
-        if wm is None:
-            wm = WorkMemory(path=path)
-            _work_memory_by_path[path] = wm
-            if len(_work_memory_by_path) > _WORK_MEMORY_CACHE_MAX:
-                _old_path, old_wm = _work_memory_by_path.popitem(last=False)
-                try:
-                    # force=True：绕过 0.5s 防抖间隔，把窗口里的写入真正落盘
-                    # 再丢弃（旧实现漏传 force，淘汰即丢数据）。
-                    old_wm.flush(force=True)
-                except Exception:  # pragma: no cover - best-effort
-                    pass
+        if wm is not None:
+            _work_memory_by_path.move_to_end(path)   # 最近使用
+            return wm
+        wm = WorkMemory(path=path)
+        _work_memory_by_path[path] = wm
+        if len(_work_memory_by_path) > _WORK_MEMORY_CACHE_MAX:
+            _old_path, old_wm = _work_memory_by_path.popitem(last=False)
+            try:
+                # force=True：绕过 0.5s 防抖间隔，把窗口里的写入真正落盘
+                # 再丢弃（旧实现漏传 force，淘汰即丢数据）。
+                old_wm.flush(force=True)
+            except Exception:  # pragma: no cover - best-effort
+                pass
     return wm
 
 

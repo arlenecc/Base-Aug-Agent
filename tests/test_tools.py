@@ -770,6 +770,10 @@ def test_code_run_leaked_thread_does_not_hijack_stdout(config):
     import time as _time
 
     reg = _reg(config)
+    # 在任何 code_run 之前记录真实 stdout：超时路径会把全局流保持在已关闭
+    # 缓冲上 ~50ms（等泄漏线程撞 ValueError 退出）才恢复，res1 返回后立即
+    # 读 sys.stdout 拿到的是已关闭缓冲，不是可比对外部流。
+    real_stdout = _sys.stdout
     # 第一次调用：启动一个后台线程持续向 stdout 写，然后主脚本超时。
     # 该泄漏线程的 finally（旧实现）会在它退出时恢复 stdout。
     res1 = reg.execute("code_run", {
@@ -789,8 +793,9 @@ def test_code_run_leaked_thread_does_not_hijack_stdout(config):
     })
     assert not res1.success and "timed out" in res1.error.lower()
 
-    real_stdout = _sys.stdout
     try:
+        # 等延迟恢复完成（50ms 窗口 + 余量），让后续断言比较的是外部流。
+        _time.sleep(0.2)
         # 第二次调用：验证其输出完整进入自己的 StringIO（未被泄漏线程吞掉）。
         res2 = reg.execute("code_run", {
             "code": "print('second-run-ok')",

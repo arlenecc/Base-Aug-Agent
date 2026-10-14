@@ -790,7 +790,15 @@ class RAGEngine:
                             # 异常穿过 _chunk_iter → add_streaming 的 except，
                             # write_failed=True —— 剩余文件的向量全部丢弃、整个
                             # manifest 作废，一次抖动毁掉整轮同步。
-                            stats["errors"] = stats.get("errors", 0) + 1
+                            # errors 是**列表**（其他错误路径都 append dict），这里
+                            # 旧实现写成 ``stats["errors"] = stats.get("errors", 0) + 1``
+                            # 会把列表覆盖成 int 且不持 stats_lock —— 同步收尾的
+                            # ``len(stats["errors"])`` 随即 TypeError，整轮已完成的
+                            # 同步以异常告终（UI 显示「显示结果时出错」）。
+                            with stats_lock:
+                                stats["errors"].append(
+                                    f"{os.path.basename(filepath)}: 文件在扫描后不可读（被删除/权限变化），已跳过"
+                                )
                             _log("  ⚠ 跳过（文件已不可读）: %s", fname)
                             continue
                         pending_manifest[filepath] = {

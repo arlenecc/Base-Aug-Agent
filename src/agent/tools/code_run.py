@@ -64,6 +64,105 @@ _leaked_threads: List[threading.Thread] = []
 _leaked_threads_lock = threading.Lock()
 _MAX_TRACKED_LEAKED = 10
 
+# ---------------------------------------------------------------------------
+# 进程级「真实 stdout/stderr」缓存（延迟恢复用）
+# ---------------------------------------------------------------------------
+
+class _BoundedIO(io.StringIO):
+    """有界 StringIO：超出上限后丢弃后续写入（只标记一次）。
+
+    模块级定义：``_snapshot_real_streams`` 需要识别「当前全局流是否为
+    code_run 遗留缓冲」，run() 内定义的类无法被模块级函数引用。
+    """
+
+    def __init__(self, limit: int = _MAX_STREAM_CHARS):
+        super().__init__()
+        self._limit = limit
+        self._truncated = False
+
+    def write(self, s) -> int:
+        # 必须显式检查 closed：截断后的快速路径（_truncated → return 0）
+        # 先于 io.StringIO.write 的 closed 检查执行，close() 对已截断的
+        # 缓冲完全不生效——超时/取消路径靠 close 让泄漏线程的下一次
+        # print 撞 ValueError 自行退出，绕过即意味着泄漏线程永不退出
+        # （往真实 stdout 无限写，解释器退出时持 stdout 锁 → 进程 abort）。
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if self._truncated:
+            return 0
+        if self.tell() + len(s) > self._limit:
+            super().write("\n… [输出超限，已截断]")
+            self._truncated = True
+            return len(s)
+        return super().write(s)
+
+
+# ---------------------------------------------------------------------------
+# 进程级「真实 stdout/stderr」缓存（延迟恢复用）
+#
+# 超时/取消路径必须把 sys.stdout **保持**在已关闭的 _BoundedIO 上一小段
+# 时间，泄漏线程的下一次 print 才会撞上 ValueError 自行退出（见 run() 内
+# 注释）。恢复被延迟期间，若紧接着又启动一场 code_run，它快照到的
+# _prev_stdout 会是上一场已关闭的缓冲——直接恢复回去会把全局 stdout
+# 永久钉死在死流上。这里在模块级记录最近一次确认的「非 code_run 缓冲」
+# 流（可能是 pytest 捕获层 / 真实终端），所有恢复动作统一恢复到它。
+# ---------------------------------------------------------------------------
+_LAST_REAL_STDOUT: Optional[Any] = None
+_LAST_REAL_STDERR: Optional[Any] = None
+_REAL_STREAMS_LOCK = threading.Lock()
+# 泄漏线程在缓冲区关闭后撞 ValueError 的宽限窗口（秒）。print 循环每秒
+# 百万次量级，50ms 足够让它在窗口内死掉；窗口过长会让主进程其他线程的
+# print 暂时打到已关闭的缓冲上（抛 ValueError）。
+_LEAK_RESTORE_DELAY = 0.05
+
+
+def _snapshot_real_streams() -> tuple:
+    """返回本场 code_run 应记为「外部原始流」的 (stdout, stderr)。
+
+    当前 stdout 已是上一场遗留的已关闭 code_run 缓冲时，绝不能把它当
+    原始流缓存/恢复——否则全局 stdout 永久指向死流。此时沿用在模块级
+    缓存的真实流。
+    """
+    global _LAST_REAL_STDOUT, _LAST_REAL_STDERR
+    with _REAL_STREAMS_LOCK:
+        cur_out, cur_err = sys.stdout, sys.stderr
+        out_is_stale = isinstance(cur_out, _BoundedIO) and cur_out.closed
+        err_is_stale = isinstance(cur_err, _BoundedIO) and cur_err.closed
+        if not out_is_stale:
+            _LAST_REAL_STDOUT = cur_out
+        if not err_is_stale:
+            _LAST_REAL_STDERR = cur_err
+        return (
+            _LAST_REAL_STDOUT if out_is_stale else cur_out,
+            _LAST_REAL_STDERR if err_is_stale else cur_err,
+        )
+
+
+def _schedule_stream_restore(buffers: tuple, delay: float = _LEAK_RESTORE_DELAY) -> None:
+    """延迟恢复全局 stdout/stderr（超时/取消路径专用）。
+
+    恢复前检查全局流是否仍指向**本场**缓冲：后续场次已换上新缓冲时不动
+    （它们会恢复到自己快照的真实流，幂等）。
+    """
+    out_buf, err_buf = buffers
+
+    def _restore() -> None:
+        time.sleep(delay)
+        with _REAL_STREAMS_LOCK:
+            try:
+                if sys.stdout is out_buf:
+                    sys.stdout = _LAST_REAL_STDOUT or sys.stdout
+            except Exception:
+                pass
+            try:
+                if sys.stderr is err_buf:
+                    sys.stderr = _LAST_REAL_STDERR or sys.stderr
+            except Exception:
+                pass
+
+    threading.Thread(target=_restore, daemon=True,
+                     name="code-run-restore").start()
+
 
 class CodeRunTool(Tool):
     name = "code_run"
@@ -135,10 +234,17 @@ class CodeRunTool(Tool):
         def _guard_open(file, mode="r", *a, **kw):
             if isinstance(file, int):
                 raise PermissionError("File descriptor access is not allowed in code_run")
+            if not isinstance(file, (str, os.PathLike)):
+                # 非 str/PathLike（bytes 之外的奇怪类型）：realpath("") 会返回
+                # cwd（= workspace）并绕过前缀检查，随后 _real_open 抛出与
+                # 根因无关的 TypeError。这里给出明确错误。
+                raise TypeError(
+                    f"open() expects a path (str/PathLike), got {type(file).__name__}"
+                )
             # 用 realpath 而不是 abspath：workspace 里的 symlink 指向外部文件时
             # （如 os.symlink("/etc/cron.d/x", "pwn") 后 open("pwn","w")），
             # abspath 仍落在 workspace 前缀内，防护被绕过。
-            path = os.path.realpath(file if isinstance(file, (str, os.PathLike)) else "")
+            path = os.path.realpath(file)
             if any(m in str(mode) for m in ("w", "a", "x", "+")):
                 if not (path == ws or path.startswith(ws + os.sep)):
                     raise PermissionError(f"Refusing to write outside workspace: {file}")
@@ -146,29 +252,16 @@ class CodeRunTool(Tool):
 
         namespace: dict = {"__name__": "__code_run__", "__file__": "<code_run>"}
 
-        class _BoundedIO(io.StringIO):
-            """有界 StringIO：超出上限后丢弃后续写入（只标记一次）。"""
-
-            def __init__(self, limit: int = _MAX_STREAM_CHARS):
-                super().__init__()
-                self._limit = limit
-                self._truncated = False
-
-            def write(self, s) -> int:
-                if self._truncated:
-                    return 0
-                if self.tell() + len(s) > self._limit:
-                    super().write("\n… [输出超限，已截断]")
-                    self._truncated = True
-                    return len(s)
-                return super().write(s)
-
         out = _BoundedIO()
         err = _BoundedIO()
 
         # 主线程侧的进程级状态快照（cwd / stdout / stderr），join 后恢复。
         _prev_cwd = os.getcwd()
-        _prev_stdout, _prev_stderr = sys.stdout, sys.stderr
+        # stdout/stderr 不能裸快照：上一场超时遗留的恢复窗口内（约 50ms）
+        # 全局流可能是**已关闭**的 _BoundedIO，恢复回去会把全局 stdout 永久
+        # 钉死在死流上（泄漏线程永远撞不到 ValueError，解释器退出时持锁
+        # abort）。走 _snapshot_real_streams 拿到可安全恢复的真实流。
+        _prev_stdout, _prev_stderr = _snapshot_real_streams()
 
         # Cooperative cancellation event: set by the main thread on timeout,
         # checked by user code via an injected `_cancelled()` function so
@@ -231,14 +324,20 @@ class CodeRunTool(Tool):
                 cancelled = True
                 break
 
-        # 无论是否超时都由主线程统一恢复进程级全局状态。恢复权**只**属于
-        # 主线程：worker 不做任何恢复（见 _worker 注释），因此超时泄漏的
-        # 线程无论何时退出都不会再污染 cwd / sys.stdout。
+        # cwd 由主线程统一立即恢复（恢复权只属于主线程，见 _worker 注释）。
+        # stdout/stderr 的恢复分两种时序：
+        #   - 正常完成（worker 已 join）：立即恢复；
+        #   - 超时/取消（泄漏线程仍在跑）：必须**延迟**恢复——旧实现先恢复
+        #     全局流再 close 缓冲，而泄漏线程的 print() 每次都**动态**查找
+        #     sys.stdout，拿到的是已恢复的真实 stdout，永远不会碰已关闭的
+        #     缓冲 → 线程永不退出，解释器退出时它正持有 stdout 缓冲锁 →
+        #     Fatal Python error: _enter_buffered_busy（进程 abort）。
+        #     先 close 再延迟恢复，泄漏线程下一次 print 即撞 ValueError
+        #     自行退出；50ms 窗口后全局流恢复为真实流。
         try:
             os.chdir(_prev_cwd)
-            sys.stdout, sys.stderr = _prev_stdout, _prev_stderr
         except OSError as e:
-            logger.warning("code_run: failed to restore process cwd/stdout: %s", e)
+            logger.warning("code_run: failed to restore process cwd: %s", e)
 
         def _partial_output() -> str:
             partial = ""
@@ -249,16 +348,20 @@ class CodeRunTool(Tool):
                 partial = ""
             return partial
 
-        if cancelled:
-            # 与超时同法：先读出已产出的内容，再关缓冲区止住 stdout 污染
-            # （getvalue 在 close 之后会抛 ValueError，顺序不能反）。
-            partial = _partial_output()
-            _cancel_evt.set()
+        def _close_buffers() -> None:
+            # getvalue 在 close 之后会抛 ValueError，必须先读再关。
             for buf in (out, err):
                 try:
                     buf.close()
                 except Exception:
                     pass
+
+        if cancelled:
+            partial = _partial_output()
+            _cancel_evt.set()
+            _close_buffers()
+            # 泄漏线程仍在跑：延迟恢复全局流，让它撞 ValueError 退出。
+            _schedule_stream_restore((out, err))
             msg = "用户取消了对话，代码执行被中断"
             if partial.strip():
                 msg += f"\n[取消前已产生的输出]\n{partial[-3000:]}"
@@ -270,24 +373,14 @@ class CodeRunTool(Tool):
             # it next checks `_cancelled()`. Track the leaked thread.
             _cancel_evt.set()
             #
-            # 泄漏线程随后 print() 时会**动态**查找 sys.stdout，而上面主线程
-            # 已经把它恢复成真实 stdout —— 不处理的话它的输出会一直打到进程
-            # 真实 stdout（不受 _BoundedIO 截断、也不会进工具结果）。
-            #
-            # 这里把缓冲区读出来再 close()：泄漏线程的下一次写入会抛
-            # ValueError: I/O operation on closed file，从而自行退出（既止住
-            # stdout 污染，也顺带回收了线程与其命名空间）。
-            partial = ""
-            try:
-                partial = (out.getvalue() or "") + (
-                    ("\n[stderr]\n" + err.getvalue()) if err.getvalue() else "")
-            except Exception:
-                partial = ""
-            for buf in (out, err):
-                try:
-                    buf.close()
-                except Exception:
-                    pass
+            # 缓冲区必须 close（而不是留着让泄漏线程继续写）：
+            # 全局 stdout/stderr 此刻仍指向这两个缓冲，close 后泄漏线程的
+            # 下一次写入抛 ValueError: I/O operation on closed file，线程
+            # 自行退出（既止住输出堆积，也顺带回收线程与其命名空间）。
+            # 全局流的恢复由 _schedule_stream_restore 延迟完成。
+            partial = _partial_output()
+            _close_buffers()
+            _schedule_stream_restore((out, err))
             with _leaked_threads_lock:
                 # Prune completed threads, then append the new one, capped.
                 _leaked_threads[:] = [lt for lt in _leaked_threads if lt.is_alive()]
@@ -312,6 +405,12 @@ class CodeRunTool(Tool):
         with _leaked_threads_lock:
             if t in _leaked_threads:
                 _leaked_threads.remove(t)
+
+        # 正常完成：worker 已 join，泄漏不可能发生，立即恢复全局流。
+        try:
+            sys.stdout, sys.stderr = _prev_stdout, _prev_stderr
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("code_run: failed to restore process stdout: %s", e)
 
         exc = result["exc"]
         if exc is not None:
