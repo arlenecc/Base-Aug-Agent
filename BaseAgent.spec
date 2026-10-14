@@ -26,8 +26,7 @@ a = Analysis(
         'huggingface_hub',
         # rapidocr (optional OCR)
         'rapidocr_onnxruntime',
-        # FlagEmbedding (optional reranker)
-        'FlagEmbedding',
+        # Reranker 现由 fastembed 提供，无需单独 hiddenimport
         # MCP
         'mcp',
         # httpx

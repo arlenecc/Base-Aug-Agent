@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# RAG 依赖（FlagEmbedding/torch/transformers/docling/chonkie 等）安装在
+# RAG 依赖（fastembed/docling/chonkie 等）安装在
 # Python 3.12 环境（macOS Intel 上 torch 仅 3.12 有 wheel）。默认的 `python3`
 # 可能指向 3.13/3.14，缺少这些依赖。这里优先使用 3.12 的解释器，保证打包
 # 出的 .app 包含完整的 RAG 能力（BGE Reranker 等）。

@@ -235,7 +235,7 @@ class RAGEngine:
         chunk_overlap: int = 80,
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
-        rerank_model: str = "BAAI/bge-reranker-base",
+        rerank_model: str = "BAAI/bge-reranker-v2-m3",
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
     ):
         self._workspace = workspace
@@ -987,7 +987,7 @@ class RAGEngine:
         """Search the knowledge base with hybrid retrieval + reranking.
 
         Retrieves top_k * 4 candidates each from vector-similarity search and
-        BM25 keyword search, merges/dedupes, then uses BGE reranker to pick
+        BM25 keyword search, merges/dedupes, then uses FastEmbed reranker to pick
         the most relevant results.  Results below the 0.7 similarity threshold
         are dropped before returning.
 
@@ -1252,7 +1252,7 @@ class RAGEngine:
         """Release the underlying VectorStore's resources.
 
         Drops the cached VectorStore (LanceDB connection, FastEmbed ONNX model,
-        BGE reranker). After close(), a new VectorStore is lazily created on
+        FastEmbed reranker). After close(), a new VectorStore is lazily created on
         the next operation. Call this when the RAGEngine is no longer needed
         (e.g. after SyncKnowledgeWorker finishes) to avoid leaking ~600MB of
         C++ heap memory per instance.

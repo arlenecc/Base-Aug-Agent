@@ -54,8 +54,7 @@ datas += collect_data_files('fastembed')
 hiddenimports += collect_submodules('onnxruntime')
 datas += collect_data_files('onnxruntime')
 
-# --- FlagEmbedding (reranker) ---
-hiddenimports += collect_submodules('FlagEmbedding')
+# --- Reranker 现由 fastembed 提供，无需 FlagEmbedding hiddenimport ---
 
 # --- Document parsers (optional RAG deps) ---
 for mod in ['docx', 'openpyxl', 'pptx', 'fitz', 'ebooklib']:

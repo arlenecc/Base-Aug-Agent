@@ -1,7 +1,9 @@
-"""Vector store — embedding + similarity search using LanceDB, with BGE reranker.
+"""Vector store — embedding + similarity search using LanceDB, with FastEmbed reranker.
 
 Embeddings are generated locally via FastEmbed (ONNX Runtime) using
 nomic-ai/nomic-embed-text-v1.5 — no API server or HuggingFace dependency.
+Reranking uses FastEmbed's TextCrossEncoder (bge-reranker-v2-m3, also ONNX
+Runtime) — same stack as embedding, no torch/FlagEmbedding dependency.
 Vectors are stored in LanceDB (Lance columnar format on local disk).
 """
 from __future__ import annotations
@@ -19,7 +21,9 @@ logger = logging.getLogger(__name__)
 # Using the -Q variant: model_quantized.onnx (~137MB) instead of model.onnx (~548MB).
 # Same 768-dim embeddings, same quality, 4x smaller download.
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
-DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-base"
+# FastEmbed cross-encoder reranker (ONNX Runtime, 与 embedding 同源)。
+# 不再使用 FlagEmbedding + BAAI/bge-reranker-base（PyTorch 依赖、numpy 2.x 不兼容）。
+DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _TABLE_NAME = "knowledge_base"
 
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
@@ -233,7 +237,8 @@ class VectorStore:
     """Local vector store backed by LanceDB with FastEmbed embeddings.
 
     Uses nomic-ai/nomic-embed-text-v1.5 via ONNX Runtime for local inference.
-    Supports optional BGE reranker for precise post-retrieval scoring.
+    Supports optional FastEmbed reranker (bge-reranker-v2-m3) for precise
+    post-retrieval scoring.
     """
 
     def __init__(
@@ -947,19 +952,19 @@ class VectorStore:
         return output
 
     # ------------------------------------------------------------------
-    # reranking with BGE
+    # reranking with FastEmbed
     # ------------------------------------------------------------------
 
     def _get_reranker(self):
-        """Lazy-load the BGE reranker model with timeout protection.
+        """Lazy-load the reranker model (FastEmbed TextCrossEncoder) with timeout protection.
 
         Returns the reranker instance, or None if loading fails (network
         timeout, missing dependency, etc.). Callers must handle None by
         falling back to distance-based ranking.
 
         Uses ``_reranker_state`` to track loading state so concurrent callers
-        don't each spawn their own load thread (which would leak ~500MB of
-        PyTorch weights per extra thread).  On timeout, the background thread
+        don't each spawn their own load thread (which would leak the model
+        weights per extra thread).  On timeout, the background thread
         is NOT abandoned — when it eventually finishes it stores the result
         (or error) on ``self`` so a later call can pick it up without reloading.
         """
@@ -971,10 +976,10 @@ class VectorStore:
             # 距离排序，加载完成后的调用自然能拿到模型。
             return None
 
-        # 状态转换必须串行：torch 探测 + import FlagEmbedding 可耗时数秒，
-        # 旧实现从「读到 idle」到「写入 loading」之间没有任何锁，两个并发
-        # 调用方都会各自起一个加载线程——各加载一份 ~500MB 模型，后写者覆盖
-        # 前者，先建的那份成为纯泄漏。
+        # 状态转换必须串行：import fastembed + 构造 TextCrossEncoder 可触发模型
+        # 下载/加载（v2-m3 约 2.3GB），耗时数秒到数分钟。旧实现从「读到 idle」
+        # 到「写入 loading」之间没有任何锁，两个并发调用方都会各自起一个加载
+        # 线程——各加载一份模型，后写者覆盖前者，先建的那份成为纯泄漏。
         with self._reranker_lock:
             state = getattr(self, "_reranker_state", "idle")
             if state == "done":
@@ -982,67 +987,51 @@ class VectorStore:
             if state in ("failed", "loading"):
                 return None
 
-            # torch/numpy 兼容性探测：FlagEmbedding 依赖 torch，而某些旧版 torch
-            # （如 macOS Intel 上最高可装的 2.2.2）与 numpy 2.x 不兼容，调用
-            # ``tensor.numpy()`` 会抛 ``Numpy is not available``，导致重排序崩溃。
-            # 这里不凭 numpy 版本号猜测，而是真正执行一次 tensor→numpy 转换来
-            # 验证 torch 与 numpy 是否兼容，避免误伤 numpy 2.x + 新版 torch 的
-            # 正常组合（如 arm64 上的 torch 2.13 + numpy 2.5 是完全兼容的）。
+            # FastEmbed 的 TextCrossEncoder 基于 ONNX Runtime（与 embedding 同源），
+            # 不依赖 torch / FlagEmbedding，因此在 numpy 2.x 下也能正常工作——
+            # 旧实现需要 torch 探测 + FlagEmbedding，正是 numpy 2.x 不兼容的根源。
             try:
-                import torch as _torch
-                try:
-                    _torch.tensor([1.0, 2.0]).numpy()
-                except Exception as _e:
-                    import numpy as _np
-                    logger.warning(
-                        "  ⚠ BGE Reranker 不可用: torch %s 与 numpy %s 不兼容 "
-                        "（tensor.numpy() 失败: %s）。重排序回退到向量距离排序。"
-                        "如需启用，请升级 torch 或降级 numpy 到 1.26.x。",
-                        getattr(_torch, "__version__", "?"),
-                        getattr(_np, "__version__", "?"),
-                        _e,
-                    )
-                    self._reranker = None
-                    self._reranker_state = "failed"
-                    return None
-            except ImportError:
-                pass  # torch 缺失时交由后续 import FlagEmbedding 报错处理
-
-            try:
-                from FlagEmbedding import FlagReranker
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
             except ImportError:
                 logger.warning(
-                    "  ⚠ FlagEmbedding 未安装, 重排序功能不可用. pip install FlagEmbedding"
+                    "  ⚠ fastembed.rerank 不可用, 重排序功能不可用. "
+                    "请升级 fastembed: pip install 'fastembed>=0.9.0'"
                 )
                 self._reranker = None
                 self._reranker_state = "failed"
                 return None
 
-            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, 约 500MB)...", self._rerank_model)
+            logger.info("  🔧 正在加载 Reranker 模型: %s (首次加载)...", self._rerank_model)
             import time as _time
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
             def _load():
                 try:
-                    reranker = FlagReranker(
-                        self._rerank_model,
-                        use_fp16=False,
+                    cache_dir = os.path.join(
+                        os.path.expanduser("~"), ".cache", "fastembed",
                     )
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        reranker = TextCrossEncoder(
+                            model_name=self._rerank_model,
+                            cache_dir=cache_dir,
+                        )
                     # 写回实例必须持 _reranker_lock 并在锁内复查 _closed：
                     # 旧实现裸写 _reranker/_reranker_state，与 close() 的裸清
-                    # 交错时，已 close 的实例会「复活」持有 ~500MB 权重，且
+                    # 交错时，已 close 的实例会「复活」持有模型权重，且
                     # state 变成 done 后下次还会再起加载线程。
                     with self._reranker_lock:
                         if getattr(self, "_closed", False):
-                            # close() 已经执行：不要再把 500MB 模型写回实例
+                            # close() 已经执行：不要再把模型写回实例
                             # （旧实现会让 close 之后的实例「复活」持有权重）。
                             del reranker
                             return
                         self._reranker = reranker
                         self._reranker_state = "done"
-                    logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
+                    logger.info("  ✅ Reranker 加载完成: %s", self._rerank_model)
                 except Exception as e:
-                    logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
+                    logger.warning("  ⚠ Reranker 加载失败: %s", e)
                     with self._reranker_lock:
                         self._reranker = None
                         self._reranker_state = "failed"
@@ -1052,18 +1041,18 @@ class VectorStore:
             t = threading.Thread(target=_load, daemon=True)
             t.start()
 
-        # join 放在锁外：避免其他调用方为等这个 join 阻塞 2 分钟。
+        # join 放在锁外：避免其他调用方为等这个 join 阻塞。
         try:
-            t.join(timeout=120)  # 2 分钟超时，足够下载 500MB
+            t.join(timeout=180)  # 3 分钟超时（v2-m3 约 2.3GB，网络慢时更久）
             if t.is_alive():
                 # 加载仍在后台进行（网络慢）。不丢弃结果——后台线程完成时会
                 # 写入 self._reranker/_reranker_state，后续调用直接复用。
                 logger.warning(
-                    "  ⚠ BGE Reranker 加载超时 (2 分钟) — 仍在后台下载中。"
+                    "  ⚠ Reranker 加载超时 (3 分钟) — 仍在后台下载中。"
                     " 本次重排序回退到向量距离排序；加载完成后自动启用。"
                 )
         except Exception as e:
-            logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
+            logger.warning("  ⚠ Reranker 加载失败: %s", e)
             with self._reranker_lock:
                 self._reranker = None
                 self._reranker_state = "failed"
@@ -1076,13 +1065,13 @@ class VectorStore:
         candidates: List[Dict[str, Any]],
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        """Fall back to vector-distance ranking when BGE reranker is unavailable.
+        """Fall back to vector-distance ranking when the reranker is unavailable.
 
         candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
-        回退模式下分数是余弦距离的近似（非 BGE sigmoid 语义分），因此不做
+        回退模式下分数是余弦距离的近似（非 reranker 语义分），因此不做
         0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
         """
-        logger.info("  ├─ 重排序: BGE Reranker 不可用, 使用向量距离排序 (回退模式)")
+        logger.info("  ├─ 重排序: Reranker 不可用, 使用向量距离排序 (回退模式)")
         for c in candidates:
             try:
                 s = float(c.get("score", 0.0))
@@ -1105,7 +1094,7 @@ class VectorStore:
         top_k: int = 3,
         min_similarity: float = 0.7,
     ) -> List[Dict[str, Any]]:
-        """Re-rank candidates using BGE reranker for precise scoring.
+        """Re-rank candidates using FastEmbed reranker for precise scoring.
 
         Falls back to distance-based similarity scoring when the reranker
         is unavailable. In both cases scores are normalized to [0, 1]
@@ -1119,7 +1108,7 @@ class VectorStore:
             return []
 
         # 使用注入的自定义 embedding（如测试的 FakeEmbeddingFunction）时，
-        # 向量空间与 BGE reranker 的语义空间不一致，rerank 打分无意义，
+        # 向量空间与 reranker 的语义空间不一致，rerank 打分无意义，
         # 直接回退到向量距离排序。
         if self._custom_ef is not None:
             return self._rerank_fallback(candidates, top_k)
@@ -1128,18 +1117,21 @@ class VectorStore:
         if reranker is None:
             return self._rerank_fallback(candidates, top_k)
 
-        # Build pairs for reranker
-        logger.info("  ├─ BGE Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
-        pairs = [[query, c["text"]] for c in candidates]
+        docs = [c["text"] for c in candidates]
+        logger.info("  ├─ FastEmbed Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
         try:
-            # normalize=True applies sigmoid so scores land in [0, 1].
-            scores = reranker.compute_score(pairs, normalize=True)
+            # fastembed 直接返回模型输出（与输入顺序一一对应）。不同 ONNX 导出
+            # 可能是原始 logits 或已 sigmoid 归一化的概率；自适应处理：数值明显
+            # 超出 [0,1]（原始 logits）时做一次 sigmoid 归一化到 [0,1]，与旧
+            # FlagEmbedding(normalize=True) 语义一致，保证 0.7 相似度阈值有效。
+            raw_scores = list(reranker.rerank(query, docs))
+            if any(abs(float(s)) > 1.0 for s in raw_scores):
+                scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
+            else:
+                scores = [float(s) for s in raw_scores]
         except Exception as e:
-            # FlagEmbedding 与 transformers 5.x 存在 API 不兼容（如
-            # XLMRobertaTokenizer 缺少 prepare_for_model），打分失败时回退到
-            # 向量距离排序，避免整个检索流程崩溃。
             logger.warning(
-                "  ⚠ BGE Reranker 打分失败, 回退到向量距离排序: %s", e,
+                "  ⚠ Reranker 打分失败, 回退到向量距离排序: %s", e,
             )
             # 标记不可用，后续直接走回退分支。必须同步置 failed，否则
             # _reranker_state 长期停在 "done" 而模型为 None（状态机失真）。
@@ -1147,9 +1139,15 @@ class VectorStore:
             self._reranker_state = "failed"
             return self._rerank_fallback(candidates, top_k)
 
-        # Normalize to list if single result
-        if not isinstance(scores, list):
-            scores = [scores]
+        # 防御：分数数量与候选数不一致（异常），回退避免错位。
+        if len(scores) != len(candidates):
+            logger.warning(
+                "  ⚠ Reranker 返回分数数量(%d)与候选数(%d)不一致, 回退到向量距离排序",
+                len(scores), len(candidates),
+            )
+            self._reranker = None
+            self._reranker_state = "failed"
+            return self._rerank_fallback(candidates, top_k)
 
         # Attach rerank scores and sort (higher is better)
         for i, score in enumerate(scores):
@@ -1164,7 +1162,7 @@ class VectorStore:
 
         # 输出重排序前后的分数变化
         if results:
-            logger.info("  ├─ BGE 重排序完成: %d → %d 条结果", len(candidates), len(results))
+            logger.info("  ├─ Reranker 重排序完成: %d → %d 条结果", len(candidates), len(results))
             for i, r in enumerate(results[:3]):
                 source = os.path.basename(r.get("source", ""))
                 logger.info("  │   [%d] %s (重排序分: %.4f)", i + 1, source, r["score"])
@@ -1306,10 +1304,11 @@ class VectorStore:
         After close(), the VectorStore cannot be used; create a new instance to
         access the same data (LanceDB persists to disk, so data survives).
 
-        Important: FastEmbed's ONNX Runtime InferenceSession and FlagReranker
-        hold significant C++ heap memory (~130MB + ~500MB). Python's GC may not
-        reclaim these promptly when the Python object is dropped — explicitly
-        nulling the references here ensures the C++ destructors run as soon
+        Important: FastEmbed's ONNX Runtime InferenceSession (embedding) and
+        reranker (TextCrossEncoder) hold significant C++ heap memory
+        (~130MB + ~2.3GB for v2-m3). Python's GC may not reclaim these promptly
+        when the Python object is dropped — explicitly nulling the references
+        here ensures the C++ destructors run as soon
         as possible, which is critical when SyncKnowledgeWorker creates a fresh
         RAGEngine per sync run.
         """
@@ -1350,11 +1349,10 @@ class VectorStore:
                     pass
             self._ef = None
         if hasattr(self, "_reranker"):
-            # FlagReranker holds a transformers model with PyTorch tensors.
-            # Try to move it to CPU and del before nulling, so CUDA/PyTorch
-            # resources are freed promptly. 必须持 _reranker_lock：与后台加载
+            # FastEmbed reranker 是 ONNX 模型（无 torch/PyTorch 张量），del 后
+            # 由 Python GC 回收 C++ 堆内存。必须持 _reranker_lock：与后台加载
             # 线程的写回（同样持锁）互斥，否则 close 交错会把已清空的实例
-            # 「复活」持有 ~500MB 权重。
+            # 「复活」持有模型权重。
             with self._reranker_lock:
                 reranker = self._reranker
                 try:

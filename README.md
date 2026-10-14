@@ -49,12 +49,12 @@
 - **知识图谱记忆** — 长期记忆采用知识图谱（实体 + 关系 + 观察），对话结束后自动用 LLM 抽取事实入图谱（异步 daemon 线程，不阻塞用户回复）；观察通过 FastEmbed + LanceDB 语义检索，精简注入 prompt 避免全量灌入拖慢响应
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
-- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FlagEmbedding（BGE 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
+- **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
 - **OCR 加速与预处理** — 图片型 PDF 的 RapidOCR 在 **Apple M 系列 Mac** 上自动启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 CLAHE 对比度增强 + 锐化**预处理，提升小字与低对比扫描件的识别率。两者均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
-- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
+- **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、FastEmbed Reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + FastEmbed reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https 与响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
@@ -111,7 +111,7 @@ pip install -e ".[all]"
 | 分组 | 安装命令 | 包含内容 |
 |------|---------|---------|
 | 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
-| RAG | `pip install -e ".[rag]"` | lancedb, fastembed, FlagEmbedding, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
+| RAG | `pip install -e ".[rag]"` | lancedb, fastembed, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
 | OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别）+ opencv-python-headless（图像预处理归一化/增强） |
 | 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
 | 全部 | `pip install -e ".[all]"` | 以上所有 |
@@ -120,12 +120,12 @@ RAG 子系统依赖也可在首次同步知识库时通过界面自动检测并�
 
 ### 环境要求（macOS Intel）
 
-RAG 依赖（`FlagEmbedding` / `torch` / `docling` / `chonkie` 等）需在 **Python 3.12** 环境安装——macOS Intel 上 `torch` 最高仅提供 3.12 的 wheel。若系统默认 `python3` 指向 3.13/3.14，会出现 `import FlagEmbedding` 失败、`docling` 无法安装等问题。
+RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；reranker 已随 fastembed 提供，无需额外的 torch / FlagEmbedding。
 
 - **运行**：使用 3.12 解释器启动 `python main.py`（或用 3.12 创建 venv）。
 - **打包**：`build.sh` 已自动优先使用 `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。
 
-> **BGE Reranker 的 numpy 兼容性**：macOS Intel 上 `torch` 最高 2.2.2（需 numpy 1.x），而 `chonkie`/`scipy`/`opencv` 新版要求 numpy 2.x，二者无法共存。当前默认使用 numpy 2.x 以保障 embedding/分块/检索/OCR 等核心功能，**BGE Reranker 在 numpy 2.x 下不可用**（`_get_reranker` 会提前检测并回退到向量距离排序，不影响检索）。如需启用 Reranker，需手动将 numpy 降至 1.26.x 并同步降级 chonkie（0.5.1）/scipy（1.13）/opencv（4.x）/transformers（4.48）。
+> **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch / FlagEmbedding，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3`（约 2.3GB ONNX，可经依赖预下载提前缓存）。
 
 ### 启动
 
@@ -204,7 +204,7 @@ python main.py
 ```
 文档目录 → 统一解析 (docling → Markdown) → Hybrid 智能分片 (结构+语义, 100-800 tokens, 10% overlap)
 → 向量化 (nomic-embed-text-v1.5 / FastEmbed ONNX) → LanceDB 存储（向量 + 完整原文 + BM25 全文索引）
-检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → BGE Reranker 精排
+检索时: 向量相似度 top_k×4 + BM25 关键词 top_k×4 → 合并去重 → FastEmbed Reranker 精排
        → 过滤相似度 < 0.7 → 返回最相关 ≤ 3 条
 ```
 
@@ -259,7 +259,7 @@ python main.py
   ├─ 向量相似度搜索: 在 48 条向量中检索 top 12...
   ├─ BM25 检索: 12 条候选
   ├─ 混合候选 20 条 (向量 12 + BM25 12, 去重后 20)
-  ├─ BGE Reranker 精排: 对 20 个候选进行交叉编码打分...
+  ├─ FastEmbed Reranker 精排: 对 20 个候选进行交叉编码打分...
   ├─ BGE 重排序完成: 20 → 3 条结果
   │   [1] rag_setup.md (重排序分: 0.8523)
   │   [2] config_guide.docx (重排序分: 0.7641)
@@ -273,7 +273,7 @@ python main.py
 - **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5-Q`（Q4 量化版，~137MB），通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。768 维向量，量化后 4x 更小，质量无损。首次下载后离线可用。
 - **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。每切片同时存入 embedding 向量、完整原文、来源文件名、切片编号，并开启 BM25 全文索引（原生 FTS + jieba 预分词）。
 - **混合检索**：向量相似度 + BM25 关键词并行检索（各取 top_k×4 候选），按 (source, chunk_index) 合并去重，兼顾语义召回与精确关键词命中（中文经 jieba 分词）。
-- **重排序**：BGE Reranker (`BAAI/bge-reranker-base`)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。
+- **重排序**：FastEmbed Reranker (`BAAI/bge-reranker-v2-m3`)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。
 - **相似度过滤**：rerank 后过滤语义相似度 < 0.7 的结果（不相关的切片不发回模型），最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
 
 ### Meta-context + Targeted RAG（动态按需检索）
@@ -303,12 +303,12 @@ python main.py
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
 - **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
-- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、FastEmbed reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
 - **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
-- **Reranker 加载去重**：BGE reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
+- **Reranker 加载去重**：FastEmbed reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
 
 ### 支持的文档格式
 
@@ -352,7 +352,7 @@ Markdown 文本
 2. 对照依赖表检查所需 Python 包是否已安装
 3. 缺失的依赖自动 `pip install`（含版本约束）
 4. 核心依赖（`lancedb`、`fastembed`）也会一并检查
-5. 可选增强依赖（chonkie 语义分块、FlagEmbedding BGE 重排序、opencv-python-headless OCR 预处理）纳入检查与自动安装，缺失不阻塞同步（均有回退路径）
+5. 可选增强依赖（chonkie 语义分块、FastEmbed Reranker 重排序、opencv-python-headless OCR 预处理）纳入检查与自动安装，缺失不阻塞同步（均有回退路径）
 6. Apple M 系列 Mac 上若 `onnxruntime` 低于 1.31（CoreML EP 加速 OCR 所需），给出升级建议命令（不强制升级，避免破坏现有环境）
 7. 安装完成后自动开始同步
 

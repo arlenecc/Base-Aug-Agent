@@ -79,13 +79,14 @@ RAG_CORE_DEPS: List[DepSpec] = [
 
 # Optional but recommended enhancements — missing → graceful fallback (no sync block).
 # Always checked so they get auto-installed on first sync and silently skipped if
-# install fails.  (chonkie: semantic chunking; FlagEmbedding: BGE reranker.)
+# install fails.  (chonkie: semantic chunking. Reranker now uses FastEmbed's
+# cross-encoder — same ONNX stack as the embedding model, so it needs NO separate
+# pip package; fastembed in RAG_CORE_DEPS already covers it.)
 SEMANTIC_CHUNK_DEPS: List[DepSpec] = [
     DepSpec("chonkie", "chonkie", "语义分块 (chonkie SemanticChunker)", required=False),
 ]
-RERANKER_DEPS: List[DepSpec] = [
-    DepSpec("FlagEmbedding", "FlagEmbedding", "重排序推理 (BGE reranker)", required=False),
-]
+# Reranker 不再需要独立 pip 依赖（FlagEmbedding/torch），保留空列表占位。
+RERANKER_DEPS: List[DepSpec] = []
 
 # Embedding model info for pre-download
 # Embedding model: quantized ONNX variant — only 137MB (vs 548MB for FP32).
@@ -108,21 +109,11 @@ _EMBEDDING_REQUIRED_FILES = [
     "vocab.txt",                   # vocabulary (~0.2MB)
 ]
 
-# Reranker model (used at search time, not ingest — pre-download to avoid
-# blocking the first search). ~500MB download, optional: search falls back
-# to distance-based ranking if unavailable.
-RERANK_MODEL_ID = "BAAI/bge-reranker-base"
-RERANK_MODEL_LABEL = "重排序模型 bge-reranker-base (~500MB, 可选)"
-
-# Files needed for the BGE reranker (minimal set for FlagEmbedding).
-_RERANKER_REQUIRED_FILES = [
-    "pytorch_model.bin",   # PyTorch weights (~500MB)
-    "config.json",         # model config
-    "tokenizer.json",      # tokenizer
-    "tokenizer_config.json",
-    "vocab.txt",
-    "sentencepiece.bpe.model",
-]
+# Reranker model (FastEmbed cross-encoder, used at search time, not ingest —
+# pre-download to avoid blocking the first search). ~2.27GB ONNX download,
+# optional: search falls back to distance-based ranking if unavailable.
+RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"
+RERANK_MODEL_LABEL = "重排序模型 bge-reranker-v2-m3 (FastEmbed ONNX, 可选)"
 
 # Version pins: packages that need specific version constraints
 VERSION_PINS: Dict[str, str] = {
@@ -667,72 +658,68 @@ def _is_importable(module_name: str) -> bool:
 
 
 def _is_reranker_cached() -> bool:
-    """Check if the BGE reranker model is cached locally.
+    """Check whether the reranker model is already cached locally.
 
-    ``try_to_load_from_cache`` does NOT return ``None`` for a known-missing
-    file in recent huggingface_hub versions — it returns the
-    ``_CACHED_NO_EXISTENT`` sentinel object.  Treating any non-None return as
-    "cached" therefore reported the model as present when it wasn't, so the
-    pre-download step never ran.  Only a real path means cached.
+    FastEmbed uses its OWN cache directory (NOT the standard HuggingFace
+    cache).  We check the persistent cache dir (~/.cache/fastembed) that we
+    configure in vector_store.py and _download_reranker_model().
     """
     try:
-        from huggingface_hub import try_to_load_from_cache
-    except Exception:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        cache_dir = _get_fastembed_cache_dir()
+        # lazy_load=True: don't load ONNX Runtime, just resolve the model path
+        # Suppress FastEmbed's "model has been updated" UserWarning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            model = TextCrossEncoder(
+                model_name=RERANK_MODEL_ID,
+                cache_dir=cache_dir,
+                lazy_load=True,
+            )
+        # 只有真实的 ONNX 权重文件才算「已缓存」。onnx/model.onnx 是核心权重，
+        # 一次中断的下载很容易只留下空目录——如果它不算缓存，就会跳过预下载，
+        # 首次检索时 FastEmbed 仍要现场下载 ~2.3GB。
+        model_dir = getattr(getattr(model, "model", None), "_model_dir", None)
+        if model_dir and os.path.isdir(model_dir):
+            onnx_path = os.path.join(model_dir, "onnx", "model.onnx")
+            if os.path.isfile(onnx_path):
+                logger.debug("RAG deps: reranker model found in FastEmbed cache: %s", onnx_path)
+                return True
         return False
-    # 只有真实的权重文件才算「已缓存」。config.json 是 HF 下载的第一个文件，
-    # 一次中断的下载很容易只留下它——如果它也算缓存，就会跳过预下载，
-    # 首次检索时 FlagEmbedding 仍要现场下载 ~500MB。
-    weight_files = ["pytorch_model.bin", "model.safetensors"]
-    for kf in weight_files:
-        try:
-            cached = try_to_load_from_cache(RERANK_MODEL_ID, kf)
-        except Exception:
-            continue
-        if isinstance(cached, (str, os.PathLike)):
-            return True
-    return False
+    except Exception as e:
+        logger.debug("RAG deps: FastEmbed reranker cache check error: %s", e)
+        return False
 
 
 def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
-    """Pre-download only the files FlagEmbedding needs for BGE reranker.
+    """Pre-download the reranker model via FastEmbed.
 
-    Uses hf_hub_download for individual files instead of snapshot_download
-    to avoid pulling the entire repo (~1GB+ with unused formats).
-
-    Runs in-process: a ``sys.executable -c`` subprocess would break in a
-    PyInstaller-frozen .app, where sys.executable is the frozen binary and
-    cannot execute Python code (same reason the embedding model download
-    was moved in-process).
+    FastEmbed handles the download to its own cache directory (same as the
+    embedding model), which is where it will look for the model at runtime.
+    Works in both dev and frozen (PyInstaller) environments.
     """
-    logger.info(
-        "RAG deps: downloading reranker model files (%d files)...",
-        len(_RERANKER_REQUIRED_FILES),
-    )
+    logger.info("RAG deps: downloading reranker model via FastEmbed...")
     if progress_callback:
-        progress_callback(f"正在下载{RERANK_MODEL_LABEL}（仅必需文件）...")
-
-    # huggingface_hub reads these at call time; set before downloading.
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    os.environ.setdefault("HF_ENDPOINT", "https://huggingface.co")
+        progress_callback(f"正在下载{RERANK_MODEL_LABEL}（FastEmbed 自动缓存）...")
 
     try:
-        from huggingface_hub import hf_hub_download
-
-        for filename in _RERANKER_REQUIRED_FILES:
-            logger.debug("RAG deps: downloading %s ...", filename)
-            hf_hub_download(repo_id=RERANK_MODEL_ID, filename=filename)
-        logger.info("RAG deps: reranker model files downloaded")
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        cache_dir = _get_fastembed_cache_dir()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            TextCrossEncoder(model_name=RERANK_MODEL_ID, cache_dir=cache_dir)
+        logger.info("RAG deps: reranker model downloaded and cached by FastEmbed")
         if progress_callback:
             progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")
         return True, "下载成功"
     except ImportError:
-        msg = "huggingface_hub 不可用"
+        msg = "fastembed 不可用"
         logger.warning("RAG deps: reranker download failed: %s", msg)
         if progress_callback:
             progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
         return False, msg
     except Exception as e:
-        # Keep only the last line — HF errors can be multi-page tracebacks.
+        # Keep only the last line — HF/ONNX errors can be multi-page tracebacks.
         msg = str(e).strip().split("\n")[-1] if str(e).strip() else "unknown error"
         logger.warning("RAG deps: reranker download exception: %s", e)
         if progress_callback:

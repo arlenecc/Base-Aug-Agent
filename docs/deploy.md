@@ -33,8 +33,8 @@ pip install -e ".[rag]"
 # 向量存储 + 嵌入模型
 pip install lancedb fastembed
 
-# 重排序模型（可选，提升检索精度）
-pip install FlagEmbedding
+# 重排序模型（可选，提升检索精度；由 fastembed 的 TextCrossEncoder 提供，
+# 无需单独安装 —— `pip install 'fastembed>=0.9.0'` 已包含）
 
 # 文档解析依赖（按需）
 pip install python-docx      # Word 文档
@@ -63,7 +63,7 @@ pip install -e ".[all]"
 | 模型 | 用途 | 大小 |
 |------|------|------|
 | `nomic-ai/nomic-embed-text-v1.5` | 文本嵌入向量化 | ~130 MB |
-| `BAAI/bge-reranker-base` | 检索结果重排序（可选） | ~500 MB |
+| `BAAI/bge-reranker-v2-m3` | 检索结果重排序（可选，fastembed ONNX） | ~2.3 GB |
 
 ### 3.2 离线部署方案
 
@@ -71,7 +71,7 @@ pip install -e ".[all]"
 # 在有网络的机器上预下载模型
 pip install huggingface_hub
 huggingface-cli download nomic-ai/nomic-embed-text-v1.5 --local-dir ./models/nomic-embed-text-v1.5
-huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base
+# 重排序模型由 fastembed 在首次检索时自动下载并缓存到 ~/.cache/fastembed，无需手动下载
 
 # 将模型目录复制到生产服务器
 scp -r ./models/ user@server:/path/to/models/
@@ -105,7 +105,7 @@ export TRANSFORMERS_OFFLINE=1
   "rag_chunk_size": 500,
   "rag_chunk_overlap": 50,
   "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5",
-  "rag_rerank_model": "BAAI/bge-reranker-base",
+  "rag_rerank_model": "BAAI/bge-reranker-v2-m3",
   "rag_rerank_enabled": true,
   "rag_auto_ingest": true,
   "browser_endpoint": "",
@@ -121,7 +121,7 @@ export TRANSFORMERS_OFFLINE=1
 | `rag_chunk_size` | 每个切片的 token 数 | 500 |
 | `rag_chunk_overlap` | 切片间重叠 token 数（10%） | 50 |
 | `rag_embedding_model` | 嵌入向量模型 | `nomic-ai/nomic-embed-text-v1.5` |
-| `rag_rerank_model` | 重排序模型 | `BAAI/bge-reranker-base` |
+| `rag_rerank_model` | 重排序模型 | `BAAI/bge-reranker-v2-m3` |
 | `rag_rerank_enabled` | 是否启用重排序 | `true` |
 | `rag_auto_ingest` | 是否启动时自动同步知识库 | `true` |
 
@@ -302,17 +302,17 @@ export TRANSFORMERS_OFFLINE=1
 **检查清单**：
 1. `knowledge_base` 路径是否正确，目录下是否有受支持的文档
 2. 是否已执行「同步知识」（查看 `rag/vectors/` 目录下是否有 `chunks.lance/`）
-3. 嵌入模型是否已下载（`~/.cache/huggingface/hub/`）
+3. 嵌入模型与重排序模型是否已下载（`~/.cache/fastembed/`）
 4. 查看右侧日志面板的检索日志，确认候选切片数和重排序结果
 
 ### 问题：重排序不生效
 
-**原因**：`FlagEmbedding` 未安装或 `BAAI/bge-reranker-base` 模型未下载。
+**原因**：`fastembed` 未安装（或版本过低，需 >=0.9.0）或 `BAAI/bge-reranker-v2-m3` 模型未下载。
 
 **解决**：
 ```bash
-pip install FlagEmbedding
-# 确保模型已缓存到 ~/.cache/huggingface/hub/
+pip install 'fastembed>=0.9.0'
+# 重排序模型由 fastembed 首次检索时自动下载并缓存到 ~/.cache/fastembed
 ```
 
 如果不需要重排序，可在配置中设置 `"rag_rerank_enabled": false`，系统会自动回退到向量距离排序。
