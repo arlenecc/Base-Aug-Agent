@@ -16,6 +16,7 @@ from .cleaner import clean_text, normalize_markdown
 from .chunker import chunk_documents
 from .document_outline import build_digest
 from .vector_store import VectorStore
+from ..atomic_io import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -106,13 +107,8 @@ def _load_manifest(rag_dir: str) -> Dict[str, Dict[str, Any]]:
 
 
 def _save_manifest(rag_dir: str, files: Dict[str, Dict[str, Any]]) -> None:
-    """Persist the manifest atomically (temp + os.replace)."""
-    os.makedirs(rag_dir, exist_ok=True)
-    path = _manifest_path(rag_dir)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"files": files}, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """Persist the manifest atomically (unique tmp + os.replace)."""
+    atomic_write_json(_manifest_path(rag_dir), {"files": files})
 
 
 def _file_signature(filepath: str) -> Optional[Dict[str, Any]]:
@@ -236,6 +232,7 @@ class RAGEngine:
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
         rerank_model: str = "BAAI/bge-reranker-v2-m3",
+        rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
     ):
         self._workspace = workspace
@@ -250,6 +247,10 @@ class RAGEngine:
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
         self._rerank_model = rerank_model
+        # 重排序总开关。config.rag_rerank_enabled 此前从未被读取——用户在配置里
+        # 关掉重排序或换模型都完全无效（README / 设计文档却宣称可用）。这里接线：
+        # 关闭时 search 直接走向量+BM25 混合排序，不加载 ~2.3GB 的 reranker。
+        self._rerank_enabled = bool(rerank_enabled)
         self._parallel_workers = max(1, int(parallel_workers))
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
@@ -783,6 +784,15 @@ class RAGEngine:
                     # 完成——下次同步因 mtime/size 未变被跳过，内容永久缺失。
                     try:
                         sig_now = _file_signature(filepath)
+                        if sig_now is None:
+                            # 文件在扫描后被删 / 权限变化：跳过它并计入 errors。
+                            # 旧实现直接 ``{**sig_now}`` 解包 None 抛 TypeError，
+                            # 异常穿过 _chunk_iter → add_streaming 的 except，
+                            # write_failed=True —— 剩余文件的向量全部丢弃、整个
+                            # manifest 作废，一次抖动毁掉整轮同步。
+                            stats["errors"] = stats.get("errors", 0) + 1
+                            _log("  ⚠ 跳过（文件已不可读）: %s", fname)
+                            continue
                         pending_manifest[filepath] = {
                             **sig_now,
                             "source_hash": _source_fingerprint(filepath, sig_now["size"]),
@@ -954,8 +964,10 @@ class RAGEngine:
         for source in removed:
             store.delete_by_source(source)
             # 同步清理 documents 元数据表里的目录概要（digest）/markdown 记录。
-            # 注意：documents 表的 doc_id 用 basename 生成（见 upsert_document），
-            # 而向量表用完整路径，故此处需取 basename。
+            # 注意：documents 表的 doc_id 用 md5(md_path) 生成（见 upsert_document），
+            # 而向量表用完整路径，故此处需取 basename。delete_document 内部按
+            # doc_id 与 doc_name 两种键删除，覆盖 md_path 为空时按 basename
+            # 建键的行。
             store.delete_document(os.path.basename(source))
             # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
             # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
@@ -1011,15 +1023,22 @@ class RAGEngine:
             query[:80], top_k, store_count,
         )
         logger.info("  ├─ 混合初检: 向量相似度 + BM25 关键词, 各取 top %d 候选", top_k * 4)
-        results = store.search_with_rerank(query, top_k=top_k, where=where)
+        if self._rerank_enabled:
+            results = store.search_with_rerank(query, top_k=top_k, where=where)
+        else:
+            logger.info("  ├─ 重排序已在配置中关闭 (rag_rerank_enabled=false)，"
+                        "直接使用混合检索排序")
+            results = store.search(query, top_k=top_k, where=where)
         t_total = time.monotonic() - t0
         if results:
             logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)
             for i, r in enumerate(results, 1):
-                source = os.path.basename(r.get("source", ""))
-                score = r.get("score", 0)
-                text_preview = r.get("text", "")[:80].replace("\n", " ")
-                logger.info("      [%d] %s (相关度: %.4f) | %s...", i, source, score, text_preview)
+                # 循环变量不能叫 source：会覆盖函数形参 source（定向检索
+                # 过滤条件），后续任何对它的引用都会拿到最后一条结果的文件名。
+                src_name = os.path.basename(r.get("source") or "")
+                score = r.get("score") or 0
+                text_preview = (r.get("text") or "")[:80].replace("\n", " ")
+                logger.info("      [%d] %s (相关度: %.4f) | %s...", i, src_name, score, text_preview)
         else:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
@@ -1048,9 +1067,11 @@ class RAGEngine:
         lines = [f"从知识库检索到 {len(results)} 条相关内容（已重排序）：\n"]
         total = 0
         for i, r in enumerate(results, 1):
-            source = os.path.basename(r["source"])
-            header = f"### [{i}] 来源: {source} (相关度: {r['score']:.4f})"
-            text = r.get("text", "") or ""
+            # 回退结果（向量排序）可能缺键，直接下标会 KeyError 打断整个工具
+            # 调用；用 .get() 兜底。
+            src_name = os.path.basename(r.get("source") or "")
+            header = f"### [{i}] 来源: {src_name} (相关度: {(r.get('score') or 0):.4f})"
+            text = r.get("text") or ""
             if len(text) > max_chars_per_result:
                 text = text[:max_chars_per_result] + "…"
             lines.append(header)

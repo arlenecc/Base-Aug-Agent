@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # 改为全局单例：所有 worker 共享同一个引擎实例，通过信号量串行执行
 # （RapidOCR 可能非线程安全，串行调用 engine(img) 避免竞态）。
 _OCR_SEMAPHORE = threading.Semaphore(1)
+# 等待 OCR 信号量的上限。单页 OCR 正常远小于此；只有卡死才会走到超时，
+# 此时跳过该页而不是让所有 worker 永久挂起。
+_OCR_ACQUIRE_TIMEOUT = 300.0
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
 
@@ -289,7 +292,18 @@ def _extract_pdf(path: Path) -> str:
                     ocr_skipped_count += 1
                     continue
 
-            with _OCR_SEMAPHORE:
+            # 无超时的 acquire 在这里是个隐患：单页 OCR 卡死（ONNX 死锁 /
+            # 病态大图）时，所有 ingest worker 连同它们的 daemon 线程一起永久
+            # 挂起，用户侧表现为「同步进度再也不动且没有任何报错」。
+            # 加一个宽松的超时，拿不到就跳过该页并计数。
+            if not _OCR_SEMAPHORE.acquire(timeout=_OCR_ACQUIRE_TIMEOUT):
+                ocr_skipped_count += 1
+                logger.warning(
+                    "RAG: OCR 信号量等待超过 %ss，跳过第 %d 页 (%s)",
+                    _OCR_ACQUIRE_TIMEOUT, page_num + 1, path.name,
+                )
+                continue
+            try:
                 # 双重检查：可能在等信号量期间其它 worker 已判定不可用
                 if ocr_engine is None:
                     ocr_unavailable = True
@@ -316,6 +330,8 @@ def _extract_pdf(path: Path) -> str:
 
                 ocr_text = _ocr_image_cached(ocr_engine, image_for_ocr,
                                              page_num + 1, path.name)
+            finally:
+                _OCR_SEMAPHORE.release()
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -464,12 +480,24 @@ def _extract_epub(path: Path) -> str:
 
     book = epub.read_epub(str(path))
     parts: List[str] = []
-    for item in book.get_items_of_type(9):  # ITEM_DOCUMENT = 9
-        content = item.get_content().decode("utf-8", errors="replace")
-        soup = BeautifulSoup(content, "html.parser")
-        text = soup.get_text(separator="\n")
-        if text.strip():
-            parts.append(text)
+    try:
+        for item in book.get_items_of_type(9):  # ITEM_DOCUMENT = 9
+            content = item.get_content().decode("utf-8", errors="replace")
+            soup = BeautifulSoup(content, "html.parser")
+            text = soup.get_text(separator="\n")
+            if text.strip():
+                parts.append(text)
+    finally:
+        # ebooklib 内部持有 zip 文件句柄。不显式关闭时，4 个 ingest worker ×
+        # 数千本 EPUB 会让 fd 持续累积（Windows 上还会锁住文件导致无法删除/覆盖）。
+        for closer in ("close", "_cleanup"):
+            fn = getattr(book, closer, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                break
     return "\n\n".join(parts)
 
 

@@ -110,7 +110,11 @@ class WebScanTool(Tool):
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
+        # max_redirects 收紧：follow_redirects=True 只校验了**初始** URL 的协议，
+        # 一个公网 URL 可以被 302 引到 file://（或内网地址）——SSRF 面。
+        # 限制跳数并禁止跨协议跳转，把重定向也管起来。
         self._http = httpx.Client(timeout=30.0, follow_redirects=True,
+                                  max_redirects=5,
                                   headers={"User-Agent": "base-agent/0.1"})
 
     def run(self, url: str, raw: bool = False) -> ToolResult:

@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
@@ -19,6 +20,7 @@ from .kernel import (
 )
 from .kernel.compressor import DISTILL_PROMPT, DISTILL_SYSTEM
 from .tools.checkpoint import restore_checkpoint
+from .atomic_io import atomic_write_text
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +345,12 @@ class Agent:
             path=os.path.join(config.workspace, ".agent", "skills.json"),
             skills_dir=os.path.join(config.workspace, ".agent", "skills"),
         )
-        self.max_iterations = int(getattr(config, "max_iterations", 15))
+        # max_iterations 走 property（见类尾部定义）：读始终取 config 的当前值，
+        # 写也落到 config —— 否则外部（UI「应用配置」）改 config.max_iterations
+        # 后这里读的还是 __init__ 时的过期快照。
+        # 注意：赋值必须发生在 property 已可用的前提下；Python 的 property 是
+        # 类属性，实例化后立即生效，所以这里直接写即可。
+        self.max_iterations = int(getattr(config, "max_iterations", 15) or 15)
         # max_history / max_context_tokens / context_shrink_ratio 仍从 config 读取
         # 以兼容既有配置与 UI；真正的上下文治理已由内核的五级压缩接管
         # （30k 预算 + L3 折叠），这里只保留字段避免外部读写报错。
@@ -411,6 +418,26 @@ class Agent:
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
 
+    # ------------------------------------------------------------------
+    # max_iterations：始终以 config 为唯一真源
+    #
+    # 旧实现是 __init__ 时的一次性快照（``self.max_iterations = config...``），
+    # 之后 UI「应用配置」改 config.max_iterations 完全不生效——只有顺手重建
+    # Agent 时才跟着变，表现为「改了最大轮次却没反应」。
+    # 改成 property：读取实时取 config，赋值也写回 config，外部两种写法都对。
+    # ------------------------------------------------------------------
+    @property
+    def max_iterations(self) -> int:
+        return int(getattr(self.config, "max_iterations", 15) or 15)
+
+    @max_iterations.setter
+    def max_iterations(self, value) -> None:
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            n = 15
+        self.config.max_iterations = max(1, n)
+
     def close(self) -> None:
         """Release the dedicated background LLM client's connection pool.
 
@@ -424,7 +451,11 @@ class Agent:
         lock = getattr(self, "_fact_extract_lock", None)
         acquired = bool(lock and lock.acquire(blocking=False))
         try:
-            self._close_extract_llm()
+            # 取不到锁说明有后台调用在跑 —— 按上面的注释应该「交给线程自己收尾」，
+            # 旧实现却无条件 _close_extract_llm()，把后台线程正在流式使用的
+            # httpx.Client 关掉，那些线程会半路炸掉并留下未归还的连接。
+            if acquired:
+                self._close_extract_llm()
         finally:
             if acquired:
                 lock.release()
@@ -510,10 +541,10 @@ class Agent:
                         existing = f.read()
                 except OSError:
                     existing = ""
-            tmp = memory_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(existing + entry)
-            os.replace(tmp, memory_path)
+            # 必须用唯一临时名：固定 ``memory_path + ".tmp"`` 在并发触发
+            # （多个后台线程同时收缩上下文）时会互相 truncate 同一个 tmp，
+            # 落盘混合内容；写失败还会留下僵尸 .tmp。
+            atomic_write_text(memory_path, existing + entry)
         except Exception as e:  # pragma: no cover - defensive
             self._log(f"[context] failed to append memory.md: {e}")
 
@@ -826,15 +857,23 @@ class Agent:
             self._log("[plan] 上一任务计划未收尾，已注入新任务/继续任务的判断提示")
         # 每轮同步一次面板：即使模型本轮没调 update_plan，用户看到的也是
         # Session 的真实状态（而不是上一轮的残影）。
+        # 必须传**深拷贝**：直接把 Session 里的活字典交给 UI 线程，正是
+        # session.py 里明确列为已修 bug 的跨线程共享可变状态模式（当前只因
+        # plan patch 走深拷贝+整体替换才侥幸安全）。
         try:
-            self.callbacks.on_plan_updated(self.session.get_plan())
+            self.callbacks.on_plan_updated(deepcopy(self.session.get_plan()))
         except Exception:  # pragma: no cover - defensive
             pass
 
-        # max_iterations 可能在构造后被 UI 改动 → 每轮同步进内核
+        # max_iterations 可能在构造后被 UI 改动 → 每轮同步进内核。
+        # property 读的就是 config 的当前值，无需再手工搬运。
         self.kernel.max_turns = max(1, int(self.max_iterations or 15))
 
-        result: KernelResult = self.kernel.run(user_input)
+        # emit_finished=False：hooks.finished 会做事实抽取 + L4 蒸馏（各一次
+        # 后台 LLM 调用）。自动续跑可能有多段，每段都触发会让单次用户输入跑最多
+        # 4×2 次冗余后台调用、并向知识图谱重复写入近似实体。统一挪到本方法末尾
+        # 只触发一次（见下方 `self._fire_finished_hook`）。
+        result: KernelResult = self.kernel.run(user_input, emit_finished=False)
         # 首段的失败上下文：续跑段要靠它接着上一段的错误找方案。
         carry: Optional[Dict[str, Any]] = self.kernel.failure_snapshot()
 
@@ -885,6 +924,7 @@ class Agent:
                     "[System] 任务在上一段达到轮次上限被截断，已自动续跑。"
                     "请继续执行计划中的剩余步骤；不要询问用户是否继续。",
                     resume=True,
+                    emit_finished=False,
                 )
             else:
                 self._log(f"[agent] 模型提前收尾但计划未完成（{open_ids}），自动续跑 "
@@ -902,6 +942,7 @@ class Agent:
                     "[System] 上一条回复被判定为提前收尾，已自动续跑。"
                     "请按上面的指示处理计划中的剩余步骤；不要询问用户是否继续。",
                     resume=True,
+                    emit_finished=False,
                 )
             carry = self.kernel.failure_snapshot()
         if result.reason is ExitReason.MAX_TURNS:
@@ -920,8 +961,32 @@ class Agent:
                     f"[系统提示] 上一轮在达到最大轮次上限（{self.max_iterations}）后被中断，"
                     "任务可能尚未完成。请先总结已完成的进展，再继续执行剩余步骤。"
                 )
+        # 连续空回复把重试额度用尽后，内核会以 DONE 退出但 final_text 为空串；
+        # 直接返回 "" 会让用户看到一个完全空白的回复，不知道出了什么。
+        if not (result.text or "").strip():
+            result.text = (
+                "（模型连续多次返回空响应，已停止重试。请检查网络/API 状态后重试，"
+                "或换个说法再问一次。）"
+            )
+            self._log("[agent] 空回复：已向用户返回可见提示")
+        self._fire_finished_hook(result.text)
         self.callbacks.on_finished()
         return result.text
+
+    def _fire_finished_hook(self, text: str) -> None:
+        """整个用户轮次（含全部自动续跑段）结束后，触发一次 finished 钩子。
+
+        事实抽取与 L4 蒸馏都在这个钩子里，是「一次用户输入一次」的语义；
+        直接由内核每段触发会把它们放大成最多 4 次。
+        """
+        hooks = getattr(self.kernel, "hooks", None)
+        finished = getattr(hooks, "finished", None)
+        if not callable(finished):
+            return
+        try:
+            finished(self.session, text or "")
+        except Exception as e:
+            self._log(f"[kernel] finished hook error: {e}")
 
     def _should_auto_continue(self, result: KernelResult) -> bool:
         """判断是否值得自动续跑。"""

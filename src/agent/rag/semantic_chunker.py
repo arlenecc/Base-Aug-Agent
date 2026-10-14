@@ -370,6 +370,12 @@ def _shared_embedding_function():
 # chonkie embedding adapter
 # ---------------------------------------------------------------------------
 
+# 已知嵌入维度（nomic-embed-text-v1.5 = 768）。chonkie 可能在构造期读
+# ``dimension``，用真实 embed 探测会把 ONNX 模型加载提前到 ingest worker
+# 线程里；先用已知值占位，首批 embed 后再用实测长度刷新。
+_KNOWN_DIM = 768
+
+
 class _ChonkieEmbeddingAdapter(_BaseEmbeddings):
     """Adapt a FastEmbed embedding function to chonkie's BaseEmbeddings interface.
 
@@ -405,7 +411,14 @@ class _ChonkieEmbeddingAdapter(_BaseEmbeddings):
         return self._to_array(self._embed_many([text])[0])
 
     def embed_batch(self, texts: List[str]):
-        return [self._to_array(v) for v in self._embed_many(list(texts))]
+        vecs = [self._to_array(v) for v in self._embed_many(list(texts))]
+        # 顺手把真实维度记下来：之后的 dimension 就用实测值，不再依赖占位。
+        if vecs and self._dim is None:
+            try:
+                self._dim = int(vecs[0].shape[-1])
+            except Exception:
+                pass
+        return vecs
 
     @staticmethod
     def _to_array(vec):
@@ -425,9 +438,20 @@ class _ChonkieEmbeddingAdapter(_BaseEmbeddings):
     # -- dimension ---------------------------------------------------------
     @property
     def dimension(self) -> int:
-        if self._dim is None:
-            self._dim = len(self.embed("probe"))
-        return self._dim
+        """向量维度。
+
+        旧实现用一次真实 embed 探测（``len(self.embed("probe"))``）。chonkie
+        可能在**构造期**就访问这个属性，于是语义分块的初始化会在 ingest worker
+        线程里强制加载 ONNX 模型 —— 而模型加载受全局锁串行化，第一个 worker
+        会把整体启动时间拖长，4 个 worker 之间还会互相干等。
+
+        改为惰性：已经算过向量就用它的长度；否则退回已知维度（本项目默认的
+        nomic-embed-text 就是 768）。真正开始分批 embed 后 ``_dim`` 会被真实
+        长度刷新（见 ``embed_batch``）。
+        """
+        if self._dim is not None:
+            return self._dim
+        return _KNOWN_DIM
 
     # -- tokenizer ---------------------------------------------------------
     def get_tokenizer(self) -> Any:

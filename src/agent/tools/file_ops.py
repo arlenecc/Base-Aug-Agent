@@ -17,6 +17,11 @@ _MAX_READ_CHARS = 200_000
 # 本来就不可靠，模型应改用 file_write 重写或 shell 处理。
 _MAX_MODIFY_BYTES = 10 * 1024 * 1024
 
+# file_write 单次写入的最大字符数。模型幻觉出的「完整文件」动辄几十 MB，
+# 一次性进内存 + 全量落盘会拖慢 agent 并可能写满磁盘。取读取上限的 5 倍
+# （1M 字符）——足够写正常源码/配置，又不会放任病态体积。
+_MAX_WRITE_CHARS = 5 * _MAX_READ_CHARS
+
 # 进程 umask 在模块导入时读一次。旧实现每次新建文件都
 # ``mask = os.umask(0); os.umask(mask)``——这是进程级全局操作且非线程安全，
 # 窗口内其它线程建文件会得到 0666。导入期尚无并发，读一次缓存即可。
@@ -152,6 +157,21 @@ class FileWriteTool(_FileTool):
             full = self._resolve(path)
         except PermissionError as e:
             return ToolResult(False, error=str(e))
+        # 写入上限：模型偶尔会吐出几十 MB 的字符串（幻觉出的「完整文件」），
+        # 一次性进内存并全量落盘既拖慢 agent 也可能把磁盘写满。与
+        # file_read 的 _MAX_READ_CHARS 策略对齐，超限时明确提示改用 shell_run
+        # 分块/流式写，而不是让它在超时后变成一个难懂的失败。
+        if not isinstance(content, str):
+            content = str(content)
+        if len(content) > _MAX_WRITE_CHARS:
+            return ToolResult(
+                False,
+                error=(
+                    f"content too large ({len(content)} chars > {_MAX_WRITE_CHARS} cap). "
+                    "Split the write into several smaller file_write calls, or use "
+                    "shell_run with a heredoc / streaming write for large files."
+                ),
+            )
         try:
             # makedirs 也放进 try：磁盘满/只读目录/权限不足都表现为 OSError，
             # 应作为工具失败返回而不是让 registry 兜底成裸异常。

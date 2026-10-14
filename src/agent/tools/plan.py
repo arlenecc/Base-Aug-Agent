@@ -182,7 +182,10 @@ class UpdatePlanTool(Tool):
             self._notify(sess)
             out = f"plan now has {len(plan['steps'])} step(s)"
             if dropped:
-                out += f"\n⚠ 步骤数超过上限，最早 {dropped} 步被丢弃"
+                # normalize_plan 保留 raw_steps[:20]，丢掉的是**最新**追加的步，
+                # 旧文案写成「最早 N 步被丢弃」与事实相反，会误导模型去重做旧步。
+                out += (f"\n⚠ 步骤数超过上限（20），最新追加的 {dropped} 步被丢弃；"
+                        "请改用 update_plan(op='create') 重建一个更聚焦的计划")
             return ToolResult(True, output=f"{out}\n{sess.render_plan()}")
 
         if op == "patch":
@@ -232,8 +235,16 @@ class UpdatePlanTool(Tool):
             touched = len(targets)
             # 把上一步标 done 时，顺带把下一个 pending 步骤标成 doing，
             # 让「Now:」始终指向当前位置（否则模型要自己推断）。
+            # 必须从**被标记的步骤之后**开始找 pending：旧实现从头找第一个
+            # pending，当被标 done 的步骤前面还有 pending（被跳过的步骤）时，
+            # 「Now:」会指回更早的步骤，模型据此反复做同一件事。
             if new_status == "done":
-                for s in steps_list:
+                target_ids = {s.get("id") for s in targets}
+                last_idx = max(
+                    (i for i, s in enumerate(steps_list) if s.get("id") in target_ids),
+                    default=-1,
+                )
+                for s in steps_list[last_idx + 1:]:
                     if s.get("status") == "pending":
                         s["status"] = "doing"
                         break

@@ -155,6 +155,10 @@ class Session:
             rec.prompt + rec.assistant_text
             + "".join(str(r.get("content", "")) for r in rec.tool_results)
         )
+        # 一次性提示到此才真正消费：本轮 turn 已落地，提示不再需要回注。
+        # 被 rollback 的轮不会走到这里，提示会继续保留给下一轮（见 anchor_prompt）。
+        self.working.pop("__truncated__", None)
+        self.working.pop("__plan_boundary__", None)
 
     # ------------------------------------------------------------------
     # 工作记忆（L4 的落地位置）
@@ -234,14 +238,19 @@ class Session:
         if plan:
             parts.append(f"### [PLAN]\n{plan}")
         # 上一轮被轮次上限截断：必须让模型看到，否则它会以为任务已完成。
-        truncated = self.working.pop("__truncated__", None)
+        # 用 peek 而不是 pop：这些提示是「一次性」的，但真正的一次性语义是
+        # 「本轮 turn 落地后才失效」。旧实现在 anchor_prompt 里 pop，而该轮
+        # 紧接着可能被反思门/前置门 rollback —— 提示随之消失，自动续跑注入的
+        # 「上一条被判提前收尾」这条关键指令模型永远看不到（只能收到泛化的
+        # 「还有 N 步未完成」）。消费点挪到 finish_turn。
+        truncated = self.working.get("__truncated__")
         if truncated:
             parts.append(f"[SYSTEM] {truncated}")
         # 任务边界提示（agent.run 在「计划仍有未完成步骤 + 新的用户请求」时
-        # 注入）：一次性消费，模型必须在「新任务重建计划 / 继续旧任务」之间
-        # 显式判断。没有这个提示时，模型会静默沿用旧计划——表现为「新任务的
-        # 计划面板显示的是上一个任务的内容」。
-        boundary = self.working.pop("__plan_boundary__", None)
+        # 注入）：让模型在「新任务重建计划 / 继续旧任务」之间显式判断。没有
+        # 这个提示时，模型会静默沿用旧计划——表现为「新任务的计划面板显示的
+        # 是上一个任务的内容」。
+        boundary = self.working.get("__plan_boundary__")
         if boundary:
             parts.append(f"[SYSTEM] {boundary}")
         facts = self.working.get("facts")
@@ -280,6 +289,14 @@ class Session:
                 break
             self.extra_digest.append(self.turns.pop(0).digest_line())
             folded += 1
+        # extra_digest 只由本方法追加、而 l3_fold 只裁**输出**不裁列表本身 ——
+        # 长跑会话里它会随 folded_count 无上限增长，且 digest_lines() /
+        # all_digest_lines() 每次都全量拷贝。这里按 max_digest_lines 滚动裁掉
+        # 最旧的行（保留一条溢出标记，避免「历史凭空消失」）。
+        if len(self.extra_digest) > self.max_digest_lines:
+            drop = len(self.extra_digest) - self.max_digest_lines
+            del self.extra_digest[:drop]
+            self.extra_digest[0] = f"[…更早的 {drop} 轮已折叠省略]"
         if folded:
             # 摘掉后 turn_index 不再等于列表长度，后续 start_turn 仍单调自增，
             # 摘要行的 [T{index}] 保持可追溯。

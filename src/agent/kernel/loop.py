@@ -12,16 +12,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .budget import ContextBudget, estimate_tokens
-from .compressor import l0_capture, l1_trim, l2_summary
+from .compressor import has_summary_tag, l0_capture, l1_trim, l2_summary
 from .outcome import (
     ExitReason, KernelState, LLMResponse, StepOutcome, ToolCall, next_state,
 )
 from .session import Session
+
+logger = logging.getLogger(__name__)
 
 
 # 空响应 / 流中断的重试上限
@@ -52,6 +55,17 @@ _MULTISTEP_HINT = re.compile(
     r"第[一二三四五六七八九十\d]+步|^\s*\d+[\.、\)]|一、|二、|首先|其次|最后|"
     r"以下任务|分别做|依次做|分步)",
     re.I | re.M,
+)
+# 多步**动词**：不含上面那些连接词也显然不是一步能做完的动作。
+# 「帮我重构 foo.py」「批量转换这些图片」「把项目部署到测试服」都不命中
+# _MULTISTEP_HINT，旧实现的 simple 豁免会把它们整条放行 → 无计划、无监督地
+# 跑完，反思门因 plan_open_steps() 恒空而完全失效。
+_MULTISTEP_VERB_RE = re.compile(
+    r"(重构|重写|批量|全部|所有|每个|一系列|整套|完整|"
+    r"部署|迁移|搭建|改造|升级|替换|整合|拆分|合并|"
+    r"整理|归档|备份|还原|恢复|排查|定位并|分析并|"
+    r"制定|实现|开发|配置|初始化|生成报告|写一份|做一份)",
+    re.I,
 )
 # 多步任务却只在文本里「规划 + 声称开始」、既没把计划写入执行计划也没真正
 # 动手就想收尾时，反思门给出的强制纠正提示。
@@ -195,15 +209,52 @@ class KernelLoop:
         if self._schemas is None:
             try:
                 self.set_schemas(self.dispatcher.schemas())
-            except Exception:
+            except Exception as e:
+                # 静默降级成「没有任何工具」会让模型在无法调用工具的状态下空跑，
+                # 用户只看到反复的文字回复却不知道原因。至少留一条日志。
+                self.log(f"[kernel] 工具 schema 获取失败，本轮将无工具可用: {e}")
+                logger.warning("kernel: tool schema unavailable: %s", e)
                 self.set_schemas([])
         self.budget.set_used("tools", self._schema_tokens)
         return self._schemas or []
 
+    def _reset_retry_guards(self) -> None:
+        """一轮被真正提交后，清掉「空回复 / 只吐代码块」的重试计数。
+
+        只应在 ``session.finish_turn`` 之后调用：被回滚的重试轮不算提交，
+        提前清零会让重试永远触不到上限（空回复无限循环）。
+        """
+        self._empty_retry = 0
+        self._reask_guard = 0
+
+    def _emit_ui(self, attr: str, *args) -> None:
+        """安全调用 UI 回调。
+
+        UI 回调抛异常不能把整轮变成 ExitReason.ERROR：那时用户只看到一句
+        「LLM error」，完全看不出是界面侧的问题（on_content / on_reasoning /
+        on_token_speed 之前都没包，同文件的 on_token_speed 收尾处却包了）。
+        这里统一降级为日志。
+        """
+        fn = getattr(self.callbacks, attr, None)
+        if not callable(fn):
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.warning("kernel: UI callback %s failed: %s", attr, e)
+
     # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
-    def run(self, user_input: str, resume: bool = False) -> KernelResult:
+    def run(self, user_input: str, resume: bool = False,
+            emit_finished: bool = True) -> KernelResult:
+        """执行一段内核循环。
+
+        ``emit_finished=False`` 供「自动续跑」使用：续跑段是同一个用户轮次的
+        一部分，此时不能触发 ``hooks.finished`` —— 它会做事实抽取与 L4 蒸馏，
+        每段都触发意味着单次用户输入最多跑 4 次冗余的后台 LLM 调用，并向知识
+        图谱重复写入多条近似实体。只有最后一段才允许触发。
+        """
         session = self.session
         self.state = KernelState.THINK
         self._empty_retry = 0
@@ -234,6 +285,14 @@ class KernelLoop:
             self._last_fail = seed.get("last_fail") or None
             self._fail_sigs = list(seed.get("fail_sigs") or [])[-_MAX_FAIL_SIGS:]
             self._fail_streak = int(seed.get("fail_streak", 0) or 0)
+            # 防死循环计数跨段续上（见 failure_snapshot 注释）
+            self._finish_nudge = int(seed.get("finish_nudge", 0) or 0)
+            self._plan_finish_nudge = int(seed.get("plan_finish_nudge", 0) or 0)
+            self._block_nudge = int(seed.get("block_nudge", 0) or 0)
+            self._empty_retry = int(seed.get("empty_retry", 0) or 0)
+            self._reask_guard = int(seed.get("reask_guard", 0) or 0)
+            self._plan_nudged = int(seed.get("plan_nudged", 0) or 0)
+            self._did_work = bool(seed.get("did_work", False))
         # max_turns 是「本次 run() 的轮次上限」，不是「整个会话的累计轮次」。
         # Session.turn_index 跨 run() 单调递增（它就是历史编号），拿它当循环
         # 上界会让 Agent 在累计 N 轮之后彻底不再调用 LLM。
@@ -334,7 +393,8 @@ class KernelLoop:
                 # 「思考里显示计划 + 声称开始第一个任务，然后就停住、什么也没干」
                 # 的失败模式。先拦：必须先把计划写入执行计划并立即发第一步工具。
                 if (session.get_plan() is None
-                        and _MULTISTEP_HINT.search(user_input or "")
+                        and (_MULTISTEP_HINT.search(user_input or "")
+                             or _MULTISTEP_VERB_RE.search(user_input or ""))
                         and not self._did_work
                         and self._plan_finish_nudge < _FINISH_NUDGE_PLAN_MAX
                         and not self._resume):
@@ -392,8 +452,11 @@ class KernelLoop:
                             f"{open_steps[0].get('id')}.{open_steps[0].get('title')}",
                         )
                         pending = (
-                            f"[System] 计划已建立，但你还**一次工具都没调用**——"
-                            f"只把计划写出来不算开始执行。这是第 {self._finish_nudge} 次提醒。\n"
+                            f"[System] 计划已建立，但你还"
+                            + ("**一次工具都没调用**" if not self._resume
+                               else "在本段没有调用任何工具")
+                            + "——只把计划写出来不算开始执行。"
+                            f"这是第 {self._finish_nudge} 次提醒。\n"
                             f"现在立即开始执行当前步骤（Now）：{now}。\n"
                             "要求：下一轮必须包含**工具调用**（读文件 / 执行命令 / "
                             "检索 / 写代码等实际动作），不要只描述你打算做什么，"
@@ -462,7 +525,8 @@ class KernelLoop:
                     and not self._resume):
                 simple = (self._turns_used <= 1
                           and len(user_input or "") <= 60
-                          and not _MULTISTEP_HINT.search(user_input or ""))
+                          and not _MULTISTEP_HINT.search(user_input or "")
+                          and not _MULTISTEP_VERB_RE.search(user_input or ""))
                 if not simple:
                     self._rollback_turn(session)
                     pending = (
@@ -496,7 +560,15 @@ class KernelLoop:
             ]
             summary = resp.summary or l2_summary(resp.content, [tc.name for tc in tool_calls])
             session.finish_turn(rec, resp.content, tool_calls, tool_results, summary)
-            has_summary = bool(resp.summary)
+            # 这一轮被真正提交了（不是被回滚的重试轮）→ 重置空回复/重问守卫。
+            # 旧实现让它们跨轮累积：长任务后期一次偶发空回复/只吐代码块，就会被
+            # 过早判成 "done" 收尾。
+            self._reset_retry_guards()
+            # 「必须输出 <summary>」的纪律提醒过去看 resp.summary 是否非空，而
+            # l2_summary 对任何非空 content 都保证返回非空（最差也给「（空回复）」）
+            # → has_summary 恒为 True，这条 TIPS 是死代码，L2 摘要纪律实际失效。
+            # 改成直接问「模型有没有真的按协议写 <summary>」。
+            has_summary = has_summary_tag(resp.content)
 
             if any(o.should_exit for o in outcomes):
                 final_text = resp.content
@@ -550,10 +622,11 @@ class KernelLoop:
                     "update_plan 补标 done；若确实不可行，标 blocked 并写明原因。）"
                 )
 
-        try:
-            self.hooks.finished(session, final_text)
-        except Exception as e:
-            self.log(f"[kernel] finished hook error: {e}")
+        if emit_finished:
+            try:
+                self.hooks.finished(session, final_text)
+            except Exception as e:
+                self.log(f"[kernel] finished hook error: {e}")
 
         return KernelResult(final_text, exit_reason, self._turns_used,
                             self.distill_requested)
@@ -618,11 +691,11 @@ class KernelLoop:
                     t = getattr(ev, "type", "")
                     if t == "content":
                         content_buf.append(ev.content)
-                        self.callbacks.on_content(ev.content)
+                        self._emit_ui("on_content", ev.content)
                         live_est += estimate_tokens(ev.content)
                     elif t == "reasoning":
                         reasoning_buf.append(ev.content)
-                        self.callbacks.on_reasoning(ev.content)
+                        self._emit_ui("on_reasoning", ev.content)
                         live_est += estimate_tokens(ev.content)
                     elif t == "done":
                         seen_done = True
@@ -633,7 +706,8 @@ class KernelLoop:
                         last_emit = now
                     elif live_est and now - last_emit >= 0.3:
                         gen = max(now - (ttfb or t0), 1e-6)
-                        self.callbacks.on_token_speed(self._total_tokens + live_est, live_est / gen)
+                        self._emit_ui("on_token_speed",
+                                      self._total_tokens + live_est, live_est / gen)
                         last_emit = now
                 break
             except Exception as e:
@@ -647,7 +721,14 @@ class KernelLoop:
                 self.log(f"[kernel] LLM 首字节前失败，{delay:.1f}s 后重试 ({attempt}): {e}")
                 if self._cancelled():
                     raise
-                time.sleep(delay)
+                # 分段休眠并轮询取消：一次性 time.sleep(delay) 最长 3s 完全不
+                # 响应「终止对话」，用户点了取消还要干等。
+                _slept = 0.0
+                while _slept < delay:
+                    if self._cancelled():
+                        raise
+                    time.sleep(min(0.1, delay - _slept))
+                    _slept += 0.1
 
         if cancelled:
             return None
@@ -679,6 +760,11 @@ class KernelLoop:
                                           completion / gen_elapsed if completion else 0.0)
         except Exception:
             pass
+
+        # 注意：这里**不能**重置 _empty_retry / _reask_guard。它们由
+        # _no_tool_event 在「本轮回复不可用」时递增、在重试额度用尽时判 done；
+        # 每次流式成功就清零会让重试永远触不到上限（空回复无限循环）。
+        # 正确的重置点是「一轮被真正提交」之后（见 _reset_retry_guards）。
 
         text = "".join(content_buf)
         resp = LLMResponse(
@@ -786,13 +872,29 @@ class KernelLoop:
             "last_fail": self._last_fail,
             "fail_sigs": list(self._fail_sigs)[-_MAX_FAIL_SIGS:],
             "fail_streak": self._fail_streak,
+            # 防死循环的各类 nudge 计数也必须跨段传递：run() 每次都会把它们清零，
+            # 而 Agent 最多自动续跑 4 段 —— 不传的话「段内最多拦 N 次」会被放大
+            # 成 4×N 次，单次用户输入最坏 4×15 轮 LLM 调用且没有墙钟上限，
+            # 推理模型下可能几十分钟不返回任何结果。
+            "finish_nudge": self._finish_nudge,
+            "plan_finish_nudge": self._plan_finish_nudge,
+            "block_nudge": self._block_nudge,
+            "empty_retry": self._empty_retry,
+            "reask_guard": self._reask_guard,
+            "plan_nudged": self._plan_nudged,
+            # 上一段是否已经真正干过活。不传的话续跑段 _did_work=False，
+            # 反思门文案会变成「你还一次工具都没调用」（对已经干过活的段是错的，
+            # 会误导模型），失败感知预算也会从 6 掉回 2。
+            "did_work": self._did_work,
         }
 
     def seed_failures(self, snapshot: Optional[Dict[str, Any]]) -> None:
         """把上一段的失败上下文带进下一段 run()（自动续跑用）。
 
-        只影响 ``_failed_total / _last_fail / _fail_sigs / _fail_streak``：
-        续跑段因此仍享有失败感知的反思门预算，且提醒里能引用上一段的真实错误。
+        除 ``_failed_total / _last_fail / _fail_sigs / _fail_streak`` 外，还带上
+        各类防死循环 nudge 计数与 ``_did_work``：续跑段因此仍享有失败感知的
+        反思门预算、提醒里能引用上一段的真实错误，且不会把「段内最多拦 N 次」
+        放大成「每段各拦 N 次」。
         """
         self._seed_failures = dict(snapshot) if snapshot else None
 

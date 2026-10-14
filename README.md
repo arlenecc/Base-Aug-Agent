@@ -126,6 +126,8 @@ RAG 依赖（`fastembed` / `docling` / `chonkie` 等）按需安装即可；rera
 - **打包**：`build.sh` 已自动优先使用 `/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。
 
 > **Reranker 的 numpy 兼容性**：reranker 现由 fastembed 的 ONNX Runtime（TextCrossEncoder）提供，与 embedding 同源，**不依赖 torch / FlagEmbedding，在 numpy 2.x 下默认可用**，无需降级 numpy。首次检索时自动加载 `BAAI/bge-reranker-v2-m3`（约 2.3GB ONNX，可经依赖预下载提前缓存）。
+>
+> **手工预下载注意**：fastembed 的模型名与它实际拉取的 HuggingFace 仓库不是一回事——`BAAI/bge-reranker-v2-m3` 实际拉的是 `onnx-community/bge-reranker-v2-m3-ONNX`，缓存目录名由**仓库名**推导（`~/.cache/fastembed/models--onnx-community--bge-reranker-v2-m3-ONNX`）。下到默认的 `~/.cache/huggingface` fastembed 看不到，报错依旧。依赖检查阶段的缓存探测是纯文件系统的，不会触发下载。
 
 ### 启动
 
@@ -151,6 +153,21 @@ python main.py
 | 超时(秒) | 请求超时 | `120` |
 
 配置自动持久化到 `~/.base-agent/config.json`。
+
+RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可手工编辑）：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `rag_embedding_model` | 嵌入模型（FastEmbed 模型名） | `nomic-ai/nomic-embed-text-v1.5-Q` |
+| `rag_rerank_model` | 重排序模型（FastEmbed cross-encoder） | `BAAI/bge-reranker-v2-m3` |
+| `rag_rerank_enabled` | 是否启用重排序；关闭后不加载 reranker 权重 | `true` |
+
+> 注意 fastembed 的**模型名**与它实际拉取的 HuggingFace 仓库不是一回事：
+> `nomic-ai/nomic-embed-text-v1.5-Q` → 仓库 `nomic-ai/nomic-embed-text-v1.5`；
+> `BAAI/bge-reranker-v2-m3` → 仓库 `onnx-community/bge-reranker-v2-m3-ONNX`。
+> 缓存目录名由**仓库名**推导（`~/.cache/fastembed/models--{org}--{repo}`），
+> 所以手工预下载时必须落到 `~/.cache/fastembed`，下到默认的
+> `~/.cache/huggingface` fastembed 看不到。
 
 ## 内置工具
 
@@ -274,6 +291,8 @@ python main.py
 - **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。每切片同时存入 embedding 向量、完整原文、来源文件名、切片编号，并开启 BM25 全文索引（原生 FTS + jieba 预分词）。
 - **混合检索**：向量相似度 + BM25 关键词并行检索（各取 top_k×4 候选），按 (source, chunk_index) 合并去重，兼顾语义召回与精确关键词命中（中文经 jieba 分词）。
 - **重排序**：FastEmbed Reranker (`BAAI/bge-reranker-v2-m3`)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。
+  - 可在配置里关掉重排序（`rag_rerank_enabled=false`）或换成别的模型（`rag_rerank_model`）；关闭后检索直接走混合排序，**不会**加载 ~2.3GB 的 reranker 权重。
+  - reranker 的原始输出是 logits，代码在首次打分时探测一次输出范围并**按模型固定**决定是否做 sigmoid 归一化（不再按「本批候选」自适应），保证 `min_similarity=0.7` 这个绝对阈值在不同查询间语义一致。
 - **相似度过滤**：rerank 后过滤语义相似度 < 0.7 的结果（不相关的切片不发回模型），最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
 
 ### Meta-context + Targeted RAG（动态按需检索）
@@ -821,6 +840,67 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 145 | busy 时按 Enter 静默丢弃 | 像输入框坏了 | 状态栏提示「正在运行中」 |
 | 146 | 清空对话无 busy 守卫、不清计数器 | 运行中清空破坏会话；token 计数残留 | 加守卫 + 复位计数 |
 | 147 | Ctrl+Enter 也发送、按键事件未 accept | 误发送；事件向父控件意外传播 | 仅裸 Enter 发送 + `e.accept()` |
+
+### 第十轮：全量复查（安全 / 泄漏 / 正确性 / 性能 / 体验）
+
+三个模块并行深审（RAG、agent 编排层、工具层与 UI）后按严重度修复。核心是三类：
+**风险分级的两类绕过**、**三处持久化的并发写损坏**、**自动续跑把防死循环预算放大多倍**。
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 148 | 风险分级可被一句话绕过：`_SHELL_VERB_RE` 只有 `rm/mv/cp…`，`python3 -c "shutil.rmtree('/Users/x')"` / `dd if=… of=/dev/rdisk3` / `curl … \| python3` 全部**零确认直接执行** | 破坏性命令绕过人工确认 | 动词表补磁盘级操作与 Python 侧等价调用名；`_PIPE_EXEC_RE` 目标扩展到 `python/node/perl/ruby/php` |
+| 149 | `code_run` 写护栏只包 `open`，`os.symlink/os.rename/os.link/shutil.move` 既拦不住也不弹确认 | 改写系统文件拓扑无感知 | 风险分级记号补齐这些调用（与工作区外路径同现即弹确认）；文档说明「护栏是提示性的、第一道防线是风险分级」 |
+| 150 | `skill_load` 可经符号链接升级成任意文件读取（`ln -s /etc <ws>/skills/x` 后读 `passwd`） | 任意文件读取 | 外部技能链接目标必须「长得像技能目录」（顶层含 SKILL.md/skill.json/prompt.md）；读取结果标注真实来源 |
+| 151 | `memory` / `graph_memory` / `skill_index` 三处持久化都用固定 `.tmp` 名 | 并发写互相 truncate → 落盘**混合 JSON**，`_load` 失败后按 `{}` 初始化 = 数据静默丢失 | 新增 `agent/atomic_io.py`（mkstemp 唯一名 + 权限继承 + fsync + finally 清理），三处统一收敛 |
+| 152 | `_load` 解析失败后静默按空数据继续，下次 `_save` 把坏文件覆盖 | 手工编辑写错/版本不兼容 → 用户数据无从排查地丢失 | 失败时先把坏文件改名备份为 `.corrupt-<时间戳>` 再空初始化 |
+| 153 | 知识图谱实体/observation 只增不减，且每次写入全量序列化 | 长跑 workspace 内存与 JSON 体积单调增长，写放大 O(N) | 每实体 200 条 / 总 5000 实体 / 20000 关系上限（按「最近优先」淘汰，同步清理向量行）；写入加 0.5s 防抖 + `flush()` + atexit 落盘 |
+| 154 | 自动续跑把防死循环预算放大多倍：`run()` 每段清零全部 nudge 计数，最多续 4 段 | 单次用户输入最坏 4×15=60+ 轮 LLM 调用、无墙钟上限，推理模型下几十分钟不返回 | nudge 计数与 `_did_work` 并入 `failure_snapshot()` 跨段传递 |
+| 155 | `hooks.finished` 每个续跑段都触发一次 | 单次输入最多 8 次冗余后台 LLM 调用 + 向图谱重复写入近似实体 | 内核 `run(emit_finished=False)`，由 `Agent.run` 在整个用户轮次结束后只触发一次 |
+| 156 | 一次性提示在 rollback 时被永久吞掉（`anchor_prompt` 里 pop，该轮随即被 rollback） | 自动续跑注入的「上一条被判提前收尾」模型**永远看不到**，只能收到泛化提示 | 改为 peek 不消费，`finish_turn` 真正落地后才清除 |
+| 157 | `simple` 豁免让反思门对短多步任务完全失效（「帮我重构 foo.py」不含多步关键词且 <60 字） | 任务在无计划、无监督状态下跑完 | 豁免条件补多步动词表（重构/批量/部署/迁移/搭建…） |
+| 158 | resume 段 `_did_work=False` | 反思门文案变成「你还一次工具都没调用」（对已干过活的段是错的，会误导模型），失败感知预算从 6 掉回 2 | `_did_work` 跨段传递；提醒文案按 `_resume` 分支 |
+| 159 | `close()` 与自己的文档相反：拿不到锁仍然裸关 `httpx.Client` | 后台抽取/蒸馏线程正在流式使用的连接被关，半路炸掉且连接未归还 | 只有拿到锁才关闭 |
+| 160 | UI 回调未包 try/except | 一个 UI 异常把整轮变成一句「LLM error」，看不出是界面问题 | `_emit_ui` 统一包装并降级为日志 |
+| 161 | 连续空回复 → 返回空字符串 | 用户看到一个完全空白的回复 | 耗尽重试后返回可见提示 |
+| 162 | `has_summary` 恒为 True | 「必须输出 `<summary>`」提醒是死代码，L2 摘要纪律实际失效 | 改为 `has_summary_tag()` 直接问模型有没有按协议写标签 |
+| 163 | `max_iterations` 同步读的是 `__init__` 快照 | UI 改 `config.max_iterations` 后不生效（「改了最大轮次却没反应」） | 改成 property：读实时取 config，写也落 config |
+| 164 | `_append_summary_to_memory` 用固定 `.tmp` 名 | 并发收缩上下文时写坏 memory.md，失败留僵尸 tmp | 统一走 `atomic_write_text` |
+| 165 | `on_plan_updated` 传 Session 活字典给 UI 线程 | 正是 `session.py` 里列为已修 bug 的跨线程共享可变状态模式 | 传深拷贝 |
+| 166 | `deps` 的模型缓存探测靠 `TextEmbedding(lazy_load=True)` | fastembed 部分版本的下载逻辑在基类 `__init__`，`lazy_load` 只跳 ONNX Session → **依赖检查可能触发 2.3GB 下载** | 纯文件系统探测（支持 hub 缓存 `models--{org}--{repo}/trees/*.json` 与旧布局），不实例化模型 |
+| 167 | 手动下载指引指向 `~/.cache/huggingface` 且仓库名少了 `-Q` 语义 | 用户照做后 fastembed 仍看不到模型，报错依旧 | 指引改为落到 `~/.cache/fastembed` 并说明模型名→仓库名映射 |
+| 168 | 探测只看 `onnx/model.onnx` 存在 | 一次中断的下载只留下 656KB 外部图，被判成「已缓存」→ 跳过预下载 | 按清单校验每个文件的 blob 完整性（排除 `.incomplete`） |
+| 169 | 装完包后重跑完整 `check_dependencies()` | 内含整树 rglob 扫描 + 逐本打开 PDF 抽前 10 页，最贵的一步做两遍 | 只复查刚装的那些包的导入情况 |
+| 170 | `install_packages` 用 `sys.executable -m pip` | PyInstaller 冻结环境下必然失败（app 二进制没有 pip） | 优先 `sys._base_executable`；拿不到时明确报错 |
+| 171 | `rag_rerank_enabled` / `rag_rerank_model` 两个配置项从未被读取 | 用户关重排序或换模型完全无效 | 透传到 `RAGEngine`，关闭时短路到混合排序且不加载 reranker |
+| 172 | `close()` 未复位 `_documents_table` | 实例复活后持有旧连接的表句柄，upsert 对新连接不可见甚至失败 | 一并置空 |
+| 173 | reranker 分数按「本批候选」自适应 sigmoid + `math.exp(-s)` 大负数溢出 | 同一 chunk 在不同查询下可能走/不走归一化，`0.7` 绝对阈值语义漂移；溢出被吞后静默回退 | 按模型固定归一化（首次探测一次并缓存）+ 数值稳定 sigmoid |
+| 174 | `**sig_now` 在文件于同步过程中被删时抛 `TypeError` | 一次抖动让剩余文件向量全部丢弃、整个 manifest 作废 | `sig_now is None` 时跳过该文件并计入 errors |
+| 175 | `delete_document` 只按 doc_id 删 | `upsert` 在 md_path 为空时按 basename 建键，那些行永远删不掉 | 同时按 `doc_id` 与 `doc_name` 两种键删除 |
+| 176 | `search` 循环变量 `source` 覆盖函数形参 `source` | 定向检索过滤条件被覆盖成最后一条结果的文件名 | 改名 `src_name`；回退结果缺键改用 `.get()` |
+| 177 | `_save_manifest` 固定 `.tmp` 名 | 并发写坏 manifest | 统一走 `atomic_write_json` |
+| 178 | `parsers` EPUB 不关 book | ebooklib zip 句柄在 4 worker × 数千文件下累积（Windows 锁文件） | try/finally 关闭 |
+| 179 | OCR 信号量无超时 acquire | 单页 OCR 卡死让所有 worker 连同 daemon 线程永久挂起，进度不再动且无报错 | 300s 超时，拿不到就跳过该页并告警 |
+| 180 | `_ChonkieEmbeddingAdapter.dimension` 触发一次真实 embed | chonkie 构造期访问它 → 在 ingest worker 里强制加载 ONNX 模型（全局锁串行化，拖慢整体） | 先用已知维度占位，首批 embed 后用实测长度刷新 |
+| 181 | `skill_retriever` 扫描时整文件读入 | 误放入的几百 MB 文件直接进内存后才截断 | 读到上限+1 再截断 |
+| 182 | `skill_retriever.build()` 先 drop 旧表再分批 embed | 第一批之后失败 → 留下半张表且 `_table` 未赋值，下次打开半张表，检索静默残缺 | 先建 staging 表、全部成功后复制数据再切换，失败只清 staging（旧表始终完好） |
+| 183 | `graph_memory._deindex_observations` 全表物化只为收集拼写集合 | 删除延迟随图谱线性增长 | 保留列投影；新增按 observation 粒度的 `_deindex_observation`（淘汰时用） |
+| 184 | `skill_save` 只写 `workspace/skills`，而关键词检索扫 `.agent/skills` | 刚固化的技能 `skill_search`（关键词）永远召不回，回执却声称都能召回 | 镜像一份到 `.agent/skills`（不覆盖用户已有版本），回执如实说明 |
+| 185 | `cleaner` 用 `&[a-zA-Z]+;` 一刀切 + 短数字行宽条件 | "AT&T;"、"R&D;" 与 "AT&T; 财报" 这类正文被误删 | 只替换真实存在的 HTML 实体名；页码行仅删独立成行的纯数字 |
+| 186 | `file_write` 对 content 体积无上限 | 模型传几十 MB 字符串一次性进内存并全量落盘 | 1M 字符上限，超限提示改用 `shell_run` 分块/流式写 |
+| 187 | `MCPTool` 不兜底畸形 inputSchema | server 返回 `"properties": null` 时 schema 发给 LLM API 可能被整体拒绝（那轮所有工具不可用） | 校验 `properties`/`required` 类型并回退空值 |
+| 188 | `ask_user` 裸访问 `registry.callbacks` | headless/测试下 AttributeError 被兜底成难懂错误 | `getattr` 链 + 明确错误文案 |
+| 189 | `web_scan` 只校验初始 URL 协议，`follow_redirects=True` | 公网 URL 可被 302 引到内网/其它主机（SSRF 面） | `max_redirects=5` 收紧 |
+| 190 | `update_plan` patch done 时把「第一个 pending」提为 doing | 被标 done 的步骤前面还有 pending（被跳过）时，`Now:` 指回更早步骤，模型反复做同一件事 | 只提升目标步骤**之后**的第一个 pending |
+| 191 | append 超限提示说反了 | `normalize_plan` 保留 `raw_steps[:20]`，丢掉的是**最新**追加步，文案写「最早 N 步被丢弃」 | 文案改为「最新追加的 N 步被丢弃」并建议重建更聚焦的计划 |
+| 192 | 中文输入法组字时按回车直接发送 | 中文用户每确认一个候选词就误发半条消息 | 放行 IME 预编辑态（`text()` 为空）的 Return |
+| 193 | 首个流式 chunk 后又重置 `_SummaryStripper` | 首块以 `<summ` 结尾时 carry 被丢弃，下一 chunk 的 `ary>` 被当正文显示 | 删除多余重置（每回合的重置已在 `_on_send`） |
+| 194 | 重试守卫不在成功轮后重置 | 长任务后期偶发空回复被过早判成 "done" 收尾 | 一轮被真正提交（`finish_turn`）后才清零，重试轮不清 |
+| 195 | LLM 首字节前失败重试 `time.sleep(delay)` | 最长 3s 完全不响应「终止对话」 | 0.1s 粒度分段休眠并轮询取消 |
+| 196 | 工具 schema 获取失败静默降级成空 | 模型在无法调用任何工具的状态下空跑，用户只看到反复文字回复 | 记日志 + UI 错误提示 |
+
+回归测试：`tests/test_kernel.py` 新增「一次性提示必须活过 rollback」用例；
+`tests/test_confirm_policy.py` 覆盖新增的绕过向量；`tests/test_rag_manifest.py`
+覆盖 `delete_document` 双键删除。
 
 ## 部署
 

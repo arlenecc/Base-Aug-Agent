@@ -246,6 +246,8 @@ class ToolRegistry:
                 workspace=self.config.workspace,
                 knowledge_base=kb,
                 embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3"),
+                rerank_enabled=bool(getattr(self.config, "rag_rerank_enabled", True)),
             )
             self._rag_engine = engine
 

@@ -7,6 +7,26 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
+# 常见 HTML 实体表。旧实现用 ``&[a-zA-Z]+;`` 一刀切，会把正文里的
+# "AT&T;"、"R&D;" 这类正常写法连同前面的词一起抹掉（PDF/OCR 抽出的文本
+# 尤其常见）。改为只替换真实存在的实体名。
+_HTML_ENTITIES = frozenset({
+    "amp", "lt", "gt", "quot", "apos", "nbsp", "copy", "reg", "trade",
+    "hellip", "mdash", "ndash", "lsquo", "rsquo", "ldquo", "rdquo",
+    "laquo", "raquo", "deg", "plusmn", "times", "divide", "frac12",
+    "sup2", "sup3", "micro", "para", "middot", "cent", "pound", "euro",
+    "yen", "sect", "bull", "dagger", "permil", "prime", "Prime", "larr",
+    "rarr", "uarr", "darr", "harr", "crarr", "spades", "clubs", "hearts",
+    "diams", "alpha", "beta", "gamma", "delta", "pi", "sigma", "omega",
+    "infin", "ne", "le", "ge", "sum", "prod", "radic", "int", "asymp",
+    "equiv", "sub", "sup", "and", "or", "not", "cap", "cup", "isin",
+})
+_ENTITY_RE = re.compile(r'&([a-zA-Z][a-zA-Z0-9]{1,10});')
+
+
+def _replace_entity(m: "re.Match") -> str:
+    return " " if m.group(1) in _HTML_ENTITIES else m.group(0)
+
 
 def clean_text(text: str) -> str:
     """Clean extracted text: remove garbage tags, normalize whitespace,
@@ -26,8 +46,8 @@ def clean_text(text: str) -> str:
     # 3. Remove remaining HTML/XML tags
     text = re.sub(r'<[^>]+>', ' ', text)
 
-    # 4. Remove HTML entities
-    text = re.sub(r'&[a-zA-Z]+;', ' ', text)
+    # 4. Remove HTML entities（只替换真实存在的实体名，见 _replace_entity）
+    text = _ENTITY_RE.sub(_replace_entity, text)
     text = re.sub(r'&#\d+;', ' ', text)
     text = re.sub(r'&#x[0-9a-fA-F]+;', ' ', text)
 
@@ -61,7 +81,10 @@ def clean_text(text: str) -> str:
         alpha_ratio = sum(1 for c in stripped if c.isalnum() or c.isspace()) / max(len(stripped), 1)
         if alpha_ratio < 0.3 and len(stripped) < 20:
             continue
-        # Skip lines that are just page numbers or headers
+        # Skip lines that are just page numbers or headers.
+        # 只删**独立成行**的短数字（典型页码），且不再顺带删掉带字母数字混排的
+        # 短行 —— 旧条件 ``alpha_ratio < 0.3 and len < 20`` 会把 "AT&T; 财报"
+        # 这类行也判成垃圾。
         if re.match(r'^\d{1,4}$', stripped):
             continue
         if re.match(r'^第\s*\d{1,4}\s*页$', stripped):

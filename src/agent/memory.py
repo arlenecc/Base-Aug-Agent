@@ -10,6 +10,8 @@ import time
 import weakref
 from typing import Dict, List, Optional
 
+from .atomic_io import atomic_write_json, backup_corrupt
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -24,7 +26,7 @@ logger = logging.getLogger(__name__)
 # 被 GC 后自动从 WeakSet 消失，回调数量恒为 1，且不会阻止 store 被回收。
 # ---------------------------------------------------------------------------
 
-_LIVE_STORES: "weakref.WeakSet[_JsonStore]" = weakref.WeakSet()
+_LIVE_STORES: "weakref.WeakSet" = weakref.WeakSet()
 _LIVE_STORES_LOCK = threading.Lock()
 _ATEXIT_REGISTERED = False
 
@@ -37,7 +39,12 @@ def _flush_all_stores() -> None:
             pass
 
 
-def _register_atexit_flush(store: "_JsonStore") -> None:
+def _register_atexit_flush(store) -> None:
+    """把任何带 ``flush(force=True)`` 的 store 挂到全局退出刷新表上。
+
+    不只服务 ``_JsonStore``：``GraphMemoryStore`` 同样用了防抖写，退出前
+    必须落盘（否则防抖窗口内的改动静默丢失）。
+    """
     global _ATEXIT_REGISTERED
     with _LIVE_STORES_LOCK:
         _LIVE_STORES.add(store)
@@ -75,7 +82,9 @@ class _JsonStore:
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
                     self._data = json.load(f)
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning("memory: failed to load %s: %s", self.path, e)
+                backup_corrupt(self.path)
                 self._data = {}
 
     def reload(self) -> None:
@@ -96,13 +105,9 @@ class _JsonStore:
             self._load()
 
     def _save(self) -> None:
-        """Atomic write: tmp → rename. Must be called under _lock."""
+        """Atomic write. Must be called under _lock."""
         try:
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
+            atomic_write_json(self.path, self._data)
             self._dirty = False
             self._last_save = time.monotonic()
         except OSError as e:

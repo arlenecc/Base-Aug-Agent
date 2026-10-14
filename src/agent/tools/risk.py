@@ -28,26 +28,49 @@ _SAFE_ABS_PATHS = frozenset({
 # 会被当成 //x/y 的绝对路径误报）。
 _PATH_TOKEN_RE = re.compile(r"(?:[~/]|\.\./)[^\s'\"`|;&<>()\[\]{}]+")
 
-# Python 侧的「破坏性调用」记号：与危险路径同现才判风险
+# Python 侧的「破坏性调用」记号：与危险路径同现才判风险。
+# 2026-10 修补：旧表只有 open 之外的 remove/rmtree/chmod/subprocess，漏掉了
+# os.symlink/os.rename/os.link/os.replace/shutil.move 这些同样能改文件系统
+# 拓扑的调用，导致 `os.rename("/etc/hosts", ...)` 这类改写系统文件的写法
+# 既零确认也不被任何护栏覆盖。
 _PY_CALL_RE = re.compile(
     r"\b(os\.system|os\.popen|os\.remove|os\.unlink|os\.rmdir|os\.removedirs"
-    r"|os\.chmod|os\.chown|shutil\.rmtree|shutil\.chown|subprocess)\b"
+    r"|os\.chmod|os\.chown|os\.symlink|os\.link|os\.rename|os\.replace"
+    r"|os\.truncate|os\.makedirs|os\.mkdir"
+    r"|shutil\.rmtree|shutil\.chown|shutil\.move|shutil\.copy|shutil\.copy2"
+    r"|shutil\.copytree|subprocess)\b"
 )
 
-# shell 侧的破坏性动词（读文件不算：cat/ls/grep/head/tail 都不在表里）
+# shell 侧的破坏性动词（读文件不算：cat/ls/grep/head/tail 都不在表里）。
+# 同时收录 Python 侧调用名：`python3 -c "shutil.rmtree('/Users/x')"` 这类写法
+# 不走任何 shell 动词，只靠解释器名是拦不住的（与危险路径同现才判风险，
+# 因此 `python3 script.py` 这种正常开发用法不会误报）。
 _SHELL_VERB_RE = re.compile(
     r"\b(rm|rmdir|mv|cp|chmod|chown|ln|truncate|shred|tee|install|mkfile"
-    r"|hdiutil|defaults)\b"
+    r"|hdiutil|defaults"
+    # 磁盘级操作
+    r"|dd|mkfs|fdisk|parted|wipefs|badblocks|mkswap|swapon|swapoff"
+    # Python 侧等价的破坏性调用
+    r"|rmtree|removedirs|unlink|os\.system|os\.popen|os\.remove|os\.unlink"
+    r"|os\.rmdir|os\.removedirs|os\.chmod|os\.chown|os\.rename|os\.replace"
+    r"|os\.symlink|os\.link|os\.truncate|shutil\.rmtree|shutil\.move"
+    r"|shutil\.copy|shutil\.copy2|shutil\.copytree"
+    r"|subprocess\.(run|call|check_call|check_output|Popen))\b"
 )
 # 重定向到绝对路径（> /etc/hosts 这种工作区外的写）
 _SHELL_REDIRECT_RE = re.compile(r">>?\s*/")
 # sudo / 系统-电源-进程-磁盘控制
 _SHELL_CTRL_RE = re.compile(
     r"\b(sudo|doas|su\s+-|shutdown|reboot|halt|poweroff|pmset|csrutil"
-    r"|launchctl|nvram|diskutil|mkfs|kill|killall|pkill|spctl)\b"
+    r"|launchctl|nvram|diskutil|mkfs|kill|killall|pkill|spctl"
+    r"|systemctl|service|ufw|iptables|pfctl|crontab)\b"
 )
-# 远程脚本直接执行（curl … | sh）
-_PIPE_EXEC_RE = re.compile(r"(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(ba|z|da|fi)?sh\b")
+# 远程脚本直接执行（curl … | sh）。2026-10 修补：旧目标只有 (ba|z|da|fi)?sh，
+# `curl … | python3` / `| node` / `| perl` 完全漏网。
+_PIPE_EXEC_RE = re.compile(
+    r"(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?"
+    r"((ba|z|da|fi)?sh|python[\d.]*|node|perl|ruby|php)\b"
+)
 # 改写远端历史
 _GIT_FORCE_RE = re.compile(r"\bgit\s+push\b[^\n]*(--force\b|--force-with-lease\b|-f\b)")
 

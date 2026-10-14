@@ -54,6 +54,11 @@ _MAX_DESC_CHARS = 2000
 _MAX_EXAMPLES_CHARS = 3000
 _MAX_COMBINED_CHARS = 6000
 
+# 扫描时单个 SKILL.md 的读取上限。技能目录里可能混进几百 MB 的语料/模型文件
+# （用户误放，或符号链接指错），无上限的 f.read() 会把它整个读进内存，
+# 之后才被 _truncate 砍掉 —— 峰值内存已经爆了。与其他工具保持同一量级。
+_MAX_SKILL_FILE_CHARS = 200_000
+
 # Directories to skip while scanning (tests, caches, etc.).
 _SKIP_DIR_NAMES = {"tests", "test", "__pycache__", ".git", ".DS_Store", "node_modules"}
 
@@ -424,10 +429,15 @@ class SkillScanner:
                     path = os.path.join(root, _SKILL_FILENAME)
                     try:
                         with open(path, "r", encoding="utf-8") as f:
-                            content = f.read()
+                            # 只读到上限+1：技能目录里可能混进几百 MB 的语料/
+                            # 模型文件（用户误放、或符号链接指错），整本读进来会
+                            # 直接吃满内存，之后才被 _truncate 砍掉。
+                            content = f.read(_MAX_SKILL_FILE_CHARS + 1)
                     except (OSError, UnicodeDecodeError) as e:
                         logger.warning("skill_retriever: failed to read %s: %s", path, e)
                         continue
+                    if len(content) > _MAX_SKILL_FILE_CHARS:
+                        content = content[:_MAX_SKILL_FILE_CHARS]
                     # dir is relative to the skills root, or absolute if not under it.
                     rel = os.path.relpath(root, self._dir) if root.startswith(self._dir) else root
                     meta = parse_skill_md(content, rel)
@@ -526,28 +536,47 @@ class SkillVectorStore:
             return 0
 
         with self._lock:
-            # Drop old table if present.
-            if _SKILL_TABLE_NAME in db.table_names():
-                db.drop_table(_SKILL_TABLE_NAME)
-            self._table = None
-
             import pyarrow as pa
             vec_type = pa.list_(pa.float32(), dim)
             schema = self._table_schema(vec_type)
 
-            table = db.create_table(_SKILL_TABLE_NAME, [], schema=schema)
-            total = 0
-            for i in range(0, len(skills), batch_size):
-                batch = skills[i:i + batch_size]
-                rows = self._embed_batch(batch)
-                table.add(rows)
-                total += len(rows)
-                logger.info(
-                    "skill_retriever: built %d/%d skills",
-                    total, len(skills),
-                )
-
-            self._table = table
+            # 先建**临时表**再替换：旧实现一上来就 drop 旧表，若第一批 embed 之后
+            # 失败（模型下载中断 / 磁盘错误），旧表已经没了、新表只写了一部分，
+            # 且 self._table 未赋值 —— 下次 _get_table() 打开这张半张表，
+            # 技能检索静默只剩一部分结果且不会有任何报错。
+            staging = f"{_SKILL_TABLE_NAME}__staging"
+            if staging in db.table_names():
+                db.drop_table(staging)
+            table = db.create_table(staging, [], schema=schema)
+            try:
+                total = 0
+                for i in range(0, len(skills), batch_size):
+                    batch = skills[i:i + batch_size]
+                    rows = self._embed_batch(batch)
+                    table.add(rows)
+                    total += len(rows)
+                    logger.info(
+                        "skill_retriever: built %d/%d skills",
+                        total, len(skills),
+                    )
+                # 全部写完才切换：drop 旧表 → 用 staging 的 arrow 数据建新表。
+                # LanceDB OSS 不支持 rename_table，所以走「复制数据」这条路；
+                # 技能表只有几十到几百行，一次 to_arrow() 的代价可以接受。
+                payload = table.to_arrow()
+                if _SKILL_TABLE_NAME in db.table_names():
+                    db.drop_table(_SKILL_TABLE_NAME)
+                db.create_table(_SKILL_TABLE_NAME, data=payload, schema=schema)
+                del payload
+                db.drop_table(staging)
+            except Exception:
+                # 失败必须清理半张 staging 表：否则下次 build 又要先 drop 它，
+                # 且它会一直占着磁盘空间。旧表在切换前始终完好，检索不受影响。
+                try:
+                    db.drop_table(staging)
+                except Exception:
+                    pass
+                raise
+            self._table = db.open_table(_SKILL_TABLE_NAME)
             self._ensure_fts_index(self._table)
             logger.info("skill_retriever: built skills table with %d rows", total)
             return total
@@ -1045,21 +1074,51 @@ class SkillRetriever:
         """Return the absolute path to a skill's directory (for reading support files).
 
         ``dir`` 由模型提供 → 拒绝绝对路径与 ``..`` 穿越（这两类不是用户建立
-        的链接，而是调用方的恶意输入）。但**允许**技能目录本身是符号链接：
-        外部技能常以 ``ln -s`` 挂载，此时 realpath 必然落在 skills 目录之外，
-        旧实现的 ``startswith(base)`` 校验会把它们一律判为非法 —— 既搜不到
-        也读不出。链接是用户自己建立的，风险由用户承担。
+        的链接，而是调用方的恶意输入）。
+
+        技能目录本身是符号链接时**有条件放行**：外部技能常以 ``ln -s`` 挂载，
+        realpath 必然落在 skills 目录之外，旧实现的 ``startswith(base)`` 校验
+        会把它们一律判为非法。但无条件放行等于把 skill_load 变成任意文件读取
+        —— agent 可以先 ``ln -s /etc <ws>/skills/x`` 再 ``skill_load("x",
+        "passwd")`` 读到任意文件。因此这里要求链接目标必须长得像一个技能
+        目录（顶层就有 SKILL.md / skill.json / prompt.md），``/etc``、``/usr``
+        这类系统目录会被直接拒绝。
+
+        调用方可用 :meth:`is_external_skill_dir` 判断返回的目录是否越出了
+        skills 根，以便在结果里向用户标注。
         """
         dir = (dir or "").strip()
         if not dir or os.path.isabs(dir) or ".." in dir.replace("\\", "/").split("/"):
             return None
         base = os.path.realpath(self._skills_dir)
         # 到这里为止路径在词法上仍位于 base 之内；唯一能走出 base 的途径就是
-        # 链接，而这正是要放行的情况。
+        # 链接，只放行「长得像技能目录」的目标。
         resolved = os.path.realpath(os.path.join(base, dir))
         if os.path.isdir(resolved):
+            if not (resolved == base or resolved.startswith(base + os.sep)):
+                if not self._looks_like_skill_dir(resolved):
+                    logger.warning(
+                        "skill_retriever: refusing external skill link %r -> %s "
+                        "(target is not a skill directory)", dir, resolved)
+                    return None
             return resolved
         return None
+
+    @staticmethod
+    def _looks_like_skill_dir(path: str) -> bool:
+        """外部技能链接目标的形态校验：顶层必须含任一技能入口文件。"""
+        for marker in ("SKILL.md", "skill.json", "prompt.md"):
+            if os.path.isfile(os.path.join(path, marker)):
+                return True
+        return False
+
+    @staticmethod
+    def is_external_skill_dir(resolved: str, skills_dir: str) -> bool:
+        """``resolved`` 是否越出了 skills 根（即本身是符号链接）。"""
+        if not resolved:
+            return False
+        base = os.path.realpath(skills_dir)
+        return not (resolved == base or resolved.startswith(base + os.sep))
 
     def close(self) -> None:
         self._store.close()

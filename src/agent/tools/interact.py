@@ -27,7 +27,16 @@ class AskUserTool(Tool):
         self.registry = registry
 
     def run(self, prompt: str) -> ToolResult:
-        answer = self.registry.callbacks.ask_user(prompt)
+        # callbacks 可能缺失（headless / 测试 / 未 bind 的 registry），裸访问会
+        # AttributeError 被 registry 兜底成一句没有上下文的错误。
+        cb = getattr(self.registry, "callbacks", None)
+        ask = getattr(cb, "ask_user", None)
+        if not callable(ask):
+            return ToolResult(
+                False,
+                error="ask_user is unavailable in this context (no UI callbacks bound).",
+            )
+        answer = ask(prompt)
         if answer is None:
             return ToolResult(False, error="User dismissed the question.")
         return ToolResult(True, output=str(answer))

@@ -20,11 +20,17 @@ class MCPTool(Tool):
         self.description = tool_def.get("description", "")
         # MCP uses JSON Schema for inputSchema; convert to OpenAI function-call
         # parameters format (they are compatible).
-        input_schema = tool_def.get("inputSchema", {})
+        # 畸形 inputSchema 要兜底：部分 server 会返回 "properties": null 或非
+        # dict，原样发给 LLM API 会被整体拒绝（那一轮所有工具都不可用）。
+        input_schema = tool_def.get("inputSchema") or {}
+        if not isinstance(input_schema, dict):
+            input_schema = {}
+        properties = input_schema.get("properties")
+        required = input_schema.get("required")
         self.parameters = {
-            "type": input_schema.get("type", "object"),
-            "properties": input_schema.get("properties", {}),
-            "required": input_schema.get("required", []),
+            "type": input_schema.get("type") or "object",
+            "properties": properties if isinstance(properties, dict) else {},
+            "required": required if isinstance(required, list) else [],
         }
         # MCP tools are external — always mark as destructive so they require
         # confirmation unless overridden in the tool definition.

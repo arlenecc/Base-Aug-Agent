@@ -30,6 +30,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from .atomic_io import atomic_write_json, backup_corrupt
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -108,6 +110,7 @@ class SkillIndex:
             # 手工写坏 / 版本不兼容的 _index.json 不能让技能检索整体失效：
             # 记日志后按空索引处理，下次 scan() 会重建。
             logger.warning("skill_index: failed to load %s: %s", self._index_path, e)
+            backup_corrupt(self._index_path)
             self._index = []
             # 关键：同时把 _last_scan 前移。否则它停留在 0，_should_scan() 恒
             # 为真——每次 search()/list_all() 都全量扫描目录并重写一个下次
@@ -117,17 +120,13 @@ class SkillIndex:
     def _save(self) -> None:
         """Atomic write of the index."""
         try:
-            os.makedirs(self._dir, exist_ok=True)
-            tmp = self._index_path + ".tmp"
             payload = {
                 "version": 1,
                 "updated_at": _now_iso(),
                 "updated_at_ts": time.time(),
                 "skills": self._index,
             }
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._index_path)
+            atomic_write_json(self._index_path, payload)
         except OSError as e:
             logger.warning("skill_index: failed to save %s: %s", self._index_path, e)
 

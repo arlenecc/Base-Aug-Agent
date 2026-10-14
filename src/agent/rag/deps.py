@@ -14,6 +14,8 @@ import logging
 import os
 import subprocess
 import warnings
+import glob
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,6 +111,27 @@ _EMBEDDING_REQUIRED_FILES = [
     "vocab.txt",                   # vocabulary (~0.2MB)
 ]
 
+# HuggingFace 仓库与「必须完整落盘」的文件清单。
+#
+# 注意 fastembed 的**模型名**与它实际拉取的 **HF 仓库**不是一回事：
+#   nomic-ai/nomic-embed-text-v1.5-Q  →  nomic-ai/nomic-embed-text-v1.5
+#   BAAI/bge-reranker-v2-m3            →  onnx-community/bge-reranker-v2-m3-ONNX
+# 缓存目录名由 HF 仓库推导（``models--{org}--{repo}``），所以探测必须用仓库名，
+# 用 fastembed 模型名会永远找不到已下载的模型。
+#
+# bge-reranker-v2-m3 的 ONNX 权重是「model.onnx + 外挂 model.onnx_data」两段
+# （合计 ~2.27GB），只检查 model.onnx 会把只下了 656KB 外部图的半成品判成已缓存。
+_EMBEDDING_HF_REPO = "nomic-ai/nomic-embed-text-v1.5"
+_RERANK_HF_REPO = "onnx-community/bge-reranker-v2-m3-ONNX"
+_RERANK_REQUIRED_FILES = [
+    "onnx/model.onnx",
+    "onnx/model.onnx_data",
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.txt",
+]
+
 # Reranker model (FastEmbed cross-encoder, used at search time, not ingest —
 # pre-download to avoid blocking the first search). ~2.27GB ONNX download,
 # optional: search falls back to distance-based ranking if unavailable.
@@ -171,12 +194,15 @@ class DependencyReport:
                 lines.append(f"  - {d.label} (pip install {d.pip_spec})")
         if self.embedding_model_missing:
             lines.append(f"缺少嵌入模型：{EMBEDDING_MODEL_LABEL}")
-            lines.append(f"  → 模型 ID: {EMBEDDING_MODEL_ID} (仅需 {len(_EMBEDDING_REQUIRED_FILES)} 个文件)")
-            lines.append(f"  → 手动下载命令：")
-            lines.append(f"     export HF_ENDPOINT=https://hf-mirror.com")
-            lines.append(f"     export HF_HUB_DISABLE_XET=1")
-            lines.append(f'     python3 -c "from huggingface_hub import hf_hub_download; '
-                         f"[hf_hub_download('{EMBEDDING_MODEL_ID}', f) for f in {_EMBEDDING_REQUIRED_FILES}]\"")
+            lines.append(f"  → fastembed 模型名: {FASTEMBED_MODEL_NAME}")
+            lines.append(f"  → HuggingFace 仓库: {_EMBEDDING_HF_REPO} (仅需 {len(_EMBEDDING_REQUIRED_FILES)} 个文件)")
+            lines.append("  → 手动下载命令（必须落到 fastembed 自己的缓存目录，")
+            lines.append("     下到默认 ~/.cache/huggingface 的话 fastembed 看不到，报错依旧）：")
+            lines.append("     export HF_ENDPOINT=https://hf-mirror.com")
+            lines.append("     export HF_HUB_DISABLE_XET=1")
+            lines.append(f'     python3 -c "from fastembed import TextEmbedding; '
+                         f"TextEmbedding(model_name='{FASTEMBED_MODEL_NAME}', "
+                         f"cache_dir='{_get_fastembed_cache_dir()}')\"")
 
         if self.has_image_pdf and not self.ocr_installed:
             lines.append("知识库包含图片版 PDF，但 OCR 引擎未安装：")
@@ -289,37 +315,71 @@ def _get_fastembed_cache_dir() -> str:
     return cache_dir
 
 
+def _model_cache_dirs(cache_dir: str, hf_repo: str) -> List[str]:
+    """某个 HF 仓库在 fastembed 缓存里的候选目录（覆盖两种布局）。
+
+    * fastembed >= 0.9 用 HuggingFace hub 风格缓存：
+      ``models--{org}--{repo}/``，内容在 ``blobs/<sha>``，清单在
+      ``trees/*.json``；
+    * 旧版 fastembed 直接把文件放在 ``{org}/{repo}/`` 下。
+
+    两种都探，避免升级 fastembed 后探测逻辑静默失效（表现为「明明下载了却
+    每次都重新下」）。
+    """
+    org, _, name = hf_repo.partition("/")
+    return [
+        os.path.join(cache_dir, "models--" + hf_repo.replace("/", "--")),
+        os.path.join(cache_dir, org, name),
+    ]
+
+
+def _model_file_cached(model_dir: str, filename: str) -> bool:
+    """判断某个模型文件是否已**完整**落盘。
+
+    中断的下载会在 hub 缓存里留下 ``blobs/<sha>.incomplete``，而完整的
+    ``blobs/<sha>`` 并不存在 —— 只按文件名判断会把半成品当成已缓存，从而跳过
+    预下载，把 ~2.3GB 的下载推迟到首次检索时现场发生。
+    """
+    # 1) 旧版布局：文件直接就在目录里
+    if os.path.isfile(os.path.join(model_dir, filename)):
+        return True
+    # 2) hub 布局：从 trees/*.json 清单找到 blob_id，确认 blobs/<blob_id> 存在
+    for tree_path in sorted(glob.glob(os.path.join(model_dir, "trees", "*.json"))):
+        try:
+            with open(tree_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        entry = (manifest.get("files") or {}).get(filename)
+        if not isinstance(entry, dict):
+            continue
+        blob_id = entry.get("blob_id")
+        if blob_id and os.path.isfile(os.path.join(model_dir, "blobs", blob_id)):
+            return True
+    return False
+
+
 def _is_embedding_model_cached() -> bool:
     """Check whether the embedding model is already cached locally.
 
     FastEmbed uses its OWN cache directory (NOT the standard HuggingFace
     cache).  We check the persistent cache dir (~/.cache/fastembed) that
     we configure in vector_store.py and _download_embedding_model().
+
+    **不实例化模型**：旧实现用 ``TextEmbedding(..., lazy_load=True)`` 探路径，
+    但 fastembed 部分版本的下载逻辑位于基类 ``__init__`` 而非
+    ``OnnxTextEmbedding.__init__``，``lazy_load`` 只跳过 ONNX Session 创建
+    —— 最坏情况下「依赖检查」这一步就会在 UI 线程上开始下载 137MB / 2.3GB。
+    纯文件系统探测没有任何下载副作用。
     """
-    try:
-        from fastembed import TextEmbedding
-        cache_dir = _get_fastembed_cache_dir()
-        # lazy_load=True: don't load ONNX Runtime, just resolve the model path
-        # Suppress FastEmbed's "model has been updated" UserWarning
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            model = TextEmbedding(
-                model_name=FASTEMBED_MODEL_NAME,
-                cache_dir=cache_dir,
-                lazy_load=True,
-            )
-        # Check if the model directory actually has the ONNX file
-        model_dir = getattr(model.model, "_model_dir", None)
-        if model_dir and os.path.isdir(model_dir):
-            # Check for the quantized ONNX file
-            onnx_path = os.path.join(model_dir, "onnx", "model_quantized.onnx")
-            if os.path.isfile(onnx_path):
-                logger.debug("RAG deps: embedding model found in FastEmbed cache: %s", onnx_path)
-                return True
-        return False
-    except Exception as e:
-        logger.debug("RAG deps: FastEmbed cache check error: %s", e)
-        return False
+    cache_dir = _get_fastembed_cache_dir()
+    for model_dir in _model_cache_dirs(cache_dir, _EMBEDDING_HF_REPO):
+        if not os.path.isdir(model_dir):
+            continue
+        if all(_model_file_cached(model_dir, f) for f in _EMBEDDING_REQUIRED_FILES):
+            logger.debug("RAG deps: embedding model cached at %s", model_dir)
+            return True
+    return False
 
 
 def _download_embedding_model(progress_callback=None) -> Tuple[bool, str]:
@@ -498,7 +558,13 @@ def install_packages(specs: List[str], progress_callback=None) -> Tuple[bool, st
         else:
             final_specs.append(spec)
 
-    cmd = [sys.executable, "-m", "pip", "install"] + final_specs
+    # PyInstaller 冻结环境下 sys.executable 是 .app 二进制，`-m pip` 必然失败
+    # （同文件 _download_embedding_model 已经为冻结环境改过子进程方案，这里却
+    # 漏了）。优先用启动时的真实解释器；拿不到再退回 sys.executable 并明确报错。
+    python_exe = getattr(sys, "_base_executable", None) or sys.executable
+    frozen = bool(getattr(sys, "frozen", False))
+
+    cmd = [python_exe, "-m", "pip", "install"] + final_specs
     if progress_callback:
         progress_callback(f"正在安装: {' '.join(final_specs)}")
 
@@ -525,6 +591,16 @@ def install_packages(specs: List[str], progress_callback=None) -> Tuple[bool, st
     except subprocess.TimeoutExpired:
         msg = "安装超时（5 分钟），请手动执行: pip install " + " ".join(final_specs)
         logger.error("RAG deps: install timed out after 5 min: %s", " ".join(final_specs))
+        if progress_callback:
+            progress_callback(msg)
+        return False, msg
+    except FileNotFoundError as e:
+        # 冻结环境里 _base_executable 也可能不可执行 —— 明确告知而不是一句
+        # 「安装异常」让用户无从下手。
+        msg = ("找不到可用的 Python 解释器执行 pip"
+               + ("（当前为打包环境，请在宿主环境手动安装）" if frozen else "")
+               + f": {e}")
+        logger.error("RAG deps: install interpreter unavailable: %s", e)
         if progress_callback:
             progress_callback(msg)
         return False, msg
@@ -592,8 +668,15 @@ def ensure_dependencies(
                     docling_parser.reset_unavailable()
                 except Exception:
                     pass
-                # Re-check to update the report
-                report = check_dependencies(kb_path, include_core=include_core)
+                # 只复查刚装的那些包的导入情况，**不**重跑 check_dependencies：
+                # 它内含 scan_extensions()（rglob 整棵知识库树）与
+                # _pdf_has_image_pages()（逐本打开 PDF 抽前 10 页文本），
+                # 装完包后再跑一遍等于把最贵的一步做两次，同步前先白等一轮。
+                still_missing = [
+                    d for d in report.all_missing if not _is_importable(d.import_name)
+                ]
+                report.missing_required = [d for d in still_missing if d.required]
+                report.missing_optional = [d for d in still_missing if not d.required]
                 # Preserve install info
                 report.installed_packages = specs_to_install
                 if report.has_blocking:
@@ -660,35 +743,18 @@ def _is_importable(module_name: str) -> bool:
 def _is_reranker_cached() -> bool:
     """Check whether the reranker model is already cached locally.
 
-    FastEmbed uses its OWN cache directory (NOT the standard HuggingFace
-    cache).  We check the persistent cache dir (~/.cache/fastembed) that we
-    configure in vector_store.py and _download_reranker_model().
+    与 ``_is_embedding_model_cached`` 同样做纯文件系统探测（不实例化模型，
+    避免依赖检查阶段触发 2.3GB 下载）。bge-reranker-v2-m3 的权重是
+    ``onnx/model.onnx`` + 外挂 ``onnx/model.onnx_data``，两个都要完整才算缓存。
     """
-    try:
-        from fastembed.rerank.cross_encoder import TextCrossEncoder
-        cache_dir = _get_fastembed_cache_dir()
-        # lazy_load=True: don't load ONNX Runtime, just resolve the model path
-        # Suppress FastEmbed's "model has been updated" UserWarning
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            model = TextCrossEncoder(
-                model_name=RERANK_MODEL_ID,
-                cache_dir=cache_dir,
-                lazy_load=True,
-            )
-        # 只有真实的 ONNX 权重文件才算「已缓存」。onnx/model.onnx 是核心权重，
-        # 一次中断的下载很容易只留下空目录——如果它不算缓存，就会跳过预下载，
-        # 首次检索时 FastEmbed 仍要现场下载 ~2.3GB。
-        model_dir = getattr(getattr(model, "model", None), "_model_dir", None)
-        if model_dir and os.path.isdir(model_dir):
-            onnx_path = os.path.join(model_dir, "onnx", "model.onnx")
-            if os.path.isfile(onnx_path):
-                logger.debug("RAG deps: reranker model found in FastEmbed cache: %s", onnx_path)
-                return True
-        return False
-    except Exception as e:
-        logger.debug("RAG deps: FastEmbed reranker cache check error: %s", e)
-        return False
+    cache_dir = _get_fastembed_cache_dir()
+    for model_dir in _model_cache_dirs(cache_dir, _RERANK_HF_REPO):
+        if not os.path.isdir(model_dir):
+            continue
+        if all(_model_file_cached(model_dir, f) for f in _RERANK_REQUIRED_FILES):
+            logger.debug("RAG deps: reranker model cached at %s", model_dir)
+            return True
+    return False
 
 
 def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:

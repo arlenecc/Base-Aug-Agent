@@ -5,10 +5,15 @@ blocked by a guarded builtins.open wrapper, while still allowing pip installs
 and network access (the whole point of code_run). A timeout prevents infinite
 loops from hanging the agent.
 
-写入护栏只是**提示性的**，不是沙箱：它只替换了命名空间里的 ``open``，
+写入护栏只是**提示性的**，不是沙箱：它替换了命名空间里的 ``open``，
 ``io.open`` / ``pathlib.Path.write_text`` / ``os.remove`` / ``shutil`` /
 ``subprocess`` 都不受约束，``__import__`` 也可绕过。真正的隔离只能靠
 容器或独立进程。
+
+因此**风险分级**（``tools/risk.py``）才是第一道防线：凡是可能改写文件系统
+拓扑的调用（``os.symlink/os.rename/os.link/os.replace/shutil.move`` …）与
+工作区之外的路径字面量同现，就必须弹人工确认。写护栏在这里只负责兜住「忘了
+弹确认」的漏网情况，而不是唯一依赖。
 
 Timeout handling: Python threads cannot be forcefully killed, but we use a
 threading.Event-based cooperative cancellation to signal the worker thread

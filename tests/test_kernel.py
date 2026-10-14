@@ -250,8 +250,32 @@ def test_session_anchor_injects_key_info_and_truncation(cfg):
     anchor = s.anchor_prompt()
     assert "端口 8080 已占用" in anchor
     assert "上一轮被截断" in anchor
-    # 提示只播报一次
-    assert "__truncated__" not in s.working
+    # anchor_prompt 只 peek 不消费：真正的一次性语义是「本轮 turn 落地后失效」。
+    # 旧实现在这里 pop，而该轮随后可能被反思门/前置门 rollback —— 提示随之消失，
+    # 自动续跑注入的「上一条被判提前收尾」模型永远看不到。
+    assert s.working.get("__truncated__") == "上一轮被截断"
+
+
+def test_one_shot_hints_survive_rollback(cfg):
+    """一次性提示必须活过 rollback，只在 turn 真正落地后才消费。"""
+    s = Session(budget=ContextBudget(30_000))
+    s.working["__plan_boundary__"] = "上一条被判提前收尾，已自动续跑"
+
+    # 第一轮：anchor 播报后该轮被回滚（提示不得被吃掉）
+    user_text = s.anchor_prompt()
+    assert "上一条被判提前收尾" in user_text
+    rec = s.start_turn(user_text)
+    s.rollback_turn(rec) if hasattr(s, "rollback_turn") else None
+    assert s.working.get("__plan_boundary__"), "rollback 后提示被吃掉了"
+
+    # 第二轮：仍然播报（模型终于看到它）
+    again = s.anchor_prompt()
+    assert "上一条被判提前收尾" in again
+
+    # 本轮被真正提交 → 提示到此消费
+    rec2 = s.start_turn(again)
+    s.finish_turn(rec2, "好的，继续执行", [], [], "继续执行")
+    assert "__plan_boundary__" not in s.working
 
 
 def test_kernel_and_session_share_one_budget(cfg):

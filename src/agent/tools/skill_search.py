@@ -12,10 +12,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 import threading
 from typing import Optional
 
+from ..atomic_io import atomic_write_text
 from ..config import AgentConfig
 from ..skill_index import SkillIndex
 from .base import Tool, ToolRegistry, ToolResult
@@ -49,6 +49,14 @@ def _read_text_capped(path: str, cap: int = _MAX_SKILL_FILE_CHARS) -> str:
     if len(text) > cap:
         return text[:cap] + f"\n… [文件过大，已截断至 {cap} 字符]"
     return text
+
+
+def _is_external_skill_dir(abs_dir: str, workspace: str) -> bool:
+    """``abs_dir`` 是否位于 workspace/.agent/skills 之外（即本身是符号链接）。"""
+    if not abs_dir:
+        return False
+    base = os.path.realpath(os.path.join(workspace, ".agent", "skills"))
+    return not (abs_dir == base or abs_dir.startswith(base + os.sep))
 
 
 def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
@@ -282,9 +290,20 @@ class SkillLoadTool(Tool):
                         target = legacy
                 if os.path.isfile(target):
                     try:
-                        return ToolResult(True, output=_read_text_capped(target))
+                        text = _read_text_capped(target)
                     except (OSError, UnicodeDecodeError) as e:
                         return ToolResult(False, error=f"read failed: {e}")
+                    # 技能目录是符号链接时，读到的内容来自工作区之外——把真实
+                    # 来源标注出来，否则用户（和模型）都看不出自己读的是哪。
+                    try:
+                        if _is_external_skill_dir(abs_dir, self.config.workspace):
+                            text = (
+                                f"[提示] 该技能目录是符号链接，实际内容来自工作区之外：\n"
+                                f"{abs_dir}\n\n{text}"
+                            )
+                    except Exception:  # pragma: no cover - 标注失败不影响读取
+                        pass
+                    return ToolResult(True, output=text)
 
         # 2) Fall back to the legacy SkillIndex (skill.json + prompt.md).
         idx = _get_skill_index(self.config, self.registry)
@@ -408,25 +427,11 @@ class SkillSaveTool(Tool):
         try:
             os.makedirs(target_dir, exist_ok=True)
             path = os.path.join(target_dir, "SKILL.md")
-            # 原子写：唯一临时文件 + replace，避免并发/中断留下半截文件。
-            # 旧实现用 `.SKILL.md.{pid}.tmp`：同一进程内 agent 线程的
-            # skill_save 与后台蒸馏线程的 skill_save 会写到**同一路径**，
-            # 内容交错产出损坏的 SKILL.md；写失败时 tmp 还不清理。
-            fd, tmp = tempfile.mkstemp(prefix=".SKILL.md.", suffix=".tmp",
-                                       dir=target_dir)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(body)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)
-            except BaseException:
-                # 失败路径必须清掉半成品 tmp（mkstemp 已创建文件）
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            # 原子写：唯一临时文件 + fsync + replace。旧实现用
+            # `.SKILL.md.{pid}.tmp`：同一进程内 agent 线程的 skill_save 与后台
+            # 蒸馏线程的 skill_save 会写到**同一路径**，内容交错产出损坏的
+            # SKILL.md；写失败时 tmp 还不清理。
+            atomic_write_text(path, body)
         except OSError as e:
             return ToolResult(False, error=f"write failed: {e}")
 
@@ -440,7 +445,26 @@ class SkillSaveTool(Tool):
         except Exception:
             pass
 
-        return ToolResult(
-            True,
-            output=f"skill saved: {path}\n下次可用 skill_semantic_search 召回（索引会自动增量同步）。",
-        )
+        # 关键词检索（skill_search / SkillIndex）扫的是 .agent/skills，与语义
+        # 检索扫的 workspace/skills 不是同一个目录。只写一处会让另一条检索路径
+        # 永远召不回刚固化的技能（回执却声称"都能召回"）。这里镜像一份过去，
+        # 且只在目标不存在时才写——不覆盖用户自己在 .agent/skills 里的版本。
+        mirrored = ""
+        try:
+            legacy_root = os.path.join(self.config.workspace, ".agent", "skills")
+            legacy_dir = _resolve_within(legacy_root, slug)
+            if legacy_dir is not None and not os.path.exists(
+                    os.path.join(legacy_dir, "SKILL.md")):
+                os.makedirs(legacy_dir, exist_ok=True)
+                atomic_write_text(os.path.join(legacy_dir, "SKILL.md"), body)
+                mirrored = str(legacy_dir)
+                idx = _get_skill_index(self.config, self.registry)
+                idx.scan(force=True)
+        except OSError as e:
+            logger.warning("skill_save: mirror to .agent/skills failed: %s", e)
+
+        note = ("下次可用 skill_semantic_search 或 skill_search 召回"
+                "（索引会自动增量同步）")
+        if mirrored:
+            note += f"；已镜像到 {mirrored} 以便关键词检索命中"
+        return ToolResult(True, output=f"skill saved: {path}\n{note}。")

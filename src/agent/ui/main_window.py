@@ -433,12 +433,13 @@ class SyncKnowledgeWorker(QThread):
     sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
-                 force: bool = False):
+                 force: bool = False, config=None):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
         self._force = force
+        self._config = config
         self._engine: Optional[RAGEngine] = None
         # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
         # 用 Lock 保护，避免多 worker 线程 append 与主线程清空之间的竞态。
@@ -490,6 +491,8 @@ class SyncKnowledgeWorker(QThread):
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
+                rerank_model=getattr(self._config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3"),
+                rerank_enabled=bool(getattr(self._config, "rag_rerank_enabled", True)),
             )
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -617,8 +620,14 @@ class SendEditor(QPlainTextEdit):
         # 只放行**裸** Enter/Return 发送：Ctrl+Enter / Meta+Enter 也走 super()
         #（旧实现 Ctrl+Enter 同样触发发送，且未 accept 的事件会继续向父控件
         # 传播，可能触发对话框默认按钮等意外行为）。
+        #
+        # 另外必须放行 IME 预编辑态的 Return：中文/日文输入法组字时按回车，
+        # Qt 发来的 Return 事件 text() 为空（那是「确认候选词」而不是「发送」）。
+        # 旧实现不看 text()，会把半条消息直接发出去——中文用户每确认一个候选词
+        # 就误发一次。
         if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)):
+                and not (e.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)
+                and (e.text() or "").strip("\r\n") != ""):
             self.send_requested.emit()
             e.accept()
             return
@@ -1244,6 +1253,7 @@ class MainWindow(QMainWindow):
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
             force=force,
+            config=self.config,
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)
@@ -1641,7 +1651,10 @@ class MainWindow(QMainWindow):
         if not self._streaming_assistant:
             self._append_chat('<p><b class="a">助手</b>: </p>')
             self._streaming_assistant = True
-            self._summary_stripper = _SummaryStripper()   # 新回合，重置标签状态
+            # 不在这里重置 _summary_stripper：每回合的重置已经在 _on_send 做过了。
+            # 旧实现多此一举，而且时机更晚——首块以 "<summ" 结尾时，这里会把
+            # feed() 刚建立的跨 chunk carry 状态整个丢掉，下一个 chunk 的 "ary>"
+            # 就会被当正文显示出来（用户看到乱入的 ary>）。
         # 合并 chunk 再写入：100 tok/s 时逐块 insertText 会让 QTextDocument
         # 每秒做数百次「取光标 → 移到末尾 → 插入 → 写回光标 → 滚到底」，
         # 每次都触发一次全视口重绘。这里按 ~25fps 缓冲刷新。

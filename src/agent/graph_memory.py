@@ -26,7 +26,27 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .atomic_io import atomic_write_json, backup_corrupt
+from .memory import _register_atexit_flush
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 规模上限（防无上限增长）
+#
+# 旧实现里实体 / observation 只增不减（去重仅按文本相等），而每次写入都全量
+# 序列化整个图谱 → JSON 体积与内存随时间单调增长，写放大 O(N)。后台事实抽取
+# 线程每轮都在追加，一个长跑 workspace 很容易攒到几万条 observation。
+#
+# 上限按「最近优先」淘汰：observation 保留最新的 N 条，实体按 created_at
+# 淘汰最旧的。被淘汰的条目同步从向量索引里删掉，避免「JSON 删了、向量还在」
+# 导致已删事实仍被 search() 召回。
+# ---------------------------------------------------------------------------
+_MAX_OBS_PER_ENTITY = 200
+_MAX_ENTITIES = 5_000
+_MAX_RELATIONS = 20_000
+# 落盘最小间隔：与 memory.py 的 _JsonStore 同一策略，把连续写入合并成一次。
+_SAVE_MIN_INTERVAL = 0.5
 
 # ---------------------------------------------------------------------------
 # Data model (plain dicts; no dataclasses to keep JSON round-trip trivial)
@@ -113,7 +133,14 @@ class GraphMemoryStore:
         # observation 的文本驻留内存。超限丢最旧并告警。
         self._pending_index: List[Tuple[str, str]] = []
         self._pending_index_max = 500
+        # 防抖写状态 + 淘汰后的向量清理队列（见 _prune_locked）
+        self._dirty = False
+        self._last_save = 0.0
+        self._prune_cleanup: List[Tuple[str, str]] = []   # (entity, observation)
+        self._prune_entities: List[str] = []
         self._load()
+        # 防抖写必须挂退出刷新，否则进程退出时窗口内的改动静默丢失。
+        _register_atexit_flush(self)
 
     # ------------------------------------------------------------------
     # persistence
@@ -133,23 +160,109 @@ class GraphMemoryStore:
             self._relations = data.get("relations", [])
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("graph_memory: failed to load %s: %s", self._path, e)
+            backup_corrupt(self._path)
             self._entities = {}
             self._relations = []
 
-    def _save(self) -> None:
-        """Atomic write. Must be called under _lock."""
+    def _save(self, force: bool = False) -> None:
+        """Atomic write (debounced unless ``force``). Must be called under _lock.
+
+        旧实现每次写入都全量序列化整个图谱：observation 只增不减，长跑后一次
+        add_observations 就要重写几 MB JSON（写放大 O(N)）。这里加最小间隔
+        合并写，与 memory.py 的 _JsonStore 同一策略；``flush()`` / atexit 走
+        ``force=True`` 保证退出前落盘。
+        """
+        self._dirty = True
+        now = time.monotonic()
+        if not force and (now - self._last_save) < _SAVE_MIN_INTERVAL:
+            return
         try:
-            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-            tmp = self._path + ".tmp"
             payload = {
                 "entities": self._entities,
                 "relations": self._relations,
             }
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self._path)
+            atomic_write_json(self._path, payload)
+            self._dirty = False
+            self._last_save = now
         except OSError as e:
             logger.warning("graph_memory: failed to save %s: %s", self._path, e)
+
+    def flush(self, force: bool = True) -> None:
+        """Force pending changes to disk (退出前 / 显式同步时调用）。"""
+        with self._lock:
+            if self._dirty:
+                self._save(force=force)
+
+    # ------------------------------------------------------------------
+    # 规模裁剪（防无上限增长）
+    # ------------------------------------------------------------------
+
+    def _prune_locked(self) -> None:
+        """把图谱压回上限内。必须在 ``_lock`` 内调用。
+
+        淘汰的 observation / 实体记进 ``_prune_cleanup`` / ``_prune_entities``，
+        由调用方在**锁外**执行向量清理（``_deindex_observations`` 内部要物化
+        全表，锁内执行会阻塞所有图读取）。
+        """
+        # 1) 每实体 observation 上限：保留最新的（最新的事实最有用）。
+        for key, e in self._entities.items():
+            obs = e.get("observations") or []
+            if len(obs) > _MAX_OBS_PER_ENTITY:
+                dropped = obs[: len(obs) - _MAX_OBS_PER_ENTITY]
+                e["observations"] = obs[len(obs) - _MAX_OBS_PER_ENTITY:]
+                name = e.get("name") or key
+                for o in dropped:
+                    self._prune_cleanup.append((name, o))
+                logger.info(
+                    "graph_memory: pruned %d oldest observations of %r "
+                    "(cap=%d)", len(dropped), name, _MAX_OBS_PER_ENTITY)
+        # 2) 实体总数上限：按 created_at 淘汰最旧的（无时间戳的排最后）。
+        if len(self._entities) > _MAX_ENTITIES:
+            ordered = sorted(
+                self._entities.items(),
+                key=lambda kv: (str(kv[1].get("created_at") or ""), kv[0]),
+            )
+            excess = len(self._entities) - _MAX_ENTITIES
+            for key, e in ordered[:excess]:
+                self._prune_entities.append(e.get("name") or key)
+                del self._entities[key]
+            # 关系里的悬边一并清掉，否则会出现指向不存在实体的边。
+            if self._prune_entities:
+                dead = {n.lower() for n in self._prune_entities}
+                self._relations = [
+                    r for r in self._relations
+                    if r["source"].lower() not in dead and r["target"].lower() not in dead
+                ]
+            logger.info(
+                "graph_memory: evicted %d oldest entities (cap=%d)",
+                excess, _MAX_ENTITIES)
+        # 3) 关系总数上限：丢最旧的。
+        if len(self._relations) > _MAX_RELATIONS:
+            drop = len(self._relations) - _MAX_RELATIONS
+            del self._relations[:drop]
+            logger.info("graph_memory: pruned %d oldest relations (cap=%d)",
+                        drop, _MAX_RELATIONS)
+
+    def _cleanup_pruned(self) -> None:
+        """锁外执行淘汰条目的向量清理（幂等、失败只记日志）。"""
+        while True:
+            with self._lock:
+                if not (self._prune_cleanup or self._prune_entities):
+                    return
+                obs_pairs = self._prune_cleanup
+                entities = self._prune_entities
+                self._prune_cleanup = []
+                self._prune_entities = []
+            for name in entities:
+                try:
+                    self._deindex_observations(name)
+                except Exception as e:  # pragma: no cover - 尽力而为
+                    logger.debug("graph_memory: deindex %r failed: %s", name, e)
+            for name, obs in obs_pairs:
+                try:
+                    self._deindex_observation(name, obs)
+                except Exception as e:  # pragma: no cover
+                    logger.debug("graph_memory: deindex obs of %r failed: %s", name, e)
 
     # ------------------------------------------------------------------
     # vector index (lazy init)
@@ -322,6 +435,23 @@ class GraphMemoryStore:
         except Exception:
             pass
 
+    def _deindex_observation(self, entity_name: str, observation: str) -> None:
+        """Remove a single observation's vector row (after it was pruned).
+
+        与 ``_deindex_observations`` 分开：淘汰是按 observation 粒度做的，
+        不能因为一条超限就把整个实体的向量都删掉。
+        """
+        if not self._vec_ready:
+            return
+        try:
+            table = self._ensure_table()
+            if table is None:
+                return
+            row_id = _hash((entity_name or "") + "|" + (observation or ""))
+            table.delete(f"id = '{row_id}'")
+        except Exception as e:
+            logger.debug("graph_memory: deindex observation failed: %s", e)
+
     def _index_observations_batch(self, entity_name: str, observations: List[str]) -> None:
         """Embed and upsert multiple observations in ONE batch.
 
@@ -426,11 +556,13 @@ class GraphMemoryStore:
                 }
                 self._entities[key] = e
                 to_index = list(e["observations"])
+            self._prune_locked()
             self._save()
             result = dict(e)
         # Index outside lock (batched: one ONNX pass for all observations)
         if to_index:
             self._index_observations_batch(name, to_index)
+        self._cleanup_pruned()
         return result
 
     def delete_entity(self, name: str) -> bool:
@@ -445,7 +577,7 @@ class GraphMemoryStore:
                 r for r in self._relations
                 if r["source"].lower() != key and r["target"].lower() != key
             ]
-            self._save()
+            self._save(force=True)
         # 向量删除移到锁外：_deindex_observations 内部是全表物化 + 逐条 delete，
         # 锁内执行会阻塞所有图读取（同 _index_observations_batch 的设计理由）。
         self._deindex_observations(name)
@@ -487,11 +619,13 @@ class GraphMemoryStore:
                 if obs not in e["observations"]:
                     e["observations"].append(obs)
                     to_index.append(obs)
-            if to_index:
+            self._prune_locked()
+            if to_index or self._prune_cleanup:
                 self._save()
         # Index outside lock (batched: one ONNX pass for all observations)
         if to_index:
             self._index_observations_batch(name, to_index)
+        self._cleanup_pruned()
         return len(to_index)
 
     # ------------------------------------------------------------------
@@ -505,6 +639,7 @@ class GraphMemoryStore:
         label = label.strip()
         if not source or not target or not label:
             return False
+        result_ok = False
         with self._lock:
             # Ensure both entities exist
             for n in (source, target):
@@ -527,8 +662,11 @@ class GraphMemoryStore:
                 "target": target,
                 "label": label,
             })
+            self._prune_locked()
             self._save()
-            return True
+            result_ok = True
+        self._cleanup_pruned()
+        return result_ok
 
     def list_relations(self) -> List[dict]:
         with self._lock:
@@ -652,7 +790,7 @@ class GraphMemoryStore:
         with self._lock:
             self._entities = {}
             self._relations = []
-            self._save()
+            self._save(force=True)
         # Drop vector table
         if self._db is not None:
             try:
@@ -695,6 +833,11 @@ class GraphMemoryStore:
         # 一并重置回填标志：close 复活的实例向量表重新打开，若 _backfilled
         # 仍为 True，已有 JSON observation 不会再回填 → 语义检索静默残缺。
         self._backfilled = False
+        # 关闭前把防抖窗口内尚未落盘的改动写出去（_save 默认只标脏）。
+        try:
+            self.flush()
+        except Exception as e:  # pragma: no cover - 退出路径尽力而为
+            logger.debug("graph_memory: flush on close failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

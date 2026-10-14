@@ -44,6 +44,20 @@ _jieba_lock = threading.Lock()
 _jieba_tried = False
 
 
+def _stable_sigmoid(x: float) -> float:
+    """数值稳定的 sigmoid。
+
+    ``1/(1+exp(-x))`` 在 x 为很大的负数时 ``exp(-x)`` 会 OverflowError
+    （reranker 的原始 logits 完全可能到 -30 以下），异常被上层 except 吞掉后
+    会静默回退到向量排序 —— 精排看起来"生效"了其实一次都没用。分支写法在两个
+    方向上都只算一次 exp，不会溢出。
+    """
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
 def _get_jieba():
     """Lazily import and return jieba, or None if unavailable."""
     global _jieba, _jieba_tried
@@ -263,6 +277,9 @@ class VectorStore:
         self._init_lock = threading.RLock()
         # 保护 reranker 状态机（避免并发加载两份 ~500MB 模型）。
         self._reranker_lock = threading.RLock()
+        # reranker 输出是否为原始 logits（需 sigmoid 归一化）。首次打分时探测
+        # 一次并缓存，之后按模型固定处理 —— 见 rerank() 内注释。
+        self._reranker_is_logits: Optional[bool] = None
         # close() 后置位：后台加载线程完成时不得把模型写回本实例。
         self._closed = False
         # documents 表内容缓存：避免 get_document_digest / list_documents 每次
@@ -1121,22 +1138,37 @@ class VectorStore:
         logger.info("  ├─ FastEmbed Reranker 精排: 对 %d 个候选进行交叉编码打分...", len(candidates))
         try:
             # fastembed 直接返回模型输出（与输入顺序一一对应）。不同 ONNX 导出
-            # 可能是原始 logits 或已 sigmoid 归一化的概率；自适应处理：数值明显
-            # 超出 [0,1]（原始 logits）时做一次 sigmoid 归一化到 [0,1]，与旧
-            # FlagEmbedding(normalize=True) 语义一致，保证 0.7 相似度阈值有效。
-            raw_scores = list(reranker.rerank(query, docs))
-            if any(abs(float(s)) > 1.0 for s in raw_scores):
-                scores = [1.0 / (1.0 + math.exp(-float(s))) for s in raw_scores]
+            # 可能是原始 logits 或已 sigmoid 归一化的概率。
+            #
+            # 归一化按**模型固定**（首次探测一次并缓存结论），不再按「本批候选」
+            # 自适应：旧实现用 any(abs(s) > 1.0) 决定是否对整个 batch 做 sigmoid，
+            # 同一个 chunk 在不同查询下可能走/不走归一化，绝对值之间不可比，而
+            # min_similarity=0.7 是绝对语义的阈值 —— 语义会随查询漂移。
+            #
+            # 数值稳定 sigmoid：s 为很大负数时 1/(1+e^-s) 会 OverflowError
+            # （被外层 except 吞掉后静默回退到向量排序，精排形同失效）。
+            raw_scores = [float(s) for s in reranker.rerank(query, docs)]
+            if self._reranker_is_logits is None:
+                self._reranker_is_logits = any(abs(s) > 1.0 for s in raw_scores)
+                logger.info(
+                    "  ├─ Reranker 输出探测: %s",
+                    "原始 logits（将做 sigmoid 归一化）" if self._reranker_is_logits
+                    else "已归一化概率（直接使用）",
+                )
+            if self._reranker_is_logits:
+                scores = [_stable_sigmoid(s) for s in raw_scores]
             else:
-                scores = [float(s) for s in raw_scores]
+                scores = raw_scores
         except Exception as e:
             logger.warning(
                 "  ⚠ Reranker 打分失败, 回退到向量距离排序: %s", e,
             )
             # 标记不可用，后续直接走回退分支。必须同步置 failed，否则
             # _reranker_state 长期停在 "done" 而模型为 None（状态机失真）。
-            self._reranker = None
-            self._reranker_state = "failed"
+            # 持锁写回：与 close() / 后台加载线程的持锁写回互斥。
+            with self._reranker_lock:
+                self._reranker = None
+                self._reranker_state = "failed"
             return self._rerank_fallback(candidates, top_k)
 
         # 防御：分数数量与候选数不一致（异常），回退避免错位。
@@ -1145,8 +1177,9 @@ class VectorStore:
                 "  ⚠ Reranker 返回分数数量(%d)与候选数(%d)不一致, 回退到向量距离排序",
                 len(scores), len(candidates),
             )
-            self._reranker = None
-            self._reranker_state = "failed"
+            with self._reranker_lock:
+                self._reranker = None
+                self._reranker_state = "failed"
             return self._rerank_fallback(candidates, top_k)
 
         # Attach rerank scores and sort (higher is better)
@@ -1327,6 +1360,11 @@ class VectorStore:
         self._closed = True
         self._table = None
         self._db = None
+        # documents 表也必须一起置空：它指向旧 lancedb.connect() 打开的表，
+        # 而 LanceDB table 持有打开时的版本快照。只置空 _table/_db 会让
+        # 复活的实例（_initialize_locked 支持 close 后重连）继续往旧连接上写，
+        # upsert_document 对新连接不可见甚至直接失败。
+        self._documents_table = None
         self._documents_cache = None
         if self._ef is not None:
             # Only release the ONNX session if this VectorStore owns a
@@ -1353,14 +1391,9 @@ class VectorStore:
             # 由 Python GC 回收 C++ 堆内存。必须持 _reranker_lock：与后台加载
             # 线程的写回（同样持锁）互斥，否则 close 交错会把已清空的实例
             # 「复活」持有模型权重。
+            # 旧实现这里还对 reranker.model 调 .cpu() —— TextCrossEncoder 的
+            # model 是 ONNX 封装，没有 cpu()，属死代码（异常还被吞掉）。
             with self._reranker_lock:
-                reranker = self._reranker
-                try:
-                    model = getattr(reranker, "model", None)
-                    if model is not None and hasattr(model, "cpu"):
-                        model.cpu()
-                except Exception:
-                    pass
                 self._reranker = None
                 self._reranker_state = "idle"
         self._initialized = False
@@ -1636,15 +1669,22 @@ class VectorStore:
         return [dict(r) for r in self._load_documents()]
 
     def delete_document(self, doc_name: str) -> None:
-        """Remove a document's metadata entry."""
+        """Remove a document's metadata entry.
+
+        按**两种键**删：``doc_id``（= md5(doc_name)）与 ``doc_name`` 字面量。
+        ``upsert_document`` 的 doc_id 在传入 ``md_path`` 时取 md5(md_path)、
+        没传时取 md5(doc_name)——只按 doc_id 删会漏掉后一类（以及历史上按
+        basename 建键的旧行），留下永远不会被清理的孤儿元数据。
+        """
         self._ensure_initialized()
         with self._documents_lock:
             table = self._ensure_documents_table_locked()
             if table is None:
                 return
-            doc_id = _hash_source(doc_name)
+            doc_id = _hash_source(doc_name or "")
+            safe_name = (doc_name or "").replace("'", "''")
             try:
-                table.delete(f"doc_id = '{doc_id}'")
+                table.delete(f"doc_id = '{doc_id}' OR doc_name = '{safe_name}'")
             except Exception as e:
                 logger.warning("删除文档元数据失败: %s", e)
             self._documents_cache = None

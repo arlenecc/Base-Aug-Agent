@@ -135,6 +135,16 @@ def strip_summary_tags(content: str) -> str:
     return _SUMMARY_RE.sub("", content).strip()
 
 
+def has_summary_tag(content: str) -> bool:
+    """模型是否**按协议**输出了 ``<summary>``。
+
+    内核的「回复必须带 <summary>」纪律检查要用这个，不能用 ``l2_summary``
+    的返回值判空：后者对任何非空 content 都保证返回非空字符串（最差也给
+    「（空回复）」），拿它判断会让纪律提醒变成永不触发的死代码。
+    """
+    return bool(content) and _SUMMARY_RE.search(content) is not None
+
+
 # ---------------------------------------------------------------------------
 # L3：会话折叠
 # ---------------------------------------------------------------------------
