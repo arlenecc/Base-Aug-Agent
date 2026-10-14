@@ -27,20 +27,20 @@ def _atomic_write(full: str, content: str, encoding: str = "utf-8") -> None:
 
     mkstemp 出于安全考虑以 0600 建文件——直接 replace 会让目标文件的权限从
     常规的 0644 变成「仅属主可读」。这里在 replace 前把权限恢复为「目标文件
-    原有权限，不存在则 0644 & ~umask」，避免每次 file_write 都悄悄改变文件
+    原有权限，不存在则 0644」，避免每次 file_write 都悄悄改变文件
     可见性（例如另一个用户/服务读不了 agent 写的文件）。
     """
     dir_name = os.path.dirname(full) or "."
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=dir_name)
     try:
         try:
-            # 目标已存在 → 继承其权限；否则按 umask 得到常规 0644。
+            # 目标已存在 → 继承其权限；否则用常规 0644。不读 umask：
+            # POSIX 取 umask 必须靠 os.umask(mask) 原子翻转，这中间其它
+            # 线程创建的文件会拿到 0666 权限（进程级副作用）。
             try:
                 mode = os.stat(full).st_mode & 0o7777
             except OSError:
-                mask = os.umask(0)
-                os.umask(mask)
-                mode = 0o666 & ~mask
+                mode = 0o644
             os.fchmod(fd, mode)
             with os.fdopen(fd, "w", encoding=encoding) as f:
                 f.write(content)
@@ -207,6 +207,10 @@ class FileModifyTool(_FileTool):
             return ToolResult(False, error=f"File is not UTF-8 text: {path}")
         except OSError as e:
             return ToolResult(False, error=f"Read failed: {e}")
+        # old 为空串时 `"" in text` 恒为 True，text.replace("", new) 会在每
+        # 两个字符之间都插入 new，一次调用静默损坏整个文件——必须在比较前拒绝。
+        if not old:
+            return ToolResult(False, error="'old' must be a non-empty string")
         if old not in text:
             return ToolResult(False, error=f"'old' string not found in {path}")
         if replace_all:

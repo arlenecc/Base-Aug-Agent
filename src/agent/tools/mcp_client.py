@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import select
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +21,12 @@ logger = logging.getLogger(__name__)
 # 但工具调用本身可能是构建、批量处理、爬取等长任务——共用 30s 会让长任务
 # 必然超时，且服务端还在跑，结果被当迟到响应丢弃。
 _TOOL_CALL_TIMEOUT = 300.0
+
+# stdin 写入超时（秒）。server 进程活着但停止读取 stdin（死锁/忙循环）且
+# 64KB 管道缓冲写满时，TextIOWrapper.flush() 会永久阻塞并持有 _write_lock
+# ——此后该 client 的所有 _call 全部卡死，agent 线程无任何 watchdog 可救。
+# 带超时的分块写把「卡死」变成「明确报不健康」，上层可 teardown 重建。
+_STDIN_WRITE_TIMEOUT = 15.0
 
 # 单次 MCP 工具返回保留的最大字符数。MCP 工具是外部代码，输出体积不受我们
 # 控制（例如让它 dump 一个大文件/数据库表），而这段文本会原样进入模型上下文
@@ -380,14 +389,46 @@ class MCPClient:
         进程引用在锁内读取：stop() 会在锁内置 ``_process = None``，旧实现
         在锁外判空、锁内解引用，与 stop() 竞态时抛 AttributeError 而不是
         清晰的 MCPError。
+
+        写入走 os.write + select 轮询（带超时），不走 TextIOWrapper.flush()：
+        server 活着但停止读取 stdin 且管道缓冲写满时，flush() 会永久阻塞并
+        持有 _write_lock，此后所有 _call 全部卡死。全部消息统一走这条路径，
+        不存在 wrapper 缓冲与 os.write 混用乱序的问题。
         """
         with self._write_lock:
             process = self._process
             if not process or not process.stdin:
                 raise MCPError(f"MCP server '{self.name}': not running")
+            data = (line + "\n").encode("utf-8")
             try:
-                process.stdin.write(line + "\n")
-                process.stdin.flush()
+                fd = process.stdin.fileno()
+            except (OSError, ValueError):
+                fd = None
+            if fd is None:
+                # 无真实 fd（测试替身/包装对象）→ 退回文本写。
+                try:
+                    process.stdin.write(line + "\n")
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError, ValueError) as e:
+                    raise MCPError(f"MCP server '{self.name}': write failed: {e}")
+                return
+            try:
+                deadline = time.monotonic() + _STDIN_WRITE_TIMEOUT
+                view = memoryview(data)
+                while view:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise MCPError(
+                            f"MCP server '{self.name}': stdin 写入超时 "
+                            f"({_STDIN_WRITE_TIMEOUT:.0f}s)——server 已停止读取，判定不健康"
+                        )
+                    _, writable, _ = select.select([], [fd], [], min(remaining, 0.5))
+                    if not writable:
+                        continue
+                    n = os.write(fd, view[:65536])
+                    view = view[n:]
+            except MCPError:
+                raise
             except (BrokenPipeError, OSError, ValueError) as e:
                 raise MCPError(f"MCP server '{self.name}': write failed: {e}")
 

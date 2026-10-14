@@ -477,7 +477,18 @@ class RAGEngine:
         skipped_detail: List[str] = []
         new_detail: List[str] = []
         for filepath in all_files:
-            sig = _file_signature(filepath)
+            # TOCTOU：rglob 扫描与 os.stat 之间文件可能被删除/重命名（编辑器
+            # 临时文件、用户操作、云盘同步）。_chunk_iter 对同一竞态已做了
+            # try/except OSError，这里漏防——单文件消失会让整个同步崩掉，
+            # 已启动的 worker 与未保存的 manifest 全部作废。逐文件隔离。
+            try:
+                sig = _file_signature(filepath)
+            except OSError as e:
+                logger.warning("  ⚠ 文件签名失败（扫描后已消失？）: %s: %s",
+                               os.path.basename(filepath), e)
+                with stats_lock:
+                    stats["errors"] += 1
+                continue
             prev = manifest.get(filepath)
             if (not force
                     and prev is not None
@@ -1001,22 +1012,27 @@ class RAGEngine:
         for source in removed:
             # 单个文件的删除失败不能中断整个清理：此时向量写入已完成、manifest
             # 尚未保存（Step 6 在其后），一次 LanceDB 异常带着未保存的 manifest
-            # 崩溃退出会让增量同步状态不一致。逐文件隔离，失败的下次同步重试。
+            # 崩溃退出会让增量同步状态不一致。逐文件隔离；失败的文件**保留在
+            # manifest 里**，下次同步重试——旧实现无条件 pop，「下次重试」的
+            # 承诺永远不成立（条目已不在 manifest，_cleanup_deleted_files 只
+            # 遍历 manifest 键），失败文件的向量会永久残留且仍可被检索。
             try:
                 store.delete_by_source(source)
                 # 同步清理 documents 元数据表里的目录概要（digest）记录。
-                # 两个名字都删：新版记录 doc_name 存相对路径，旧版记录存
-                # basename（其 doc_id 是 basename 的哈希）。
+                # 三个名字都删：doc_name 存的是相对路径（子目录文件），其
+                # doc_id 是 md 缓存路径的哈希——只按 basename/source 找永远
+                # 找不到子目录文件的行（digest 孤儿行永久累积，rag_outline
+                # 继续列出已删文档）。rel_path 按 doc_name 精确命中。
+                store.delete_document(os.path.relpath(source, self._knowledge_base))
+                # 两个旧版兼容：basename 哈希（最早版本）与完整路径哈希。
                 store.delete_document(os.path.basename(source))
                 store.delete_document(source)
                 logger.info("  🗑 已清理: %s", os.path.basename(source))
+                new_manifest.pop(source, None)
+                with stats_lock:
+                    stats["files_deleted"] += 1
             except Exception as e:
                 logger.warning("  ⚠ 清理已删除文件失败 %s: %s（下次同步将重试）", source, e)
-            # 无论删除成功与否，都从 new_manifest 移除——向量表按 source 精确删除
-            # 是幂等的，下次同步时该文件仍不在盘上，会再次尝试清理。
-            new_manifest.pop(source, None)
-            with stats_lock:
-                stats["files_deleted"] += 1
         return set(removed)
 
     # ------------------------------------------------------------------
@@ -1246,10 +1262,14 @@ class RAGEngine:
                 if existing is not None and digest == existing.get("digest", ""):
                     continue
                 # 传入已计算的 digest/chapters，避免 build_and_store_digest 内部
-                # 再跑一遍昂贵的标题提取。
+                # 再跑一遍昂贵的标题提取。md_path 必须传：upsert 的 doc_id 以它
+                # 为输入——漏传会落库 hash(doc_name) 的重复行，与已有记录
+                # （hash(md_path)）并存，get_document_digest 精确匹配永远命中
+                # 旧行，重刷结果对用户不可见且 by_md_path 反查永久失效。
                 self.build_and_store_digest(
                     doc_name, markdown,
                     digest=digest, chapters=chapters,
+                    md_path=md_path,
                 )
                 created += 1
                 logger.info("  ├─ 补做/重刷缩略版本: %s (%d 字符)", doc_name, len(markdown))

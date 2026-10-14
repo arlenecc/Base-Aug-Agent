@@ -100,7 +100,11 @@ class SkillSearchTool(Tool):
         idx = _get_skill_index(self.config, self.registry)
         # 模型可能传 null/超限值：归一化后再用（同仓其他检索工具一致）。
         query = (query or "").strip()
-        top_k = max(1, min(int(top_k or 5), 20))
+        try:
+            top_k = int(top_k or 5)
+        except (TypeError, ValueError):
+            top_k = 5  # 垃圾值（"abc"/[1]）不能让整次调用裸异常失败
+        top_k = max(1, min(top_k, 20))
         if op == "list":
             results = idx.list_all()
             # Compact output: name + path + description (truncated)

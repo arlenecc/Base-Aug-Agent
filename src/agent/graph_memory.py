@@ -94,6 +94,9 @@ class GraphMemoryStore:
         self._embedding_model_name = embedding_model
         self._lock = threading.Lock()
         self._vec_lock = threading.Lock()  # protects vector-index lazy init
+        # backfill 的独立非阻塞锁：防止并发重复回填（_vec_lock 保护的是
+        # lazy init 本身，语义不同，混用会把回填串行进 init 持锁路径）。
+        self._backfill_lock = threading.Lock()
         self._entities: Dict[str, dict] = {}  # name → entity
         self._relations: List[dict] = []
         self._db = None
@@ -113,16 +116,26 @@ class GraphMemoryStore:
         if not os.path.exists(self._path):
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
+            with open(self._path, "r", encoding="utf-8", errors="replace") as f:
                 data = json.load(f)
-            self._entities = {n.lower(): e for n, e in data.get("entities", {}).items()}
+            # 结构校验：手工编辑/其他程序写坏可能产出「合法 JSON 但结构错误」
+            # 的文件（顶层 list、entities 为 list 等）——AttributeError 会在
+            # 之后任意一次图操作时从很远的位置抛出，且没有任何恢复路径。
+            # 不满足结构约定时走与解析失败相同的「警告 + 置空」处理。
+            if not isinstance(data, dict):
+                raise ValueError("graph json root is not an object")
+            entities = data.get("entities", {})
+            relations = data.get("relations", [])
+            if not isinstance(entities, dict) or not isinstance(relations, list):
+                raise ValueError("graph json entities/relations have wrong types")
+            self._entities = {n.lower(): e for n, e in entities.items()}
             # Normalise: ensure every entity has observations list
             for e in self._entities.values():
                 if not isinstance(e.get("observations"), list):
                     e["observations"] = []
-            self._relations = data.get("relations", [])
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("graph_memory: failed to load %s: %s", self._path, e)
+            self._relations = relations
+        except (OSError, ValueError) as e:
+            logger.warning("graph_memory: failed to load %s: %s（按空图继续，坏文件保留在磁盘）", self._path, e)
             self._entities = {}
             self._relations = []
 
@@ -157,9 +170,14 @@ class GraphMemoryStore:
         before the vector index existed become searchable too).
         """
         if self._vec_ready or self._vec_tried:
+            # init 已定型（成功/失败各一次）。backfill 的重试必须走独立
+            # 轻量路径——放在早退 gate 之后不可达，日志里「下次调用将重试」
+            # 的承诺从未成立，回填失败的历史事实在本进程内永远无法语义召回。
+            self._retry_backfill()
             return
         with self._vec_lock:
             if self._vec_ready or self._vec_tried:  # double-check
+                self._retry_backfill()
                 return
             try:
                 import lancedb
@@ -181,16 +199,27 @@ class GraphMemoryStore:
                 # 「失败不记忆」会让每次 search() 都重新 connect + import
                 # （并且每次都把同样那条 debug 日志刷出来）。
                 self._vec_tried = True
-        # Backfill outside the lock (embedding is slow). Only once per instance.
-        # 注意：只在**成功**后把 _backfilled 置 True。旧实现先置位再执行，
-        # 中途失败（模型下载失败、embed 批次报错）后状态永久为 True，本进程内
-        # 再也不会重试 —— 「JSON 图里有、向量表里没有」的历史事实一直检索不到。
-        if self._vec_ready and not getattr(self, "_backfilled", False):
+        if self._vec_ready:
+            self._retry_backfill()
+
+    def _retry_backfill(self) -> None:
+        """Run the one-shot backfill with retry-on-failure (non-blocking)."""
+        if getattr(self, "_backfilled", False):
+            return
+        if not self._vec_ready:
+            return
+        # 非阻塞：已有线程在回填（embed 慢）时后来的调用直接跳过，
+        # 等它失败后下一次调用再试。
+        if not self._backfill_lock.acquire(blocking=False):
+            return
+        try:
             try:
                 self._backfill_vectors()
                 self._backfilled = True
             except Exception as e:
                 logger.warning("graph_memory: backfill failed (下次调用将重试): %s", e)
+        finally:
+            self._backfill_lock.release()
 
     def _backfill_vectors(self) -> None:
         """Index any observations present in the graph JSON but missing from
@@ -233,15 +262,12 @@ class GraphMemoryStore:
         if not missing:
             return
         # Embed + insert missing observations in batches of 100.
-        texts = [obs for _, obs in missing]
         for i in range(0, len(missing), 100):
             batch = missing[i:i + 100]
             batch_texts = [obs for _, obs in batch]
-            try:
-                vecs = self._ef.embed_documents(batch_texts)
-            except Exception as e:
-                logger.warning("graph_memory: backfill embed failed: %s", e)
-                return
+            # embed 失败必须抛出：静默 return 会让调用方把「部分失败」标记为
+            # 已完成（_backfilled=True），剩余批次的历史事实再也补不上。
+            vecs = self._ef.embed_documents(batch_texts)
             records = [
                 {
                     "id": _hash(name + "|" + obs),
@@ -446,9 +472,14 @@ class GraphMemoryStore:
                 if (r.get("source") or "").lower() != key
                 and (r.get("target") or "").lower() != key
             ]
-            self._deindex_observations(name)
             self._save()
-            return True
+        # _deindex_observations 内部是 LanceDB 删除事务 + table_names() 文件
+        # 系统探测（50-500ms 量级），必须放在图锁外——create_entity /
+        # add_observations / batch_apply 都遵守「embedding/LanceDB 操作绝不
+        # 持图锁」的约定（否则冻结每轮系统提示的 snapshot/搜索），唯独这里
+        # 漏了，删除实体期间所有图读取被阻塞。
+        self._deindex_observations(name)
+        return True
 
     def get_entity(self, name: str) -> Optional[dict]:
         key = _norm_name(name).lower()
@@ -863,6 +894,26 @@ def extract_facts_via_llm(
             return {"entities": [], "relations": []}
         data.setdefault("entities", [])
         data.setdefault("relations", [])
+        # 类型收敛：模型输出脏 JSON（"observations": "likes Python" 字符串、
+        # entities 混入非 dict 元素）会让 batch_apply 的迭代行为错乱——字符串
+        # 被逐字符拆成单字「事实」永久污染图谱（去重机制无法自愈），非 dict
+        # 元素抛 AttributeError 使整批抽取被丢弃。这里统一收敛到约定结构。
+        ents = data.get("entities")
+        data["entities"] = (
+            [e for e in ents if isinstance(e, dict)] if isinstance(ents, list) else []
+        )
+        rels = data.get("relations")
+        data["relations"] = (
+            [r for r in rels if isinstance(r, dict)] if isinstance(rels, list) else []
+        )
+        for e in data["entities"]:
+            obs = e.get("observations", [])
+            if isinstance(obs, str):
+                e["observations"] = [obs] if obs.strip() else []
+            elif isinstance(obs, list):
+                e["observations"] = [str(o) for o in obs if o is not None and str(o).strip()]
+            else:
+                e["observations"] = []
         return data
     except Exception as e:
         logger.debug("graph_memory: extract_facts failed: %s", e)

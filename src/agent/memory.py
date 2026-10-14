@@ -73,9 +73,14 @@ class _JsonStore:
     def _load(self) -> None:
         if os.path.exists(self.path):
             try:
-                with open(self.path, "r", encoding="utf-8") as f:
+                with open(self.path, "r", encoding="utf-8", errors="replace") as f:
                     self._data = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
+                # 结构校验：手工编辑可能产出「合法 JSON 但顶层不是对象」的文件
+                # （如 list）——之后 get/set 会从很远的位置抛 AttributeError，
+                # 且没有恢复路径。与解析失败同等处理。
+                if not isinstance(self._data, dict):
+                    raise ValueError("json root is not an object")
+            except (OSError, ValueError) as e:
                 # 损坏文件必须先备份再置空：旧实现直接 _data = {} 且 _dirty
                 # 保持 False，下一次 set() 就会用新内容**覆盖**掉损坏文件 ——
                 # 用户原有的记忆数据被静默抹掉，连恢复的机会都没有。

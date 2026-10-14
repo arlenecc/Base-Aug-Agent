@@ -1610,23 +1610,34 @@ class Agent:
         try:
             llm = self._get_extract_llm()
             if llm is not None and llm is not self.llm:
-                prompt = (
-                    "用 ≤20 字中文说明以下代码/命令做什么，只输出这一句，"
-                    "不要贴代码、不要以「这段代码」开头：\n\n"
-                    + code[:2000]
-                )
-                # chat_stream 产出的是 StreamEvent 数据类，不是 dict。旧代码写
-                # `ev.get(...)` 会抛 AttributeError 并被下面的 except 吞掉，
-                # 导致 LLM 兜底永远是死代码、只能退回通用描述。这里按属性访问。
-                answer_parts = []
-                for ev in llm.chat_stream([{"role": "user", "content": prompt}]):
-                    if ev.type == "content":
-                        answer_parts.append(ev.content)
-                    elif ev.type == "done":
-                        break
-                answer = "".join(answer_parts).strip()
-                if answer:
-                    return answer[:80]
+                # 持防堆叠锁使用：后台抽取线程在整个 LLM 调用期间也持有这把
+                # 锁，而快路径 _get_extract_llm 本身不持锁——不加这层的话
+                # confirm 的流式请求会与后台抽取并发共用同一个 httpx.Client
+                # （模块明确声明非线程安全），两边流交错损坏。拿不到锁说明
+                # 抽取正在进行：LLM 兜底只是锦上添花，退回启发式描述，
+                # 弹窗不延迟。
+                if not self._fact_extract_lock.acquire(blocking=False):
+                    return heuristic
+                try:
+                    prompt = (
+                        "用 ≤20 字中文说明以下代码/命令做什么，只输出这一句，"
+                        "不要贴代码、不要以「这段代码」开头：\n\n"
+                        + code[:2000]
+                    )
+                    # chat_stream 产出的是 StreamEvent 数据类，不是 dict。旧代码写
+                    # `ev.get(...)` 会抛 AttributeError 并被下面的 except 吞掉，
+                    # 导致 LLM 兜底永远是死代码、只能退回通用描述。这里按属性访问。
+                    answer_parts = []
+                    for ev in llm.chat_stream([{"role": "user", "content": prompt}]):
+                        if ev.type == "content":
+                            answer_parts.append(ev.content)
+                        elif ev.type == "done":
+                            break
+                    answer = "".join(answer_parts).strip()
+                    if answer:
+                        return answer[:80]
+                finally:
+                    self._fact_extract_lock.release()
         except Exception:
             pass
         return heuristic

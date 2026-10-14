@@ -461,19 +461,32 @@ class SkillVectorStore:
             schema = self._table_schema(vec_type)
 
             table = db.create_table(_SKILL_TABLE_NAME, [], schema=schema)
-            total = 0
-            for i in range(0, len(skills), batch_size):
-                batch = skills[i:i + batch_size]
-                rows = self._embed_batch(batch)
-                table.add(rows)
-                total += len(rows)
-                logger.info(
-                    "skill_retriever: built %d/%d skills",
-                    total, len(skills),
-                )
+            try:
+                total = 0
+                for i in range(0, len(skills), batch_size):
+                    batch = skills[i:i + batch_size]
+                    rows = self._embed_batch(batch)
+                    table.add(rows)
+                    total += len(rows)
+                    logger.info(
+                        "skill_retriever: built %d/%d skills",
+                        total, len(skills),
+                    )
 
-            self._table = table
-            self._ensure_fts_index(self._table)
+                self._table = table
+                self._ensure_fts_index(self._table)
+            except Exception:
+                # 中途失败（嵌入异常/磁盘满等）会把「部分填充的新表」留在磁盘，
+                # 而 _table 仍是 None——之后 _get_table() 发现表已存在走增量
+                # 路径，skills 目录 mtime 未变时不重建，最长一个扫描周期内
+                # 语义检索基于残缺索引（后半部分技能不可见）。失败即删表，
+                # 下次 ensure_indexed 走完整重建。
+                try:
+                    db.drop_table(_SKILL_TABLE_NAME)
+                except Exception:
+                    pass
+                self._table = None
+                raise
             logger.info("skill_retriever: built skills table with %d rows", total)
             return total
 

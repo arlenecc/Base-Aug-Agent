@@ -32,9 +32,9 @@ _OCR_ENGINE_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {
-    ".docx", ".doc",
-    ".xlsx", ".xls",
-    ".pptx", ".ppt",
+    ".docx",
+    ".xlsx",
+    ".pptx",
     ".pdf",
     ".epub",
     ".mobi", ".azw3", ".azw",
@@ -42,6 +42,9 @@ SUPPORTED_EXTENSIONS = {
     ".csv", ".tsv",
     ".html", ".htm",
 }
+# 旧版二进制格式（.doc/.xls/.ppt）不在支持列表：python-docx/openpyxl/
+# python-pptx 与 docling 均只支持 OOXML，解析必然失败（extract_text 对它们
+# 给出明确的「另存为」提示）。保留在支持列表里只会让用户误以为可用。
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -71,10 +74,31 @@ def extract_text(filepath: str) -> str:
     logger.debug("    解析文件类型: %s (%s)", path.name, label)
 
     if suffix in (".docx", ".doc"):
+        if suffix == ".doc":
+            # python-docx 只支持 OOXML（.docx）；旧版 OLE2 二进制 .doc 传进来
+            # 100% 抛异常（docling 同样不支持 legacy 格式），之前表现为一条
+            # 难懂的库报错。直接给出可行动的提示。
+            raise ValueError(
+                "旧版 .doc 二进制格式不受支持（python-docx/docling 均只支持 .docx），"
+                "请先用 Word/WPS 另存为 .docx 后重新同步"
+            )
         return _extract_docx(path)
     elif suffix in (".xlsx", ".xls"):
+        if suffix == ".xls":
+            # openpyxl 明确不支持旧版 .xls（BIFF），必然抛
+            # "does not support the old .xls file format"。
+            raise ValueError(
+                "旧版 .xls 二进制格式不受支持（openpyxl 只支持 .xlsx），"
+                "请先用 Excel/WPS 另存为 .xlsx 后重新同步"
+            )
         return _extract_xlsx(path)
     elif suffix in (".pptx", ".ppt"):
+        if suffix == ".ppt":
+            # python-pptx 只支持 OOXML（.pptx），同上。
+            raise ValueError(
+                "旧版 .ppt 二进制格式不受支持（python-pptx 只支持 .pptx），"
+                "请先用 PowerPoint/WPS 另存为 .pptx 后重新同步"
+            )
         return _extract_pptx(path)
     elif suffix == ".pdf":
         return _extract_pdf(path)
@@ -557,7 +581,20 @@ def _extract_mobi(path: Path) -> str:
 
 
 def _extract_mobi_raw(path: Path) -> str:
-    """Basic MOBI text extraction without external tools."""
+    """Basic MOBI text extraction without external tools.
+
+    对二进制原始字节做全文正则扫描，内存峰值 ≈ 原始字节 + 解码副本 + 匹配
+    列表 ≈ 3× 文件大小——数百 MB 的电子书会把 GUI 进程打向 OOM，且 extract
+    的效果本来就差（正则捞可读块）。calibre 缺失时的裸解析只对小文件有意义，
+    超过上限直接报错让用户装 calibre（正路）。
+    """
+    _MAX_RAW_MOBI_BYTES = 100 * 1024 * 1024  # 100MB
+    size = path.stat().st_size
+    if size > _MAX_RAW_MOBI_BYTES:
+        raise ValueError(
+            f"MOBI/AZW3 文件过大（{size // (1024 * 1024)}MB），裸解析需全量载入内存。"
+            f"请安装 calibre 后重试（会走正规转换）：brew install --cask calibre"
+        )
     with open(path, "rb") as f:
         data = f.read()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -37,7 +38,17 @@ def _is_ssrf_target(url: str) -> bool:
         host = (urlparse(url).hostname or "").strip().strip("[]")
         if not host:
             return False
-        ip = ipaddress.ip_address(host)
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            # 非点分十进制字面量的变体：纯十进制整数（http://2852039166/）与
+            # 0x 十六进制（http://0xA9FEA9FE/）也会被 getaddrinfo 解析回真实
+            # IP——只拦点分形式等于没拦。归一成整数后再判；带点的 host、
+            # 超出 v4 范围的大整数按普通主机名放行（DNS 层防御不在本层职责内）。
+            if re.fullmatch(r"(?:\d+|0[xX][0-9a-fA-F]+)", host):
+                ip = ipaddress.ip_address(int(host, 0))
+            else:
+                return False
     except ValueError:
         # 主机名（非 IP 字面量）→ 不做判断。
         return False

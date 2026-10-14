@@ -230,6 +230,16 @@ class MemoryGraphTool(Tool):
         if lm is None:
             return ToolResult(False, error="长期记忆已释放（registry 已关闭）")
         g = lm.graph
+        # 模型可能把 observations 传成单个字符串——字符串会被 for 循环按
+        # 字符迭代，一次调用就往图谱塞几十条单字垃圾观察并触发同等数量的
+        # 嵌入计算。非 list[str] 的脏值统一归一/过滤。
+        if observations is not None:
+            if isinstance(observations, str):
+                observations = [observations]
+            elif isinstance(observations, (list, tuple)):
+                observations = [str(o) for o in observations if o is not None]
+            else:
+                observations = None
         if op == "create_entity":
             if not name:
                 return ToolResult(False, error="op 'create_entity' requires 'name'")

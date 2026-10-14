@@ -20,6 +20,10 @@ import threading
 import time
 from typing import Any, List, Optional
 
+# _gap_between 已上移到 chunker.py 共用（recursive 路径的 _merge_overlap 也有
+# 同样的「硬编码分隔符伪造非原文内容」问题），本模块通过既有依赖方向引用。
+from .chunker import _gap_between, estimate_tokens  # noqa: F401  (estimate_tokens re-exported for tests)
+
 logger = logging.getLogger(__name__)
 
 # SemanticChunker splits sentences on ". "/"! "/"? "/newline.  Chinese text
@@ -116,38 +120,6 @@ def semantic_chunk_text(
         logger.warning("semantic chunking failed (%s), falling back to recursive: %s",
                        type(e).__name__, e)
         return None
-
-
-def _gap_between(source: Optional[str], left: str, right: str) -> str:
-    """Return the exact text that separates ``left`` and ``right`` in ``source``.
-
-    Merging/overlapping chunks used to hardcode ``"\\n\\n"`` as the joiner.
-    When the two chunks were adjacent in the source with different whitespace
-    (a single ``\\n``, a space, or nothing at all), the joined chunk contained
-    characters the source never had — so chunk text was not a substring of the
-    document, and the model saw text that doesn't exist in the file.
-
-    Falls back to ``"\\n\\n"`` when the pieces can't be located in ``source``
-    (no source supplied, or the chunker re-wrote whitespace).
-    """
-    if not source or not left or not right:
-        return "\n\n"
-    # left 可能在原文出现多次（重复段落/样板文本），str.find 命中更早实例后
-    # j 会跨越真实 chunk 边界，算出的 gap 把不属于这两个 chunk 的文本拼进
-    # 结果——合并后的 chunk 不再是原文子串，极端情况下 gap 巨大。这里限定
-    # gap 上限，超限时尝试 left 的下一个出现位置。
-    _MAX_GAP = 256
-    start = 0
-    while True:
-        i = source.find(left, start)
-        if i < 0:
-            return "\n\n"
-        j = source.find(right, i + len(left))
-        if j < 0:
-            return "\n\n"
-        if j - (i + len(left)) <= _MAX_GAP:
-            return source[i + len(left):j]
-        start = i + 1
 
 
 def _merge_to_target_size(

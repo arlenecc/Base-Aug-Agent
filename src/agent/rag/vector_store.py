@@ -586,6 +586,9 @@ class VectorStore:
         if table is None:
             return 0
         h = _hash_source(source)
+        # 删除失败必须抛出而不是吞掉：engine._cleanup_deleted_files 依赖
+        # 「无异常 = 删除成功」决定是否从 manifest 移除条目——吞掉异常会让
+        # 失败文件被无条件 pop，向量永久残留且下次同步没有重试机会。
         try:
             table.delete(f"id LIKE '{h}_%'")
             # 向量删了，但 BM25 倒排索引里的 term 还在——必须失效索引，
@@ -595,7 +598,7 @@ class VectorStore:
             return 1
         except Exception as e:
             logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
-            return 0
+            raise
 
     @_store_op
     def add_streaming(

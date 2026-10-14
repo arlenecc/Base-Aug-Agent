@@ -609,6 +609,9 @@ class MainWindow(QMainWindow):
         # 流式文本的攒批缓冲（见 _on_content / _flush_stream_buffer）。
         self._stream_buf: list = []
         self._stream_flush_timer: Optional[QTimer] = None
+        # 思考流的攒批缓冲（见 _on_reasoning / _flush_reason_buffer）。
+        self._reason_buf: list = []
+        self._reason_flush_timer: Optional[QTimer] = None
         self._busy = False
         # 「获取模型」/「同步知识」各有独立的忙碌态。旧实现让 _set_controls_busy
         # 统一用 self._busy 决定这两个按钮的 enable：agent 一轮结束就把它们
@@ -1236,7 +1239,10 @@ class MainWindow(QMainWindow):
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)
         self._sync_worker.sync_progress.connect(self._on_sync_progress)
-        self._sync_worker.finished.connect(self._on_sync_thread_finished)
+        # finished 时 worker 可能已被 _on_sync_finished 置 None——用默认参数
+        # 在 connect 时快照引用，保证兜底槽拿到真正的 worker。
+        self._sync_worker.finished.connect(
+            lambda w=self._sync_worker: self._on_sync_thread_finished(w))
         self._sync_worker.finished.connect(self._sync_worker.deleteLater)
         self._sync_worker.start()
         # 启动日志轮询定时器：每 100ms 消费 _log_buffer，实时显示同步日志
@@ -1317,15 +1323,20 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _remove_sync_tmp_handler(self) -> None:
+    def _remove_sync_tmp_handler(self, worker=None) -> None:
         """摘除同步线程挂上的临时 logging handler（幂等）。
 
         ``SyncKnowledgeWorker.run()`` 的 finally 会摘一次，但线程被
-        ``terminate()`` 时 Python 的 finally 不保证执行；这里作为兜底，在
-        QThread.finished 的槽里无条件再摘一次，避免 handler 泄漏与日志重复。
+        ``terminate()`` 时 Python 的 finally 不保证执行；这里作为兜底再摘
+        一次。handler 引用挂在 **worker** 对象上（run() 里
+        ``self._sync_tmp_handler = ...``），所以必须把 worker 传进来——
+        旧实现作为 MainWindow 方法读 window 上的同名属性，永远是 None，
+        兜底从未生效。
         """
-        handler = getattr(self, "_sync_tmp_handler", None)
-        loggers = getattr(self, "_sync_tmp_loggers", None)
+        if worker is None:
+            return
+        handler = getattr(worker, "_sync_tmp_handler", None)
+        loggers = getattr(worker, "_sync_tmp_loggers", None)
         if handler is None or not loggers:
             return
         for name in loggers:
@@ -1333,10 +1344,10 @@ class MainWindow(QMainWindow):
                 logging.getLogger(name).removeHandler(handler)
             except Exception:
                 pass
-        self._sync_tmp_handler = None
-        self._sync_tmp_loggers = None
+        worker._sync_tmp_handler = None
+        worker._sync_tmp_loggers = None
 
-    def _on_sync_thread_finished(self) -> None:
+    def _on_sync_thread_finished(self, worker=None) -> None:
         """兜底检查：QThread.finished 信号在 run() 返回后自动发射。
 
         如果 sync_finished / sync_failed 信号已正常处理，此时按钮应该已经
@@ -1352,7 +1363,7 @@ class MainWindow(QMainWindow):
         # 无条件补摘一次同步用的临时 handler：线程被 terminate() 时 run() 里的
         # finally 不保证执行，handler 会永久挂在 agent.rag logger 上（闭包还
         # 强引用整个 worker），下次同步再挂一个 → 日志重复输出。
-        self._remove_sync_tmp_handler()
+        self._remove_sync_tmp_handler(worker)
         self._poll_sync_logs()
         btn_text = self.sync_knowledge_btn.text()
         if btn_text in ("同步中…", "检查依赖…", "正在同步知识库…"):
@@ -1421,8 +1432,12 @@ class MainWindow(QMainWindow):
         # → 进程 abort）。典型触发：获取模型成功后关闭窗口。
         self._fetch_worker = None
         self._fetch_busy = False
-        self.fetch_btn.setEnabled(True)
-        self.progress.setRange(0, 1)
+        # 忙碌态合成规则是 not (busy or _fetch_busy)：agent 正在跑时
+        # （_on_send 不拦 _fetch_busy），fetch 完成不能无条件解锁按钮/
+        # 复位进度条——否则出现「可点击的获取模型按钮 + 空进度条」假空闲态。
+        self.fetch_btn.setEnabled(not self._busy)
+        if not self._busy:
+            self.progress.setRange(0, 1)
         current = self.model_combo.currentText().strip()
         self.model_combo.clear()
         # 服务端可能返回非字符串元素（数字 id / null），addItems 会抛
@@ -1442,10 +1457,16 @@ class MainWindow(QMainWindow):
     def _on_fetch_failed(self, msg: str) -> None:
         self._fetch_worker = None
         self._fetch_busy = False
-        self.fetch_btn.setEnabled(True)
-        self.progress.setRange(0, 1)
-        self.status_label.setText("获取模型失败")
-        QMessageBox.warning(self, "获取模型失败", msg)
+        self.fetch_btn.setEnabled(not self._busy)
+        if not self._busy:
+            self.progress.setRange(0, 1)
+        self.status_label.setText(f"获取模型失败: {msg}")
+        # agent 运行中不用模态弹窗——它会阻塞事件循环，流式输出/工具回调
+        # 全部停摆直到用户点掉弹窗。失败详情在状态栏与日志面板可见。
+        if not self._busy:
+            QMessageBox.warning(self, "获取模型失败", msg)
+        else:
+            self._append_log(f"[cfg] 获取模型失败: {msg}")
 
     # ------------------------------------------------------------------
     # chat send / stop
@@ -1482,6 +1503,11 @@ class MainWindow(QMainWindow):
         self._busy = True
         self._set_controls_busy(True)
         self.think_view.clear()
+        # 视图清空后缓冲里可能还有未 flush 的 reasoning 残段——不清会把上一
+        # 轮的尾巴写进新一轮的思考区。
+        self._reason_buf.clear()
+        if self._reason_flush_timer is not None:
+            self._reason_flush_timer.stop()
         self.speed_label.setText("0.0 tok/s")
         self._callbacks.reset()
         self._worker = AgentWorker(self._agent, self._callbacks)
@@ -1641,6 +1667,23 @@ class MainWindow(QMainWindow):
         text = _sanitize_stream_text(text)
         if not text:
             return
+        # 与 _on_content 相同的攒批写入：推理模型的 reasoning 流量不低于
+        # content，每个 chunk 五步光标操作（取光标→移末→写回→插入→滚动）
+        # 会让思考区越长主线程越卡。先入缓冲，100ms 定时统一 flush。
+        self._reason_buf.append(text)
+        if self._reason_flush_timer is None:
+            self._reason_flush_timer = QTimer(self)
+            self._reason_flush_timer.setSingleShot(True)
+            self._reason_flush_timer.timeout.connect(self._flush_reason_buffer)
+        if not self._reason_flush_timer.isActive():
+            self._reason_flush_timer.start(100)
+
+    def _flush_reason_buffer(self) -> None:
+        """把攒下的 reasoning 文本一次性写入思考视图（见 _on_reasoning）。"""
+        if not self._reason_buf:
+            return
+        text = "".join(self._reason_buf)
+        self._reason_buf.clear()
         # Move the widget cursor to the end before inserting. Without this,
         # insertPlainText writes at whatever position the cursor happens to be
         # (e.g. after the user clicked the view to read earlier output), which
@@ -1655,6 +1698,7 @@ class MainWindow(QMainWindow):
         import json as _json
         # 工具调用前必须先把攒下的流式文本落地，否则工具输出会插在它前面。
         self._flush_stream_buffer()
+        self._flush_reason_buffer()
         self._streaming_assistant = False  # close any streaming assistant block
         try:
             pretty = _json.dumps(args, ensure_ascii=False)
@@ -2031,6 +2075,9 @@ class MainWindow(QMainWindow):
         self._stream_buf.clear()
         self.chat_view.clear()
         self.think_view.clear()
+        self._reason_buf.clear()
+        if self._reason_flush_timer is not None:
+            self._reason_flush_timer.stop()
         self._streaming_assistant = False
         # 清空对话后 token/速度标签也要复位，否则仍显示上一轮的累计值。
         self._total_tokens = 0
@@ -2050,13 +2097,25 @@ class MainWindow(QMainWindow):
     def _restore_geometry(self) -> None:
         """恢复上次的窗口尺寸与分割比例（失败就用默认值，不影响启动）。"""
         try:
-            from PyQt6.QtCore import QSettings
+            from PyQt6.QtCore import QSettings, QByteArray
             s = QSettings()
-            geo = s.value("ui/geometry")
-            if isinstance(geo, bytes) and geo:
+
+            def _as_bytes(v):
+                # QSettings.value 对 saveGeometry() 存入的 QByteArray 回读时
+                # 返回 QByteArray（不是 bytes 子类），Linux ini 后端则返回
+                # str——旧实现 isinstance(geo, bytes) 永远为 False，窗口
+                # 几何/分割条持久化全平台静默失效。
+                if isinstance(v, QByteArray):
+                    return bytes(v)
+                if isinstance(v, (bytes, bytearray)):
+                    return bytes(v)
+                return None
+
+            geo = _as_bytes(s.value("ui/geometry"))
+            if geo:
                 self.restoreGeometry(geo)
-            state = s.value("ui/splitter")
-            if isinstance(state, bytes) and state and hasattr(self, "_main_split"):
+            state = _as_bytes(s.value("ui/splitter"))
+            if state and hasattr(self, "_main_split"):
                 self._main_split.restoreState(state)
         except Exception as e:
             logger.debug("UI: restore geometry failed: %s", e)
@@ -2105,6 +2164,11 @@ class MainWindow(QMainWindow):
             self._fetch_worker = None
         # --- SyncKnowledgeWorker: cooperative cancel (finishes current file).
         if self._shutdown_worker(self._sync_worker, "sync"):
+            # terminate 路径下 finished 信号被 blockSignals 吞掉，
+            # _on_sync_thread_finished 兜底不会触发——这里显式再摘一次
+            # 临时 handler（闭包强引用整个 worker 与 RAG 引擎，不摘会
+            # 阻止数百 MB 资源回收）。
+            self._remove_sync_tmp_handler(self._sync_worker)
             self._sync_worker = None
         # --- InstallDepsWorker: no cancel mechanism, just wait.
         if self._shutdown_worker(self._deps_worker, "deps",

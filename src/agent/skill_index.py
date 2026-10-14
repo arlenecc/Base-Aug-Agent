@@ -247,7 +247,12 @@ class SkillIndex:
     ) -> Optional[Dict[str, Any]]:
         """Read skill.json from a skill directory."""
         try:
-            with open(meta_path, "r", encoding="utf-8") as f:
+            # errors="replace"：GBK 等非 UTF-8 编码的 skill.json 抛
+            # UnicodeDecodeError（ValueError 分支，JSONDecodeError 捕不到），
+            # 会从 scan() 冒泡到 search() 整体失败——_index 来不及更新，
+            # 之后每次 search 都重新扫描、重新失败，全部技能永久不可用。
+            # 损坏字节替换后走正常 JSON 解析，坏名/坏类型由下面的归一兜底。
+            with open(meta_path, "r", encoding="utf-8", errors="replace") as f:
                 meta = json.load(f)
             if not isinstance(meta, dict):
                 return None
@@ -295,7 +300,7 @@ class SkillIndex:
                 "path": dirname,
                 "entry": entry,
             }
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
             logger.warning("skill_index: failed to read %s: %s", meta_path, e)
             return None
 
@@ -374,16 +379,18 @@ class SkillIndex:
             logger.warning("skill_index: rejected unsafe path: %s/%s", skill_path, entry)
             return None
         try:
-            with open(abs_path, "r", encoding="utf-8") as f:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 # 上限读取：内容会原样进模型上下文，一个误放进 skills 目录的
-                # 大文件会被整个读进内存并撑爆上下文。
+                # 大文件会被整个读进内存并撑爆上下文。errors="replace"：GBK
+                # 的 prompt.md 旧实现直接抛 UnicodeDecodeError（except OSError
+                # 捕不到），skill_load 对该技能永久失败。
                 text = f.read(_MAX_ENTRY_CHARS + 1)
             if len(text) > _MAX_ENTRY_CHARS:
                 text = text[:_MAX_ENTRY_CHARS] + (
                     f"\n… [文件过大，已截断到 {_MAX_ENTRY_CHARS} 字符]"
                 )
             return text
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             logger.warning("skill_index: failed to read %s: %s", abs_path, e)
             return None
 
@@ -406,7 +413,16 @@ class SkillIndex:
 import re
 
 _TOKEN_RE = re.compile(r"\w+")
+# 中文没有空格，\w+ 会把连续中文当成一个整体 token，与 name/keywords 的
+# token 集合做交集恒为空——未空格的中文查询（"提取pdf表格"）检索不到任何
+# 技能。与 skills.py 的 _keywords_of 对齐：CJK 连续段额外产出整段与二元组。
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 
 
 def _tokenize(text: str) -> List[str]:
-    return _TOKEN_RE.findall(text)
+    toks = [w.lower() for w in _TOKEN_RE.findall(text)]
+    for run in _CJK_RUN_RE.findall(text):
+        toks.append(run)
+        for i in range(len(run) - 1):
+            toks.append(run[i:i + 2])
+    return toks

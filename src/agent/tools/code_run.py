@@ -383,15 +383,54 @@ def _run_in_subprocess(code: str, timeout: float, ws: str) -> Optional[ToolResul
 
     def _pump(stream, sink):
         try:
+            # readline() 在返回前会把整行累积进 TextIOWrapper 的内部缓冲——
+            # 一条 500MB 的无换行 print，父进程内存峰值就是 500MB，原来的
+            # 截断发生在整行读进来之后，防的不是内存是最终副本。改用分块
+            # 读取 + 自行按 \n 切行：行内累计超过 _MAX_LINE_CHARS 立即写出
+            # 截断标记并丢弃到行尾，内存峰值恒定于 O(块大小 + 行上限)。
+            buf = []
+            buf_len = 0
+            line_dropped = False
             while True:
-                line = stream.readline()
-                if not line:
+                chunk = stream.read(8192)
+                if not chunk:
                     break
-                # 单行长度也要封顶：一次 print 一个 500MB 的无换行字符串，
-                # 父进程侧的 line 同样是 500MB。
+                pos = 0
+                while pos < len(chunk):
+                    nl = chunk.find("\n", pos)
+                    if nl < 0:
+                        piece = chunk[pos:]
+                        pos = len(chunk)
+                    else:
+                        piece = chunk[pos:nl + 1]
+                        pos = nl + 1
+                    buf.append(piece)
+                    buf_len += len(piece)
+                    if piece.endswith("\n"):
+                        # 行结束：截断后写入，重置行缓冲
+                        if line_dropped:
+                            line = "…[单行过长已截断]\n"
+                            line_dropped = False
+                        else:
+                            line = "".join(buf)
+                            if len(line) > _MAX_LINE_CHARS:
+                                line = line[:_MAX_LINE_CHARS] + "…[单行过长已截断]\n"
+                        buf = []
+                        buf_len = 0
+                        if not sink.truncated:
+                            sink.write(line)
+                    elif buf_len > _MAX_LINE_CHARS:
+                        # 行还没结束但已超限：写出截断标记，丢弃到行尾
+                        line_dropped = True
+                        buf = []
+                        buf_len = 0
+                        if not sink.truncated:
+                            sink.write("…[单行过长已截断]\n")
+            # 流结束但最后一行没有换行符
+            if buf:
+                line = "".join(buf)
                 if len(line) > _MAX_LINE_CHARS:
-                    line = line[:_MAX_LINE_CHARS] + "…[单行过长已截断]\n"
-                # 截断后仍继续读，避免子进程写满管道卡死。
+                    line = line[:_MAX_LINE_CHARS] + "…[单行过长已截断]"
                 if not sink.truncated:
                     sink.write(line)
         except Exception:

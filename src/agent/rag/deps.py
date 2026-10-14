@@ -44,13 +44,13 @@ class DepSpec:
 
 
 # Map each file extension to its required dependencies.
+# 旧版二进制格式（.doc/.xls/.ppt）不在表内：python-docx/openpyxl/python-pptx
+# 均只支持 OOXML，装了也解析不了（parsers 对它们给出明确的「另存为」提示），
+# 列在这里只会制造「已支持」的假象并白装依赖。
 EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".docx": [DepSpec("docx", "python-docx", "Word 文档解析")],
-    ".doc":  [DepSpec("docx", "python-docx", "Word 文档解析")],
     ".xlsx": [DepSpec("openpyxl", "openpyxl", "Excel 表格解析")],
-    ".xls":  [DepSpec("openpyxl", "openpyxl", "Excel 表格解析")],
     ".pptx": [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
-    ".ppt":  [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
     ".pdf":  [
         DepSpec("fitz", "PyMuPDF", "PDF 文字解析"),
         # OCR 引擎（rapidocr 3.x 或旧版 rapidocr-onnxruntime 1.x，任一即可）
