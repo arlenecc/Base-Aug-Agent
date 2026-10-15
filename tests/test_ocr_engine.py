@@ -37,19 +37,111 @@ class _FakeSession:
 # ---------------------------------------------------------------------------
 
 
+def _ep_list_mechanism(cls):
+    """返回该 rapidocr 布局使用的注入机制：'method' 或 'factory'。"""
+    return "method" if hasattr(cls, "_get_ep_list") else "factory"
+
+
+def _patched_marker(cls):
+    """当前注入路径上的「已 patch」标记（两种布局通用）。"""
+    if hasattr(cls, "_get_ep_list"):
+        return getattr(cls._get_ep_list, "_coreml_patched", False)
+    mod = sys.modules.get(getattr(cls, "__module__", ""))
+    return bool(mod) and getattr(
+        getattr(mod, "InferenceSession", None), "_coreml_patched", False
+    )
+
+
 def test_patch_injects_coreml_ep_first():
     cls = oe._ort_infer_session_class()
     assert cls is not None, "rapidocr OrtInferSession 类未找到"
     try:
         ok = oe._patch_coreml_ep(cls)
         assert ok, "patch 未生效"
-        ep_list = cls._get_ep_list(_FakeSession())
-        assert ep_list[0][0] == oe._COREML_EP, "CoreML 必须排在最前"
-        assert any(name == oe._CPU_EP for name, _ in ep_list), "CPU 必须保留作回退"
+        if hasattr(cls, "_get_ep_list"):
+            ep_list = cls._get_ep_list(_FakeSession())
+            assert ep_list, "EP 列表为空"
+            first = ep_list[0]
+            first_name = first[0] if isinstance(first, (list, tuple)) else first
+            assert first_name == oe._COREML_EP, "CoreML 必须排在最前"
+            assert any(
+                (ep[0] if isinstance(ep, (list, tuple)) else ep) == oe._CPU_EP
+                for ep in ep_list
+            ), "CPU 必须保留作回退"
+        else:
+            # rapidocr 1.2.x 布局：EP 列表在 __init__ 内联构建，
+            # 注入点是模块级 InferenceSession 工厂（行为由
+            # test_factory_patch_injects_coreml 单独验证）。
+            assert _patched_marker(cls), "factory 未被标记为已 patch"
     finally:
         oe._unpatch_coreml_ep(cls)
-        ep_list2 = cls._get_ep_list(_FakeSession())
-        assert ep_list2[0][0] != oe._COREML_EP, "unpatch 后必须恢复原始 EP 列表"
+        assert not _patched_marker(cls), "unpatch 后必须恢复原始 EP 列表/工厂"
+
+
+def test_patch_is_idempotent():
+    """重复 patch 不重复包装（两种布局都不能套两层）。"""
+    cls = oe._ort_infer_session_class()
+    assert cls is not None
+    try:
+        assert oe._patch_coreml_ep(cls) is True
+        assert oe._patch_coreml_ep(cls) is True
+        if hasattr(cls, "_get_ep_list"):
+            # 套两层会把 CoreML 插两次——幂等性必须保证只插一次
+            eps = cls._get_ep_list(_FakeSession())
+            coreml_count = sum(
+                1 for ep in eps
+                if (ep[0] if isinstance(ep, (list, tuple)) else ep) == oe._COREML_EP
+            )
+            assert coreml_count == 1, "CoreML 被重复注入"
+    finally:
+        oe._unpatch_coreml_ep(cls)
+
+
+def test_factory_patch_injects_coreml(monkeypatch):
+    """factory 路径（rapidocr 1.2.x 布局）：验证 providers 注入与恢复。
+
+    用一个注册进 sys.modules 的假模块驱动 ``_session_module``，
+    不触碰真实 rapidocr / onnxruntime。
+    """
+    import types
+
+    mod = types.ModuleType("rapidocr_fake_infer_engine")
+    calls = []
+
+    class _FakeIS:
+        def __init__(self, *a, **kw):
+            calls.append(kw)
+
+    mod.InferenceSession = _FakeIS
+    monkeypatch.setitem(sys.modules, "rapidocr_fake_infer_engine", mod)
+
+    class _FakeSessionCls:
+        pass
+
+    _FakeSessionCls.__module__ = "rapidocr_fake_infer_engine"
+
+    try:
+        assert oe._patch_inference_session_factory(_FakeSessionCls) is True
+        # 幂等
+        assert oe._patch_inference_session_factory(_FakeSessionCls) is True
+        mod.InferenceSession("model.onnx", providers=[("CPUExecutionProvider", {})])
+        providers = calls[-1]["providers"]
+        assert providers[0][0] == oe._COREML_EP, "CoreML 必须排在最前"
+        assert any(p[0] == oe._CPU_EP for p in providers), "CPU 必须保留作回退"
+    finally:
+        oe._unpatch_coreml_ep(_FakeSessionCls)
+        assert mod.InferenceSession is _FakeIS, "unpatch 后必须恢复原工厂"
+
+
+def test_factory_patch_rejects_foreign_module():
+    """非 rapidocr 模块的类不得被 patch（避免误伤无关代码）。"""
+    import types
+
+    class _Local:
+        pass
+
+    assert oe._patch_inference_session_factory(_Local) is False
+    assert oe._unpatch_coreml_ep(_Local) is None
 
 
 def test_create_ocr_engine_injects_coreml_on_apple_silicon(monkeypatch):
@@ -86,12 +178,64 @@ def test_create_ocr_engine_no_coreml_when_disabled(monkeypatch):
 
     monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR)
     cls = oe._ort_infer_session_class()
-    was_patched = getattr(cls._get_ep_list, "_coreml_patched", False)
+    if hasattr(cls, "_get_ep_list"):
+        was_patched = getattr(cls._get_ep_list, "_coreml_patched", False)
+    else:
+        mod = sys.modules.get(getattr(cls, "__module__", ""))
+        was_patched = getattr(
+            getattr(mod, "InferenceSession", None), "_coreml_patched", False
+        )
     eng = oe.create_ocr_engine(use_coreml=False)
     assert isinstance(eng, FakeRapidOCR)
     assert captured.get("det_limit_side_len") == oe._DET_LIMIT_SIDE_LEN
-    # 关闭时不得注入 CoreML 到全局类
-    assert getattr(cls._get_ep_list, "_coreml_patched", False) == was_patched
+    # 关闭时不得注入 CoreML 到全局类/工厂
+    if hasattr(cls, "_get_ep_list"):
+        now_patched = getattr(cls._get_ep_list, "_coreml_patched", False)
+    else:
+        mod = sys.modules.get(getattr(cls, "__module__", ""))
+        now_patched = getattr(
+            getattr(mod, "InferenceSession", None), "_coreml_patched", False
+        )
+    assert now_patched == was_patched
+
+
+def test_create_ocr_engine_survives_kwargs_incompatibility(monkeypatch):
+    """rapidocr 1.2.x 布局：det_* kwargs 触发上游 KeyError 时必须降级建成。
+
+    复现真实缺陷：只传 det_limit_side_len 而不传 det_model_path 时，
+    rapidocr 1.2.3 的 UpdateParameters 抛 KeyError('model_path')，
+    旧实现让 OCR 引擎永远建不起来（表现为「提示未安装」）。
+    """
+    attempts = []
+
+    class FakeRapidOCR12x:
+        """模拟 rapidocr 1.2.x：缺 det_model_path 就 KeyError。"""
+
+        def __init__(self, **kw):
+            attempts.append(kw)
+            if any(k.startswith("det_") for k in kw) and "det_model_path" not in kw:
+                raise KeyError("model_path")
+
+    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCR12x)
+    eng = oe.create_ocr_engine(use_coreml=False)
+    assert isinstance(eng, FakeRapidOCR12x)
+    # 第一次带完整调优参数失败，第二次补 det_model_path 成功
+    assert len(attempts) >= 2
+    assert attempts[-1].get("det_model_path") == ""
+    assert attempts[-1].get("det_limit_side_len") == oe._DET_LIMIT_SIDE_LEN
+
+
+def test_create_ocr_engine_falls_back_to_bare(monkeypatch):
+    """kwargs 全不兼容时退到裸构造——OCR 可用性优先于分辨率调优。"""
+
+    class FakeRapidOCRStrict:
+        def __init__(self, **kw):
+            if kw:
+                raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeRapidOCRStrict)
+    eng = oe.create_ocr_engine(use_coreml=False)
+    assert isinstance(eng, FakeRapidOCRStrict)
 
 
 def test_coreml_reason_refuses_on_non_apple():

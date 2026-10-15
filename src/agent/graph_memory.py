@@ -152,13 +152,45 @@ class GraphMemoryStore:
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self._entities = {n.lower(): e for n, e in data.get("entities", {}).items()}
-            # Normalise: ensure every entity has observations list
-            for e in self._entities.values():
+            # 结构校验：手改坏/旧版本/写一半崩溃的 JSON 只要「能解析」
+            # 就会带着畸形结构进入内存——随后 _prune_locked / snapshot /
+            # list_relations 对 None/缺字段记录做下标访问，把整个记忆系统
+            # 打炸（不只是坏那条）。与 entities 一样，relations 也必须归一化。
+            if not isinstance(data, dict):
+                raise ValueError("graph root is not an object")
+            raw_entities = data.get("entities", {})
+            if not isinstance(raw_entities, dict):
+                raise ValueError("graph entities is not an object")
+            entities: Dict[str, dict] = {}
+            for n, e in raw_entities.items():
+                if not isinstance(n, str) or not isinstance(e, dict):
+                    continue                      # 跳过畸形实体
+                e.setdefault("name", n)
+                e.setdefault("type", "")
                 if not isinstance(e.get("observations"), list):
                     e["observations"] = []
-            self._relations = data.get("relations", [])
-        except (OSError, json.JSONDecodeError) as e:
+                entities[n.lower()] = e
+            raw_relations = data.get("relations", [])
+            if not isinstance(raw_relations, list):
+                raise ValueError("graph relations is not a list")
+            relations: List[dict] = []
+            for r in raw_relations:
+                if not isinstance(r, dict):
+                    continue                      # 跳过畸形关系
+                src = str(r.get("source", "") or "").strip()
+                tgt = str(r.get("target", "") or "").strip()
+                lbl = str(r.get("label", "") or "").strip()
+                if not (src and tgt and lbl):
+                    continue                      # 缺字段的关系没有语义
+                relations.append({
+                    "source": src,
+                    "target": tgt,
+                    "label": lbl,
+                    "created": str(r.get("created", "") or ""),
+                })
+            self._entities = entities
+            self._relations = relations
+        except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.warning("graph_memory: failed to load %s: %s", self._path, e)
             backup_corrupt(self._path)
             self._entities = {}

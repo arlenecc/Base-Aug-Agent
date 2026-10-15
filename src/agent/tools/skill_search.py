@@ -10,6 +10,7 @@ a skill.json metadata file and a prompt.md entry file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -20,6 +21,8 @@ from ..config import AgentConfig
 from ..skill_index import SkillIndex
 from .base import Tool, ToolRegistry, ToolResult
 
+
+logger = logging.getLogger(__name__)
 
 _skill_index_lock = threading.Lock()
 
@@ -51,11 +54,17 @@ def _read_text_capped(path: str, cap: int = _MAX_SKILL_FILE_CHARS) -> str:
     return text
 
 
-def _is_external_skill_dir(abs_dir: str, workspace: str) -> bool:
-    """``abs_dir`` 是否位于 workspace/.agent/skills 之外（即本身是符号链接）。"""
+def _is_external_skill_dir(abs_dir: str, skills_root: str) -> bool:
+    """``abs_dir`` 是否位于 ``skills_root`` 之外（即本身是符号链接）。
+
+    ``skills_root`` 必须是**产出 ``abs_dir`` 的那个检索器的根目录**：
+    语义检索器扫 ``<workspace>/skills``，旧体系扫
+    ``<workspace>/.agent/skills``。拿其中一个当基线去判另一个的结果，
+    会把每一个正常技能都误标成「来自工作区之外」。
+    """
     if not abs_dir:
         return False
-    base = os.path.realpath(os.path.join(workspace, ".agent", "skills"))
+    base = os.path.realpath(skills_root)
     return not (abs_dir == base or abs_dir.startswith(base + os.sep))
 
 
@@ -295,8 +304,11 @@ class SkillLoadTool(Tool):
                         return ToolResult(False, error=f"read failed: {e}")
                     # 技能目录是符号链接时，读到的内容来自工作区之外——把真实
                     # 来源标注出来，否则用户（和模型）都看不出自己读的是哪。
+                    # 基线必须用**语义检索器自己的** skills 根目录：abs_dir 来自
+                    # 它（根是 <workspace>/skills），拿 .agent/skills 当基线会把
+                    # 每一个正常技能都误标成外部链接。
                     try:
-                        if _is_external_skill_dir(abs_dir, self.config.workspace):
+                        if _is_external_skill_dir(abs_dir, retriever.skills_dir):
                             text = (
                                 f"[提示] 该技能目录是符号链接，实际内容来自工作区之外：\n"
                                 f"{abs_dir}\n\n{text}"
@@ -449,6 +461,10 @@ class SkillSaveTool(Tool):
         # 检索扫的 workspace/skills 不是同一个目录。只写一处会让另一条检索路径
         # 永远召不回刚固化的技能（回执却声称"都能召回"）。这里镜像一份过去，
         # 且只在目标不存在时才写——不覆盖用户自己在 .agent/skills 里的版本。
+        #
+        # 镜像必须同时写 skill.json：SkillIndex._read_skill_meta 只收录
+        # 「目录里有 skill.json」的技能，只写 SKILL.md 的镜像永远不会被
+        # 关键词索引收录（回执里「已镜像以便关键词检索命中」是空话）。
         mirrored = ""
         try:
             legacy_root = os.path.join(self.config.workspace, ".agent", "skills")
@@ -457,6 +473,18 @@ class SkillSaveTool(Tool):
                     os.path.join(legacy_dir, "SKILL.md")):
                 os.makedirs(legacy_dir, exist_ok=True)
                 atomic_write_text(os.path.join(legacy_dir, "SKILL.md"), body)
+                meta = {
+                    "name": slug,
+                    "description": (description or "").strip()[:200],
+                    "keywords": tag_list,
+                    "tags": tag_list,
+                    "version": "1.0",
+                    "entry": "SKILL.md",
+                }
+                atomic_write_text(
+                    os.path.join(legacy_dir, "skill.json"),
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                )
                 mirrored = str(legacy_dir)
                 idx = _get_skill_index(self.config, self.registry)
                 idx.scan(force=True)

@@ -146,14 +146,21 @@ _patch_lock = threading.Lock()
 def _ort_infer_session_class():
     """Locate RapidOCR's ``OrtInferSession`` across package layouts.
 
-    Different rapidocr_onnxruntime releases place it in different modules;
-    return ``None`` when it cannot be found so callers can bail out instead
-    of guessing at internals.
+    Different rapidocr_onnxruntime releases place it in different modules:
+
+    * 1.2.x（当前最新版）→ ``rapidocr_onnxruntime.utils``，且 EP 列表在
+      ``__init__`` 里内联构建，**没有** ``_get_ep_list`` 方法；
+    * 其它发布 → 各推理引擎子模块，多数暴露 ``_get_ep_list``。
+
+    只按「模块里有 OrtInferSession」判定，不要求 ``_get_ep_list`` ——
+    旧实现额外要求该方法，导致在 1.2.3 上永远返回 None，CoreML EP
+    静默失效（日志只打「找不到 OrtInferSession」）。
     """
     candidates = (
+        "rapidocr_onnxruntime.utils",                          # 1.2.x（实际布局）
         "rapidocr_onnxruntime.utils.infer_engine",
-        "rapidocr_onnxruntime.inference_engine.ort_inference_engine",
         "rapidocr_onnxruntime.utils.ort_infer_engine",
+        "rapidocr_onnxruntime.inference_engine.ort_inference_engine",
     )
     import importlib
     for mod_name in candidates:
@@ -162,7 +169,7 @@ def _ort_infer_session_class():
         except Exception:
             continue
         cls = getattr(mod, "OrtInferSession", None)
-        if cls is not None and hasattr(cls, "_get_ep_list"):
+        if isinstance(cls, type):
             return cls
     return None
 
@@ -170,11 +177,22 @@ def _ort_infer_session_class():
 def _patch_coreml_ep(session_cls) -> bool:
     """Prepend CoreMLExecutionProvider to the EP list RapidOCR builds.
 
-    ``OrtInferSession._get_ep_list()`` returns CPU (+CUDA/DirectML when asked).
-    We wrap it so CoreML comes first and CPU stays last — ONNX Runtime then
-    automatically falls back to CPU for any subgraph CoreML cannot handle, so
-    an unsupported op degrades to the old speed instead of failing.
+    两种布局各有一条注入路径：
+
+    1. **有 ``_get_ep_list`` 的版本** —— 包装该方法，让 CoreML 排最前、
+       CPU 留最后。ONNX Runtime 会自动把 CoreML 不支持的子图回退到 CPU，
+       因此不支持的算子只会降速而不是报错。
+    2. **只有 ``__init__`` 内联构建 EP 列表的版本**（如 rapidocr 1.2.x）
+       —— 它通过模块级 ``InferenceSession(...)`` 工厂建会话，包装该工厂、
+       在 ``providers`` 参数里注入 CoreML 即可，语义与上面一致。
     """
+    if _patch_ep_list_method(session_cls):
+        return True
+    return _patch_inference_session_factory(session_cls)
+
+
+def _patch_ep_list_method(session_cls) -> bool:
+    """路径 1：包装 ``_get_ep_list``（暴露该方法的版本）。"""
     original = getattr(session_cls, "_get_ep_list", None)
     if original is None:
         return False
@@ -198,12 +216,64 @@ def _patch_coreml_ep(session_cls) -> bool:
     return True
 
 
+def _session_module(session_cls):
+    """返回 ``OrtInferSession`` 定义所在模块（已 import），失败返回 None。"""
+    mod_name = getattr(session_cls, "__module__", None) or ""
+    if not mod_name.startswith("rapidocr"):
+        return None
+    import sys
+    return sys.modules.get(mod_name)
+
+
+def _patch_inference_session_factory(session_cls) -> bool:
+    """路径 2：包装 ``OrtInferSession`` 模块里的 ``InferenceSession`` 工厂。
+
+    rapidocr 1.2.x 的 ``__init__`` 直接调模块级
+    ``InferenceSession(model_path, sess_options=..., providers=EP_list)``。
+    替换该全局引用即可在 providers 里注入 CoreML；``__init__`` 里的其它
+    逻辑（CUDA 探测、sess_opt）不受影响。
+    """
+    mod = _session_module(session_cls)
+    if mod is None:
+        return False
+    original_is = getattr(mod, "InferenceSession", None)
+    if original_is is None:
+        return False
+    if getattr(original_is, "_coreml_patched", False):
+        return True
+
+    def _make_session(*args, **kwargs):  # type: ignore[no-untyped-def]
+        providers = list(kwargs.get("providers") or [])
+        providers = [p for p in providers
+                     if (p[0] if isinstance(p, (list, tuple)) else p) != _COREML_EP]
+        providers.insert(0, (_COREML_EP, dict(_COREML_EP_OPTIONS)))
+        kwargs["providers"] = providers
+        return original_is(*args, **kwargs)
+
+    _make_session._coreml_patched = True          # type: ignore[attr-defined]
+    _make_session._coreml_original = original_is  # type: ignore[attr-defined]
+    mod.InferenceSession = _make_session          # type: ignore[assignment]
+    return True
+
+
 def _unpatch_coreml_ep(session_cls) -> None:
-    """Restore the stock EP list (used when CoreML session creation fails)."""
+    """Restore the stock EP list (used when CoreML session creation fails).
+
+    两条注入路径都要能恢复：``_get_ep_list`` 包装与
+    ``InferenceSession`` 工厂包装。
+    """
     patched = getattr(session_cls, "_get_ep_list", None)
     original = getattr(patched, "_coreml_original", None)
     if original is not None:
         session_cls._get_ep_list = original      # type: ignore[assignment]
+        return
+    mod = _session_module(session_cls)
+    if mod is None:
+        return
+    cur_is = getattr(mod, "InferenceSession", None)
+    orig_is = getattr(cur_is, "_coreml_original", None)
+    if orig_is is not None:
+        mod.InferenceSession = orig_is           # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +295,40 @@ def _engine_kwargs(**overrides) -> Dict[str, Any]:
     return kwargs
 
 
+def _build_rapid_ocr(engine_kwargs: Dict[str, Any]):
+    """构造 RapidOCR 引擎，兼容各版本的 kwargs 体系。
+
+    rapidocr 1.2.x 的 ``UpdateParameters`` 在收到**任何** ``det_*``
+    kwargs 时都会无条件读 ``det_dict['model_path']`` —— 只传
+    ``det_limit_side_len`` 而不传 ``det_model_path`` 会直接
+    ``KeyError: 'model_path'``（上游缺陷），引擎根本建不起来，表现为
+    「明明装了 rapidocr 却提示未安装」。旧版（1.1.x）的 argparse 体系
+    则不认 ``det_model_path`` 这个多余参数。
+
+    因此按顺序降级重试，任一成功即返回：
+    1. 完整 kwargs（保留 1024 分辨率调优）；
+    2. 补 ``det_model_path=""`` —— 空值让 1.2.x 回退到自带模型路径；
+    3. 裸构造 —— 放弃调优也要保证 OCR 可用。
+    """
+    from rapidocr_onnxruntime import RapidOCR
+
+    with_model_path = dict(engine_kwargs)
+    with_model_path.setdefault("det_model_path", "")
+    attempts = [engine_kwargs, with_model_path, {}]
+
+    last_exc: Optional[BaseException] = None
+    for kw in attempts:
+        try:
+            return RapidOCR(**kw)
+        except (KeyError, TypeError) as e:
+            # kwargs 体系不兼容 → 换下一组更保守的参数。
+            # 其它异常（模型下载失败等）直接上抛，重试没有意义。
+            last_exc = e
+            logger.debug("OCR: RapidOCR(**%s) 失败，降级重试: %s", sorted(kw), e)
+    assert last_exc is not None
+    raise last_exc
+
+
 def create_ocr_engine(use_coreml: bool = True, **kwargs):
     """Build a RapidOCR engine, preferring CoreML EP on Apple Silicon.
 
@@ -233,17 +337,19 @@ def create_ocr_engine(use_coreml: bool = True, **kwargs):
     builds) — the patch is rolled back before retrying so a later construction
     is not poisoned by the failed attempt.
     """
-    from rapidocr_onnxruntime import RapidOCR
-
     engine_kwargs = _engine_kwargs(**kwargs)
+
+    def _build():
+        return _build_rapid_ocr(engine_kwargs)
+
     if not use_coreml:
         logger.info("OCR: CoreML EP 已按配置关闭，使用默认 EP")
-        return RapidOCR(**engine_kwargs)
+        return _build()
 
     usable, reason = coreml_reason()
     if not usable:
         logger.info("OCR: 未启用 CoreML EP — %s", reason)
-        return RapidOCR(**engine_kwargs)
+        return _build()
 
     with _patch_lock:
         session_cls = _ort_infer_session_class()
@@ -251,11 +357,11 @@ def create_ocr_engine(use_coreml: bool = True, **kwargs):
             logger.warning(
                 "OCR: 找不到 rapidocr 的 OrtInferSession，无法注入 CoreML EP，回退默认 EP"
             )
-            return RapidOCR(**engine_kwargs)
+            return _build()
         if not _patch_coreml_ep(session_cls):
-            return RapidOCR(**engine_kwargs)
+            return _build()
         try:
-            engine = RapidOCR(**engine_kwargs)
+            engine = _build()
             logger.info("OCR: 已启用 CoreML EP（MLComputeUnits=ALL，CPU+GPU+ANE）— %s", reason)
             return engine
         except Exception as e:
@@ -264,7 +370,7 @@ def create_ocr_engine(use_coreml: bool = True, **kwargs):
             # works — a failed EP must never break ingestion.
             _unpatch_coreml_ep(session_cls)
             logger.warning("OCR: CoreML EP 初始化失败，回退 CPU EP: %s", e)
-            return RapidOCR(**engine_kwargs)
+            return _build()
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,10 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
+# ``\s+`` 会匹配换行符：整篇文本上 ``#\n标题`` 这样的「空 ATX 标题行」
+# 会把下一行正文吞并成标题（group(2) 跨行命中），污染章节提取。
+# 限定为行内空白 [ \t]。
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)
 
 # 中文章节标题：第{数字|中文数字}章/节/卷/篇/部/部分，后跟空格或标题。
 # 也兼容无「第」字的数字+卷/章格式（如「1卷 我的财产告白」）。

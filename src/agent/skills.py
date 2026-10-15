@@ -10,6 +10,7 @@ an _index.json table for fast lookup via the skill_search tool.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
+from .atomic_io import atomic_write_text
 from .memory import _JsonStore
 
 _TOKEN_RE = re.compile(r"\w+")
@@ -76,11 +78,28 @@ class SkillManager:
         # Defensive: a corrupted store may have null values. Directly modify
         # _data to avoid triggering a debounced _save() which would set
         # _last_save and delay subsequent real writes.
+        # 修复必须**落盘**：只改内存的话，下次 reload()/重启又会从磁盘读回
+        # 坏值，防御代码每轮都白修一遍（且 reload 前的 set() 才会顺带写出去，
+        # 纯查询型用法永远修不掉）。
         with self._store._lock:
+            repaired = False
             if not isinstance(self._store._data.get("skills"), list):
                 self._store._data["skills"] = []
+                repaired = True
             if not isinstance(self._store._data.get("requests"), dict):
                 self._store._data["requests"] = {}
+                repaired = True
+            if repaired:
+                self._store._dirty = True
+        if repaired:
+            # _JsonStore._lock 不是可重入锁，必须在 with 之外 flush。
+            self._store.flush(force=True)
+            # flush(force=True) 会把 _last_save 刷成当前时刻——紧接着的
+            # 第一次 set() 就会被 0.5s 防抖吞掉（磁盘上只有空骨架），
+            # 表现为「刚创建的技能换实例就读不到」。复位时间戳，让后续
+            # 真实写入保持「首次立即落盘」的旧语义。
+            with self._store._lock:
+                self._store._last_save = 0.0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -131,7 +150,7 @@ class SkillManager:
             return self._load_skills()
 
     def create_skill(self, name: str, keywords: List[str], prompt: str) -> Skill:
-        skill = Skill(name=name, keywords=[k.lower() for k in keywords], prompt=prompt)
+        skill = Skill(name=name, keywords=[k.lower() for k in (keywords or [])], prompt=prompt)
         with self._lock:
             skills = [s for s in self._load_skills() if s.name != name]
             skills.append(skill)
@@ -156,34 +175,45 @@ class SkillManager:
         if not self._skills_dir:
             raise ValueError("skills_dir not configured")
 
+        keywords = list(keywords or [])
+        tags = list(tags or [])
+
         # Sanitize name → directory name
         dir_name = re.sub(r"[^\w\-.]", "-", name.lower().strip()).strip("-")
         if not dir_name:
             dir_name = "unnamed-skill"
-        # Ensure uniqueness
+        # Ensure uniqueness.
+        # 旧实现 while os.path.exists(...) 是 TOCTOU：两个线程同时建同名
+        # 技能会选到同一目录并互相覆盖。改用 makedirs 的 FileExistsError
+        # 重试——「建目录」本身就是原子占用，不存在判断窗口。
         skill_dir = os.path.join(self._skills_dir, dir_name)
         counter = 1
-        while os.path.exists(skill_dir):
-            skill_dir = os.path.join(self._skills_dir, f"{dir_name}-{counter}")
-            counter += 1
+        for _ in range(100):
+            try:
+                os.makedirs(skill_dir, exist_ok=False)
+                break
+            except FileExistsError:
+                skill_dir = os.path.join(self._skills_dir, f"{dir_name}-{counter}")
+                counter += 1
+        else:
+            raise ValueError(f"cannot create a unique skill directory for {name!r}")
 
-        os.makedirs(skill_dir, exist_ok=True)
-
-        # Write skill.json
+        # Write skill.json + prompt.md —— 原子写：崩溃/并发不会留下半截文件
+        # （旧实现裸 open()+write()，半截 skill.json 会让 SkillIndex 静默
+        # 跳过该技能）。
         meta = {
             "name": name,
             "description": description or f"Skill: {name}",
             "keywords": [k.lower() for k in keywords],
-            "tags": tags or [],
+            "tags": tags,
             "version": "1.0",
             "entry": "prompt.md",
         }
-        with open(os.path.join(skill_dir, "skill.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-        # Write prompt.md
-        with open(os.path.join(skill_dir, "prompt.md"), "w", encoding="utf-8") as f:
-            f.write(prompt)
+        atomic_write_text(
+            os.path.join(skill_dir, "skill.json"),
+            json.dumps(meta, ensure_ascii=False, indent=2),
+        )
+        atomic_write_text(os.path.join(skill_dir, "prompt.md"), prompt)
 
         # Also register a flat record so _match_skill() can hit this skill.
         # The flat record's prompt tells the agent to load the full
@@ -228,9 +258,17 @@ class SkillManager:
         key. The old implementation joined ALL keywords in original order, so
         dropping or adding a single word produced a different key and the
         counter never reached the suggestion threshold.
+
+        超过 80 字符的长 key 不能直接截断：两个只有尾部不同的长请求会碰撞成
+        同一个计数键，产生虚假的「重复请求 → 建议固化」。截断后补一段全文
+        哈希，保证不同 key 必然不同（已有的短 key 不受影响，格式兼容）。
         """
         kws = sorted({w for w in _keywords_of(text) if w not in _STOPWORDS})
-        return " ".join(kws)[:80]
+        full = " ".join(kws)
+        if len(full) <= 80:
+            return full
+        digest = hashlib.sha1(full.encode("utf-8")).hexdigest()[:8]
+        return f"{full[:72]}#{digest}"
 
     def record_request(self, text: str) -> Optional[Skill]:
         """Track a user request. Returns a *suggested* (unsaved) Skill once the

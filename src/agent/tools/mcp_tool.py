@@ -51,6 +51,19 @@ class MCPTool(Tool):
                 error=f"Invalid arguments for {self.name}: "
                       f"missing required argument(s): {', '.join(missing)}",
             )
+        # 模型多传的、schema 未声明的参数也要拦下：原样转发给严格校验的
+        # server 会直接失败（错误信息还指向远端，模型难以自纠）。
+        # properties 为空（server 没给 schema）时不过滤——那时没有任何
+        # 依据判断哪些参数合法。
+        properties = self.parameters.get("properties")
+        if isinstance(properties, dict) and properties:
+            unknown = [k for k in kwargs if k not in properties]
+            if unknown:
+                return ToolResult(
+                    success=False,
+                    error=f"Invalid arguments for {self.name}: "
+                          f"unknown argument(s): {', '.join(sorted(unknown))}",
+                )
         try:
             output = self._client.call_tool(self.name, kwargs)
             return ToolResult(success=True, output=output)

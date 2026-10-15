@@ -101,8 +101,11 @@ def _parse_frontmatter(text: str) -> Dict[str, Any]:
     但描述是垃圾 —— 语义检索永远召回不到它。
     """
     result: Dict[str, Any] = {}
-    if not text.startswith("---"):
+    # BOM / 前导空白会让 startswith("---") 判false：整个 frontmatter 不可见，
+    # name 取空 → 技能被静默丢弃（Windows 编辑器保存的 SKILL.md 必带 BOM）。
+    if not text.lstrip("\ufeff \t\r\n").startswith("---"):
         return result
+    text = text.lstrip("\ufeff \t\r\n")
 
     end = text.find("\n---", 3)
     if end == -1:
@@ -478,28 +481,43 @@ class SkillVectorStore:
         self._ef = embedding_function
         self._db = None
         self._table = None
-        self._lock = threading.Lock()
+        # RLock：build()/sync() 持锁期间会调用 _get_db()/_get_table()，
+        # 普通 Lock 会让这些路径自锁死（与 VectorStore._documents_lock 同类）。
+        self._lock = threading.RLock()
 
     def _get_ef(self):
+        # 双检锁：并发首次调用（两个 skill_semantic_search 线程）会各自
+        # get_or_create_embedding_function() —— 该函数内部有锁，模型不会
+        # 加载两份，但这里的赋值竞态会让一个实例拿到后被另一个覆盖。
         if self._ef is None:
-            from .rag.vector_store import get_or_create_embedding_function
-            self._ef = get_or_create_embedding_function()
+            with self._lock:
+                if self._ef is None:
+                    from .rag.vector_store import get_or_create_embedding_function
+                    self._ef = get_or_create_embedding_function()
         return self._ef
 
     def _get_db(self):
+        # 双检锁：两个线程并发首次调用会各建一个 lancedb.connect()，
+        # 后写者覆盖 _db，先建的那个连接（含文件句柄）永不关闭。
         if self._db is None:
-            import lancedb
-            os.makedirs(self._db_path, exist_ok=True)
-            self._db = lancedb.connect(self._db_path)
+            with self._lock:
+                if self._db is None:
+                    import lancedb
+                    os.makedirs(self._db_path, exist_ok=True)
+                    self._db = lancedb.connect(self._db_path)
         return self._db
 
     def _get_table(self):
-        db = self._get_db()
+        # 双检锁：check-then-act 竞态会让两个线程各自 open_table，
+        # 其中一个句柄被丢弃（LanceDB 表句柄持有版本快照与缓存）。
         if self._table is None:
-            if _SKILL_TABLE_NAME in db.table_names():
-                self._table = db.open_table(_SKILL_TABLE_NAME)
-            else:
-                self._table = None
+            with self._lock:
+                if self._table is None:
+                    db = self._get_db()
+                    if _SKILL_TABLE_NAME in db.table_names():
+                        self._table = db.open_table(_SKILL_TABLE_NAME)
+                    else:
+                        self._table = None
         return self._table
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
@@ -672,6 +690,14 @@ class SkillVectorStore:
         removed_dirs = [d for d in existing if d not in scanned]
 
         with self._lock:
+            # 锁内重新取表：上面的读取在锁外，并发的 build()/close() 可能
+            # 已经替换或丢弃了句柄（拿着旧句柄写会打到已关闭的连接上）。
+            table = self._get_table()
+            if table is None:
+                # 表在锁内被清掉了 → 直接锁内重建，不再走外面的 build。
+                self.build(skills, batch_size=batch_size)
+                return {"added": len(skills), "updated": 0, "removed": 0}
+
             # Remove deleted skills.
             # 目录名来自文件系统/LLM，可能含单引号——直接拼进 SQL 字面量会
             # 产生语法错误甚至注入。转义 '' 后再拼接。
@@ -681,19 +707,27 @@ class SkillVectorStore:
                 except Exception as e:
                     logger.warning("skill_retriever: delete %s failed: %s", d, e)
 
-            # Re-add updated skills (delete then add, since vectors changed).
-            for d in updated_dirs:
-                try:
-                    table.delete(f"dir = '{_sql_quote(d)}'")
-                except Exception:
-                    pass
-
             # Embed + add new and updated skills in small batches.
+            # 更新项**先 add 再按旧 fingerprint 删**：旧实现先 delete 再 add，
+            # 中途 embedding/add 失败时该技能从索引里永久消失且无回滚。
+            # 先 add 失败 → 旧行还在（功能不丢）；成功后删旧行失败 → 最多
+            # 短暂重复行（检索按 dir 字典合并，重复行无害）。
+            # 不能按 dir 删旧行——那会把刚 add 的新行一起删掉。
             to_add = [scanned[d] for d in (added_dirs + updated_dirs)]
             for i in range(0, len(to_add), batch_size):
                 batch = to_add[i:i + batch_size]
                 rows = self._embed_batch(batch)
                 table.add(rows)
+
+            # 新行落盘后再清理更新项的旧行（按旧 fingerprint 精确匹配）。
+            for d in updated_dirs:
+                old_fp = existing.get(d, "")
+                try:
+                    table.delete(
+                        f"dir = '{_sql_quote(d)}' AND fingerprint = '{_sql_quote(old_fp)}'"
+                    )
+                except Exception as e:
+                    logger.debug("skill_retriever: stale-row cleanup %s failed: %s", d, e)
 
             # 数据增删后重建 FTS（BM25）索引，确保新增/删除项参与全文检索。
             if added_dirs or updated_dirs or removed_dirs:
@@ -788,8 +822,17 @@ class SkillVectorStore:
         """Convert a normalized L2 distance to a cosine similarity in [0,1].
 
         归一化后 ||a-b||² = 2 - 2·cos(θ)，故 cos(θ) = 1 - d²/2。
+
+        ``distance`` 为 None（行里没有 ``_distance`` 字段）时返回 **0.0**：
+        旧实现按 0.0 距离算成满分 1.0，任何缺字段的行都会拿到完美相似度、
+        必然通过 _MIN_SIMILARITY 阈值并排到最前，排序随之失效。
         """
-        d = float(distance if distance is not None else 0.0)
+        if distance is None:
+            return 0.0
+        try:
+            d = float(distance)
+        except (TypeError, ValueError):
+            return 0.0
         return max(0.0, 1.0 - (d * d) / 2.0)
 
     def _row_to_dict(self, r: Dict[str, Any]) -> Dict[str, Any]:
@@ -862,14 +905,23 @@ class SkillRetriever:
     def __init__(self, skills_dir: str, db_path: str, embedding_function=None):
         self._scanner = SkillScanner(skills_dir)
         self._store = SkillVectorStore(db_path, embedding_function=embedding_function)
-        self._skills_dir = skills_dir
-        # 索引同步必须在锁内完成：skill_semantic_search 在并发白名单里，
+        self._skills_dir = skills_dir        # 索引同步必须在锁内完成：skill_semantic_search 在并发白名单里，
         # 两个线程同时进 sync() 会读到同一份 existing、各写一份 → 重复行；
         # 同时进 build() 则第二个会把第一个刚建好的表 drop 掉重算。
         self._index_lock = threading.RLock()
         # 外部（skill_save / UI）直接写了 SKILL.md：此时目录 mtime 可能还没
         # 变到 _should_scan 能察觉，必须显式标脏，否则新技能永远进不了索引。
         self._dirty = False
+
+    @property
+    def skills_dir(self) -> str:
+        """本检索器扫描的技能根目录（``<workspace>/skills``）。
+
+        调用方（如 skill_load 标注「技能目录是符号链接」）必须用**这个**
+        目录做基线——用别的目录（如 .agent/skills）会把每个正常技能都误判
+        成外部链接。
+        """
+        return self._skills_dir
 
     def mark_stale(self) -> None:
         """外部写入技能目录后调用：强制下一次检索前重新同步索引。"""

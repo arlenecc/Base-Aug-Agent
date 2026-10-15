@@ -102,6 +102,21 @@ class MCPClient:
         if self._running:
             return
 
+        # 上一次连接的残留状态必须先清掉：
+        # * _fail_pending / stop() 可能已在 _write_queue 里留下 None 哨兵，
+        #   新写线程会立刻消费它并退出 → 之后所有 _call() 干等 30~300s 超时；
+        # * _pending/_results 里可能躺着上一次连接的迟到条目，污染新会话。
+        # 不清的话「瞬时写失败 → _fail_pending 置 _running=False → 重启」
+        # 这条路永远修不好一个只是打了磕绊的连接。
+        while True:
+            try:
+                self._write_queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._pending.clear()
+            self._results.clear()
+
         env = None
         if self.env:
             import os
@@ -224,6 +239,12 @@ class MCPClient:
         self._writer_thread = None
         if writer and writer.is_alive() and writer is not threading.current_thread():
             writer.join(timeout=2)
+        # 无论 writer 是否退出，都换一个**全新**的写队列：
+        # 卡在 get() 里的旧 writer 会一直阻塞在那条旧队列上（daemon，无害），
+        # 但它若还挂在旧队列上，重启后就会和新 writer 变成同一队列的两个
+        # 消费者——旧 writer 拿到消息后往已置 None 的 stdin 写，抛错又走
+        # _fail_pending 把新连接再次判死。
+        self._write_queue = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
         # Wait for reader threads to finish (they should exit once _running is
         # False and stdin is closed, causing readline() to return "").
         for t in (self._reader_thread, self._stderr_thread):

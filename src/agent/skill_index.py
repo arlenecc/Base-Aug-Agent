@@ -100,7 +100,11 @@ class SkillIndex:
             if not isinstance(data, dict):
                 raise ValueError("index root is not an object")
             skills = data.get("skills", [])
-            self._index = skills if isinstance(skills, list) else []
+            # 逐条校验：手写坏/旧版本的 _index.json 可能含非 dict 记录，
+            # 原样留下会让 search() 的 skill.get(...) / SkillSearchTool 的
+            # s["name"] 在后续某次查询时突然炸掉。
+            self._index = [r for r in skills if isinstance(r, dict)] \
+                if isinstance(skills, list) else []
             ts = data.get("updated_at_ts", 0)
             self._last_scan = ts if isinstance(ts, (int, float)) else 0
             # Sync _last_dir_mtime so _should_scan() doesn't immediately
@@ -169,7 +173,14 @@ class SkillIndex:
                 max_mtime = mtime
         except OSError:
             pass
-        for entry in os.scandir(self._dir):
+        # scandir 本身也要包 try：目录权限变化/被删时 PermissionError 会
+        # 一路抛出 _load()（__init__）与 scan()，整个技能检索不可用。
+        try:
+            entries = list(os.scandir(self._dir))
+        except OSError as e:
+            logger.debug("skill_index: scandir %s failed: %s", self._dir, e)
+            return max_mtime
+        for entry in entries:
             if not entry.is_dir() or entry.name.startswith("_"):
                 continue
             try:
@@ -204,7 +215,17 @@ class SkillIndex:
                 return 0
 
             new_index: List[Dict[str, Any]] = []
-            for entry in os.scandir(self._dir):
+            try:
+                entries = list(os.scandir(self._dir))
+            except OSError as e:
+                # 目录不可读：按「没有技能」处理并刷新时间戳，避免每次
+                # search() 都重试扫描 + 重写索引文件。
+                logger.warning("skill_index: cannot scan %s: %s", self._dir, e)
+                self._index = []
+                self._last_scan = time.time()
+                self._last_dir_mtime = 0.0
+                return 0
+            for entry in entries:
                 if not entry.is_dir():
                     continue
                 if entry.name.startswith("_") or entry.name.startswith("."):
@@ -234,10 +255,31 @@ class SkillIndex:
                 meta = json.load(f)
             if not isinstance(meta, dict):
                 return None
-            name = meta.get("name", "").strip()
+            # 字段逐个校验类型：手写坏的 skill.json（name 是数字、
+            # keywords 是字符串…）会让 .strip()/列表推导抛 AttributeError/
+            # TypeError——旧实现只捕 OSError/JSONDecodeError，一个坏文件
+            # 就能让整次 scan/search 失败。
+            raw_name = meta.get("name", "")
+            if not isinstance(raw_name, str):
+                return None
+            name = raw_name.strip()
             if not name:
                 return None
+            raw_desc = meta.get("description", "")
+            description = raw_desc if isinstance(raw_desc, str) else ""
+            raw_kw = meta.get("keywords", [])
+            if isinstance(raw_kw, list):
+                keywords = [str(k).lower() for k in raw_kw if isinstance(k, str)]
+            else:
+                keywords = []
+            raw_tags = meta.get("tags", [])
+            if isinstance(raw_tags, list):
+                tags = [str(t) for t in raw_tags if isinstance(t, str)]
+            else:
+                tags = []
             entry = meta.get("entry", _DEFAULT_ENTRY)
+            if not isinstance(entry, str) or not entry.strip():
+                entry = _DEFAULT_ENTRY
             # Verify the entry file exists
             entry_path = os.path.join(skill_dir, entry)
             if not os.path.isfile(entry_path):
@@ -251,13 +293,13 @@ class SkillIndex:
                     return None
             return {
                 "name": name,
-                "description": meta.get("description", ""),
-                "keywords": [k.lower() for k in meta.get("keywords", [])],
-                "tags": meta.get("tags", []),
+                "description": description,
+                "keywords": keywords,
+                "tags": tags,
                 "path": dirname,
                 "entry": entry,
             }
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError) as e:
             logger.warning("skill_index: failed to read %s: %s", meta_path, e)
             return None
 
@@ -289,24 +331,33 @@ class SkillIndex:
         scored = []
         for skill in index:
             score = 0
-            # Match against name
-            name_tokens = set(_tokenize(skill.get("name", "").lower()))
+            # Match against name（记录可能来自旧版/手改的 _index.json，
+            # 逐个字段兜底类型，一个坏记录不能让整次查询炸掉）
+            name = skill.get("name", "")
+            name_tokens = set(_tokenize(name.lower())) if isinstance(name, str) else set()
             score += len(query_tokens & name_tokens) * 3
             # Match against keywords
-            kw_tokens = set(skill.get("keywords", []))
+            raw_kw = skill.get("keywords", [])
+            kw_tokens = {k for k in raw_kw if isinstance(k, str)} \
+                if isinstance(raw_kw, list) else set()
             score += len(query_tokens & kw_tokens) * 2
             # Match against tags
-            tag_tokens = set(t.lower() for t in skill.get("tags", []))
+            raw_tags = skill.get("tags", [])
+            tag_tokens = {t.lower() for t in raw_tags if isinstance(t, str)} \
+                if isinstance(raw_tags, list) else set()
             score += len(query_tokens & tag_tokens) * 2
             # Match against description (substring)
-            desc = skill.get("description", "").lower()
+            desc = skill.get("description", "")
+            desc = desc.lower() if isinstance(desc, str) else ""
             for token in query_tokens:
                 if token in desc:
                     score += 1
             if score > 0:
                 scored.append((score, skill))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        # 次级排序键（name）：同分时仅按 score 排序的结果取决于 os.scandir
+        # 的任意顺序，两次查询可能返回不同顺序，模型侧表现为「结果不稳定」。
+        scored.sort(key=lambda x: (-x[0], str(x[1].get("name", ""))))
         return [s for _, s in scored[:top_k]]
 
     def _resolve_within(self, *parts: str) -> Optional[str]:
@@ -352,7 +403,9 @@ class SkillIndex:
         """Return the full index (triggers a scan if needed)."""
         self.scan()
         with self._lock:
-            return list(self._index)
+            # 深拷贝记录：浅拷贝会让调用方与索引共享同一个 step/record
+            # dict，调用方改字段会污染索引（UI 面板/工具各持一份快照）。
+            return [dict(r) for r in self._index]
 
     def reload(self) -> None:
         """Force reload from disk."""

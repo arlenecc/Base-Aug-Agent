@@ -57,8 +57,10 @@ _SHELL_VERB_RE = re.compile(
     r"|shutil\.copy|shutil\.copy2|shutil\.copytree"
     r"|subprocess\.(run|call|check_call|check_output|Popen))\b"
 )
-# 重定向到绝对路径（> /etc/hosts 这种工作区外的写）
-_SHELL_REDIRECT_RE = re.compile(r">>?\s*/")
+# 重定向到工作区之外的路径（> /etc/hosts、> ~/.bashrc、>> ../outside）。
+# 旧正则只匹配 ``>/``：``~`` 展开与 ``../`` 逃逸两种工作区外写入零确认。
+# 注意 ``./`` 是工作区内相对路径，不能算风险（旧行为就不算）。
+_SHELL_REDIRECT_RE = re.compile(r">>?\s*(?:~|\.\./|/)")
 # sudo / 系统-电源-进程-磁盘控制
 _SHELL_CTRL_RE = re.compile(
     r"\b(sudo|doas|su\s+-|shutdown|reboot|halt|poweroff|pmset|csrutil"
@@ -89,7 +91,9 @@ def mentions_outside_path(text: str, workspace: str) -> bool:
     except OSError:
         ws = os.path.realpath(workspace or "/")
     for tok in _PATH_TOKEN_RE.findall(cleaned):
-        tok = tok.rstrip(".,;:)\"'")
+        # 尾部标点全部剥掉：旧字符集漏了 ``!``/``?``/``]``/``}``，``~/foo!``
+        # 会被当成不存在的绝对路径字面量而漏判。
+        tok = tok.rstrip(".,;:)\"'!?]}>")
         expanded = os.path.expanduser(tok)
         if tok.startswith("../") or tok == "..":
             # ../ 逃逸：shell 子进程不受写护栏约束，必须按 workspace 解析

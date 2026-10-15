@@ -50,7 +50,7 @@
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
-- **OCR 加速与预处理** — 图片型 PDF 的 RapidOCR 在 **Apple M 系列 Mac** 上自动启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 CLAHE 对比度增强 + 锐化**预处理，提升小字与低对比扫描件的识别率。两者均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
+- **OCR 加速与预处理** — 图片型 PDF 的 RapidOCR 在 **Apple M 系列 Mac** 上自动启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；引擎构造兼容 rapidocr 1.1/1.2 两代 kwargs 体系（1.2.x 缺 `det_model_path` 会抛 `KeyError`，已做降级链兜底）。识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 CLAHE 对比度增强 + 锐化**预处理，提升小字与低对比扫描件的识别率。两者均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、FastEmbed Reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
@@ -634,9 +634,9 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
-失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。
+失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启清理残留等。
 
-当前共 547 个用例（不含 RAG e2e 的快速集 497 例全部通过；`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`，未安装该可选依赖时在 setup 阶段报环境错误，不影响其余测试）。
+当前共 594 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`，`test_ocr_engine` 依赖 `rapidocr-onnxruntime`；未安装这些可选依赖时报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -854,6 +854,45 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 152 | `_work_memory` 的 `move_to_end` 在锁外调用 | 与锁内 `popitem` 并发修改 OrderedDict → RuntimeError / 条目错乱 | 命中/新建/淘汰三者同锁 |
 | 153 | code_run 护栏对非 str/PathLike 的 `open()` 参数走 `realpath("")`（=cwd） | 绕过前缀检查后炸出与根因无关的底层 TypeError，模型无法自纠 | 明确报 `open() expects a path (str/PathLike)` |
 | 154 | UI 不校验 `request_timeout ≤ 0` / `temperature < 0` | timeout=0 → httpx 立即超时，所有请求必失败且无提示 | 钳到合法下限 + 复位输入框 + 状态栏点名 |
+
+### 第十二轮：全量代码重审（OCR 失效 / 竞态 / 加载校验 / 性能）
+
+对全部源码再次逐文件重审（两个子代理并行审查技能/记忆/RAG 子系统 + 主代理审查
+内核/UI/工具），详见 [软件设计文档 §14](docs/软件设计文档.md)。本轮最严重的发现是
+**OCR 功能在两个层面上从未真正工作**：CoreML EP 注入的模块清单不匹配
+rapidocr 1.2.x 的真实布局，且其 kwargs 体系变更会让引擎构造直接抛
+`KeyError`——图片型 PDF 的识别在装了 rapidocr 的环境里也 100% 失败。
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 197 | OCR CoreML EP 注入的候选模块清单不含 `rapidocr_onnxruntime.utils`（1.2.x 真实布局），且强制要求 `_get_ep_list`（1.2.x 没有） | Apple Silicon 上 CoreML 加速**从未生效**，日志只打「找不到 OrtInferSession」后静默回退 CPU | 候选清单补 1.2.x 布局；按「模块里有 OrtInferSession」判定；新增 factory 注入路径（包装模块级 `InferenceSession`，在 providers 里注入 CoreML），`unpatch` 两条路径都能恢复 |
+| 198 | rapidocr 1.2.x 的 `UpdateParameters` 收到任何 `det_*` kwargs 都无条件读 `det_dict['model_path']` | 只传 `det_limit_side_len` 就抛 `KeyError: 'model_path'` → **OCR 引擎永远建不起来**（提示却是「未安装」） | `create_ocr_engine` 增加降级链：完整 kwargs → 补 `det_model_path=""` → 裸构造；OCR 可用性优先于分辨率调优 |
+| 199 | `skill_search.py` 镜像写入的 except 分支引用未定义的 `logger` | 主写成功后的镜像失败抛 `NameError`，`skill_save` 整体报失败且原始错误丢失 | 补 `import logging` + `logger` |
+| 200 | `skill_load` 用 `.agent/skills` 当基线判断「技能目录是符号链接」，而 `abs_dir` 来自语义检索器（根是 `skills/`） | 每一个正常技能都被打上「内容来自工作区之外」的错误横幅 | 基线改用检索器自己的 `skills_dir`（新增公开 property） |
+| 201 | `skill_save` 镜像到 `.agent/skills` 只写 `SKILL.md`，而 `SkillIndex` 要求同目录有 `skill.json` | 镜像目录永远进不了关键词索引，回执里「已镜像以便关键词检索命中」是空话 | 镜像同时写 `skill.json`（name/description/keywords/entry） |
+| 202 | `SkillVectorStore._get_ef/_get_db/_get_table` 完全无锁 | 并发首次调用各建一个 LanceDB 连接（后写者覆盖，先建的永不 close）；`_table` 赋值竞态 | 双检锁；`_lock` 改 RLock（build/sync 持锁期间会调这些 getter） |
+| 203 | `skill_retriever.sync()` 在取锁**前**拿表，且更新项先 delete 再 add | 与并发 build/close 交错时打到已 drop 的表；add 失败时技能从索引永久消失且无回滚 | 锁内重新取表；更新项改「先 add、再按旧 fingerprint 精确删」（不能按 dir 删——会连新行一起删） |
+| 204 | `SkillVectorStore._distance_to_similarity(None)` 按距离 0 算成满分 | 缺 `_distance` 的行必过 0.5 阈值并排最前，排序失效 | None/非数字返回 0.0 |
+| 205 | `_parse_frontmatter` 要求 `text.startswith("---")` | 带 UTF-8 BOM（Windows 编辑器常见）的 SKILL.md frontmatter 不可见 → 技能被静默丢弃 | 先 `lstrip("\ufeff \t\r\n")` |
+| 206 | `skill_index._read_skill_meta` 只捕 `OSError/JSONDecodeError`；`_dir_mtime`/`scan` 的 `os.scandir` 未包 try；`_load` 不校验记录类型 | 一个手写坏的 skill.json（name 是数字/keywords 是字符串）或目录权限变化就让整次 scan/search 失败 | 逐字段 isinstance 校验 + 异常面补 `TypeError/AttributeError`；scandir 包 try；非 dict 记录过滤；`list_all` 返回拷贝；同分排序加 name 次级键 |
+| 207 | `skills.py` 的 `skill.json`/`prompt.md` 用裸 `open()+write()`；目录唯一性靠 `while os.path.exists`（TOCTOU）；`keywords=None` 直接 TypeError | 崩溃留下半截 skill.json（SkillIndex 静默跳过）；两个线程同名技能互相覆盖 | 统一走 `atomic_write_text`；`makedirs(exist_ok=False)` + `FileExistsError` 重试；入口处 `keywords or []` |
+| 208 | `SkillManager.__init__` 的损坏修复只改内存不落盘 | 下次 reload/重启又从磁盘读回坏值，防御每轮白修 | 修复后 `flush(force=True)` 并复位 `_last_save`（防止把随后真正的 set() 吞进防抖窗口——后者是本轮修复自身引入并被回归测试抓住的回归） |
+| 209 | `_request_key` 把长 key 截断到 80 字符 | 两个只有尾部不同的长请求碰撞成同一计数键，产生虚假「建议固化」 | 超长 key 补全文 sha1 后缀；短 key 格式不变（兼容已有计数） |
+| 210 | `graph_memory._load` 对 relations 完全不校验、entities 值不校验、根节点不校验 | 手改坏/旧版本的 JSON（只要能解析）就让 `_prune_locked`/`snapshot`/`list_relations` 抛异常，**整个记忆系统不可用** | 归一化：非 dict 根按空处理；实体值必须 dict 且 observations 必须 list；关系必须 source/target/label 齐全 |
+| 211 | `document_outline._HEADING_RE` 用 `\s+`（匹配换行）且作用于整篇文本 | `#\n标题` 这种空 ATX 标题行把下一行正文吞并成章节标题 | 改 `[ \t]+` |
+| 212 | `cleaner` 逐字符 `isalnum()/isspace()` 统计 | 数 MB 文档的清洗阶段是纯解释器级 O(n) 迭代 | 预编译正则 C 层计数（语义等价，纯分隔行仍被分隔符规则收掉） |
+| 213 | `risk._SHELL_REDIRECT_RE` 只匹配 `>/` | `> ~/.bashrc`、`>> ../outside` 两种工作区外写入零确认执行 | 放宽为 `>>?\s*(?:~|\.\./|/)`（`./` 仍不算风险）；路径 token 的尾部标点剥离补 `!?]>` |
+| 214 | `MCPClient.start()` 不清理上一次连接的残留 | `_fail_pending` 置 `_running=False` 后重启：旧写队列里的 `None` 哨兵被新写线程立刻消费并退出 → 之后所有 `_call` 干等 30~300s 超时；旧 writer 还会把新连接再次判死 | `start()` 先排空写队列 + 清 `_pending/_results`；`stop()` 换全新写队列隔离卡死的旧 writer |
+| 215 | `MCPTool` 把模型多传的未声明参数原样转发 | 严格校验的 MCP server 直接失败，错误还指向远端 | 按 schema properties 过滤未知参数（properties 为空时不过滤） |
+| 216 | MCP 重名工具被静默吞掉且无日志 | 用户以为两个 server 的工具都挂了，实际只注册了先连上的 | 记 warning 说明冲突 |
+| 217 | `parsers._extract_pdf` 信号量内的「双重检查」是死代码（局部变量其它 worker 改不到） | 无（误导性注释） | 删除死分支 |
+| 218 | ebook-convert 返回码 0 即采用，即使输出为空 | 静默跳过承诺的 raw 回退路径，文档变零内容 | 仅非空才采用，否则继续回退 |
+| 219 | `_get_ocr_engine` 对非 ImportError 的初始化失败无负缓存 | 模型下载失败时每个图片型 PDF 都重试一遍完整加载（可能数分钟） | 60s 冷却期；`release_ocr_engine` 同时清冷却 |
+
+回归测试：`tests/test_round12_fixes.py`（24 例）覆盖以上各项；
+`tests/test_ocr_engine.py` 重写为同时覆盖 `_get_ep_list` 与 factory 两种注入路径
+（含 rapidocr 1.2.x 的 `KeyError` 降级与裸构造回退），并用「记录器子类」在真实
+rapidocr 模块上验证 CoreML providers 真的排到最前、CPU 保留作回退、unpatch 恢复原厂。
 
 ### 第十轮：全量复查（安全 / 泄漏 / 正确性 / 性能 / 体验）
 

@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
@@ -29,6 +30,11 @@ _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ACQUIRE_TIMEOUT = 300.0
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
+# 初始化失败后的冷却截止时间（monotonic）。已安装但加载失败（模型下载
+# 不了 / ONNX 会话建不起来）时，负缓存避免每个图片型 PDF 都重试一次
+# 完整加载（每次都要跑一遍可能耗时数分钟的下载尝试）。
+_OCR_RETRY_AFTER = 0.0
+_OCR_RETRY_COOLDOWN = 60.0
 
 # AgentConfig（可选注入）。未提供时按「全部开启」处理 —— config 的默认值
 # 本身就是 True，不注入不会改变行为；注入后 UI 的开关才生效。
@@ -304,11 +310,6 @@ def _extract_pdf(path: Path) -> str:
                 )
                 continue
             try:
-                # 双重检查：可能在等信号量期间其它 worker 已判定不可用
-                if ocr_engine is None:
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
-                    continue
                 # 自适应 DPI：页面物理尺寸差异很大（A4 / letter / 裁剪的小图），
                 # 固定 200dpi 会让检测器看到完全不同的字形大小。先按页面尺寸
                 # 解出「短边落在目标像素」的 DPI，再做归一化。
@@ -404,12 +405,16 @@ def _get_ocr_engine():
     引擎构造交给 :mod:`agent.rag.ocr_engine`：Apple Silicon 上会注入 CoreML EP
     （CPU+GPU+ANE），非 Apple 平台或 onnxruntime 过旧时自动回退默认 EP。
     """
-    global _OCR_ENGINE
+    global _OCR_ENGINE, _OCR_RETRY_AFTER
     if _OCR_ENGINE is not None:
         return _OCR_ENGINE
     with _OCR_ENGINE_LOCK:
         if _OCR_ENGINE is not None:
             return _OCR_ENGINE
+        # 冷却期内不重试：持续失败的加载（模型下载不了）不该每个文件
+        # 都重新触发一遍。到期后放行一次，网络恢复后能自愈。
+        if time.monotonic() < _OCR_RETRY_AFTER:
+            return None
         try:
             from .ocr_engine import create_ocr_engine, coreml_reason
             use_coreml = bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True))
@@ -429,6 +434,7 @@ def _get_ocr_engine():
             return None
         except Exception as e:
             logger.warning("Failed to init RapidOCR: %s", e)
+            _OCR_RETRY_AFTER = time.monotonic() + _OCR_RETRY_COOLDOWN
             return None
 
 
@@ -441,12 +447,15 @@ def release_ocr_engine() -> None:
     Call this from RAGEngine.close() after a sync finishes; the engine is
     lazily re-created on the next OCR-requiring ingestion.
     """
-    global _OCR_ENGINE
+    global _OCR_ENGINE, _OCR_RETRY_AFTER
     with _OCR_ENGINE_LOCK:
         if _OCR_ENGINE is not None:
             # RapidOCR wraps an onnxruntime InferenceSession.  Drop the
             # reference so the session's C++ heap is freed on GC.
             _OCR_ENGINE = None
+            # 同时清掉负缓存冷却：显式释放意味着调用方要求「可重新加载」，
+            # 残留冷却会让下一次 ingest 在冷却期内直接跳过 OCR。
+            _OCR_RETRY_AFTER = 0.0
             logger.info("RapidOCR engine released (memory reclaimed)")
 
 
@@ -521,7 +530,16 @@ def _extract_mobi(path: Path) -> str:
             )
             if result.returncode == 0 and os.path.exists(txt_path):
                 with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
+                    converted = f.read()
+                # 只有非空才算转换成功：ebook-convert 对个别文件会
+                # 返回 0 但产出空文件，旧实现直接 return 空串，静默
+                # 跳过下面承诺的 raw 回退路径（文档变成零内容）。
+                if converted.strip():
+                    return converted
+                logger.warning(
+                    "ebook-convert produced empty output for '%s', "
+                    "falling back to raw extraction", path.name,
+                )
         except subprocess.TimeoutExpired:
             logger.warning("ebook-convert timed out for '%s'", path.name)
         except Exception as e:

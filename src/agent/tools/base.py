@@ -206,6 +206,14 @@ class ToolRegistry:
                         t.bind(self.config, self)
                         self._tools[t.name] = t
                         logger.info("MCP tool registered: %s (server: %s)", t.name, name)
+                    elif t.name:
+                        # 重名工具静默吞掉第二个：用户以为两个 server 的工具
+                        # 都挂了，实际只注册了先连上的那个，且无任何线索。
+                        logger.warning(
+                            "MCP tool %s from server '%s' skipped: name already "
+                            "registered (another server or builtin tool wins)",
+                            t.name, name,
+                        )
             except MCPError as e:
                 logger.warning("MCP server '%s' init failed: %s", name, e)
             except Exception as e:

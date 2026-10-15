@@ -23,6 +23,13 @@ _HTML_ENTITIES = frozenset({
 })
 _ENTITY_RE = re.compile(r'&([a-zA-Z][a-zA-Z0-9]{1,10});')
 
+# 「字母/数字/空白」计数用预编译正则（C 层 findall），替代旧实现的
+# 逐字符 ``c.isalnum() or c.isspace()`` Python 循环——大文档（数 MB）下
+# 后者是纯解释器级 O(n) 迭代，叠加全文十余遍正则替换后清洗阶段明显偏慢。
+# ``\w`` ≈ isalnum()（含 unicode 字母数字，另含下划线——纯分隔行随后
+# 仍会被分隔符规则收掉，行为不变），``\s`` ≈ isspace()。
+_ALNUM_OR_SPACE_RE = re.compile(r'[\w\s]', re.UNICODE)
+
 
 def _replace_entity(m: "re.Match") -> str:
     return " " if m.group(1) in _HTML_ENTITIES else m.group(0)
@@ -78,7 +85,8 @@ def clean_text(text: str) -> str:
             cleaned_lines.append('')
             continue
         # Skip lines that are mostly non-alphanumeric garbage
-        alpha_ratio = sum(1 for c in stripped if c.isalnum() or c.isspace()) / max(len(stripped), 1)
+        # （计数走 C 层正则，见 _ALNUM_OR_SPACE_RE 注释）
+        alpha_ratio = len(_ALNUM_OR_SPACE_RE.findall(stripped)) / max(len(stripped), 1)
         if alpha_ratio < 0.3 and len(stripped) < 20:
             continue
         # Skip lines that are just page numbers or headers.
