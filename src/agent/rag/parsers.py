@@ -6,6 +6,7 @@ installed.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -26,6 +27,14 @@ logger = logging.getLogger(__name__)
 _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
+
+# OCR 引擎周期性重建页数。CoreML/ORT 的原生缓存按输入形状保留（实测真实
+# 扫描页 ~35MB/页，#119：400 页扫描书滞留 ~14GB，进程退出前不释放，最终
+# 被系统压缩到 17GB 直至 50GB 崩溃）。每 N 页强制重建引擎冲刷全部原生
+# 缓存：峰值滞留被钳制在 N × 35MB 量级，代价仅一次 ~6s 的引擎重载
+# （相对每页 5-12s 的 OCR 可忽略）。合成小图触发不了该累积，只有真实
+# 200dpi 大页 + 密集文字框才会——不要因为「合成实验没复现」而移除。
+_OCR_RECYCLE_PAGES = 60
 
 # ---------------------------------------------------------------------------
 # Format → extension mapping
@@ -276,7 +285,6 @@ def _extract_pdf(path: Path) -> str:
 
         total_pages = len(doc)
         parts: List[str] = []
-        ocr_engine = None       # lazy-init, 复用同一个引擎实例
         ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
 
         # 统计各类型页面数量，用于最终日志
@@ -310,24 +318,18 @@ def _extract_pdf(path: Path) -> str:
                 ocr_skipped_count += 1
                 continue
 
-            if ocr_engine is None:
+            with _OCR_SEMAPHORE:
+                # 每页从进程级单例取引擎，页末即释放局部引用（#123）。
+                # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
+                # （release + 全局置 None）只影响触发回收的 worker，其它
+                # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
+                # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
+                # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
                 ocr_engine = _get_ocr_engine()
                 if ocr_engine is None:
                     ocr_unavailable = True
                     ocr_skipped_count += 1
                     continue
-
-            with _OCR_SEMAPHORE:
-                # 信号量等待期间本 worker 的 ocr_engine 局部变量不可能被其它
-                # 线程改动（旧实现的「双重检查」对此恒为假，是误导性死代码）；
-                # 真正会在等待期间变化的是进程级 _get_ocr_engine() 的失败状态，
-                # 它在拿不到引擎时返回 None，因此这里对 **获取结果** 复查即可。
-                if ocr_engine is None:
-                    ocr_engine = _get_ocr_engine()
-                    if ocr_engine is None:
-                        ocr_unavailable = True
-                        ocr_skipped_count += 1
-                        continue
                 # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
                 # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
                 pix = page.get_pixmap(dpi=200, colorspace=fitz.csGRAY)
@@ -352,10 +354,28 @@ def _extract_pdf(path: Path) -> str:
             else:
                 # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
+
+            # 周期性重建引擎：冲刷 CoreML/ORT 按形状保留的原生缓存（见
+            # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
+            # 下一页都会重新取用/重建——旧引擎随各 worker 页末的引用释放
+            # 而销毁，原生缓存真正被冲刷。
+            if (ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0:
+                release_ocr_engine()
+                logger.info("PDF '%s': OCR 引擎已周期重建（每 %d 页，冲刷原生缓存）",
+                            path.name, _OCR_RECYCLE_PAGES)
     finally:
         # 必须放在 finally：中途抛异常（加密 PDF、损坏文件、OCR 崩溃）时
         # 旧实现直接跳过 doc.close()，泄漏文件句柄与整份文档的解码缓存。
         doc.close()
+        # MuPDF 的 store 会缓存解码后的嵌入图（每张满页扫描图解码后
+        # ~10MB+，数百页累计可观且进程内常驻）；全书解析完立即收缩并
+        # 回收 Python 侧临时对象。store 是进程级全局的，收缩会影响其它
+        # worker 正在打开的文档——只是缓存失效（重解码），不影响正确性。
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
+        gc.collect()
 
     # 汇总日志：清晰报告各类型页面的处理情况
     detail_parts = [f"text={text_page_count}"]

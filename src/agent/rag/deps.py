@@ -13,6 +13,7 @@ import importlib
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import warnings
 import sys
@@ -727,34 +728,45 @@ def _is_importable(module_name: str) -> bool:
         return True
 
 
+def _reranker_cache_roots() -> List[Path]:
+    """Return the cache roots where the reranker weights may live.
+
+    按优先级：
+    1. 持久缓存 ``~/.cache/fastembed``（与嵌入模型同目录；当前版本的
+       ``_download_reranker_model`` 显式传 cache_dir 到这里——临时目录会被
+       macOS 定期清理，曾导致每次同步重新下载 570MB，#121）
+    2. 旧版落点 ``<tmp>/fastembed_cache``（fastembed 默认 ``cache_dir=None``
+       的行为；历史安装的权重可能还在这里，清空前避免一次多余下载）
+    """
+    roots = [Path(_get_fastembed_cache_dir())]
+    tmp_cache = Path(tempfile.gettempdir()) / "fastembed_cache"
+    if tmp_cache != roots[0]:
+        roots.append(tmp_cache)
+    return roots
+
+
 def _is_reranker_cached() -> bool:
     """Check whether the fastembed reranker model is already downloaded locally.
 
-    fastembed 经 huggingface_hub 的 snapshot_download 缓存模型，目录结构：
-    ``<fastembed_cache>/models--<org>--<name>/snapshots/<rev>/<files>``。
-    缓存根目录由 fastembed 决定（FASTEMBED_CACHE_PATH 环境变量或
-    ``~/.cache/fastembed``），这里复用 ``define_cache_dir`` 保证与运行时
-    实际使用的目录一致。
+    fastembed 的 ``TextCrossEncoder`` 经 huggingface_hub 把权重下到
+    ``<cache_dir>/models--<org>--<name>/snapshots/<rev>/<weight>``。缓存根
+    由 :func:`_reranker_cache_roots` 给出（持久目录优先，兼容旧临时目录）。
     """
-    try:
-        from fastembed.common.utils import define_cache_dir
-        cache_root = Path(define_cache_dir("local_cache"))
-    except Exception:
-        # fastembed 未安装/过旧时谈不上「已缓存」——调用方会先处理包问题。
-        return False
-    repo_dir = cache_root / ("models--" + _RERANKER_HF_REPO.replace("/", "--"))
-    snapshots = repo_dir / "snapshots"
-    if not snapshots.is_dir():
-        return False
-    # 只有真实的权重文件才算「已缓存」。config/tokenizer 是下载的前几个文件，
-    # 一次中断的下载很容易只留下它们——如果它们也算缓存，就会跳过预下载，
-    # 首次检索时仍要现场下载数百 MB。
-    for snap in snapshots.iterdir():
-        try:
-            if (snap / _RERANKER_WEIGHT_FILE).is_file():
-                return True
-        except OSError:
+    repo_dirname = "models--" + _RERANKER_HF_REPO.replace("/", "--")
+    weight_rel = Path(*_RERANKER_WEIGHT_FILE.split("/"))
+    for root in _reranker_cache_roots():
+        snapshots = root / repo_dirname / "snapshots"
+        if not snapshots.is_dir():
             continue
+        # 只有真实的权重文件才算「已缓存」。config/tokenizer 是下载的前几个文件，
+        # 一次中断的下载很容易只留下它们——如果它们也算缓存，就会跳过预下载，
+        # 首次检索时仍要现场下载数百 MB。
+        for snap in snapshots.iterdir():
+            try:
+                if (snap / weight_rel).is_file():
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -792,7 +804,14 @@ def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
             return False, msg
 
     try:
-        TextCrossEncoder(RERANK_MODEL_ID, lazy_load=True)
+        # cache_dir 必须显式指定为持久目录：fastembed 默认 cache_dir=None →
+        # 系统临时目录（/var/folders/.../T/fastembed_cache），macOS 会定期清理，
+        # 导致每次同步都重新下载 570MB（#121）。与嵌入模型同一持久目录。
+        TextCrossEncoder(
+            RERANK_MODEL_ID,
+            lazy_load=True,
+            cache_dir=_get_fastembed_cache_dir(),
+        )
         logger.info("RAG deps: reranker model files downloaded")
         if progress_callback:
             progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")

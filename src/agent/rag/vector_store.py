@@ -135,6 +135,11 @@ class FastEmbedEmbeddingFunction:
                     self._model = TextEmbedding(
                         model_name=self._model_name,
                         cache_dir=cache_dir,
+                        # ORT intra-op 线程数：默认值在本机实测与 4 相当
+                        # （57 vs 63 tok/s），留一半核心给 OCR/解析 worker。
+                        # 嵌入吞吐的主要杠杆是长度分桶（见 _embed_chunks），
+                        # 线程数影响很小（#122）。
+                        threads=4,
                     )
             except Exception as e:
                 # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
@@ -775,33 +780,53 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。
 
-        将每批拆分为更小的子批次（每子批 5 个 chunk）进行 embedding，
-        每个子批次完成后主动 time.sleep() 释放 GIL，让主线程有机会
-        处理 Qt 事件（日志渲染、进度更新）。ONNX Runtime 的 embed()
-        在 C++ 计算期间持有 GIL，整批一次性嵌入会导致 UI 长时间冻结。
+        将每批拆分为更小的子批次进行 embedding，每个子批次完成后主动
+        time.sleep() 释放 GIL，让主线程有机会处理 Qt 事件（日志渲染、进度
+        更新）。ONNX Runtime 的 embed() 在 C++ 计算期间持有 GIL，整批一次
+        性嵌入会导致 UI 长时间冻结。
+
+        关键优化：**按文本长度排序分桶**（#122）。fastembed 的批内所有序列
+        padding 到批内最长——长度混杂的批 padding 浪费 2-4 倍算力（实测
+        32 条混杂批 309s ≈ 40 tok/s，而同模型「长度排序 + 8-12 条/批」
+        ~2000 tok/s，差 30 倍）。排序后每批长度相近、padding 归零，向量按
+        原顺序回填，结果与混杂批完全一致。
         """
         import time as _time
-        # 子批大小：ONNX Runtime 的批处理吞吐远高于逐条推理，5 太小
-        # （10 万切片 ≈ 2 万次调用 + 2 万次 sleep ≈ 200s 纯等待）。32 兼顾
-        # 吞吐与单次持锁时长。
-        _SUB_BATCH = 32
+        # 子批大小：ORT 的批处理吞吐高于逐条推理，但 BERT-large（nomic v1.5）
+        # 的激活内存随「子批 × 批内最大序列长」增长——长度分桶后批内长度相近，
+        # 12 条的峰值 ~1.6GB（#122）。
+        _SUB_BATCH = 12
         # 让出 GIL 的累计耗时阈值：不是「每子批都 sleep」，而是累计占用 GIL
         # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
         _YIELD_INTERVAL = 0.05
         texts = [c["text"] for c in chunks]
-        all_vectors: List[List[float]] = []
+        # 长度降序分桶：批内长度相近，padding 浪费最小（降序让最长批最先
+        # 出现，提早把激活水位顶到峰值，后续批更轻）。
+        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        vectors_by_idx: List[Optional[List[float]]] = [None] * len(texts)
         _last_yield = _time.monotonic()
-        for sub_start in range(0, len(texts), _SUB_BATCH):
-            sub_texts = texts[sub_start:sub_start + _SUB_BATCH]
-            sub_vectors = self._ef(sub_texts)
-            all_vectors.extend(sub_vectors)
+        _t_embed = _time.monotonic()
+        _n_sub = (len(order) + _SUB_BATCH - 1) // _SUB_BATCH
+        for sub_start in range(0, len(order), _SUB_BATCH):
+            idxs = order[sub_start:sub_start + _SUB_BATCH]
+            _t_sub = _time.monotonic()
+            sub_vectors = self._ef([texts[i] for i in idxs])
+            for i, v in zip(idxs, sub_vectors):
+                vectors_by_idx[i] = v
+            # 子批级进度日志：嵌入一个子批要数十秒且中间完全静默，用户会
+            # 误判为「卡死」（#122）。每个子批一条，给出速率。
+            logger.info(
+                "  ├─ 嵌入子批 %d/%d: %d 条, %.1fs (累计 %.0fs)",
+                sub_start // _SUB_BATCH + 1, _n_sub, len(idxs),
+                _time.monotonic() - _t_sub, _time.monotonic() - _t_embed,
+            )
             # 主动释放 GIL，让 Qt 事件循环有机会处理排队的日志/进度信号。
             # 这是关键：ONNX Runtime 在 embed() 期间持有 GIL，只有在 Python
             # 层主动 sleep 时才释放。
             if _time.monotonic() - _last_yield >= _YIELD_INTERVAL:
                 _time.sleep(0.01)
                 _last_yield = _time.monotonic()
-        vectors = all_vectors
+        vectors = vectors_by_idx
         records: List[Dict[str, Any]] = []
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
         # 都重算一次 md5（写入侧纯浪费）。

@@ -132,19 +132,11 @@ class TestCheckDependencies:
                        for d in report2.missing_required)
 
     def test_reranker_cached_detection(self, tmp_path, monkeypatch):
-        """_is_reranker_cached 只认 fastembed 缓存里的真实权重文件。"""
+        """_is_reranker_cached 只认缓存根目录里的真实权重文件。"""
         import src.agent.rag.deps as deps_mod
 
-        def _fake_cache(_name):
-            return str(tmp_path)
-
-        # 测试环境未装 fastembed：mock 完整的导入链
-        # fastembed → fastembed.common → fastembed.common.utils
-        fake_utils = types.ModuleType("fastembed.common.utils")
-        fake_utils.define_cache_dir = _fake_cache
-        monkeypatch.setitem(sys.modules, "fastembed", types.ModuleType("fastembed"))
-        monkeypatch.setitem(sys.modules, "fastembed.common", types.ModuleType("fastembed.common"))
-        monkeypatch.setitem(sys.modules, "fastembed.common.utils", fake_utils)
+        # 缓存根目录改为 tmp_path（隔离真实环境的持久/临时缓存）
+        monkeypatch.setattr(deps_mod, "_reranker_cache_roots", lambda: [tmp_path])
 
         snap = (tmp_path / "models--onnx-community--bge-reranker-v2-m3-ONNX"
                 / "snapshots" / "abc123" / "onnx")

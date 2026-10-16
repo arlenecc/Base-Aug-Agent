@@ -292,6 +292,44 @@ def _extract_with_docling(filepath: str) -> tuple:
     return extract_text(filepath), False
 
 
+def _shard_files_balanced(files: List[str], num_workers: int) -> List[List[str]]:
+    """把文件列表分片给 worker：按大小降序 + 贪心最轻负载（LPT 调度）。
+
+    旧实现按 ``ceil(n/workers)`` 连续切片：n=9、workers=4 时第 4 片为空
+    （3×3=9 已分完），第 4 个 worker 领空启动即退；且慢文件（扫描书要
+    逐页 OCR）按文件名顺序扎在同一片时，其余 worker 早早干完长时空转，
+    同步尾延迟被拉长。
+
+    现按文件大小降序，每次把文件分给当前累计字节数最小、并列时当前
+    已分配文件数最少的 worker：最大的 ``num_workers`` 个文件必然分属
+    不同的 worker，n ≥ workers 时空片不可能出现，慢书自动摊开。大小
+    只是处理时长的近似（扫描书按页数 OCR、文本书直读），但显著优于
+    随机顺序的连续切片。
+    """
+    if num_workers <= 1:
+        return [list(files)]
+    sized: List[List[int]] = []
+    for f in files:
+        try:
+            sized.append([os.path.getsize(f), 0, 0])
+        except OSError:
+            # 扫描后文件消失（TOCTOU）：按 0 处理，worker 内再行隔离
+            sized.append([0, 0, 0])
+    # 大小降序（并列时按原序号稳定），随后贪心分配
+    order = sorted(range(len(files)),
+                   key=lambda i: (-sized[i][0], i))
+    shards: List[List[str]] = [[] for _ in range(num_workers)]
+    totals = [0] * num_workers
+    counts = [0] * num_workers
+    for i in order:
+        # 负载键：累计字节 → 已分配文件数 → worker 序号（保证确定性）
+        k = min(range(num_workers), key=lambda w: (totals[w], counts[w], w))
+        shards[k].append(files[i])
+        totals[k] += sized[i][0]
+        counts[k] += 1
+    return shards
+
+
 
 class RAGEngine:
     """Local knowledge base engine.
@@ -767,14 +805,10 @@ class RAGEngine:
             # 其持有的整文档切片内存一起泄漏到进程退出。
             _abort = threading.Event()
 
-            # 把文件列表分片给各 worker（保证负载均衡）
+            # 把文件列表分片给各 worker（LPT 负载均衡，见 _shard_files_balanced）
             # 动态调整并发数：文件数少于默认 worker 数时，只启动必要数量的线程
             num_workers = min(self._parallel_workers, len(files_to_process))
-            chunks_per_worker = (len(files_to_process) + num_workers - 1) // num_workers
-            file_shards = [
-                files_to_process[i * chunks_per_worker:(i + 1) * chunks_per_worker]
-                for i in range(num_workers)
-            ]
+            file_shards = _shard_files_balanced(files_to_process, num_workers)
 
             threads = []
             for shard in file_shards:
