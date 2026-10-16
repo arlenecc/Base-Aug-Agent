@@ -242,6 +242,272 @@ def get_or_create_embedding_function(
 
 
 # ---------------------------------------------------------------------------
+# 自适应嵌入子批大小控制器
+# ---------------------------------------------------------------------------
+
+# 子批大小探索范围与步长（#125，#126/#127/#128 生产验证后修订）：真实
+# 切片上的实测是「吞吐与内存都随子批增大单调变差」——激活工作集 ∝ 子批
+# ×批内最长序列，超出 CPU 缓存后被内存带宽卡死，「大批次摊薄开销」在此
+# 不成立。真实 200 切片实测：size2 = 2071 tok/s @ 1.28GB，size4 = 1864 @
+# 2.14GB，size12 = 1163 @ 4.99GB。1-5 覆盖「单条最省内存」到「短切片批
+# 效率」的合理区间，步长 1 让爬山在平坦段也能精细寻优；初始 2 起步即落
+# 在实测最优区（#128 用户规格）。
+_SUBBATCH_MIN = 1
+_SUBBATCH_MAX = 5
+_SUBBATCH_START = 2
+_SUBBATCH_STEP = 1
+# RSS 软墙（#129，用户定参 8GB）：内存偶尔冲高是正常的（OCR 缓存、压缩
+# 计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB 闩锁版
+# 会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1 再
+# 也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
+# 已启动的应用生效，需要完全重启。
+_SUBBATCH_RSS_LIMIT = 8.0  # GB
+# 恢复阈值（#129）：monitor 下速率回到历史最优 95% 且当前尺寸低于最优
+# 尺寸时，回到最优尺寸重新爬升——消除「降档单向棘轮」（降需连续 2 窗口
+# <75%，回却需 >110%，一次短暂内存尖峰会永久降档）。低于 100% 是安全
+# 的：回到最优尺寸后 probe 会重新验证，验证不过自然回退。
+_SUBBATCH_RECOVER = 0.95
+# 形状预算（#126 修订）：嵌入激活 ∝ 子批条数 × 批内最长序列²（attention 项
+# 主导）。基准标定：size8 × 1311² ≈ 13.75M 单位 ≈ 4.7GB 激活（≈0.34GB/M
+# 单位）——预算 6M 单位把瞬时激活压在 ~2GB。不用绝对 RSS 阈值：真实同步
+# 进程基线本就有 6-10GB（OCR 原生缓存、LanceDB 等），绝对阈值会在首个子批
+# 就触发降档并永久卡死在下限（实测「子批很快降到 1」的根因）。形状预算
+# 只对超长文本钳制条数，与进程里其它组件的内存正交。
+_SUBBATCH_SHAPE_BUDGET = 6_000_000  # 条 × 字符²
+
+
+def _shape_cap_size(size: int, max_len: int) -> int:
+    """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。"""
+    if max_len <= 0:
+        return size
+    budget = _SUBBATCH_SHAPE_BUDGET // (max_len * max_len)
+    return max(1, min(size, budget))
+
+
+# 每个窗口聚合的子批数：太小易被单批噪声带偏，太大响应迟钝。
+_SUBBATCH_WINDOW = 2
+# 爬升判定：候选子批的算力速率需比基线高 3% 才采纳——低于该阈值的波动
+# 视为噪声，避免在吞吐平坦段来回抖动。
+_SUBBATCH_IMPROVE = 1.03
+# 降档判定：连续 2 个窗口的速率低于历史最优的 75% 视为环境劣化（OCR
+# worker 抢占 CPU、热降频等），降 2 档避让，直到 4 为下限。
+_SUBBATCH_DEGRADE = 0.75
+_SUBBATCH_DEGRADE_STREAK = 2
+# 历史最优速率的逐窗口衰减：环境永久变慢后旧纪录缓慢失效，不至于永远
+# 拿旧峰值当标尺。
+_SUBBATCH_BEST_DECAY = 0.999
+# 重新爬升判定：monitor 阶段实测速率比历史最优高出 10%（如 OCR worker
+# 结束、CPU 空出来）→ 环境已变，重新从小尺寸向上爬山，否则会永远停在
+# 忙时降下来的小尺寸上。
+_SUBBATCH_RE_CLIMB = 1.10
+
+
+class _SubBatchTuner:
+    """在 [1, 5] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
+
+    度量：不用原始 tok/s——长度分桶后各批序列长度天然不同，直接比
+    tok/s 有系统性偏差。改用算力速率 ``ops/s = n × max_len² / dt``（以
+    字符数近似 token 数，单调代理即可），对批大小与批内最长长度同时
+    归一，跨窗口、跨尺寸可比。
+
+    状态机（#125 用户规格，#126/#127/#128 生产验证修订）：
+      climb   初始 2：基线窗口（2 子批）→ 试探 +1 → 更快（≥3%）则采纳并
+              继续上调，变慢则回退到上一个数字，进入 monitor。起步即落
+              在实测最优区，步长 1 在吞吐平坦段也能精细寻优；
+      monitor 持续盯速率：连续 2 窗口低于历史最优 75% → 降 1 避让（下限
+              1），速率恢复即停；速率回到历史最优 95% 且尺寸低于最优尺寸 →
+              尖峰已过去，回到最优尺寸重新爬升（#129，消除降档单向棘轮）；
+              实测速率比历史最优高 10% → 环境变快，重新爬升。
+
+    内存安全双保险（#126/#129）：
+      ① 形状预算：_embed_chunks 组装每个子批时按 ``_shape_cap_size`` 钳制
+         条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小。绝对 RSS
+         阈值在真实同步进程（基线 6-10GB）必然误触发，曾导致永久卡死。
+      ② RSS 软墙 8GB（无闩锁）：超墙每子批 force_down 降 1 档，回墙下即
+         停，恢复交给 monitor 恢复分支——旧 5GB 闩锁版是「降到 1 再也不
+         回去」的根因。调优器 report() 收到的是钳制后的实际条数，状态机
+         在可行域内正常爬山。
+
+    预热丢弃（#126 修订）：首个完整窗口包含模型加载 / ONNX 会话初始化
+    （可达 10s+），会把爬升基线拉到虚低，让热身的试探窗口显得「暴涨」
+    被误采纳——第一个窗口只用于预热，丢弃不计入判定。
+
+    线程安全：内部状态由锁保护（add() 与 add_streaming() 可能来自不同
+    线程，窗口聚合不会交错损坏）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.size = max(_SUBBATCH_MIN, min(_SUBBATCH_MAX, _SUBBATCH_START))
+        self._phase = "climb"  # climb | monitor
+        self._climb_state = "baseline"  # baseline | probe
+        self._prev_size = self.size  # 爬升失败时回退到此处
+        self._baseline_score: Optional[float] = None
+        self._win_ops = 0.0
+        self._win_dt = 0.0
+        self._win_n = 0
+        self._ema: Optional[float] = None
+        self._best: Optional[float] = None
+        # 历史最优速率对应的尺寸（#129）：恢复判定的参照——降档棘轮的解药
+        self._best_size = self.size
+        self._degrade_streak = 0
+        self._warmed = False  # 预热窗口是否已丢弃
+
+    def propose(self) -> int:
+        """返回下一个子批应使用的大小。"""
+        with self._lock:
+            return self.size
+
+    def report(self, n: int, max_len: int, dt: float) -> None:
+        """上报一个子批的实测结果（条数、批内最长字符数、耗时）。"""
+        ops = float(n) * float(max(max_len, 1)) ** 2
+        with self._lock:
+            self._win_ops += ops
+            self._win_dt += max(dt, 1e-6)
+            self._win_n += 1
+            if self._win_n < _SUBBATCH_WINDOW:
+                return
+            score = self._win_ops / self._win_dt
+            self._win_ops = 0.0
+            self._win_dt = 0.0
+            self._win_n = 0
+            if not self._warmed:
+                # 预热窗口丢弃：含模型加载/会话初始化，基线会虚低
+                self._warmed = True
+                return
+            if self._phase == "climb":
+                self._on_climb_window(score)
+            else:
+                self._on_monitor_window(score)
+
+    def _on_climb_window(self, score: float) -> None:
+        """爬升阶段窗口结果。调用时已持锁。"""
+        if self._climb_state == "baseline":
+            self._baseline_score = score
+            nxt = self.size + _SUBBATCH_STEP
+            if nxt > _SUBBATCH_MAX:
+                self._phase = "monitor"
+                self._best_size = self.size  # 操作点已重新验证（#129）
+                return
+            self._prev_size = self.size
+            self.size = nxt
+            self._climb_state = "probe"
+            logger.info(
+                "  ├─ 子批自适应: %d → %d (试探吞吐)", self._prev_size, nxt
+            )
+            return
+        # probe 窗口结果：与基线比较
+        assert self._baseline_score is not None
+        ratio = score / self._baseline_score
+        if ratio >= _SUBBATCH_IMPROVE:
+            logger.info(
+                "  ├─ 子批自适应: %d 吞吐 %+.0f%%, 采纳并继续上调",
+                self.size, (ratio - 1) * 100,
+            )
+            self._baseline_score = score
+            self._best_size = self.size  # 采纳 = 已验证（#129）
+            nxt = self.size + _SUBBATCH_STEP
+            if nxt > _SUBBATCH_MAX:
+                self._phase = "monitor"
+            else:
+                self._prev_size = self.size
+                self.size = nxt
+        else:
+            logger.info(
+                "  ├─ 子批自适应: %d 吞吐 %+.0f%%, 回退到 %d",
+                self.size, (ratio - 1) * 100, self._prev_size,
+            )
+            self.size = self._prev_size
+            self._phase = "monitor"
+            # 回退 = 大尺寸被否决，操作点锚在此处，防止恢复循环（#129）
+            self._best_size = self.size
+
+    def _on_monitor_window(self, score: float) -> None:
+        """监控阶段窗口结果：盯劣化降档，盯变快重新爬升。调用时已持锁。"""
+        self._ema = score if self._ema is None else self._ema * 0.5 + score * 0.5
+        prev_best = self._best
+        # 恢复（#129）：当前尺寸低于最优尺寸、且速率回到历史最优 95% →
+        # 尖峰（内存压力 / 抢 CPU）已过去，直接回到最优尺寸（不走路爬山：
+        # plateau 上试探必然持平 <3% 被回退，回退锚会把最优尺寸永久改小，
+        # 恰好复现「降到 1 再也不回去」）。留在 monitor：若最优尺寸在新
+        # 环境下确实过慢，降档路径会再次接管，自校正无循环。放在 best
+        # 更新之前，避免恢复窗口把 best/best_size 就地改写成小尺寸。
+        if (
+            prev_best is not None
+            and prev_best > 0
+            and self._ema is not None
+            and self.size < self._best_size
+            and self._ema >= prev_best * _SUBBATCH_RECOVER
+        ):
+            logger.info(
+                "  ├─ 子批自适应: 速率恢复到最优的 %.0f%%, %d → %d 回到最优尺寸",
+                self._ema / prev_best * 100, self.size, self._best_size,
+            )
+            self.size = self._best_size
+            self._ema = None
+            self._degrade_streak = 0
+            return
+        if self._best is None or self._ema > self._best:
+            self._best = self._ema
+        else:
+            self._best *= _SUBBATCH_BEST_DECAY
+        # 环境明显变快（新 EMA 比旧纪录高 10%）→ 重新爬升
+        if (
+            prev_best is not None
+            and self._ema is not None
+            and prev_best > 0
+            and self._ema >= prev_best * _SUBBATCH_RE_CLIMB
+        ):
+            logger.info(
+                "  ├─ 子批自适应: 速率比历史最优高 %.0f%%, 环境变快, 重新爬升",
+                (self._ema / prev_best - 1) * 100,
+            )
+            self._phase = "climb"
+            self._climb_state = "baseline"
+            self._baseline_score = None
+            self._ema = None
+            self._degrade_streak = 0
+            return
+        if self._ema is not None and self._best and self._ema < self._best * _SUBBATCH_DEGRADE:
+            self._degrade_streak += 1
+        else:
+            self._degrade_streak = 0
+        if self._degrade_streak >= _SUBBATCH_DEGRADE_STREAK and self.size > _SUBBATCH_MIN:
+            new_size = max(_SUBBATCH_MIN, self.size - _SUBBATCH_STEP)
+            logger.info(
+                "  ├─ 子批自适应: 吞吐降至最优的 %.0f%%, %d → %d 避让",
+                self._ema / self._best * 100, self.size, new_size,
+            )
+            self.size = new_size
+            self._ema = None
+            self._degrade_streak = 0
+
+    def force_down(self) -> None:
+        """RSS 软墙（#129）：降 1 档并丢弃半满窗口。
+
+        与速率状态机独立，**无闩锁**：超墙时每个子批调一次（激活随之变小、
+        RSS 自然回落），回墙下即停，之后由恢复分支 / 重爬把尺寸带回来。
+        旧 5GB 闩锁版（mem_pressed 永不解除）会在真实同步基线 6-10GB 下
+        首个子批就触发并永久卡死在下限，是「降到 1 再也不回去」的根因。
+        """
+        with self._lock:
+            self._win_ops = 0.0
+            self._win_dt = 0.0
+            self._win_n = 0
+            if self.size <= _SUBBATCH_MIN:
+                return
+            new_size = max(_SUBBATCH_MIN, self.size - _SUBBATCH_STEP)
+            logger.info(
+                "  ├─ 子批自适应: RSS 超 %.0fGB, %d → %d 降档避让",
+                _SUBBATCH_RSS_LIMIT, self.size, new_size,
+            )
+            self.size = new_size
+            self._phase = "monitor"
+            self._ema = None
+            self._degrade_streak = 0
+
+
+# ---------------------------------------------------------------------------
 # Vector store backed by LanceDB
 # ---------------------------------------------------------------------------
 
@@ -290,6 +556,7 @@ class VectorStore:
         # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
         self._documents_cache: Optional[List[Dict[str, Any]]] = None
         self._ef = None  # embedding function
+        self._subbatch_tuner = _SubBatchTuner()  # 自适应子批大小（#125）
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
         self._fts_ready = False  # BM25 全文索引是否已就绪
@@ -785,6 +1052,15 @@ class VectorStore:
         更新）。ONNX Runtime 的 embed() 在 C++ 计算期间持有 GIL，整批一次
         性嵌入会导致 UI 长时间冻结。
 
+        子批大小不固定（历史值 12）：由 :class:`_SubBatchTuner` 在 1-5 内
+        自适应（#125，#126/#127/#128 生产验证修订：真实切片上吞吐与内存都
+        随子批增大单调变差，size2 双优）。长度分桶后 padding 已归零。
+
+        形状预算（#126 修订）：每个子批组装时按 ``_shape_cap_size`` 钳制
+        条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小，把瞬时激活
+        压在 ~2GB。不再使用绝对 RSS 阈值——真实同步进程基线 6-10GB，绝对
+        阈值会误触发并永久卡死在下限。
+
         关键优化：**按文本长度排序分桶**（#122）。fastembed 的批内所有序列
         padding 到批内最长——长度混杂的批 padding 浪费 2-4 倍算力（实测
         32 条混杂批 309s ≈ 40 tok/s，而同模型「长度排序 + 8-12 条/批」
@@ -792,11 +1068,6 @@ class VectorStore:
         原顺序回填，结果与混杂批完全一致。
         """
         import time as _time
-        # 子批大小：ORT 的批处理吞吐高于逐条推理，但 BERT-large（nomic v1.5）
-        # 的激活内存随「子批 × 批内最大序列长」增长——长度分桶后批内长度相近。
-        # 6 条虽省内存（~1.3GB）但吞吐损失明显（用户实测反馈），12 条是
-        # 内存（~2.7GB）与速度的平衡点（#124 用户回调节）。
-        _SUB_BATCH = 12
         # 让出 GIL 的累计耗时阈值：不是「每子批都 sleep」，而是累计占用 GIL
         # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
         _YIELD_INTERVAL = 0.05
@@ -805,22 +1076,49 @@ class VectorStore:
         # 出现，提早把激活水位顶到峰值，后续批更轻）。
         order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
         vectors_by_idx: List[Optional[List[float]]] = [None] * len(texts)
+        tuner = self._subbatch_tuner
         _last_yield = _time.monotonic()
         _t_embed = _time.monotonic()
-        _n_sub = (len(order) + _SUB_BATCH - 1) // _SUB_BATCH
-        for sub_start in range(0, len(order), _SUB_BATCH):
-            idxs = order[sub_start:sub_start + _SUB_BATCH]
+        sub_idx = 0
+        sub_start = 0
+        while sub_start < len(order):
+            size = tuner.propose()
+            # 形状预算钳制（#126 修订）：激活 ∝ 条数 × 批内最长序列²，对
+            # 超长文本收缩本子批条数，把瞬时激活压在 ~2GB（常量注释含标定）。
+            # 降序分桶下切片首条即批内最长，钳制后 report() 收到实际条数。
+            size = _shape_cap_size(size, len(texts[order[sub_start]]))
+            idxs = order[sub_start:sub_start + size]
             _t_sub = _time.monotonic()
             sub_vectors = self._ef([texts[i] for i in idxs])
+            _dt = _time.monotonic() - _t_sub
             for i, v in zip(idxs, sub_vectors):
                 vectors_by_idx[i] = v
+            sub_idx += 1
+            sub_start += len(idxs)
             # 子批级进度日志：嵌入一个子批要数十秒且中间完全静默，用户会
-            # 误判为「卡死」（#122）。每个子批一条，给出速率。
+            # 误判为「卡死」（#122）。每个子批一条，给出速率与当前子批大小。
+            n_chars = sum(len(texts[i]) for i in idxs)
             logger.info(
-                "  ├─ 嵌入子批 %d/%d: %d 条, %.1fs (累计 %.0fs)",
-                sub_start // _SUB_BATCH + 1, _n_sub, len(idxs),
-                _time.monotonic() - _t_sub, _time.monotonic() - _t_embed,
+                "  ├─ 嵌入子批 #%d [size=%d]: %d 条 %.1fk字符, %.1fs (%.0f k字符/s, 累计 %.0fs)",
+                sub_idx, size, len(idxs), n_chars / 1000, _dt,
+                n_chars / max(_dt, 1e-6) / 1000,
+                _time.monotonic() - _t_embed,
             )
+            tuner.report(len(idxs), max(len(texts[i]) for i in idxs), _dt)
+            # RSS 软墙（#129，8GB）：内存偶尔冲高是正常波动，超墙只要求降档
+            # 避让——每子批检查一次，降 1 档、激活变小、RSS 自然回落，回墙
+            # 下即停。无闩锁（旧 5GB 闩锁版是「卡死在 1」的根因），恢复交给
+            # 调优器自身的恢复分支 / 重爬。psutil 缺失时静默跳过。
+            try:
+                import psutil as _psutil
+
+                if (
+                    _psutil.Process().memory_info().rss / 1024**3
+                    > _SUBBATCH_RSS_LIMIT
+                ):
+                    tuner.force_down()
+            except Exception:
+                pass
             # 主动释放 GIL，让 Qt 事件循环有机会处理排队的日志/进度信号。
             # 这是关键：ONNX Runtime 在 embed() 期间持有 GIL，只有在 Python
             # 层主动 sleep 时才释放。
