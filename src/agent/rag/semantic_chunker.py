@@ -5,12 +5,16 @@ threshold) instead of naive character/recursive splits.  Semantic chunks keep
 topically-related sentences together, which materially improves retrieval
 quality for e-books and long documents.
 
-The embedding model is the *same* nomic-embed-text instance used by the vector
-store (shared process-wide singleton), so semantic chunking does not load a
-second copy of the ~137MB ONNX model.
+Embedding backends (in priority order):
+  1. Explicitly injected ``embedding_function`` → wrapped via
+     ``_ChonkieEmbeddingAdapter`` (tests / external callers).
+  2. model2vec static embeddings (potion-base-32M) — fast path for chunking
+     decisions, ~100x faster than BERT inference (#118).
+  3. Shared nomic-embed-text singleton → adapter (fallback when model2vec is
+     unavailable; slow but correct).
 
-If ``chonkie`` is not installed, :func:`semantic_chunk_text` returns ``None``
-so callers fall back to the existing recursive chunker.
+If none is available (or ``chonkie`` is not installed), :func:`semantic_chunk_text`
+returns ``None`` so callers fall back to the existing recursive chunker.
 """
 from __future__ import annotations
 
@@ -85,14 +89,23 @@ def semantic_chunk_text(
         return None
 
     try:
-        ef = embedding_function or _shared_embedding_function()
-        if ef is None:
-            logger.debug("semantic chunking skipped: no embedding function available")
-            return None
-
         from chonkie import SemanticChunker
 
-        embeddings = _ChonkieEmbeddingAdapter(ef)
+        if embedding_function is not None:
+            # 显式注入（测试/外部调用）：走适配器，行为与旧版一致。
+            embeddings = _ChonkieEmbeddingAdapter(embedding_function)
+        else:
+            # 生产路径：优先 model2vec 静态嵌入（切片决策不需要与检索向量
+            # 同空间，静态嵌入的相对相似度足够；吞吐高约两个数量级）。
+            # model2vec 缺失时回退共享 nomic 适配器（慢但正确），再不行
+            # 返回 None 交给上层递归切片兜底。
+            embeddings = _get_static_embeddings()
+            if embeddings is None:
+                shared = _shared_embedding_function()
+                if shared is None:
+                    logger.debug("semantic chunking skipped: no embedding backend available")
+                    return None
+                embeddings = _ChonkieEmbeddingAdapter(shared)
 
         # When chonkie is present, _BaseEmbeddings is the real base class and
         # the isinstance check in SemanticChunker.__init__ will pass.  When it
@@ -279,6 +292,59 @@ def _shared_embedding_function():
             _shared_ef = None
             _shared_ef_failed_at = time.monotonic()
     return _shared_ef
+
+
+# ---------------------------------------------------------------------------
+# static embeddings for chunking decisions (potion via model2vec)
+# ---------------------------------------------------------------------------
+
+# 语义切片的「快路径」嵌入后端：model2vec 静态嵌入（potion-base-32M，
+# ~30MB，纯 numpy 查表 + 平均池化，无 BERT 前向）。它只服务「相邻窗口是否
+# 语义断裂」的切片决策——决策只需要相邻相似度的相对大小，不需要与检索
+# 向量同空间，静态嵌入完全够用。实测吞吐比共享 nomic 适配器（BERT 推理
+# + 2N 次 embed）高约两个数量级（88k 字符章节 90-150s → 秒级，#118）。
+#
+# chonkie 自带的 AutoEmbeddings 会把 minishlab/* 路由到 Model2VecEmbeddings
+# （chonkie.embeddings.registry），model2vec 未安装时其构造抛 ImportError。
+_STATIC_EMBS = None
+_STATIC_EMBS_RESOLVED = False
+_STATIC_EMBS_FAILED_AT: Optional[float] = None
+_STATIC_EMBS_RETRY_INTERVAL = 60.0  # 失败负缓存：60s 内不重复尝试
+_STATIC_EMBS_LOCK = threading.Lock()
+
+_POTION_MODEL = "minishlab/potion-base-32M"
+
+
+def _get_static_embeddings():
+    """Return the model2vec static embeddings for chunking, or None.
+
+    失败负缓存与 ``_shared_embedding_function`` 同款：deps 在同步前自动
+    安装 model2vec，安装成功后的下一次尝试（60s 负缓存过期后）自动升级
+    到快路径，无需重启。首次使用会下载 potion 权重（~30MB，HF 缓存）。
+    """
+    global _STATIC_EMBS, _STATIC_EMBS_RESOLVED, _STATIC_EMBS_FAILED_AT
+    if _STATIC_EMBS_RESOLVED:
+        return _STATIC_EMBS
+    if (
+        _STATIC_EMBS_FAILED_AT is not None
+        and time.monotonic() - _STATIC_EMBS_FAILED_AT < _STATIC_EMBS_RETRY_INTERVAL
+    ):
+        return None
+    with _STATIC_EMBS_LOCK:
+        if _STATIC_EMBS_RESOLVED:
+            return _STATIC_EMBS
+        try:
+            from chonkie.embeddings import AutoEmbeddings
+
+            _STATIC_EMBS = AutoEmbeddings.get_embeddings(_POTION_MODEL)
+            _STATIC_EMBS_RESOLVED = True
+            _STATIC_EMBS_FAILED_AT = None
+            logger.info("语义切片使用静态嵌入 %s（model2vec 快路径）", _POTION_MODEL)
+        except Exception as e:
+            logger.debug("model2vec 静态嵌入不可用（%s），回退 nomic 适配器", e)
+            _STATIC_EMBS = None
+            _STATIC_EMBS_FAILED_AT = time.monotonic()
+    return _STATIC_EMBS
 
 
 # ---------------------------------------------------------------------------

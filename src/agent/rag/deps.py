@@ -448,6 +448,18 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                     required=False)
         )
 
+    # ---- model2vec: chonkie 语义切片的静态嵌入快路径（potion-base-32M）----
+    # 没有它，chonkie 的 AutoEmbeddings 构造 potion 会失败，semantic_chunker
+    # 回退共享 nomic 适配器——BERT 推理 + 2N 次 embed，88k 字符章节要
+    # 90-150s（#118）。model2vec 纯 numpy 查表，秒级。仅在 chonkie 已
+    # 安装时才有意义（chonkie 都没有的话语义切片整体回退递归）。
+    if _is_importable("chonkie") and not _is_importable("model2vec"):
+        report.missing_optional.append(
+            DepSpec("model2vec", "model2vec",
+                    "语义切片静态嵌入 model2vec（可选，缺失时切片走 nomic 慢路径）",
+                    required=False)
+        )
+
     # ---- onnxruntime 版本下限：CoreML EP 需要 >= 1.31 ----
     # Apple Silicon 上的 OCR 推理加速（parsers._get_ocr_engine）依赖官方
     # wheel 内置的 CoreMLExecutionProvider；旧版本会静默回退 CPU EP。

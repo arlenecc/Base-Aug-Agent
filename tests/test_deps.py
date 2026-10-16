@@ -82,6 +82,31 @@ class TestCheckDependencies:
                        "ebooklib", "beautifulsoup4", "docling"}
         assert not any(d.pip_spec in ext_related for d in report.missing_optional)
 
+    def test_model2vec_optional_dep_only_with_chonkie(self, tmp_path, monkeypatch):
+        """model2vec 仅在 chonkie 可用且自身缺失时进入 missing_optional。"""
+        (tmp_path / "notes.txt").write_text("x")
+        import src.agent.rag.deps as deps_mod
+
+        # chonkie 可用 + model2vec 缺失 → 提示安装（快路径缺失）
+        monkeypatch.setattr(deps_mod, "_is_importable",
+                            lambda name: name == "chonkie")
+        report = check_dependencies(str(tmp_path), include_core=False)
+        specs = [d.pip_spec for d in report.missing_optional]
+        assert "model2vec" in specs
+
+        # model2vec 已装 → 不再提示
+        monkeypatch.setattr(deps_mod, "_is_importable",
+                            lambda name: name in ("chonkie", "model2vec"))
+        report2 = check_dependencies(str(tmp_path), include_core=False)
+        specs2 = [d.pip_spec for d in report2.missing_optional]
+        assert "model2vec" not in specs2
+
+        # chonkie 都没有 → 整个语义切片回退递归，model2vec 无意义，不提示
+        monkeypatch.setattr(deps_mod, "_is_importable", lambda name: False)
+        report3 = check_dependencies(str(tmp_path), include_core=False)
+        specs3 = [d.pip_spec for d in report3.missing_optional]
+        assert "model2vec" not in specs3
+
     def test_fastembed_version_floor(self, tmp_path, monkeypatch):
         (tmp_path / "notes.txt").write_text("x")
         import src.agent.rag.deps as deps_mod

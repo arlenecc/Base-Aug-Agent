@@ -36,6 +36,10 @@ rag = [
     "PyMuPDF>=1.23.0",
     "ebooklib>=0.18",
     "chonkie[semantic]>=1.0.0",
+    # 语义切片快路径：model2vec 静态嵌入（potion-base-32M）驱动 chonkie 的
+    # 切片决策，纯 numpy 推理，比共享 nomic 适配器快约两个数量级（#118）。
+    # 缺失时自动回退 nomic 适配器（慢但正确）。
+    "model2vec>=0.3",
     "docling>=2.0.0",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",

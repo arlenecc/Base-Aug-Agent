@@ -147,3 +147,57 @@ def test_chunk_documents_uses_semantic_when_available(topic_ef):
     assert all(c["text"].strip() for c in chunks)
     # chunk_index is sequential
     assert [c["chunk_index"] for c in chunks] == list(range(len(chunks)))
+
+
+# ---------------------------------------------------------------------------
+# #118: embedding backend resolution (potion fast path → nomic fallback)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
+def test_semantic_chunk_prefers_static_embeddings(monkeypatch):
+    """model2vec 静态嵌入可用时，SemanticChunker 收到的是它而非 nomic 适配器。"""
+    import chonkie
+    from agent.rag import semantic_chunker as sc
+
+    sentinel = object()
+    seen = {}
+    calls = []
+
+    class _FakeChunker:
+        def __init__(self, embedding_model=None, **kwargs):
+            seen["embedding_model"] = embedding_model
+            calls.append(1)
+
+        def chunk(self, text):
+            t = text.strip()
+
+            class _C:
+                text = t
+            return [_C()]
+
+    monkeypatch.setattr(chonkie, "SemanticChunker", _FakeChunker)
+    monkeypatch.setattr(sc, "_get_static_embeddings", lambda: sentinel)
+    out = sc.semantic_chunk_text("这是一个测试句子。这也是另一个测试句子，主题相近。")
+    assert out is not None
+    assert seen["embedding_model"] is sentinel
+
+
+@pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
+def test_semantic_chunk_falls_back_to_shared_ef(monkeypatch, topic_ef):
+    """静态嵌入不可用时回退共享 nomic 适配器，仍能产出切片。"""
+    from agent.rag import semantic_chunker as sc
+
+    monkeypatch.setattr(sc, "_get_static_embeddings", lambda: None)
+    monkeypatch.setattr(sc, "_shared_embedding_function", lambda: topic_ef)
+    out = sc.semantic_chunk_text("深度学习是机器学习的一个分支。" * 50)
+    assert out is not None and len(out) > 0
+
+
+@pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
+def test_semantic_chunk_returns_none_when_all_backends_missing(monkeypatch):
+    """静态嵌入与共享 EF 都不可用 → 返回 None（上层递归切片兜底）。"""
+    from agent.rag import semantic_chunker as sc
+
+    monkeypatch.setattr(sc, "_get_static_embeddings", lambda: None)
+    monkeypatch.setattr(sc, "_shared_embedding_function", lambda: None)
+    assert sc.semantic_chunk_text("这是一段没有任何后端可用的文本。") is None
