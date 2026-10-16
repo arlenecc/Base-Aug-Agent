@@ -435,6 +435,19 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                     required=False)
         )
 
+    # ---- jieba: BM25 中文预分词（RAG 全文检索 + 技能语义检索共用）----
+    # 缺失时 _tokenize_for_fts 静默退化为空白切分：中文整句作为一个 token，
+    # BM25 召回大幅下降且用户无感知。纯 Python + 内置词典（~19MB）无重依赖，
+    # 与 chonkie 同级处理——缺失时随同步自动安装。
+    # 注意：写入侧退化是持久的（text_fts 列在 add 时已按坏分词落库），安装
+    # 后需 force 重新同步才能修复历史向量；查询侧装完即生效。
+    if not _is_importable("jieba"):
+        report.missing_optional.append(
+            DepSpec("jieba", "jieba",
+                    "中文分词 jieba（可选，未安装时 BM25 中文检索退化）",
+                    required=False)
+        )
+
     # ---- onnxruntime 版本下限：CoreML EP 需要 >= 1.31 ----
     # Apple Silicon 上的 OCR 推理加速（parsers._get_ocr_engine）依赖官方
     # wheel 内置的 CoreMLExecutionProvider；旧版本会静默回退 CPU EP。
