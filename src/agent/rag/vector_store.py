@@ -794,8 +794,8 @@ class VectorStore:
         import time as _time
         # 子批大小：ORT 的批处理吞吐高于逐条推理，但 BERT-large（nomic v1.5）
         # 的激活内存随「子批 × 批内最大序列长」增长——长度分桶后批内长度相近，
-        # 12 条的峰值 ~1.6GB（#122）。
-        _SUB_BATCH = 12
+        # 12 条峰值 ~2.7GB 仍偏高（#122），6 条压到 ~1.3GB，吞吐损失 ~10-15%。
+        _SUB_BATCH = 6
         # 让出 GIL 的累计耗时阈值：不是「每子批都 sleep」，而是累计占用 GIL
         # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
         _YIELD_INTERVAL = 0.05
