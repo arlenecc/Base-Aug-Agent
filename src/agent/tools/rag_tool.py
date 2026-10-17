@@ -27,7 +27,7 @@ class RagSearchTool(Tool):
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数，默认 3，范围 1-10。",
+                "description": "返回结果数，默认 3，上限 3。",
             },
             "source": {
                 "type": "string",
@@ -52,12 +52,14 @@ class RagSearchTool(Tool):
         if not query:
             return ToolResult(success=False, error="请提供搜索查询词")
 
-        # 限制 top_k 上限，防止模型传入过大值导致返回海量内容撑爆上下文窗口。
+        # 限制 top_k 上限：候选数 = top_k × 4 × 2 路，全量送 BGE 重排（逐对
+        # 串行 ~0.55s/对，实测 568M INT8 在本机 CPU 的地板，批并行/线程/截断
+        # 均无收益）。LLM 传 5 时 40 条 ≈ 23s（#132 实测），封顶 3 → 24 条。
         try:
             top_k = int(top_k)
         except (TypeError, ValueError):
             top_k = 3
-        top_k = max(1, min(top_k, 10))
+        top_k = max(1, min(top_k, 3))
 
         source = (source or "").strip()
         logger.info(
