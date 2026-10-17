@@ -50,6 +50,34 @@ _QUEUE_CAPACITY_FACTOR = 2  # = parallel_workers * 2
 # 哨兵：worker 全部完成后投递到队列，主线程据此退出消费循环
 _SENTINEL = object()
 
+# 向量库写入批大小。LanceDB 每次 add 都会产生新 fragment，批太小会在大库上
+# 留下海量碎片，检索退化为逐段扫描；批太大则单次失败要重做的量变多。
+_WRITE_BATCH_SIZE = 200
+
+
+def _md_meta_path(md_path: str) -> str:
+    """Markdown 缓存的 sidecar 路径：保存「缓存文件名 → 原始文档名」映射。"""
+    return md_path + ".meta.json"
+
+
+def _write_md_meta(md_path: str, payload: Dict[str, Any]) -> None:
+    """写 sidecar。失败只告警——它只是加速/纠错的辅助数据，不影响主流程。"""
+    try:
+        with open(_md_meta_path(md_path), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning("Markdown meta 写入失败: %s: %s", md_path, e)
+
+
+def _read_md_meta(md_path: str) -> Optional[Dict[str, Any]]:
+    """读 sidecar；不存在或损坏返回 None。"""
+    try:
+        with open(_md_meta_path(md_path), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
 
 # ---------------------------------------------------------------------------
 # ingest 互斥锁（跨实例，按 rag_dir 键控）
@@ -83,12 +111,24 @@ def _manifest_path(rag_dir: str) -> str:
     return os.path.join(rag_dir, "manifest.json")
 
 
-def _load_manifest(rag_dir: str) -> Dict[str, Dict[str, Any]]:
-    """Load the document manifest.
+# 进程内的 manifest 串行化（跨进程由 _ManifestLock 的 flock 保证）。
+#
+# 必须是**不可重入**的 Lock，并且与 flock 的重入计数解耦：flock 绑定在 open
+# file description 上，同一线程对同一文件再 open 一次拿到的 fd 与已有的
+# LOCK_EX **互斥**（不区分同进程）。若这里用 RLock，嵌套进入就会让线程第二次
+# flock 自己等自己 → 永久挂起。用普通 Lock 时嵌套会立刻在线程锁上暴露。
+_MANIFEST_THREAD_LOCK = threading.Lock()
+# 线程本地的重入深度：同一线程嵌套进入只加计数，不再重复 flock。
+_MANIFEST_TLS = threading.local()
 
-    Returns a dict mapping source_path -> {mtime, size, chunk_count, content_hash}.
-    Returns {} if the manifest is missing or corrupted.
-    """
+
+def _manifest_lock_path(rag_dir: str) -> str:
+    """Path to the manifest lock file (cross-process advisory lock)."""
+    return os.path.join(rag_dir, "manifest.lock")
+
+
+def _load_manifest_unlocked(rag_dir: str) -> Dict[str, Dict[str, Any]]:
+    """``_load_manifest`` 的实现（不加锁，供持锁路径内部调用）。"""
     path = _manifest_path(rag_dir)
     if not os.path.exists(path):
         logger.debug("RAG: manifest not found at %s (first sync)", path)
@@ -106,9 +146,107 @@ def _load_manifest(rag_dir: str) -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _save_manifest(rag_dir: str, files: Dict[str, Dict[str, Any]]) -> None:
-    """Persist the manifest atomically (unique tmp + os.replace)."""
-    atomic_write_json(_manifest_path(rag_dir), {"files": files})
+def _load_manifest(rag_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Load the document manifest (加锁读，避免读到写入一半的状态）。"""
+    with _ManifestLock(rag_dir):
+        return _load_manifest_unlocked(rag_dir)
+
+
+class _ManifestLock:
+    """manifest 的跨进程/跨实例互斥锁（fcntl.flock advisory lock）。
+
+    同步可能由多个入口并发触发：UI 的「同步知识库」用一个 RAGEngine，agent
+    侧的自动 ingest 用另一个，二者各持一份内存中的 manifest 快照。旧实现
+    ``_save_manifest`` 是**全量覆盖写**——后写者会用自己那份旧快照抹掉前者
+    刚写入的条目，于是「已同步」的文件被判定为「未同步」，下次全量重跑。
+
+    Windows 上没有 fcntl：退化为「只加线程锁 + 直接写」（该平台不支持多进程
+    同步场景，且不会比现状更差）。
+    """
+
+    _HAVE_FCNTL = True
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:  # pragma: no cover - Windows
+        _HAVE_FCNTL = False
+
+    def __init__(self, rag_dir: str):
+        self._rag_dir = rag_dir
+        self._fh = None
+        self._thread_lock = _MANIFEST_THREAD_LOCK
+        # 本次 __enter__ 是否真的拿到了 flock（嵌套时不重复加锁/解锁）。
+        self._acquired = False
+
+    def __enter__(self):
+        depth = getattr(_MANIFEST_TLS, "depth", 0)
+        if depth > 0:
+            # 同一线程重入：只加深计数，不再 flock（否则会等自己）。
+            _MANIFEST_TLS.depth = depth + 1
+            return self
+        self._thread_lock.acquire()
+        _MANIFEST_TLS.depth = 1
+        self._acquired = True
+        if self._HAVE_FCNTL:
+            try:
+                import fcntl
+                os.makedirs(self._rag_dir, exist_ok=True)
+                self._fh = open(_manifest_lock_path(self._rag_dir), "a+")
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            except Exception as e:
+                logger.debug("RAG: manifest 文件锁不可用 (%s)，退化为仅线程锁", e)
+                if self._fh is not None:
+                    try:
+                        self._fh.close()
+                    except Exception:
+                        pass
+                    self._fh = None
+        return self
+
+    def __exit__(self, *exc):
+        depth = getattr(_MANIFEST_TLS, "depth", 0)
+        if depth > 1:
+            _MANIFEST_TLS.depth = depth - 1
+            return False
+        _MANIFEST_TLS.depth = 0
+        if self._fh is not None:
+            try:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+        if self._acquired:
+            self._acquired = False
+            self._thread_lock.release()
+        return False
+
+
+def _save_manifest(
+    rag_dir: str,
+    files: Dict[str, Dict[str, Any]],
+    removed: Optional[set] = None,
+) -> None:
+    """Persist the manifest atomically (unique tmp + os.replace), **读改写合并**。
+
+    不再全量覆盖：写入前重新读一次磁盘上的最新内容，把本次调用没碰过的条目
+    保留下来。否则两个并发的同步（UI 一个、agent 一个）会互相抹掉对方的
+    记录。
+
+    ``removed`` 是**本次有意删除**的 source 集合：这些键即使在磁盘版本里
+    存在也必须删掉（否则「别的实例刚写入的条目」和「我刚删掉的条目」无法
+    区分，删除会被合并逻辑复活）。
+    """
+    os.makedirs(rag_dir, exist_ok=True)
+    with _ManifestLock(rag_dir):
+        merged = dict(_load_manifest_unlocked(rag_dir))
+        for key in removed or ():
+            merged.pop(key, None)
+        merged.update(files)
+        atomic_write_json(_manifest_path(rag_dir), {"files": merged})
 
 
 def _file_signature(filepath: str) -> Optional[Dict[str, Any]]:
@@ -208,6 +346,43 @@ def _extract_with_docling(filepath: str) -> tuple:
         pass
     return extract_text(filepath), False
 
+
+def _shard_files_balanced(files: List[str], num_workers: int) -> List[List[str]]:
+    """把文件列表分片给 worker：按大小降序 + 贪心最轻负载（LPT 调度）。
+
+    旧实现按 ``ceil(n/workers)`` 连续切片：n=9、workers=4 时第 4 片为空
+    （3×3=9 已分完），第 4 个 worker 领空启动即退；且慢文件（扫描书要
+    逐页 OCR）按文件名顺序扎在同一片时，其余 worker 早早干完长时空转，
+    同步尾延迟被拉长。
+
+    现按文件大小降序，每次把文件分给当前累计字节数最小、并列时当前
+    已分配文件数最少的 worker：最大的 ``num_workers`` 个文件必然分属
+    不同的 worker，n ≥ workers 时空片不可能出现，慢书自动摊开。大小
+    只是处理时长的近似（扫描书按页数 OCR、文本书直读），但显著优于
+    随机顺序的连续切片。
+    """
+    if num_workers <= 1:
+        return [list(files)]
+    sized: List[List[int]] = []
+    for f in files:
+        try:
+            sized.append([os.path.getsize(f), 0, 0])
+        except OSError:
+            # 扫描后文件消失（TOCTOU）：按 0 处理，worker 内再行隔离
+            sized.append([0, 0, 0])
+    # 大小降序（并列时按原序号稳定），随后贪心分配
+    order = sorted(range(len(files)),
+                   key=lambda i: (-sized[i][0], i))
+    shards: List[List[str]] = [[] for _ in range(num_workers)]
+    totals = [0] * num_workers
+    counts = [0] * num_workers
+    for i in order:
+        # 负载键：累计字节 → 已分配文件数 → worker 序号（保证确定性）
+        k = min(range(num_workers), key=lambda w: (totals[w], counts[w], w))
+        shards[k].append(files[i])
+        totals[k] += sized[i][0]
+        counts[k] += 1
+    return shards
 
 
 class RAGEngine:
@@ -411,11 +586,11 @@ class RAGEngine:
             # Even with no files, clean up manifest entries for deleted sources
             # and save the (now empty) manifest so the deletion persists.
             new_manifest = _load_manifest(self._rag_dir)
-            self._cleanup_deleted_files(all_files, stats, stats_lock,
-                                        old_manifest=dict(new_manifest),
-                                        new_manifest=new_manifest)
+            removed = self._cleanup_deleted_files(all_files, stats, stats_lock,
+                                                  old_manifest=dict(new_manifest),
+                                                  new_manifest=new_manifest)
             try:
-                _save_manifest(self._rag_dir, new_manifest)
+                _save_manifest(self._rag_dir, new_manifest, removed=removed)
             except OSError as e:
                 logger.warning("RAG: failed to save manifest: %s", e)
             return stats
@@ -506,6 +681,9 @@ class RAGEngine:
 
         # Step 3: worker 并行解析+chunk，主线程消费并增量写入
         # 只有 files_to_process 才进入 worker 池——跳过的文件不解析不 chunk
+        # 本次实际写入的切片数（取消/失败分支要用它，而不是全库总数）。
+        # 必须在 if 之前初始化：全跳过时下面的取消分支也要读它。
+        added = 0
         if files_to_process:
             _log("━━━ Step 3/6: 解析文档 + 清洗 + 切片（%d 个文件，%d 个并行 Worker） ━━━",
                         len(files_to_process), self._parallel_workers)
@@ -618,6 +796,14 @@ class RAGEngine:
                                     logger.debug("    ├─ Markdown 已缓存: %s", md_name)
                                 except OSError as e:
                                     logger.warning("    ├─ Markdown 缓存写入失败: %s: %s", filepath, e)
+                            # 无论走缓存还是重新清洗，都补写一次 sidecar：
+                            # 「缓存文件名 → 原始文档名」的映射无法从文件名反推
+                            # （_safe_filename 会删空格、截断），历史缓存文件也
+                            # 借此在下次同步时自动获得正确映射。
+                            _write_md_meta(md_path, {
+                                "doc_name": os.path.basename(filepath),
+                                "source": rel_path,
+                            })
                             del text
 
                             if not cleaned.strip():
@@ -630,7 +816,10 @@ class RAGEngine:
                             # "# 目录\n\n文件名" 的空 digest 入库。
                             try:
                                 self.build_and_store_digest(
-                                    os.path.basename(filepath),
+                                    # 传相对路径而非 basename：documents 表的
+                                    # doc_id 以它为输入，basename 会让不同目录
+                                    # 下的同名文件互相覆盖/误删。
+                                    rel_path,
                                     cleaned,
                                     md_path=md_path,
                                 )
@@ -718,14 +907,10 @@ class RAGEngine:
             # 其持有的整文档切片内存一起泄漏到进程退出。
             _abort = threading.Event()
 
-            # 把文件列表分片给各 worker（保证负载均衡）
+            # 把文件列表分片给各 worker（LPT 负载均衡，见 _shard_files_balanced）
             # 动态调整并发数：文件数少于默认 worker 数时，只启动必要数量的线程
             num_workers = min(self._parallel_workers, len(files_to_process))
-            chunks_per_worker = (len(files_to_process) + num_workers - 1) // num_workers
-            file_shards = [
-                files_to_process[i * chunks_per_worker:(i + 1) * chunks_per_worker]
-                for i in range(num_workers)
-            ]
+            file_shards = _shard_files_balanced(files_to_process, num_workers)
 
             threads = []
             for shard in file_shards:
@@ -832,14 +1017,17 @@ class RAGEngine:
             write_failed = False
             pending_manifest: Dict[str, Dict[str, Any]] = {}
             try:
-                _log("  开始流式向量化写入 (每批 %d 个切片)", 20)
+                # 批量 200（旧值 20）：LanceDB 每次 add 都会产生一个新
+                # fragment，小批量在大库上留下海量碎片，检索要逐段扫描。
+                _log("  开始流式向量化写入 (每批 %d 个切片)", _WRITE_BATCH_SIZE)
                 added = store.add_streaming(
                     _chunk_iter(),
-                    batch_size=20,
+                    batch_size=_WRITE_BATCH_SIZE,
                     on_batch=_on_batch,
                     is_cancelled=self._is_cancelled,
                 )
                 stats["chunks"] = added
+                stats["chunks_total"] = store.count()
                 _log("  向量化写入完成: 共 %d 个切片已存入向量库", added)
             except Exception as e:
                 logger.error("  向量化写入失败: %s", e, exc_info=True)
@@ -847,7 +1035,10 @@ class RAGEngine:
                 # 失败、磁盘满、LanceDB 写入异常）不是用户主动取消，不应该设置
                 # cancelled 标志。否则 UI 会错误地显示"同步已取消"并丢弃已
                 # 解析的数据。改为将异常记录到 errors，让 ingest 正常结束。
-                stats["chunks"] = store.count()
+                #
+                # stats["chunks"] 必须记「本次写入量」而不是全库总数：UI 用它
+                # 展示「本次新增多少切片」，写全库数会让用户以为全部重算了。
+                stats["chunks"] = added
                 stats["errors"].append(f"Vector store add failed: {e}")
                 write_failed = True
             finally:
@@ -882,13 +1073,15 @@ class RAGEngine:
         cancelled = self._is_cancelled()
         if cancelled:
             stats["cancelled"] = True
-            stats["chunks"] = store.count()
+            # 记本次写入量而非全库总数：UI 展示的是「这次同步了多少切片」。
+            stats["chunks"] = added
             _log("⚠ 同步已被用户取消: %d/%d 文件已提取, %d 切片已存储",
                         stats["files_extracted"], stats["files_found"], stats["chunks"])
 
         # Step 5: 清理已删除文件
         _log("━━━ Step 5/6: 清理已删除文件 ━━━")
-        self._cleanup_deleted_files(all_files, stats, stats_lock, manifest, new_manifest)
+        removed_sources = self._cleanup_deleted_files(
+            all_files, stats, stats_lock, manifest, new_manifest)
         if stats["files_deleted"] > 0:
             _log("  已清理 %d 个已删除文件的旧向量", stats["files_deleted"])
         else:
@@ -897,7 +1090,9 @@ class RAGEngine:
         # Step 6: 保存 manifest
         _log("━━━ Step 6/6: 保存同步记录 ━━━")
         try:
-            _save_manifest(self._rag_dir, new_manifest)
+            # 读改写合并 + 跨进程锁：并存的另一个 RAGEngine（agent 侧自动
+            # ingest）刚写入的条目不能被这份旧快照抹掉。
+            _save_manifest(self._rag_dir, new_manifest, removed=removed_sources)
             _log("  同步记录已保存: %d 个文件条目 → %s",
                         len(new_manifest), _manifest_path(self._rag_dir))
         except OSError as e:
@@ -953,11 +1148,14 @@ class RAGEngine:
         stats_lock: threading.Lock,
         old_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
         new_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> None:
+    ) -> set:
         """Delete vectors and manifest entries for files removed from the KB.
 
         Runs on every ingest (force or not): if a file was in the manifest
         but is no longer on disk, its vectors are stale and must be removed.
+
+        Returns 本次有意删除的 source 集合——``_save_manifest`` 需要它来区分
+        「我删掉的条目」（必须删）与「别的实例并发写入的条目」（必须保留）。
         """
         if old_manifest is None:
             old_manifest = _load_manifest(self._rag_dir)
@@ -966,33 +1164,53 @@ class RAGEngine:
         current_set = set(current_files)
         removed = [fp for fp in old_manifest if fp not in current_set]
         if not removed:
-            return
+            return set()
         logger.info("  发现 %d 个已删除文件，清理对应向量与目录概要...", len(removed))
         store = self._get_store()
         for source in removed:
-            store.delete_by_source(source)
-            # 同步清理 documents 元数据表里的目录概要（digest）/markdown 记录。
-            # 注意：documents 表的 doc_id 用 md5(md_path) 生成（见 upsert_document），
-            # 而向量表用完整路径，故此处需取 basename。delete_document 内部按
-            # doc_id 与 doc_name 两种键删除，覆盖 md_path 为空时按 basename
-            # 建键的行。
-            store.delete_document(os.path.basename(source))
-            # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
-            # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
-            # 「有缓存文件、无 digest 记录」，于是用旧缓存重新生成一条 ——
-            # 表现是日志打了「🗑 已清理」，但 rag_outline 仍列出该文档，
-            # 且 rag/documents/ 下的 .md 永久堆积。
-            md_path = self._cache_md_path(source)
-            store.delete_document_by_md_path(md_path)
+            # 单个文件的删除失败不能中断整个清理：此时向量写入已完成、manifest
+            # 尚未保存（Step 6 在其后），一次 LanceDB 异常带着未保存的 manifest
+            # 崩溃退出会让增量同步状态不一致。逐文件隔离；失败的文件**保留在
+            # manifest 里**，下次同步重试——旧实现无条件 pop，「下次重试」的
+            # 承诺永远不成立（条目已不在 manifest，_cleanup_deleted_files 只
+            # 遍历 manifest 键），失败文件的向量会永久残留且仍可被检索。
             try:
-                if os.path.isfile(md_path):
-                    os.remove(md_path)
-            except OSError as e:
-                logger.warning("  ⚠ 删除 Markdown 缓存失败 %s: %s", md_path, e)
-            new_manifest.pop(source, None)
-            with stats_lock:
-                stats["files_deleted"] += 1
-            logger.info("  🗑 已清理: %s", os.path.basename(source))
+                store.delete_by_source(source)
+                # 同步清理 documents 元数据表里的目录概要（digest）/markdown 记录。
+                # 三个名字都删：doc_name 存的是相对路径（子目录文件），其
+                # doc_id 是 md 缓存路径的哈希——只按 basename/source 找永远
+                # 找不到子目录文件的行（digest 孤儿行永久累积，rag_outline
+                # 继续列出已删文档）。rel_path 按 doc_name 精确命中。
+                store.delete_document(os.path.relpath(source, self._knowledge_base))
+                # 两个旧版兼容：basename 哈希（最早版本）与完整路径哈希。
+                store.delete_document(os.path.basename(source))
+                store.delete_document(source)
+                # 缓存的 Markdown 也必须一起删。旧实现只删了向量和元数据，
+                # 而紧接着的 Step 7（ensure_digests_for_cached_documents）会发现
+                # 「有缓存文件、无 digest 记录」，于是用旧缓存重新生成一条 ——
+                # 表现是日志打了「🗑 已清理」，但 rag_outline 仍列出该文档，
+                # 且 rag/documents/ 下的 .md 永久堆积。
+                md_path = self._cache_md_path(source)
+                store.delete_document_by_md_path(md_path)
+                try:
+                    if os.path.isfile(md_path):
+                        os.remove(md_path)
+                    # sidecar 一并清掉：留着会在同名新文件复用时读到旧映射
+                    sidecar = _md_meta_path(md_path)
+                    if os.path.isfile(sidecar):
+                        os.remove(sidecar)
+                except OSError as e:
+                    logger.warning("  ⚠ 删除 Markdown 缓存失败 %s: %s", md_path, e)
+                new_manifest.pop(source, None)
+                with stats_lock:
+                    stats["files_deleted"] += 1
+                logger.info("  🗑 已清理: %s", os.path.basename(source))
+            except Exception as e:
+                logger.warning(
+                    "  ⚠ 清理已删除文件失败 %s: %s（保留 manifest 条目，下次同步重试）",
+                    source, e,
+                )
+        return set(removed)
 
     # ------------------------------------------------------------------
     # retrieval
@@ -1114,6 +1332,8 @@ class RAGEngine:
         doc_name: str,
         markdown: str,
         md_path: str = "",
+        digest: Optional[str] = None,
+        chapters: Optional[list] = None,
     ) -> str:
         """Build a document's digest (缩略版本) and store it in the metadata table.
 
@@ -1123,8 +1343,12 @@ class RAGEngine:
 
         ``markdown`` 只用于**构建**目录结构，不会写入元数据表（全文已缓存在
         ``rag/documents/*.md``，表内再存一份是第三份冗余且会被全量载入内存）。
+
+        ``digest`` / ``chapters`` 允许调用方传入已计算好的结果（批量重刷场景
+        里 build_digest 的标题提取很昂贵，避免算两遍）。
         """
-        digest, chapters = build_digest(markdown)
+        if chapters is None:
+            digest, chapters = build_digest(markdown)
         # 兜底：纯文本解析结果（如 PDF OCR）通常没有 Markdown 标题，提取不到
         # 任何章节。此时用文档名作为最小缩略版本，避免 rag_outline 返回空目录。
         if not chapters:
@@ -1136,8 +1360,12 @@ class RAGEngine:
             ensure_ascii=False,
         )
         store = self._get_store()
+        # 存完整 doc_name（通常是相对路径）：basename 会让不同目录下的同名
+        # 文件在 documents 表里共用 doc_id 互相覆盖。doc_name 列同时承担
+        # rag_outline 的展示与按名检索（含 basename/子串匹配），存相对路径
+        # 不影响这两种用法。
         store.upsert_document(
-            doc_name=os.path.basename(doc_name),
+            doc_name=doc_name,
             digest=digest,
             chapters=chapters_json,
             md_path=md_path,
@@ -1198,13 +1426,25 @@ class RAGEngine:
                 continue
             md_path = os.path.join(self._markdown_dir, fn)
             try:
-                # 先用 md_path 精确匹配：缓存文件名经过清洗（空格/括号/中文
-                # 标点都被丢掉），从文件名反推 doc_name 必然失真，会把
-                # "Chapter 1.pdf" 认成 "Chapter1.pdf"，于是每轮同步都判定
-                # 缺记录并写入一条重复行。md_path 是入库时原样记录的。
-                existing = by_md_path.get(os.path.abspath(md_path))
-                doc_name = existing["doc_name"] if existing else ""
-                if existing is None:
+                # doc_name 的解析优先级：
+                #   1) sidecar（写缓存时落下的原始 source 相对路径，最权威）
+                #   2) documents 表按 md_path 反查（表里的 md_path 也是原值）
+                #   3) 从缓存文件名反推（**不可靠**：_safe_filename 会删掉空格、
+                #      并把名字截断到 32 字符，"Report 2024.pdf" → "Report2024.pdf"）
+                # 只用第 3 种会导致每次同步都查不到已有记录 → 全文重读 + 重建
+                # digest，并用错名字再写一条 → documents 表出现永久重复条目。
+                meta = _read_md_meta(md_path)
+                doc_name = ""
+                if meta:
+                    doc_name = (meta.get("source") or meta.get("doc_name") or "").strip()
+                if not doc_name:
+                    # 表记录按 md_path 精确匹配：缓存文件名经过清洗（空格/括号/
+                    # 中文标点都被丢掉），从文件名反推 doc_name 必然失真，会把
+                    # "Chapter 1.pdf" 认成 "Chapter1.pdf"，于是每轮同步都判定
+                    # 缺记录并写入一条重复行。md_path 是入库时原样记录的。
+                    existing = by_md_path.get(os.path.abspath(md_path))
+                    doc_name = existing["doc_name"] if existing else ""
+                if not doc_name:
                     # 兜底：老缓存没有 md_path 记录时才退回按文件名猜。
                     # 缓存文件名格式：{safe_base}_{md5[:12]}.md → 还原 doc_name。
                     stem = fn[:-3]  # 去掉 .md
@@ -1213,6 +1453,9 @@ class RAGEngine:
                         suffix = stem[-12:]
                         if all(c in "0123456789abcdef" for c in suffix):
                             doc_name = stem[:-13]
+                # 统一用内存快照判定「记录是否存在」，不再逐文件查表。
+                existing = by_md_path.get(os.path.abspath(md_path))
+                if existing is None:
                     # 廉价预检：先查记录再决定要不要读全文。绝大多数缓存文件的
                     # digest 记录已是最新——旧实现无条件全文读入 + build_digest，
                     # 大知识库下每次同步都白跑一遍全文 IO 和解析。
@@ -1226,11 +1469,20 @@ class RAGEngine:
                     markdown = f.read()
                 if not markdown.strip():
                     continue
-                digest, _ = build_digest(markdown)
+                digest, chapters = build_digest(markdown)
                 # 记录存在但格式合法时只有内容真的变了才需要重写。
                 if existing is not None and digest == existing.get("digest", ""):
                     continue
-                self.build_and_store_digest(doc_name, markdown, md_path=md_path)
+                # 传入已计算的 digest/chapters，避免 build_and_store_digest 内部
+                # 再跑一遍昂贵的标题提取。md_path 必须传：upsert 的 doc_id 以它
+                # 为输入——漏传会落库 hash(doc_name) 的重复行，与已有记录
+                # （hash(md_path)）并存，get_document_digest 精确匹配永远命中
+                # 旧行，重刷结果对用户不可见且 by_md_path 反查永久失效。
+                self.build_and_store_digest(
+                    doc_name, markdown,
+                    digest=digest, chapters=chapters,
+                    md_path=md_path,
+                )
                 created += 1
                 logger.info("  ├─ 补做/重刷缩略版本: %s (%d 字符)", doc_name, len(markdown))
             except Exception as e:
@@ -1268,13 +1520,18 @@ class RAGEngine:
             logger.info("  已清除缓存 Markdown 文件")
         # Clear the incremental-sync manifest so the next ingest processes
         # everything from scratch (no stale "already processed" entries).
+        # 必须持 manifest 锁：并发的另一个实例可能已进入 _save_manifest 的
+        # 读改写（它 merged 里是旧条目），我们删完后它 os.replace 一写，
+        # manifest **立刻被复活** → 向量库空、记录满，此后所有文件都被判为
+        # 「已同步」而跳过，检索永远返回空且不会自愈。
         manifest = _manifest_path(self._rag_dir)
-        if os.path.exists(manifest):
-            try:
-                os.remove(manifest)
-                logger.info("  已清除同步记录文件")
-            except OSError as e:
-                logger.warning("  同步记录文件删除失败: %s", e)
+        with _ManifestLock(self._rag_dir):
+            if os.path.exists(manifest):
+                try:
+                    os.remove(manifest)
+                    logger.info("  已清除同步记录文件")
+                except OSError as e:
+                    logger.warning("  同步记录文件删除失败: %s", e)
         logger.info("  知识库已清空")
 
     def close(self) -> None:

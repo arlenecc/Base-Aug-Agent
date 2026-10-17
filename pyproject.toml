@@ -36,12 +36,20 @@ rag = [
     "PyMuPDF>=1.23.0",
     "ebooklib>=0.18",
     "chonkie[semantic]>=1.0.0",
+    # 语义切片快路径：model2vec 静态嵌入（potion-base-32M）驱动 chonkie 的
+    # SemanticChunker——切片决策只比较相邻窗口的相对相似度，不需要与检索
+    # 向量同空间，静态嵌入（纯 numpy 查表）比 BERT 前向快约两个数量级
+    # （88k 字符章节 90-150s → 0.4s，#118）。缺失时自动回退共享 nomic
+    # 适配器（慢但正确）。
+    "model2vec>=0.3",
     "docling>=2.0.0",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)
-ocr = ["rapidocr-onnxruntime>=1.0.0"]
+# rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
+# 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
+ocr = ["rapidocr>=3.10"]
 # All optional features
 #all = ["base-agent[test,rag,ocr]"]
 

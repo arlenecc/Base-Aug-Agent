@@ -205,10 +205,45 @@ class TestExtensionDeps:
             assert ext in EXTENSION_DEPS, f"Extension {ext} missing from EXTENSION_DEPS"
 
     def test_pdf_has_ocr_as_optional(self):
+        # OCR 引擎本体已从 EXTENSION_DEPS 移除（#111）：「未装 OCR」与「装了
+        # 但加载失败」在依赖层完全无法区分，前者是正常的可选缺失、后者必须
+        # 告警，统一放 optional 会让两者都只能产出无差别的「可选缺失」提示。
+        # 真正的安装提示由 check_dependencies() 在检测到图片版 PDF 时动态升级
+        # 为必需依赖给出（见 test_ocr_upgraded_to_required_for_image_pdf）。
         pdf_deps = EXTENSION_DEPS[".pdf"]
-        ocr_deps = [d for d in pdf_deps if d.import_name == "rapidocr_onnxruntime"]
-        assert len(ocr_deps) == 1
-        assert not ocr_deps[0].required
+        ocr_deps = [d for d in pdf_deps
+                    if d.import_name in ("rapidocr", "rapidocr_onnxruntime")]
+        assert ocr_deps == []
+
+    def test_ocr_upgraded_to_required_for_image_pdf(self, tmp_path, monkeypatch):
+        """知识库含图片版 PDF 且未装 OCR → 升级为必需依赖并给出安装命令。"""
+        from src.agent.rag import deps as _deps
+
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+        monkeypatch.setattr(_deps, "_pdf_has_image_pages", lambda *a, **k: True)
+        monkeypatch.setattr(_deps, "_is_importable", lambda name: False)
+
+        report = _deps.check_dependencies(str(tmp_path), include_core=False)
+        assert report.has_image_pdf is True
+        assert report.ocr_installed is False
+        assert any(d.pip_spec == "rapidocr" for d in report.missing_required)
+        # 不能同时出现在可选缺失里（否则 pip 装两遍、summary 重复列出）
+        assert not any(d.pip_spec == "rapidocr" for d in report.missing_optional)
+
+    def test_ocr_not_required_when_installed(self, tmp_path, monkeypatch):
+        """已装任一 OCR 引擎（3.x 或 1.x）→ 不报缺失。"""
+        from src.agent.rag import deps as _deps
+
+        (tmp_path / "scan.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+        monkeypatch.setattr(_deps, "_pdf_has_image_pages", lambda *a, **k: True)
+
+        def _fake_importable(name):
+            return name in ("rapidocr", "rapidocr_onnxruntime")
+
+        monkeypatch.setattr(_deps, "_is_importable", _fake_importable)
+        report = _deps.check_dependencies(str(tmp_path), include_core=False)
+        assert report.ocr_installed is True
+        assert not any(d.pip_spec == "rapidocr" for d in report.missing_required)
 
     def test_pdf_has_fitz_as_required(self):
         pdf_deps = EXTENSION_DEPS[".pdf"]

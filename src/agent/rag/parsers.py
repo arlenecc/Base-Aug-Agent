@@ -6,6 +6,7 @@ installed.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
@@ -36,6 +37,16 @@ _OCR_ENGINE_LOCK = threading.Lock()
 _OCR_RETRY_AFTER = 0.0
 _OCR_RETRY_COOLDOWN = 60.0
 
+# OCR 引擎周期性重建页数。CoreML/ORT 的原生缓存按输入形状保留（实测真实
+# 扫描页 ~35MB/页，#119：400 页扫描书滞留 ~14GB，进程退出前不释放，最终
+# 被系统压缩到 17GB 直至 50GB 崩溃）。每 N 页强制重建引擎冲刷全部原生
+# 缓存：#130 系统扫描（N=10..100，单线程真实 200dpi 页）证实热重建仅
+# 1-2s/次、峰值足迹在各 N 下持平 ~5.2GB（压缩器吸收缓存增长），N 对速度
+# 影响仅 1-3%/400 页书。取 50：单代水位 ~1.8GB（#123 后单代存活，4 worker
+# 聚合约同量级），重建开销摊薄到 ~0.5%。合成小图触发不了该积累，只有真实
+# 200dpi 大页 + 密集文字框才会——不要因为「合成实验没复现」而移除。
+_OCR_RECYCLE_PAGES = 50
+
 # AgentConfig（可选注入）。未提供时按「全部开启」处理 —— config 的默认值
 # 本身就是 True，不注入不会改变行为；注入后 UI 的开关才生效。
 _OCR_CONFIG = None
@@ -55,9 +66,9 @@ def set_ocr_config(config) -> None:
 # ---------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {
-    ".docx", ".doc",
-    ".xlsx", ".xls",
-    ".pptx", ".ppt",
+    ".docx",
+    ".xlsx",
+    ".pptx",
     ".pdf",
     ".epub",
     ".mobi", ".azw3", ".azw",
@@ -65,6 +76,9 @@ SUPPORTED_EXTENSIONS = {
     ".csv", ".tsv",
     ".html", ".htm",
 }
+# 旧版二进制格式（.doc/.xls/.ppt）不在支持列表：python-docx/openpyxl/
+# python-pptx 与 docling 均只支持 OOXML，解析必然失败（extract_text 对它们
+# 给出明确的「另存为」提示）。保留在支持列表里只会让用户误以为可用。
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -94,10 +108,31 @@ def extract_text(filepath: str) -> str:
     logger.debug("    解析文件类型: %s (%s)", path.name, label)
 
     if suffix in (".docx", ".doc"):
+        if suffix == ".doc":
+            # python-docx 只支持 OOXML（.docx）；旧版 OLE2 二进制 .doc 传进来
+            # 100% 抛异常（docling 同样不支持 legacy 格式），之前表现为一条
+            # 难懂的库报错。直接给出可行动的提示。
+            raise ValueError(
+                "旧版 .doc 二进制格式不受支持（python-docx/docling 均只支持 .docx），"
+                "请先用 Word/WPS 另存为 .docx 后重新同步"
+            )
         return _extract_docx(path)
     elif suffix in (".xlsx", ".xls"):
+        if suffix == ".xls":
+            # openpyxl 明确不支持旧版 .xls（BIFF），必然抛
+            # "does not support the old .xls file format"。
+            raise ValueError(
+                "旧版 .xls 二进制格式不受支持（openpyxl 只支持 .xlsx），"
+                "请先用 Excel/WPS 另存为 .xlsx 后重新同步"
+            )
         return _extract_xlsx(path)
     elif suffix in (".pptx", ".ppt"):
+        if suffix == ".ppt":
+            # python-pptx 只支持 OOXML（.pptx），同上。
+            raise ValueError(
+                "旧版 .ppt 二进制格式不受支持（python-pptx 只支持 .pptx），"
+                "请先用 PowerPoint/WPS 另存为 .pptx 后重新同步"
+            )
         return _extract_pptx(path)
     elif suffix == ".pdf":
         return _extract_pdf(path)
@@ -205,6 +240,23 @@ def _extract_pptx(path: Path) -> str:
             pass
 
 
+def _pixmap_is_blank(pix) -> bool:
+    """检测渲染后的整页位图是否为纯色/近纯色（无有效内容）。
+
+    均匀采样至多 8192 字节取 min/max：极差 ≤ 12 视为近纯色。覆盖两类
+    场景：页面上只有纯色占位图/装饰条；扫描件里的空白纸页（整页白纸
+    带轻微压缩噪点）。这些页送 OCR 必然返回 "text detection result is
+    empty"，每页白白消耗 2-5 秒。极差阈值 12 足以容纳 JPEG/扫描噪点，
+    而任何含文字的页都有大量暗像素，极差远超此值。
+    """
+    samples = pix.samples
+    if not samples:
+        return True
+    step = max(1, len(samples) // 8192)
+    data = samples[::step]
+    return (max(data) - min(data)) <= 12
+
+
 def _extract_pdf(path: Path) -> str:
     """Extract text from PDF. Auto-detects text vs image-based pages.
 
@@ -233,8 +285,11 @@ def _extract_pdf(path: Path) -> str:
 
         total_pages = len(doc)
         parts: List[str] = []
-        ocr_engine = None       # lazy-init, 复用同一个引擎实例
         ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
+        # 汇总日志用：记录「本本书 OCR 是否可用」。循环内每页重新绑定
+        # （页末即释放，不跨页持有旧引擎——见 _OCR_RECYCLE_PAGES 注释），
+        # 纯文本书不进 OCR 分支时保持 None。
+        ocr_engine = None
 
         # OCR 图像预处理（自适应 DPI + 尺寸归一化 + CLAHE + 锐化）：默认开启，
         # 可由 AgentConfig.rag_ocr_preprocess 关闭。放在循环外只解析一次，
@@ -291,13 +346,6 @@ def _extract_pdf(path: Path) -> str:
                 ocr_skipped_count += 1
                 continue
 
-            if ocr_engine is None:
-                ocr_engine = _get_ocr_engine()
-                if ocr_engine is None:
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
-                    continue
-
             # 无超时的 acquire 在这里是个隐患：单页 OCR 卡死（ONNX 死锁 /
             # 病态大图）时，所有 ingest worker 连同它们的 daemon 线程一起永久
             # 挂起，用户侧表现为「同步进度再也不动且没有任何报错」。
@@ -310,12 +358,29 @@ def _extract_pdf(path: Path) -> str:
                 )
                 continue
             try:
+                # 每页从进程级单例取引擎，页末即释放局部引用（#123）。
+                # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
+                # （release + 全局置 None）只影响触发回收的 worker，其它
+                # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
+                # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
+                # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
+                ocr_engine = _get_ocr_engine()
+                if ocr_engine is None:
+                    ocr_unavailable = True
+                    ocr_skipped_count += 1
+                    continue
                 # 自适应 DPI：页面物理尺寸差异很大（A4 / letter / 裁剪的小图），
                 # 固定 200dpi 会让检测器看到完全不同的字形大小。先按页面尺寸
                 # 解出「短边落在目标像素」的 DPI，再做归一化。
                 dpi = render_dpi_for_page(page)
                 pix = page.get_pixmap(dpi=dpi)
                 try:
+                    if _pixmap_is_blank(pix):
+                        # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
+                        # 空白纸页）：OCR 检测必然为空，直接跳过，省下每页
+                        # 2-5 秒的 OCR（真实日志中单文档可浪费 1 分钟以上）。
+                        blank_page_count += 1
+                        continue
                     img_bytes = pix.tobytes("png")
                 finally:
                     # Pixmap 持有整页位图（数 MB），显式释放避免多页循环时
@@ -340,10 +405,28 @@ def _extract_pdf(path: Path) -> str:
             else:
                 # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
+
+            # 周期性重建引擎：冲刷 CoreML/ORT 按形状保留的原生缓存（见
+            # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
+            # 下一页都会重新取用/重建——旧引擎随各 worker 页末的引用释放
+            # 而销毁，原生缓存真正被冲刷。
+            if (ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0:
+                release_ocr_engine()
+                logger.info("PDF '%s': OCR 引擎已周期重建（每 %d 页，冲刷原生缓存）",
+                            path.name, _OCR_RECYCLE_PAGES)
     finally:
         # 必须放在 finally：中途抛异常（加密 PDF、损坏文件、OCR 崩溃）时
         # 旧实现直接跳过 doc.close()，泄漏文件句柄与整份文档的解码缓存。
         doc.close()
+        # MuPDF 的 store 会缓存解码后的嵌入图（每张满页扫描图解码后
+        # ~10MB+，数百页累计可观且进程内常驻）；全书解析完立即收缩并
+        # 回收 Python 侧临时对象。store 是进程级全局的，收缩会影响其它
+        # worker 正在打开的文档——只是缓存失效（重解码），不影响正确性。
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
+        gc.collect()
 
     # 汇总日志：清晰报告各类型页面的处理情况
     detail_parts = [f"text={text_page_count}"]
@@ -402,8 +485,12 @@ def _get_ocr_engine():
     _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
     invoked by one thread at a time.
 
-    引擎构造交给 :mod:`agent.rag.ocr_engine`：Apple Silicon 上会注入 CoreML EP
-    （CPU+GPU+ANE），非 Apple 平台或 onnxruntime 过旧时自动回退默认 EP。
+    引擎选择：优先 rapidocr 3.x（支持 CoreML EP、模型目录与 docling 共享、
+    懒加载省内存），未安装再回退旧版 rapidocr-onnxruntime 1.x（经
+    :mod:`agent.rag.ocr_engine` 注入 CoreML EP）。Apple Silicon（M 系列）上
+    3.x 启用 onnxruntime 的 CoreML EP（ANE+GPU 推理）；CoreML 初始化失败
+    自动回退 CPU EP。两种版本都会预热一次（空图）——模型本来马上就会被用到，
+    预热同时消除首页 OCR 的加载延迟并探测实际生效的 EP。
     """
     global _OCR_ENGINE, _OCR_RETRY_AFTER
     if _OCR_ENGINE is not None:
@@ -416,26 +503,76 @@ def _get_ocr_engine():
         if time.monotonic() < _OCR_RETRY_AFTER:
             return None
         try:
-            from .ocr_engine import create_ocr_engine, coreml_reason
-            use_coreml = bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True))
-            if not use_coreml:
-                logger.info("OCR: CoreML EP 按配置关闭")
-            else:
-                _, reason = coreml_reason()
-                logger.info("OCR: CoreML EP 检测 — %s", reason)
-            _OCR_ENGINE = create_ocr_engine(use_coreml=use_coreml)
+            _OCR_ENGINE = _build_ocr_engine()
+            _warmup_ocr_engine(_OCR_ENGINE)
             logger.info("RapidOCR engine loaded (global singleton)")
             return _OCR_ENGINE
         except ImportError:
             logger.warning(
-                "rapidocr-onnxruntime is required for OCR on image-based PDFs. "
-                "pip install rapidocr-onnxruntime"
+                "rapidocr is required for OCR on image-based PDFs. "
+                "pip install rapidocr"
             )
             return None
         except Exception as e:
             logger.warning("Failed to init RapidOCR: %s", e)
             _OCR_RETRY_AFTER = time.monotonic() + _OCR_RETRY_COOLDOWN
             return None
+
+
+def _build_ocr_engine():
+    """按可用性构造 RapidOCR 引擎：3.x 优先，1.x 回退（均带 CoreML 加速）。"""
+    use_coreml = bool(getattr(_OCR_CONFIG, "rag_ocr_coreml", True))
+    params = None
+    try:
+        from rapidocr import RapidOCR  # 3.x
+        if use_coreml and _is_apple_silicon():
+            params = {"EngineConfig.onnxruntime.use_coreml": True}
+    except ImportError:
+        from .ocr_engine import create_ocr_engine, coreml_reason
+        if not use_coreml:
+            logger.info("OCR: CoreML EP 按配置关闭")
+        else:
+            _, reason = coreml_reason()
+            logger.info("OCR: CoreML EP 检测 — %s", reason)
+        return create_ocr_engine(use_coreml=use_coreml)
+    if params:
+        try:
+            return RapidOCR(params=params)
+        except Exception as e:
+            # CoreML 会话建不起来（不支持的算子 / MLProgram 缺失）→ 回退 CPU EP。
+            logger.info(
+                "RapidOCR CoreML EP init failed (%s); using CPU EP", type(e).__name__
+            )
+            return RapidOCR()
+    return RapidOCR()
+
+
+def _is_apple_silicon() -> bool:
+    """当前是否为 Apple Silicon（M 系列）Mac。
+
+    优先用 :mod:`agent.rag.ocr_engine` 的探测（``sysctl`` 读真实 CPU 型号，
+    Rosetta 下 ``platform.machine()`` 会谎报 x86_64）；拿不到时退回简单的
+    arm64 判断。Intel Mac 返回 False，继续用 CPU EP。
+    """
+    try:
+        from .ocr_engine import is_apple_silicon as _detect
+        return bool(_detect())
+    except Exception:
+        import platform
+        return platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
+
+
+def _warmup_ocr_engine(engine) -> None:
+    """用一张空白图预热：提前加载模型并探测实际生效的 EP（失败无感跳过）。"""
+    try:
+        import numpy as np
+        engine(np.full((64, 64), 255, dtype=np.uint8))
+        inner = getattr(getattr(engine, "text_det", None), "session", None)
+        inner = getattr(inner, "session", inner)
+        if inner is not None and hasattr(inner, "get_providers"):
+            logger.info("RapidOCR engine loaded, EP: %s", inner.get_providers())
+    except Exception:
+        logger.debug("OCR 预热跳过（不影响使用）")
 
 
 def release_ocr_engine() -> None:
@@ -464,13 +601,20 @@ def _ocr_image_cached(engine, image, page_num: int, filename: str) -> str:
 
     ``image`` 可以是 PNG bytes（旧路径）或已预处理的 BGR ndarray——RapidOCR
     的 LoadImage 两者都接受，ndarray 走零拷贝路径，省掉一次编解码往返。
+    兼容两代 API 的返回：3.x 返回 RapidOCROutput（行文本在 .txts）；
+    1.x 返回 (result, elapse)，result 是 [box, text, score] 列表。
     """
     try:
-        result, _ = engine(image)
-        if not result:
+        out = engine(image)
+        if isinstance(out, tuple):
+            out = out[0]
+        txts = getattr(out, "txts", None)
+        if txts is not None:
+            return "\n".join(t for t in txts if t and t.strip())
+        if not out:
             return ""
         lines = []
-        for item in result:
+        for item in out:
             text = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else str(item)
             if text.strip():
                 lines.append(text)

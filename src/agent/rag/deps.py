@@ -2,7 +2,7 @@
 
 Covers three layers:
 1. Python packages (lancedb, fastembed, PyMuPDF, python-docx, etc.)
-2. OCR engine (rapidocr-onnxruntime) — auto-detected if PDF has image pages
+2. OCR engine (rapidocr 3.x，兼容旧版 rapidocr-onnxruntime) — auto-detected if PDF has image pages
 3. Embedding model (nomic-ai/nomic-embed-text-v1.5) — pre-downloaded from HF
 
 Runs before every sync so users never hit missing-dependency errors mid-ingest.
@@ -17,11 +17,16 @@ import warnings
 import glob
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 重排序模型下载失败的短时负缓存（monotonic 时间戳）：见 ensure_rag_deps Step 3。
+_RERANKER_DOWNLOAD_FAILED_AT: Optional[float] = None
+_RERANKER_RETRY_INTERVAL = 600.0  # 10 分钟内不重复尝试下载
 
 # ---------------------------------------------------------------------------
 # Dependency registry
@@ -38,18 +43,15 @@ class DepSpec:
 
 
 # Map each file extension to its required dependencies.
+# 旧版二进制格式（.doc/.xls/.ppt）不在表内：python-docx/openpyxl/python-pptx
+# 均只支持 OOXML，装了也解析不了（parsers 对它们给出明确的「另存为」提示），
+# 列在这里只会制造「已支持」的假象并白装依赖。
 EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".docx": [DepSpec("docx", "python-docx", "Word 文档解析")],
-    ".doc":  [DepSpec("docx", "python-docx", "Word 文档解析")],
     ".xlsx": [DepSpec("openpyxl", "openpyxl", "Excel 表格解析")],
-    ".xls":  [DepSpec("openpyxl", "openpyxl", "Excel 表格解析")],
     ".pptx": [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
-    ".ppt":  [DepSpec("pptx", "python-pptx", "PPT 幻灯片解析")],
     ".pdf":  [
         DepSpec("fitz", "PyMuPDF", "PDF 文字解析"),
-        # OCR is conditional: only required when the PDF actually has image pages.
-        # check_dependencies() will upgrade it to required if image pages are detected.
-        DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别", required=False),
         # OCR image pre-processing (adaptive DPI + scale normalisation + CLAHE +
         # sharpen) needs cv2. Missing → ocr_engine falls back to the raw bitmap,
         # so this stays optional rather than blocking every PDF sync.
@@ -115,28 +117,27 @@ _EMBEDDING_REQUIRED_FILES = [
 #
 # 注意 fastembed 的**模型名**与它实际拉取的 **HF 仓库**不是一回事：
 #   nomic-ai/nomic-embed-text-v1.5-Q  →  nomic-ai/nomic-embed-text-v1.5
-#   BAAI/bge-reranker-v2-m3            →  onnx-community/bge-reranker-v2-m3-ONNX
+#   BAAI/bge-reranker-v2-m3-int8      →  onnx-community/bge-reranker-v2-m3-ONNX
 # 缓存目录名由 HF 仓库推导（``models--{org}--{repo}``），所以探测必须用仓库名，
 # 用 fastembed 模型名会永远找不到已下载的模型。
 #
-# bge-reranker-v2-m3 的 ONNX 权重是「model.onnx + 外挂 model.onnx_data」两段
-# （合计 ~2.27GB），只检查 model.onnx 会把只下了 656KB 外部图的半成品判成已缓存。
+# 重排序选官方 INT8 量化版（~570MB，fp32 全量 2.3GB 的一半不到；CPU EP 上有
+# int8 加速，且 bge-reranker-v2-m3 的多语种/中文精排能力优于 bge-reranker-base）。
+# INT8 版没有外挂 ``model.onnx_data``（fp32 才有），权重是单文件
+# ``onnx/model_int8.onnx``——它是下载的最后一个文件，它完整落盘即意味着
+# tokenizer 等前置文件也已就绪（中断的下载只会留下前置文件，见
+# _model_file_cached 的 .incomplete 处理）。
 _EMBEDDING_HF_REPO = "nomic-ai/nomic-embed-text-v1.5"
 _RERANK_HF_REPO = "onnx-community/bge-reranker-v2-m3-ONNX"
 _RERANK_REQUIRED_FILES = [
-    "onnx/model.onnx",
-    "onnx/model.onnx_data",
-    "config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "vocab.txt",
+    "onnx/model_int8.onnx",
 ]
 
 # Reranker model (FastEmbed cross-encoder, used at search time, not ingest —
-# pre-download to avoid blocking the first search). ~2.27GB ONNX download,
+# pre-download to avoid blocking the first search). ~570MB ONNX download,
 # optional: search falls back to distance-based ranking if unavailable.
-RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3"
-RERANK_MODEL_LABEL = "重排序模型 bge-reranker-v2-m3 (FastEmbed ONNX, 可选)"
+RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3-int8"
+RERANK_MODEL_LABEL = "重排序模型 bge-reranker-v2-m3 (INT8, ~570MB, 可选)"
 
 # Version pins: packages that need specific version constraints
 VERSION_PINS: Dict[str, str] = {
@@ -470,15 +471,18 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
     if ".pdf" in exts:
         has_images = _pdf_has_image_pages(kb_path)
         report.has_image_pdf = has_images
-        # Check if OCR is installed
-        report.ocr_installed = _is_importable("rapidocr_onnxruntime")
+        # Check if OCR is installed.
+        # 新版 rapidocr (3.x) 与旧版 rapidocr-onnxruntime (1.x) 任一可用即可，
+        # 引擎选择见 parsers._get_ocr_engine。
+        report.ocr_installed = (_is_importable("rapidocr")
+                                or _is_importable("rapidocr_onnxruntime"))
         if has_images and not report.ocr_installed:
             # Move OCR from optional to required.
             # 必须同时从 missing_optional 里移除：否则同一个 pip_spec 会同时
             # 出现在「缺失必需」和「缺失可选」里 → pip 装两遍、summary 里
             # 重复列出同一项。按 pip_spec 去重（DepSpec 是 dataclass，值相等
             # 即可比较，但这里显式按 pip_spec 匹配更稳）。
-            ocr_spec = DepSpec("rapidocr_onnxruntime", "rapidocr-onnxruntime", "图片型 PDF OCR 识别")
+            ocr_spec = DepSpec("rapidocr", "rapidocr", "图片型 PDF OCR 识别")
             report.missing_optional = [
                 d for d in report.missing_optional if d.pip_spec != ocr_spec.pip_spec
             ]
@@ -489,8 +493,35 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
     if exts & {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".epub"}:
         if not _is_importable("docling"):
             report.missing_optional.append(
-                DepSpec("docling", "docling", "统一文档解析引擎 docling（可选，未安装时回退按格式解析）")
+                DepSpec("docling", "docling",
+                        "统一文档解析引擎 docling（可选，未安装时回退按格式解析）",
+                        required=False)
             )
+
+    # ---- jieba: BM25 中文预分词（RAG 全文检索 + 技能语义检索共用）----
+    # 缺失时 _tokenize_for_fts 静默退化为空白切分：中文整句作为一个 token，
+    # BM25 召回大幅下降且用户无感知。纯 Python + 内置词典（~19MB）无重依赖，
+    # 与 chonkie 同级处理——缺失时随同步自动安装。
+    # 注意：写入侧退化是持久的（text_fts 列在 add 时已按坏分词落库），安装
+    # 后需 force 重新同步才能修复历史向量；查询侧装完即生效。
+    if not _is_importable("jieba"):
+        report.missing_optional.append(
+            DepSpec("jieba", "jieba",
+                    "中文分词 jieba（可选，未安装时 BM25 中文检索退化）",
+                    required=False)
+        )
+
+    # ---- model2vec: chonkie 语义切片的静态嵌入快路径（potion-base-32M）----
+    # 没有它，chonkie 的 AutoEmbeddings 构造 potion 会失败，semantic_chunker
+    # 回退共享 nomic 适配器——BERT 推理 + 2N 次 embed，88k 字符章节要
+    # 90-150s（#118）。model2vec 纯 numpy 查表，秒级。仅在 chonkie 已
+    # 安装时才有意义（chonkie 都没有话语义切片整体回退递归）。
+    if _is_importable("chonkie") and not _is_importable("model2vec"):
+        report.missing_optional.append(
+            DepSpec("model2vec", "model2vec",
+                    "语义切片静态嵌入 model2vec（可选，缺失时切片走 nomic 慢路径）",
+                    required=False)
+        )
 
     # ---- Embedding model ----
     if include_core:
@@ -706,16 +737,33 @@ def ensure_dependencies(
             report.install_errors.append(f"嵌入模型下载失败: {msg}")
 
     # ---- Step 3: Pre-download reranker model (optional, non-blocking) ----
-    if report.reranker_model_missing:
-        if progress_callback:
-            progress_callback(f"重排序模型未缓存，开始后台下载 {RERANK_MODEL_LABEL}…")
-        success, msg = _download_reranker_model(progress_callback)
-        if success:
-            report.reranker_model_missing = False
-            installed_anything = True
+    # 不依赖 report.reranker_model_missing：它是在 pip 安装**之前**判定的，
+    # fastembed 刚被 Step 1 从旧版升级上来的场景里该标志会被跳过，模型下载
+    # 就要延迟到下一轮同步。这里用安装完成后的实时状态重新判定。
+    if _is_importable("fastembed") and not _is_reranker_cached():
+        global _RERANKER_DOWNLOAD_FAILED_AT
+        recent_failure = (
+            _RERANKER_DOWNLOAD_FAILED_AT is not None
+            and time.monotonic() - _RERANKER_DOWNLOAD_FAILED_AT < _RERANKER_RETRY_INTERVAL
+        )
+        if recent_failure:
+            # 负缓存：上次下载失败（网络不通等）后不再每次同步都同步阻塞一整轮
+            # 网络超时。重排序是可选能力，跳过不影响同步。
+            report.install_errors.append(
+                "重排序模型此前下载失败，短时间内不再重试（可选，不影响同步）"
+            )
         else:
-            # Reranker is optional — don't block sync if download fails
-            report.install_errors.append(f"重排序模型下载失败（可选，不影响同步）: {msg}")
+            if progress_callback:
+                progress_callback(f"重排序模型未缓存，开始后台下载 {RERANK_MODEL_LABEL}…")
+            success, msg = _download_reranker_model(progress_callback)
+            if success:
+                report.reranker_model_missing = False
+                installed_anything = True
+                _RERANKER_DOWNLOAD_FAILED_AT = None
+            else:
+                # Reranker is optional — don't block sync if download fails
+                report.install_errors.append(f"重排序模型下载失败（可选，不影响同步）: {msg}")
+                _RERANKER_DOWNLOAD_FAILED_AT = time.monotonic()
 
     if installed_anything and progress_callback:
         progress_callback("依赖检查完成。")
@@ -760,6 +808,13 @@ def _is_reranker_cached() -> bool:
 def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
     """Pre-download the reranker model via FastEmbed.
 
+    用 ``TextCrossEncoder(..., lazy_load=True)``：fastembed 会把 catalog 里的
+    权重 + tokenizer 下到 HF-hub 风格缓存，但**不创建** onnxruntime 会话——
+    依赖检查跑在同步前的 UI 线程上，少了 ~0.5GB 常驻内存与数秒模型加载。
+    调用是幂等的：已缓存时瞬间返回。
+    cache_dir 显式指定为持久目录（与嵌入模型同一目录），不用 fastembed 默认的
+    临时目录（macOS 会定期清理，曾导致每次同步重新下载，#121）。
+
     FastEmbed handles the download to its own cache directory (same as the
     embedding model), which is where it will look for the model at runtime.
     Works in both dev and frozen (PyInstaller) environments.
@@ -770,20 +825,30 @@ def _download_reranker_model(progress_callback=None) -> Tuple[bool, str]:
 
     try:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
+    except ImportError:
+        try:
+            # fastembed 0.6–0.8 在顶层导出 TextCrossEncoder，0.9 起移入子模块。
+            from fastembed import TextCrossEncoder  # type: ignore[no-redef]
+        except ImportError:
+            msg = "fastembed 未安装或版本过旧（需要 >= 0.6）"
+            logger.warning("RAG deps: reranker download failed: %s", msg)
+            if progress_callback:
+                progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
+            return False, msg
+
+    try:
         cache_dir = _get_fastembed_cache_dir()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            TextCrossEncoder(model_name=RERANK_MODEL_ID, cache_dir=cache_dir)
+            TextCrossEncoder(
+                RERANK_MODEL_ID,
+                lazy_load=True,
+                cache_dir=cache_dir,
+            )
         logger.info("RAG deps: reranker model downloaded and cached by FastEmbed")
         if progress_callback:
             progress_callback(f"✅ {RERANK_MODEL_LABEL} 下载完成")
         return True, "下载成功"
-    except ImportError:
-        msg = "fastembed 不可用"
-        logger.warning("RAG deps: reranker download failed: %s", msg)
-        if progress_callback:
-            progress_callback(f"⚠ 重排序模型下载失败（可选）: {msg}")
-        return False, msg
     except Exception as e:
         # Keep only the last line — HF/ONNX errors can be multi-page tracebacks.
         msg = str(e).strip().split("\n")[-1] if str(e).strip() else "unknown error"

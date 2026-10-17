@@ -5,12 +5,16 @@ threshold) instead of naive character/recursive splits.  Semantic chunks keep
 topically-related sentences together, which materially improves retrieval
 quality for e-books and long documents.
 
-The embedding model is the *same* nomic-embed-text instance used by the vector
-store (shared process-wide singleton), so semantic chunking does not load a
-second copy of the ~137MB ONNX model.
+Embedding backends (in priority order):
+  1. Explicitly injected ``embedding_function`` → wrapped via
+     ``_ChonkieEmbeddingAdapter`` (tests / external callers).
+  2. model2vec static embeddings (potion-base-32M) — fast path for chunking
+     decisions, ~100x faster than BERT inference (#118).
+  3. Shared nomic-embed-text singleton → adapter (fallback when model2vec is
+     unavailable; slow but correct).
 
-If ``chonkie`` is not installed, :func:`semantic_chunk_text` returns ``None``
-so callers fall back to the existing recursive chunker.
+If none is available (or ``chonkie`` is not installed), :func:`semantic_chunk_text`
+returns ``None`` so callers fall back to the existing recursive chunker.
 """
 from __future__ import annotations
 
@@ -82,14 +86,23 @@ def semantic_chunk_text(
 
     ef = None
     try:
-        ef = embedding_function or _shared_embedding_function()
-        if ef is None:
-            logger.debug("semantic chunking skipped: no embedding function available")
-            return None
-
         from chonkie import SemanticChunker
 
-        embeddings = _ChonkieEmbeddingAdapter(ef)
+        if embedding_function is not None:
+            # 显式注入（测试/外部调用）：走适配器，行为与旧版一致。
+            embeddings = _ChonkieEmbeddingAdapter(embedding_function)
+        else:
+            # 生产路径：优先 model2vec 静态嵌入（切片决策不需要与检索向量
+            # 同空间，静态嵌入的相对相似度足够；吞吐高约两个数量级）。
+            # model2vec 缺失时回退共享 nomic 适配器（慢但正确），再不行
+            # 返回 None 交给上层递归切片兜底。
+            embeddings = _get_static_embeddings()
+            if embeddings is None:
+                ef = _shared_embedding_function()
+                if ef is None:
+                    logger.debug("semantic chunking skipped: no embedding backend available")
+                    return None
+                embeddings = _ChonkieEmbeddingAdapter(ef)
 
         # When chonkie is present, _BaseEmbeddings is the real base class and
         # the isinstance check in SemanticChunker.__init__ will pass.  When it
@@ -134,9 +147,18 @@ class _SourceLocator:
     这里加一个单调游标：merge / overlap 都按文档顺序处理 chunk，位置不会
     回退，因此从游标附近起找即可，总扫描量降到 O(N)。游标 miss 时再退回
     全量 find（chonkie 偶发重排 whitespace 的情况），结果进缓存复用。
+
+    与主线 chunker._gap_between 一样带 ``_MAX_GAP`` 防护：left 可能在原文
+    出现多次（重复段落/样板文本），命中了更早的错误实例时 right 会落在
+    很远的位置——算出的 gap 会把不属于这两个 chunk 的文本拼进结果。间隔
+    超限就换 left 的下一个出现位置重试。
     """
 
     __slots__ = ("source", "_next", "_cache")
+
+    # gap 上限：超过即认为 left 命中了错误实例（正常相邻 chunk 的间隔远
+    # 小于此；只有跨章节的误匹配才会超过）。
+    _MAX_GAP = 256
 
     def __init__(self, source: Optional[str]):
         self.source = source
@@ -155,14 +177,20 @@ class _SourceLocator:
         i = self.source.find(left, start)
         if i < 0:
             i = self.source.find(left)
-        if i < 0:
-            self._cache[key] = "\n\n"
-            return "\n\n"
-        j = self.source.find(right, i + len(left))
-        gap = self.source[i + len(left):j] if j >= 0 else "\n\n"
-        self._cache[key] = gap
-        self._next = (j if j >= 0 else i) + len(right)
-        return gap
+        result = "\n\n"
+        while i >= 0:
+            j = self.source.find(right, i + len(left))
+            if j < 0:
+                # right 在 left 之后完全不存在：后续出现位置也不可能更好
+                break
+            if j - (i + len(left)) <= self._MAX_GAP:
+                result = self.source[i + len(left):j]
+                self._next = j + len(right)
+                break
+            # 间隔异常大：left 命中了更早的错误实例，换下一个出现位置重试
+            i = self.source.find(left, i + 1)
+        self._cache[key] = result
+        return result
 
 
 def _gap_between(source: Optional[str], left: str, right: str) -> str:
@@ -364,6 +392,59 @@ def _shared_embedding_function():
             _shared_ef = None
             _shared_ef_failed_at = time.monotonic()
     return _shared_ef
+
+
+# ---------------------------------------------------------------------------
+# static embeddings for chunking decisions (potion via model2vec)
+# ---------------------------------------------------------------------------
+
+# 语义切片的「快路径」嵌入后端：model2vec 静态嵌入（potion-base-32M，
+# ~30MB，纯 numpy 查表 + 平均池化，无 BERT 前向）。它只服务「相邻窗口是否
+# 语义断裂」的切片决策——决策只需要相邻相似度的相对大小，不需要与检索
+# 向量同空间，静态嵌入完全够用。实测吞吐比共享 nomic 适配器（BERT 推理
+# + 2N 次 embed）高约两个数量级（88k 字符章节 90-150s → 秒级，#118）。
+#
+# chonkie 自带的 AutoEmbeddings 会把 minishlab/* 路由到 Model2VecEmbeddings
+# （chonkie.embeddings.registry），model2vec 未安装时其构造抛 ImportError。
+_STATIC_EMBS = None
+_STATIC_EMBS_RESOLVED = False
+_STATIC_EMBS_FAILED_AT: Optional[float] = None
+_STATIC_EMBS_RETRY_INTERVAL = 60.0  # 失败负缓存：60s 内不重复尝试
+_STATIC_EMBS_LOCK = threading.Lock()
+
+_POTION_MODEL = "minishlab/potion-base-32M"
+
+
+def _get_static_embeddings():
+    """Return the model2vec static embeddings for chunking, or None.
+
+    失败负缓存与 ``_shared_embedding_function`` 同款：deps 在同步前自动
+    安装 model2vec，安装成功后的下一次尝试（60s 负缓存过期后）自动升级
+    到快路径，无需重启。首次使用会下载 potion 权重（~30MB，HF 缓存）。
+    """
+    global _STATIC_EMBS, _STATIC_EMBS_RESOLVED, _STATIC_EMBS_FAILED_AT
+    if _STATIC_EMBS_RESOLVED:
+        return _STATIC_EMBS
+    if (
+        _STATIC_EMBS_FAILED_AT is not None
+        and time.monotonic() - _STATIC_EMBS_FAILED_AT < _STATIC_EMBS_RETRY_INTERVAL
+    ):
+        return None
+    with _STATIC_EMBS_LOCK:
+        if _STATIC_EMBS_RESOLVED:
+            return _STATIC_EMBS
+        try:
+            from chonkie.embeddings import AutoEmbeddings
+
+            _STATIC_EMBS = AutoEmbeddings.get_embeddings(_POTION_MODEL)
+            _STATIC_EMBS_RESOLVED = True
+            _STATIC_EMBS_FAILED_AT = None
+            logger.info("语义切片使用静态嵌入 %s（model2vec 快路径）", _POTION_MODEL)
+        except Exception as e:
+            logger.debug("model2vec 静态嵌入不可用（%s），回退 nomic 适配器", e)
+            _STATIC_EMBS = None
+            _STATIC_EMBS_FAILED_AT = time.monotonic()
+    return _STATIC_EMBS
 
 
 # ---------------------------------------------------------------------------

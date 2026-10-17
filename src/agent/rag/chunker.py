@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ def _split_recursive(
             chunks.append(current)
 
         if chunks:
-            return _merge_overlap(chunks, chunk_overlap, sep)
+            return _merge_overlap(chunks, chunk_overlap, sep, source=text)
 
     # Fallback: character-level split (was previously returning an oversized chunk)
     return _split_by_tokens(text, chunk_size, chunk_overlap)
@@ -316,6 +316,11 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
             break
 
         # Advance position with overlap — incremental token count
+        if chunk_overlap <= 0:
+            # 零重叠：直接推进。旧实现循环条件 >= 0 恒真，仍会先吃进 1 个
+            # 字符再判断，导致永远有 1 字符重叠，与「零重叠」语义不符。
+            pos = end
+            continue
         overlap_start = end
         ov_cjk = 0
         ov_other = 0
@@ -333,7 +338,35 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     return chunks
 
 
-def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
+def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "\n\n") -> str:
+    """Return the exact text that separates ``left`` and ``right`` in ``source``.
+
+    拼接相邻 chunk 时硬编码分隔符会在「源文本里两者的真实间隔不是该分隔符」
+    时伪造出原文没有的内容（chunk 不再是原文子串）。这里在原文中定位两个
+    片段的相邻出现，返回真实间隔；定位失败/间隔异常大时退回 fallback。
+
+    left 可能在原文出现多次（重复段落/样板文本），str.find 命中更早实例后
+    j 会跨越真实 chunk 边界，算出的 gap 把不属于这两个 chunk 的文本拼进
+    结果。这里限定 gap 上限，超限时尝试 left 的下一个出现位置。
+    """
+    if not source or not left or not right:
+        return fallback
+    _MAX_GAP = 256
+    start = 0
+    while True:
+        i = source.find(left, start)
+        if i < 0:
+            return fallback
+        j = source.find(right, i + len(left))
+        if j < 0:
+            return fallback
+        if j - (i + len(left)) <= _MAX_GAP:
+            return source[i + len(left):j]
+        start = i + 1
+
+
+def _merge_overlap(chunks: List[str], overlap: int, sep: str,
+                   source: Optional[str] = None) -> List[str]:
     """Add token-based overlap between consecutive chunks.
 
     Prepends the tail of the previous chunk to the current chunk so that
@@ -369,11 +402,15 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str) -> List[str]:
             prev_end = prev[boundary:]
 
             # Prepend overlap to current chunk for context continuity.
-            # prev_end + sep + curr is still a substring of the source text
-            # because prev_end is a suffix of the previous segment and curr
-            # is the next segment in the original split.
+            # prev_end + gap + curr 仍是原文子串：prev_end 是前段后缀、curr
+            # 是原文里的下一段。分隔符必须是两者在原文中的**真实间隔**——
+            # chunks 列表会混入深层递归的 sub_chunks（外层按 "\n\n" 切、
+            # 深层按句号/空格切），相邻片段之间未必存在外层 sep；硬编码
+            # sep 会伪造出原文没有的字符（与 semantic_chunker 的同类 bug）。
+            # 没有原文可查时退回 sep（与旧行为一致）。
             if prev_end.strip():
-                merged.append(prev_end + sep + curr)
+                gap = _gap_between(source, prev, curr, fallback=sep)
+                merged.append(prev_end + gap + curr)
             else:
                 merged.append(curr)
         else:

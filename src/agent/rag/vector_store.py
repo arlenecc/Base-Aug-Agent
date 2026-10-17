@@ -8,10 +8,12 @@ Vectors are stored in LanceDB (Lance columnar format on local disk).
 """
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
 import threading
+import time
 import warnings
 from typing import Any, Dict, List, Optional
 
@@ -21,9 +23,11 @@ logger = logging.getLogger(__name__)
 # Using the -Q variant: model_quantized.onnx (~137MB) instead of model.onnx (~548MB).
 # Same 768-dim embeddings, same quality, 4x smaller download.
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
-# FastEmbed cross-encoder reranker (ONNX Runtime, 与 embedding 同源)。
-# 不再使用 FlagEmbedding + BAAI/bge-reranker-base（PyTorch 依赖、numpy 2.x 不兼容）。
-DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+# 重排序走 fastembed TextCrossEncoder（ONNX，无 PyTorch 依赖）。选官方 INT8
+# 量化版：~570MB（fp32 全量 2.3GB 的一半不到），且 v2-m3 的多语种/中文精排
+# 能力优于 bge-reranker-base。旧配置里的 bge-reranker-base 仍被 fastembed
+# 支持（fp32 onnx ~1.1GB），无需迁移。
+DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
 _TABLE_NAME = "knowledge_base"
 
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
@@ -143,6 +147,11 @@ class FastEmbedEmbeddingFunction:
                     model = TextEmbedding(
                         model_name=self._model_name,
                         cache_dir=cache_dir,
+                        # ORT intra-op 线程数：默认值在本机实测与 4 相当
+                        # （57 vs 63 tok/s），留一半核心给 OCR/解析 worker。
+                        # 嵌入吞吐的主要杠杆是长度分桶（见 _embed_chunks），
+                        # 线程数影响很小（#122）。
+                        threads=4,
                     )
                 self._model = model
             except Exception as e:
@@ -211,6 +220,290 @@ _EF_SINGLETONS_LOCK = threading.Lock()
 _TABLE_CREATE_LOCK = threading.Lock()
 # FTS 建索引的跨实例互斥（见 _ensure_fts_index 内注释）。
 _FTS_CREATE_LOCK = threading.Lock()
+
+
+def _store_op(func):
+    """装饰 VectorStore 的公开方法：登记在途操作，与 clear()/close() 互斥。
+
+    不装饰内部方法（``_*``）：它们由已登记的操作调用，重复计数会让
+    clear() 永远等不到排空（自己等自己）。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self._begin_op()
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            self._end_op()
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# 自适应嵌入子批大小控制器
+# ---------------------------------------------------------------------------
+
+# 子批大小探索范围与步长（#125，#126/#127/#128 生产验证后修订）：真实
+# 切片上的实测是「吞吐与内存都随子批增大单调变差」——激活工作集 ∝ 子批
+# ×批内最长序列，超出 CPU 缓存后被内存带宽卡死，「大批次摊薄开销」在此
+# 不成立。真实 200 切片实测：size2 = 2071 tok/s @ 1.28GB，size4 = 1864 @
+# 2.14GB，size12 = 1163 @ 4.99GB。1-5 覆盖「单条最省内存」到「短切片批
+# 效率」的合理区间，步长 1 让爬山在平坦段也能精细寻优；初始 2 起步即落
+# 在实测最优区（#128 用户规格）。
+_SUBBATCH_MIN = 1
+_SUBBATCH_MAX = 5
+_SUBBATCH_START = 2
+_SUBBATCH_STEP = 1
+# RSS 软墙（#129，用户定参 8GB）：内存偶尔冲高是正常的（OCR 缓存、压缩
+# 计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB 闩锁版
+# 会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1 再
+# 也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
+# 已启动的应用生效，需要完全重启。
+_SUBBATCH_RSS_LIMIT = 8.0  # GB
+# 恢复阈值（#129）：monitor 下速率回到历史最优 95% 且当前尺寸低于最优
+# 尺寸时，回到最优尺寸重新爬升——消除「降档单向棘轮」（降需连续 2 窗口
+# <75%，回却需 >110%，一次短暂内存尖峰会永久降档）。低于 100% 是安全
+# 的：回到最优尺寸后 probe 会重新验证，验证不过自然回退。
+_SUBBATCH_RECOVER = 0.95
+# 形状预算（#126 修订）：嵌入激活 ∝ 子批条数 × 批内最长序列²（attention 项
+# 主导）。基准标定：size8 × 1311² ≈ 13.75M 单位 ≈ 4.7GB 激活（≈0.34GB/M
+# 单位）——预算 6M 单位把瞬时激活压在 ~2GB。不用绝对 RSS 阈值：真实同步
+# 进程基线本就有 6-10GB（OCR 原生缓存、LanceDB 等），绝对阈值会在首个子批
+# 就触发降档并永久卡死在下限（实测「子批很快降到 1」的根因）。形状预算
+# 只对超长文本钳制条数，与进程里其它组件的内存正交。
+_SUBBATCH_SHAPE_BUDGET = 6_000_000  # 条 × 字符²
+
+
+def _shape_cap_size(size: int, max_len: int) -> int:
+    """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。"""
+    if max_len <= 0:
+        return size
+    budget = _SUBBATCH_SHAPE_BUDGET // (max_len * max_len)
+    return max(1, min(size, budget))
+
+
+# 每个窗口聚合的子批数：太小易被单批噪声带偏，太大响应迟钝。
+_SUBBATCH_WINDOW = 2
+# 爬升判定：候选子批的算力速率需比基线高 3% 才采纳——低于该阈值的波动
+# 视为噪声，避免在吞吐平坦段来回抖动。
+_SUBBATCH_IMPROVE = 1.03
+# 降档判定：连续 2 个窗口的速率低于历史最优的 75% 视为环境劣化（OCR
+# worker 抢占 CPU、热降频等），降 1 档避让，直到下限 1。
+_SUBBATCH_DEGRADE = 0.75
+_SUBBATCH_DEGRADE_STREAK = 2
+# 历史最优速率的逐窗口衰减：环境永久变慢后旧纪录缓慢失效，不至于永远
+# 拿旧峰值当标尺。
+_SUBBATCH_BEST_DECAY = 0.999
+# 重新爬升判定：monitor 阶段实测速率比历史最优高出 10%（如 OCR worker
+# 结束、CPU 空出来）→ 环境已变，重新从小尺寸向上爬山，否则会永远停在
+# 忙时降下来的小尺寸上。
+_SUBBATCH_RE_CLIMB = 1.10
+
+
+class _SubBatchTuner:
+    """在 [1, 5] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
+
+    度量：不用原始 tok/s——长度分桶后各批序列长度天然不同，直接比
+    tok/s 有系统性偏差。改用算力速率 ``ops/s = n × max_len² / dt``（以
+    字符数近似 token 数，单调代理即可），对批大小与批内最长长度同时
+    归一，跨窗口、跨尺寸可比。
+
+    状态机（#125 用户规格，#126/#127/#128 生产验证修订）：
+      climb   初始 2：基线窗口（2 子批）→ 试探 +1 → 更快（≥3%）则采纳并
+              继续上调，变慢则回退到上一个数字，进入 monitor。起步即落
+              在实测最优区，步长 1 在吞吐平坦段也能精细寻优；
+      monitor 持续盯速率：连续 2 窗口低于历史最优 75% → 降 1 避让（下限
+              1），速率恢复即停；速率回到历史最优 95% 且尺寸低于最优尺寸 →
+              尖峰已过去，回到最优尺寸重新爬升（#129，消除降档单向棘轮）；
+              实测速率比历史最优高 10% → 环境变快，重新爬升。
+
+    内存安全双保险（#126/#129）：
+      ① 形状预算：_embed_chunks 组装每个子批时按 ``_shape_cap_size`` 钳制
+         条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小。绝对 RSS
+         阈值在真实同步进程（基线 6-10GB）必然误触发，曾导致永久卡死。
+      ② RSS 软墙 8GB（无闩锁）：超墙每子批 force_down 降 1 档，回墙下即
+         停，恢复交给 monitor 恢复分支——旧 5GB 闩锁版是「降到 1 再也不
+         回去」的根因。调优器 report() 收到的是钳制后的实际条数，状态机
+         在可行域内正常爬山。
+
+    预热丢弃（#126 修订）：首个完整窗口包含模型加载 / ONNX 会话初始化
+    （可达 10s+），会把爬升基线拉到虚低，让热身的试探窗口显得「暴涨」
+    被误采纳——第一个窗口只用于预热，丢弃不计入判定。
+
+    线程安全：内部状态由锁保护（add() 与 add_streaming() 可能来自不同
+    线程，窗口聚合不会交错损坏）。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.size = max(_SUBBATCH_MIN, min(_SUBBATCH_MAX, _SUBBATCH_START))
+        self._phase = "climb"  # climb | monitor
+        self._climb_state = "baseline"  # baseline | probe
+        self._prev_size = self.size  # 爬升失败时回退到此处
+        self._baseline_score: Optional[float] = None
+        self._win_ops = 0.0
+        self._win_dt = 0.0
+        self._win_n = 0
+        self._ema: Optional[float] = None
+        self._best: Optional[float] = None
+        # 历史最优速率对应的尺寸（#129）：恢复判定的参照——降档棘轮的解药
+        self._best_size = self.size
+        self._degrade_streak = 0
+        self._warmed = False  # 预热窗口是否已丢弃
+
+    def propose(self) -> int:
+        """返回下一个子批应使用的大小。"""
+        with self._lock:
+            return self.size
+
+    def report(self, n: int, max_len: int, dt: float) -> None:
+        """上报一个子批的实测结果（条数、批内最长字符数、耗时）。"""
+        ops = float(n) * float(max(max_len, 1)) ** 2
+        with self._lock:
+            self._win_ops += ops
+            self._win_dt += max(dt, 1e-6)
+            self._win_n += 1
+            if self._win_n < _SUBBATCH_WINDOW:
+                return
+            score = self._win_ops / self._win_dt
+            self._win_ops = 0.0
+            self._win_dt = 0.0
+            self._win_n = 0
+            if not self._warmed:
+                # 预热窗口丢弃：含模型加载/会话初始化，基线会虚低
+                self._warmed = True
+                return
+            if self._phase == "climb":
+                self._on_climb_window(score)
+            else:
+                self._on_monitor_window(score)
+
+    def _on_climb_window(self, score: float) -> None:
+        """爬升阶段窗口结果。调用时已持锁。"""
+        if self._climb_state == "baseline":
+            self._baseline_score = score
+            nxt = self.size + _SUBBATCH_STEP
+            if nxt > _SUBBATCH_MAX:
+                self._phase = "monitor"
+                self._best_size = self.size  # 操作点已重新验证（#129）
+                return
+            self._prev_size = self.size
+            self.size = nxt
+            self._climb_state = "probe"
+            logger.info(
+                "  ├─ 子批自适应: %d → %d (试探吞吐)", self._prev_size, nxt
+            )
+            return
+        # probe 窗口结果：与基线比较
+        assert self._baseline_score is not None
+        ratio = score / self._baseline_score
+        if ratio >= _SUBBATCH_IMPROVE:
+            logger.info(
+                "  ├─ 子批自适应: %d 吞吐 %+.0f%%, 采纳并继续上调",
+                self.size, (ratio - 1) * 100,
+            )
+            self._baseline_score = score
+            self._best_size = self.size  # 采纳 = 已验证（#129）
+            nxt = self.size + _SUBBATCH_STEP
+            if nxt > _SUBBATCH_MAX:
+                self._phase = "monitor"
+            else:
+                self._prev_size = self.size
+                self.size = nxt
+        else:
+            logger.info(
+                "  ├─ 子批自适应: %d 吞吐 %+.0f%%, 回退到 %d",
+                self.size, (ratio - 1) * 100, self._prev_size,
+            )
+            self.size = self._prev_size
+            self._phase = "monitor"
+            # 回退 = 大尺寸被否决，操作点锚在此处，防止恢复循环（#129）
+            self._best_size = self.size
+
+    def _on_monitor_window(self, score: float) -> None:
+        """监控阶段窗口结果：盯劣化降档，盯变快重新爬升。调用时已持锁。"""
+        self._ema = score if self._ema is None else self._ema * 0.5 + score * 0.5
+        prev_best = self._best
+        # 恢复（#129）：当前尺寸低于最优尺寸、且速率回到历史最优 95% →
+        # 尖峰（内存压力 / 抢 CPU）已过去，直接回到最优尺寸（不走路爬山：
+        # plateau 上试探必然持平 <3% 被回退，回退锚会把最优尺寸永久改小，
+        # 恰好复现「降到 1 再也不回去」）。留在 monitor：若最优尺寸在新
+        # 环境下确实过慢，降档路径会再次接管，自校正无循环。放在 best
+        # 更新之前，避免恢复窗口把 best/best_size 就地改写成小尺寸。
+        if (
+            prev_best is not None
+            and prev_best > 0
+            and self._ema is not None
+            and self.size < self._best_size
+            and self._ema >= prev_best * _SUBBATCH_RECOVER
+        ):
+            logger.info(
+                "  ├─ 子批自适应: 速率恢复到最优的 %.0f%%, %d → %d 回到最优尺寸",
+                self._ema / prev_best * 100, self.size, self._best_size,
+            )
+            self.size = self._best_size
+            self._ema = None
+            self._degrade_streak = 0
+            return
+        if self._best is None or self._ema > self._best:
+            self._best = self._ema
+        else:
+            self._best *= _SUBBATCH_BEST_DECAY
+        # 环境明显变快（新 EMA 比旧纪录高 10%）→ 重新爬升
+        if (
+            prev_best is not None
+            and self._ema is not None
+            and prev_best > 0
+            and self._ema >= prev_best * _SUBBATCH_RE_CLIMB
+        ):
+            logger.info(
+                "  ├─ 子批自适应: 速率比历史最优高 %.0f%%, 环境变快, 重新爬升",
+                (self._ema / prev_best - 1) * 100,
+            )
+            self._phase = "climb"
+            self._climb_state = "baseline"
+            self._baseline_score = None
+            self._ema = None
+            self._degrade_streak = 0
+            return
+        if self._ema is not None and self._best and self._ema < self._best * _SUBBATCH_DEGRADE:
+            self._degrade_streak += 1
+        else:
+            self._degrade_streak = 0
+        if self._degrade_streak >= _SUBBATCH_DEGRADE_STREAK and self.size > _SUBBATCH_MIN:
+            new_size = max(_SUBBATCH_MIN, self.size - _SUBBATCH_STEP)
+            logger.info(
+                "  ├─ 子批自适应: 吞吐降至最优的 %.0f%%, %d → %d 避让",
+                self._ema / self._best * 100, self.size, new_size,
+            )
+            self.size = new_size
+            self._ema = None
+            self._degrade_streak = 0
+
+    def force_down(self) -> None:
+        """RSS 软墙（#129）：降 1 档并丢弃半满窗口。
+
+        与速率状态机独立，**无闩锁**：超墙时每个子批调一次（激活随之变小、
+        RSS 自然回落），回墙下即停，之后由恢复分支 / 重爬把尺寸带回来。
+        旧 5GB 闩锁版（mem_pressed 永不解除）会在真实同步基线 6-10GB 下
+        首个子批就触发并永久卡死在下限，是「降到 1 再也不回去」的根因。
+        """
+        with self._lock:
+            self._win_ops = 0.0
+            self._win_dt = 0.0
+            self._win_n = 0
+            if self.size <= _SUBBATCH_MIN:
+                return
+            new_size = max(_SUBBATCH_MIN, self.size - _SUBBATCH_STEP)
+            logger.info(
+                "  ├─ 子批自适应: RSS 超 %.0fGB, %d → %d 降档避让",
+                _SUBBATCH_RSS_LIMIT, self.size, new_size,
+            )
+            self.size = new_size
+            self._phase = "monitor"
+            self._ema = None
+            self._degrade_streak = 0
 
 
 def get_or_create_embedding_function(
@@ -282,19 +575,79 @@ class VectorStore:
         self._reranker_is_logits: Optional[bool] = None
         # close() 后置位：后台加载线程完成时不得把模型写回本实例。
         self._closed = False
+        # ---- 在途操作计数：与 clear()/close() 互斥 ----
+        # clear() 会 drop_table、close() 会把 _db 置 None，二者若与在途的
+        # add/search 并发，在途操作会打到已删除的表或 None 连接上（表现是
+        # 随机 AttributeError / 检索到已删数据）。这里用在途计数 + 条件变量：
+        # 业务操作进出各记一次，clear/close 先排空在途操作再动手。
+        self._op_cv = threading.Condition(threading.Lock())
+        self._inflight = 0
+        self._closing = False
         # documents 表内容缓存：避免 get_document_digest / list_documents 每次
         # 都全表 to_pylist()（表内含完整 markdown，反复全量扫描既慢又占内存）。
         # 写入（upsert/delete/clear）时置 None 失效，下次读取时重新加载。
         self._documents_cache: Optional[List[Dict[str, Any]]] = None
         self._ef = None  # embedding function
+        self._subbatch_tuner = _SubBatchTuner()  # 自适应子批大小（#125）
         self._initialized = False
         self._table_checked = False  # 是否已检查过 table_names（避免重复磁盘扫描）
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
+        self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 在途操作计数（与 clear/close 互斥）
+    # ------------------------------------------------------------------
+
+    def _begin_op(self) -> None:
+        """登记一次在途操作。store 已关闭/正在关闭时抛明确的错误。
+
+        ``_closing`` 必须一起检查：``clear()`` 排空完在途操作后会执行
+        drop_table，若此时新操作仍能进来，就正好撞上这次改动想消除的竞态
+        （读到/写到一张已被删除的表）。旧实现只检查 ``_closed``，漏了它。
+        """
+        with self._op_cv:
+            if self._closed:
+                raise RuntimeError("VectorStore is closed")
+            if self._closing:
+                raise RuntimeError("VectorStore is shutting down (clear in progress)")
+            self._inflight += 1
+
+    def _end_op(self) -> None:
+        with self._op_cv:
+            self._inflight = max(0, self._inflight - 1)
+            if self._inflight == 0:
+                self._op_cv.notify_all()
+
+    def _drain_ops(self, timeout: float = 10.0) -> bool:
+        """排空在途操作，期间拒绝新的操作。返回 True 表示已排空。
+
+        超时后仍会继续：关闭/清空不能因为某个卡住的操作（例如慢 embedding）
+        而永久挂起，宁可冒一次竞态也不能把 UI 卡死。
+        """
+        deadline = time.monotonic() + timeout
+        with self._op_cv:
+            self._closing = True
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "VectorStore: %d 个在途操作未在 %.0fs 内结束，将继续关闭",
+                        self._inflight, timeout,
+                    )
+                    return False
+                self._op_cv.wait(remaining)
+            return True
+
+    def _resume_ops(self) -> None:
+        """clear() 结束后解除「拒绝新操作」状态。"""
+        with self._op_cv:
+            self._closing = False
+            self._op_cv.notify_all()
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -326,6 +679,10 @@ class VectorStore:
         # 不复位 _closed 的话，后台 reranker 加载线程一看到它就丢弃模型并
         # return —— 重排对该实例永久失效，且没有任何日志。
         self._closed = False
+        # _closing 同理：close() 的 _drain_ops() 会把它置 True 且不再复位
+        # （close 后本应永久拒绝新操作）。但本引擎的实例支持复活重连，
+        # 不复位会让复活后的实例被 _begin_op 永久拒绝（「clear in progress」）。
+        self._closing = False
 
         # Use injected embedding function (for testing) or create FastEmbed one
         if self._custom_ef is not None:
@@ -443,6 +800,7 @@ class VectorStore:
     # CRUD
     # ------------------------------------------------------------------
 
+    @_store_op
     def add(
         self,
         chunks: List[Dict[str, Any]],
@@ -526,6 +884,7 @@ class VectorStore:
         logger.info("VectorStore: added %d chunks", total)
         return total
 
+    @_store_op
     def delete_by_source(self, source: str) -> int:
         """删除指定 source 的全部记录。返回删除的记录数（无法统计时为 1/0）。
 
@@ -557,9 +916,13 @@ class VectorStore:
                 return 1
             return max(0, before - after)
         except Exception as e:
+            # 删除失败必须抛出而不是吞掉：engine._cleanup_deleted_files 依赖
+            # 「无异常 = 删除成功」决定是否从 manifest 移除条目——吞掉异常会让
+            # 失败文件被无条件 pop，向量永久残留且下次同步没有重试机会。
             logger.warning("VectorStore: delete_by_source '%s' failed: %s", source, e)
-            return 0
+            raise
 
+    @_store_op
     def add_streaming(
         self,
         chunk_iter,
@@ -739,24 +1102,84 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """Embed 一批 chunks，返回 records（含 vector）。内部辅助方法。
 
-        将每批拆分为更小的子批次（每子批 5 个 chunk）进行 embedding，
-        每个子批次完成后主动 time.sleep() 释放 GIL，让主线程有机会
-        处理 Qt 事件（日志渲染、进度更新）。ONNX Runtime 的 embed()
-        在 C++ 计算期间持有 GIL，整批一次性嵌入会导致 UI 长时间冻结。
+        将每批拆分为更小的子批次进行 embedding，每个子批次完成后主动
+        time.sleep() 释放 GIL，让主线程有机会处理 Qt 事件（日志渲染、进度
+        更新）。ONNX Runtime 的 embed() 在 C++ 计算期间持有 GIL，整批一次
+        性嵌入会导致 UI 长时间冻结。
+
+        子批大小不固定（历史值 5/12）：由 :class:`_SubBatchTuner` 在 1-5 内
+        自适应（#125，#126/#127/#128 生产验证修订：真实切片上吞吐与内存都
+        随子批增大单调变差，size2 双优）。长度分桶后 padding 已归零。
+
+        形状预算（#126 修订）：每个子批组装时按 ``_shape_cap_size`` 钳制
+        条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小，把瞬时激活
+        压在 ~2GB。不再使用绝对 RSS 阈值——真实同步进程基线 6-10GB，绝对
+        阈值会误触发并永久卡死在下限。
+
+        关键优化：**按文本长度排序分桶**（#122）。fastembed 的批内所有序列
+        padding 到批内最长——长度混杂的批 padding 浪费 2-4 倍算力（实测
+        32 条混杂批 309s ≈ 40 tok/s，而同模型「长度排序 + 8-12 条/批」
+        ~2000 tok/s，差 30 倍）。排序后每批长度相近、padding 归零，向量按
+        原顺序回填，结果与混杂批完全一致。
         """
-        import time as _time
-        _SUB_BATCH = 5  # 每子批 5 个 chunk，平衡吞吐与 UI 响应
+        # 让出 GIL 的累计耗时阈值：不是「每子批都 sleep」，而是累计占用 GIL
+        # 超过 50ms 才让出一次，保证 UI 响应又不为 sleep 付出固定开销。
+        _YIELD_INTERVAL = 0.05
         texts = [c["text"] for c in chunks]
-        all_vectors: List[List[float]] = []
-        for sub_start in range(0, len(texts), _SUB_BATCH):
-            sub_texts = texts[sub_start:sub_start + _SUB_BATCH]
-            sub_vectors = self._ef(sub_texts)
-            all_vectors.extend(sub_vectors)
-            # 每个子批次完成后释放 GIL，让 Qt 事件循环有机会处理
-            # 排队的日志/进度信号。这是关键：ONNX Runtime 在 embed()
-            # 期间持有 GIL，只有在 Python 层主动 sleep 时才释放。
-            _time.sleep(0.01)
-        vectors = all_vectors
+        # 长度降序分桶：批内长度相近，padding 浪费最小（降序让最长批最先
+        # 出现，提早把激活水位顶到峰值，后续批更轻）。
+        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        vectors_by_idx: List[Optional[List[float]]] = [None] * len(texts)
+        tuner = self._subbatch_tuner
+        _last_yield = time.monotonic()
+        _t_embed = time.monotonic()
+        sub_idx = 0
+        sub_start = 0
+        while sub_start < len(order):
+            size = tuner.propose()
+            # 形状预算钳制（#126 修订）：激活 ∝ 条数 × 批内最长序列²，对
+            # 超长文本收缩本子批条数，把瞬时激活压在 ~2GB（常量注释含标定）。
+            # 降序分桶下切片首条即批内最长，钳制后 report() 收到实际条数。
+            size = _shape_cap_size(size, len(texts[order[sub_start]]))
+            idxs = order[sub_start:sub_start + size]
+            _t_sub = time.monotonic()
+            sub_vectors = self._ef([texts[i] for i in idxs])
+            _dt = time.monotonic() - _t_sub
+            for i, v in zip(idxs, sub_vectors):
+                vectors_by_idx[i] = v
+            sub_idx += 1
+            sub_start += len(idxs)
+            # 子批级进度日志：嵌入一个子批要数十秒且中间完全静默，用户会
+            # 误判为「卡死」（#122）。每个子批一条，给出速率与当前子批大小。
+            n_chars = sum(len(texts[i]) for i in idxs)
+            logger.info(
+                "  ├─ 嵌入子批 #%d [size=%d]: %d 条 %.1fk字符, %.1fs (%.0f k字符/s, 累计 %.0fs)",
+                sub_idx, size, len(idxs), n_chars / 1000, _dt,
+                n_chars / max(_dt, 1e-6) / 1000,
+                time.monotonic() - _t_embed,
+            )
+            tuner.report(len(idxs), max(len(texts[i]) for i in idxs), _dt)
+            # RSS 软墙（#129，8GB）：内存偶尔冲高是正常波动，超墙只要求降档
+            # 避让——每子批检查一次，降 1 档、激活变小、RSS 自然回落，回墙
+            # 下即停。无闩锁（旧 5GB 闩锁版是「卡死在 1」的根因），恢复交给
+            # 调优器自身的恢复分支 / 重爬。psutil 缺失时静默跳过。
+            try:
+                import psutil as _psutil
+
+                if (
+                    _psutil.Process().memory_info().rss / 1024**3
+                    > _SUBBATCH_RSS_LIMIT
+                ):
+                    tuner.force_down()
+            except Exception:
+                pass
+            # 主动释放 GIL，让 Qt 事件循环有机会处理排队的日志/进度信号。
+            # 这是关键：ONNX Runtime 在 embed() 期间持有 GIL，只有在 Python
+            # 层主动 sleep 时才释放。
+            if time.monotonic() - _last_yield >= _YIELD_INTERVAL:
+                time.sleep(0.01)
+                _last_yield = time.monotonic()
+        vectors = vectors_by_idx
         records: List[Dict[str, Any]] = []
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
         # 都重算一次 md5（写入侧纯浪费）。
@@ -799,6 +1222,11 @@ class VectorStore:
         """
         if self._fts_ready:
             return True
+        # 建索引失败过就不再重试：旧实现只把 _fts_checked 置 True，而
+        # _fts_checked 全项目没有任何读取点 —— 于是每次检索都会重跑一遍
+        # 昂贵的全库建索引，然后再次失败。
+        if getattr(self, "_fts_failed", False):
+            return False
 
         # 原生 FTS 配置（两种 lancedb 版本共用同一语义）：
         #  - simple base tokenizer 按空格/标点切分，配合 jieba 预分词列，
@@ -822,16 +1250,27 @@ class VectorStore:
         # _fts_ready 都为 False 时会对同一张表并发 replace 建索引（同步中用户
         # 同时检索即可触发），可能报错或索引不一致。建索引是低频操作，全局
         # 锁没有吞吐影响。
+        #
+        # 注意：ImportError 必须单独捕获——0.25.x 上根本没有 lancedb.index.FTS
+        # 这个模块，裸 import 会抛 ImportError；若掉进通用 except Exception 分支，
+        # _fts_failed 被置 True 后 0.25.x 的回退路径就永远走不到了（BM25 永久禁用）。
+        try:
+            from lancedb.index import FTS
+        except ImportError:
+            FTS = None
         with _FTS_CREATE_LOCK:
             try:
-                from lancedb.index import FTS
-                table.create_index(
-                    _FTS_COLUMN,
-                    config=FTS(**fts_kwargs),
-                    replace=True,
-                )
+                if FTS is not None:
+                    table.create_index(
+                        _FTS_COLUMN,
+                        config=FTS(**fts_kwargs),
+                        replace=True,
+                    )
+                else:
+                    raise TypeError  # 走 0.25.x 回退分支
             except TypeError:
-                # 0.25.x 的 create_index 无 config 参数，回退到 create_fts_index。
+                # 0.25.x 的 create_index 无 config 参数（或 FTS 不可用），回退到
+                # create_fts_index。
                 try:
                     table.create_fts_index(
                         _FTS_COLUMN,
@@ -843,6 +1282,7 @@ class VectorStore:
                     logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
                     self._fts_checked = True
                     self._fts_ready = False
+                    self._fts_failed = True
                     return False
             except Exception as e:
                 # 并发对方刚建好 → 本方报「已存在」类错误时按成功处理，
@@ -854,6 +1294,7 @@ class VectorStore:
                     logger.warning("  ⚠ BM25 全文索引创建失败 (回退纯向量检索): %s", e)
                     self._fts_checked = True
                     self._fts_ready = False
+                    self._fts_failed = True
                     return False
 
         self._fts_ready = True
@@ -861,6 +1302,7 @@ class VectorStore:
         logger.info("  ├─ BM25 全文索引已创建 (原生 FTS simple tokenizer + jieba 预分词)")
         return True
 
+    @_store_op
     def search_fts(
         self,
         query: str,
@@ -878,6 +1320,9 @@ class VectorStore:
         channels consistently.
         """
         self._ensure_initialized()
+        # 空查询直接短路：否则会白白触发一次全库 FTS 建索引 + 一次空查询。
+        if not (query or "").strip():
+            return []
         table = self._ensure_table()
         if table is None:
             return []
@@ -900,17 +1345,25 @@ class VectorStore:
 
         output: List[Dict[str, Any]] = []
         for r in results:
-            # Tantivy returns BM25 score in `_score` (higher is better).
+            # Tantivy/原生 FTS 返回的 BM25 分在 `_score`（越大越好），是无上界
+            # 的原始分（常见 5~30+）。绝不能把它直接塞进 `score`：
+            # `score` 在有向量候选的场合被当作 [0,1] 余弦相似度使用，
+            # _rerank_fallback 会对其做 `1 - s²/2` 换算 —— BM25=15 会被算成
+            # 1-112.5 → clamp 到 0.0，纯关键词候选集体排到末尾，混合检索
+            # 在 reranker 不可用时静默退化成纯向量检索。
+            # 这里用 s/(1+s) 归一化到 [0,1)，原始分另存 fts_score。
             raw = float(r.get("_score", 0.0))
+            norm = raw / (1.0 + raw) if raw > 0 else 0.0
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
                 "chunk_index": r.get("chunk_index", 0),
-                "score": raw,
+                "score": norm,
                 "fts_score": raw,
             })
         return output
 
+    @_store_op
     def search(
         self,
         query: str,
@@ -942,7 +1395,14 @@ class VectorStore:
         logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
         search = table.search(query_vec).limit(top_k)
         if where:
-            search = search.where(where)
+            # prefilter=True：先按条件过滤再做 ANN。默认的后置过滤是「先取
+            # ANN top-k 再过滤」，定向检索（rag_search(source=...)）下候选
+            # 会被先截断再筛，可能漏召回甚至返回空。
+            try:
+                search = search.where(where, prefilter=True)
+            except TypeError:
+                # 旧版 lancedb 的 where() 不接受 prefilter 关键字。
+                search = search.where(where)
         results = search.to_list()
         logger.info("  ├─ 向量检索完成: 获得 %d 个候选切片", len(results))
 
@@ -985,6 +1445,10 @@ class VectorStore:
         is NOT abandoned — when it eventually finishes it stores the result
         (or error) on ``self`` so a later call can pick it up without reloading.
         """
+        # close() 之后的实例不允许再拉起 reranker：后台加载线程看到 _closed
+        # 会直接 return（状态置 failed），避免状态机卡死或「复活」持有权重。
+        if getattr(self, "_closed", False):
+            return None
         state = getattr(self, "_reranker_state", "idle")
         if state == "done":
             return self._reranker
@@ -1043,6 +1507,11 @@ class VectorStore:
                             # close() 已经执行：不要再把模型写回实例
                             # （旧实现会让 close 之后的实例「复活」持有权重）。
                             del reranker
+                            # 必须把状态机从 "loading" 里救出来：旧实现直接
+                            # return，状态永远停在 loading → 之后所有 rerank()
+                            # 都命中 loading 分支永久返回 None，重排序静默失效
+                            # 且无日志。
+                            self._reranker_state = "failed"
                             return
                         self._reranker = reranker
                         self._reranker_state = "done"
@@ -1104,6 +1573,7 @@ class VectorStore:
         logger.info("  ├─ 重排序完成(回退): %d → %d 条结果", len(candidates), len(result))
         return result
 
+    @_store_op
     def rerank(
         self,
         query: str,
@@ -1224,6 +1694,7 @@ class VectorStore:
             )
         return kept
 
+    @_store_op
     def search_with_rerank(
         self,
         query: str,
@@ -1300,8 +1771,12 @@ class VectorStore:
             results = self._rerank_fallback(merged, top_k)
         return results
 
-    def clear(self) -> None:
-        """Delete all documents from the store."""
+    def _clear_locked(self) -> None:
+        """Delete all documents from the store.
+
+        调用方必须已排空在途操作（见 ``clear``）：drop_table 与在途的
+        add/search 并发，会让后者打到一张已被删除的表上。
+        """
         self._ensure_initialized()
         table = self._ensure_table()
         if table is None:
@@ -1312,18 +1787,40 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
-            # 新表上没有 FTS 索引；不置 False 的话 _ensure_fts_index() 会
-            # 直接返回 True，BM25 通道静默失效（与 close() 一致）。
+            # 必须同时重置 FTS 三标记（与 close() 同款）：漏掉的话 _fts_ready
+            # 仍为 True，add() 重建新表时会跳过建索引，search_fts 也认为索引
+            # 就绪 → 在未索引列上跑 FTS 抛异常被吞掉 → BM25 通道从此永久
+            # 静默返回空，无任何告警。
             self._fts_ready = False
             self._fts_checked = False
+            self._fts_failed = False
             logger.info("VectorStore: cleared %d documents", count)
         # 同步清空文档元数据表。
         if _DOCUMENTS_TABLE_NAME in self._db.table_names():
             self._db.drop_table(_DOCUMENTS_TABLE_NAME)
+        # documents 表**不存在**时也要清缓存/句柄：否则残留的旧缓存会让
+        # get_document_digest 继续返回已删除文档的 digest。清缓存必须与
+        # _load_documents 一样持 _documents_lock。
+        with self._documents_lock:
             self._documents_table = None
             self._documents_cache = None
             logger.info("VectorStore: cleared documents metadata table")
 
+    def clear(self) -> None:
+        """清空向量库与文档元数据。
+
+        真正实现在 ``_clear_locked``：``clear`` 需要在拿到在途操作排空权之后
+        再动手——drop_table 与在途的 add/search 并发会让后者打到已删除的表上。
+        注意这里**不能**加 ``@_store_op``：它会先把自己登记为在途操作，随后
+        ``_drain_ops()`` 就会等自己结束（自锁）。
+        """
+        self._drain_ops()
+        try:
+            self._clear_locked()
+        finally:
+            self._resume_ops()
+
+    @_store_op
     def count(self) -> int:
         self._ensure_initialized()
         table = self._ensure_table()
@@ -1337,14 +1834,22 @@ class VectorStore:
         After close(), the VectorStore cannot be used; create a new instance to
         access the same data (LanceDB persists to disk, so data survives).
 
-        Important: FastEmbed's ONNX Runtime InferenceSession (embedding) and
-        reranker (TextCrossEncoder) hold significant C++ heap memory
-        (~130MB + ~2.3GB for v2-m3). Python's GC may not reclaim these promptly
-        when the Python object is dropped — explicitly nulling the references
-        here ensures the C++ destructors run as soon
+        Important: FastEmbed's embedding and reranker ONNX Runtime sessions
+        hold significant C++ heap memory (~130MB + ~570MB INT8). Python's GC may
+        not reclaim these promptly when the Python object is dropped — explicitly
+        nulling the references here ensures the C++ destructors run as soon
         as possible, which is critical when SyncKnowledgeWorker creates a fresh
         RAGEngine per sync run.
+
+        Waits for in-flight ``add``/``search`` operations to finish first:
+        tearing down the LanceDB connection underneath them produces random
+        AttributeErrors (``self._db`` is None) or silently wrong results.
         """
+        # 先排空并**保持**排空态：若此时正有 add/search 在跑，它们会撞上被置
+        # None 的 _db 或已被 drop 的表。这里不能像 clear() 那样 _resume_ops()——
+        # close() 之后本实例永久不可用，_closing 保持 True 正好与
+        # _begin_op() 的检查一致（close 后新操作一律被拒）。
+        self._drain_ops()
         # Try to explicitly release the ONNX InferenceSession held by
         # FastEmbed's OnnxEmbeddings. FastEmbed wraps the model in a
         # `model` attribute (ort.InferenceSession). Calling .release() on
@@ -1403,6 +1908,9 @@ class VectorStore:
         # 于是 BM25 检索静默失效（新表上没有索引）。
         self._fts_ready = False
         self._fts_checked = False
+        # close() 后可以重新 open：失败标记必须一并复位，否则新建的实例会
+        # 永久跳过全文索引。
+        self._fts_failed = False
         logger.info("VectorStore: resources released")
 
     def reload(self) -> None:
@@ -1415,7 +1923,18 @@ class VectorStore:
 
         Call this after a sync completes to ensure the agent's VectorStore sees
         the freshly written data on its next search.
+
+        与 clear()/close() 一样先排空在途操作：``_table = None`` 与在途的
+        search() 并发时，后者可能正持有旧句柄做查询，行为未定义。
         """
+        self._drain_ops()
+        try:
+            self._reload_locked()
+        finally:
+            self._resume_ops()
+
+    def _reload_locked(self) -> None:
+        """``reload()`` 的实现，调用方必须已排空在途操作。"""
         self._table = None
         self._table_checked = False
         # documents 元数据表与其缓存同样持有打开时的快照：同步新增/更新了
@@ -1426,8 +1945,10 @@ class VectorStore:
             self._documents_cache = None
         self._fts_ready = False
         self._fts_checked = False
+        self._fts_failed = False
         logger.debug("VectorStore: table handles dropped for reload")
 
+    @_store_op
     def list_sources(self) -> List[str]:
         """Return unique source filenames in the store."""
         self._ensure_initialized()
@@ -1511,6 +2032,7 @@ class VectorStore:
             )
         return self._documents_table
 
+    @_store_op
     def upsert_document(
         self,
         doc_name: str,
@@ -1618,6 +2140,7 @@ class VectorStore:
             self._documents_cache = rows
             return rows
 
+    @_store_op
     def get_document_digest(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """Return {doc_name, digest, markdown, chapters} for a document by name.
 
@@ -1652,12 +2175,14 @@ class VectorStore:
                 }
         return None
 
+    @_store_op
     def list_documents(self) -> List[str]:
         """Return the list of stored document names (for the outline tool)."""
         self._ensure_initialized()
         rows = self._load_documents()
         return sorted({r.get("doc_name", "") for r in rows if r.get("doc_name")})
 
+    @_store_op
     def all_document_rows(self) -> List[Dict[str, Any]]:
         """返回 documents 表全部行的**浅拷贝**（按列读取，不含 markdown）。
 
@@ -1668,6 +2193,7 @@ class VectorStore:
         self._ensure_initialized()
         return [dict(r) for r in self._load_documents()]
 
+    @_store_op
     def delete_document(self, doc_name: str) -> None:
         """Remove a document's metadata entry.
 
@@ -1689,6 +2215,7 @@ class VectorStore:
                 logger.warning("删除文档元数据失败: %s", e)
             self._documents_cache = None
 
+    @_store_op
     def get_document_by_md_path(self, md_path: str) -> Optional[Dict[str, Any]]:
         """按 markdown 缓存路径精确查找文档元数据。
 
@@ -1712,6 +2239,7 @@ class VectorStore:
                 }
         return None
 
+    @_store_op
     def delete_document_by_md_path(self, md_path: str) -> bool:
         """删除指定 markdown 缓存对应的元数据行。"""
         if not md_path:

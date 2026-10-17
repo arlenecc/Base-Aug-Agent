@@ -50,7 +50,7 @@
 - **本地 RAG 知识库** — 自动解析文档、清洗、切片、向量化，BGE 重排序精准召回
 - **增量同步** — 通过 manifest.json 记录文件签名（mtime + size + content_hash），未修改文件完全跳过；右键「同步知识」可强制全量重处理
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖；chonkie（语义分块）、FastEmbed Reranker（bge-reranker-v2-m3 重排序）、opencv-python-headless（OCR 预处理）等可选增强也会一并检测与自动安装
-- **OCR 加速与预处理** — 图片型 PDF 的 RapidOCR 在 **Apple M 系列 Mac** 上自动启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；引擎构造兼容 rapidocr 1.1/1.2 两代 kwargs 体系（1.2.x 缺 `det_model_path` 会抛 `KeyError`，已做降级链兜底）。识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 CLAHE 对比度增强 + 锐化**预处理，提升小字与低对比扫描件的识别率。两者均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
+- **OCR 加速与预处理** — 图片型 PDF 优先使用 rapidocr 3.x（模型目录与 docling 共享、懒加载省内存），在 **Apple M 系列 Mac** 上启用 onnxruntime **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+**ANE** 神经网络引擎，需 onnxruntime≥1.31）；CoreML 初始化失败自动回退 CPU EP，Intel/非 Apple 平台直接用 CPU EP（避免必然失败的 CoreML 初始化）。未装 3.x 时回退 rapidocr-onnxruntime 1.x（同样注入 CoreML EP）。引擎构造兼容 1.1/1.2 两代 kwargs 体系（1.2.x 缺 `det_model_path` 会抛 `KeyError`，已做降级链兜底）。识别前对每页做**尺寸归一化（自适应 DPI + 短边放大）+ 灰度 + 暗色主题自动反色 + CLAHE 对比度增强 + 锐化**预处理，提升小字、低对比度与暗色主题扫描件的识别率；纯色/空白页直接跳过。引擎每 50 页周期重建（冲刷 CoreML/ORT 按形状保留的原生缓存，真实扫描页 ~35MB/页）。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、FastEmbed Reranker 精排过程和最终结果排名
 - **失败自动恢复** — 计划步骤失败时**不停车**：内核依据失败信息自动换方案重试（反思门失败感知：失败后提醒预算 2→8 次、引用最近错误**和已试过且失败的方案**、明确禁止「停下来问用户是否继续」）；**首次失败**即要求换方法（禁止原样重发、禁止把错误念给用户）；原样重试同一失败调用会被点名禁止；连续失败会要求先诊断再换方法；失败尝试不足 3 次就把步骤标 `blocked` 会被守卫拦回。失败上下文跨自动续跑段传递，续跑段仍知道上一段卡在哪
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性；「终止对话」会立即中断并回收 `code_run`/`shell_run` 子进程（旧实现子进程要跑到自身超时，最长 600s）
@@ -112,7 +112,7 @@ pip install -e ".[all]"
 |------|---------|---------|
 | 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
 | RAG | `pip install -e ".[rag]"` | lancedb, fastembed, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
-| OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别）+ opencv-python-headless（图像预处理归一化/增强） |
+| OCR | `pip install -e ".[ocr]"` | rapidocr 3.x（图片型 PDF 识别，未装时回退 1.x 兼容层）+ opencv-python-headless（图像预处理归一化/增强） |
 | 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
 | 全部 | `pip install -e ".[all]"` | 以上所有 |
 
@@ -318,16 +318,16 @@ RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可�
 - **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
-- **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
+- **流式 ingest**：worker 池（默认 4 线程）按 LPT 负载均衡分片（文件大小降序 + 贪心最轻负载）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型，且每页从单例取用、页末释放（引擎每 50 页周期重建，冲刷原生缓存）。写入批量 200 个切片。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
-- **批量嵌入**：嵌入按批次进行（默认 20 条/批），避免大知识库一次性嵌入导致 OOM。每批次内再拆分为 5 条/子批，子批次间主动释放 GIL 让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
+- **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内**按文本长度降序分桶**（批内长度相近使 padding 归零——混杂批的 padding 可浪费 2-4 倍算力）再拆为 1-5 条/子批，子批大小由自适应调优器按实际吞吐在边界上收敛；子批间主动释放 GIL 让 UI 保持响应，并按激活形状预算（条数 × 批内最长序列²）钳制超长文本的子批大小、以 8GB RSS 软墙降档避让。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、FastEmbed reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
 - **BM25 索引一致性**：写入（含单批写完的提前出口）与删除都会失效 FTS 标记并按需重建，`reload()` 也会重置——避免「混合检索静默退化成纯向量」或「已删文档仍被召回」。
-- **Reranker 加载去重**：FastEmbed reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。
+- **Reranker 加载去重**：FastEmbed reranker 加载用状态机（`idle/loading/done/failed`）标记，并发调用不会各自起加载线程（每线程 ~500MB PyTorch 权重）；超时后后台线程完成时仍写入结果，后续调用直接复用。close 之后的实例直接拒绝加载；后台加载完成时若实例已 close，状态置 `failed` 而非卡在 `loading`（后者会让重排静默失效）。
 
 ### 支持的文档格式
 
@@ -338,13 +338,13 @@ RAG 相关配置（写在同一个 `config.json` 里，界面未暴露的项可�
 | Word | `.docx`, `.doc` | docling（回退 `python-docx`） |
 | Excel | `.xlsx`, `.xls` | docling（回退 `openpyxl`） |
 | PowerPoint | `.pptx`, `.ppt` | docling（回退 `python-pptx`） |
-| PDF | `.pdf` | docling（图片型/纯扫描走 `rapidocr-onnxruntime` + `opencv-python-headless` 预处理） |
+| PDF | `.pdf` | docling（图片型/纯扫描走 rapidocr 3.x（或 1.x 回退）+ `opencv-python-headless` 预处理，Apple Silicon 上启用 CoreML EP） |
 | EPUB | `.epub` | docling（回退 `ebooklib`） |
 | MOBI/AZW | `.mobi`, `.azw3` | calibre（可选） |
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
 | HTML | `.html`, `.htm` | `beautifulsoup4` |
 
-**OCR 优化（图片型 PDF）**：扫描/图片型 PDF 经由 RapidOCR（onnxruntime）识别。在 **Apple M 系列 Mac** 上，检测到 CPU 为 Apple M 且 `onnxruntime≥1.31` 时引擎自动启用 **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+ANE 神经网络引擎），相比纯 CPU 推理显著加速；低于 1.31 或 Intel/非 Apple 平台则回退默认 EP。识别前对每页做**图像预处理与归一化**：按页面物理尺寸自适应 DPI 渲染、短边放大到目标像素、灰度 + CLAHE 对比度增强 + 锐化，提升小字与低对比扫描件的识别率。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭。
+**OCR 优化（图片型 PDF）**：扫描/图片型 PDF 优先经 rapidocr 3.x 识别（未安装时回退 rapidocr-onnxruntime 1.x）。在 **Apple M 系列 Mac** 上，3.x 通过 `EngineConfig.onnxruntime.use_coreml` 启用 **CoreML EP**（`MLComputeUnits=ALL`，调度 CPU+GPU+ANE 神经网络引擎），相比纯 CPU 推理显著加速；CoreML 初始化失败自动回退 CPU EP，Intel/非 Apple 平台直接用 CPU EP（避免必然失败的 CoreML 初始化）。识别前对每页做**图像预处理与归一化**：按页面物理尺寸自适应 DPI 渲染、短边放大到目标像素、灰度 + **暗色主题自动反色** + CLAHE 对比度增强 + 锐化，提升小字、低对比度与暗色主题扫描件的识别率；渲染后为纯色/空白的页直接跳过。引擎每 50 页周期重建，冲刷 CoreML/ORT 按输入形状保留的原生缓存（真实扫描页约 35MB/页，400 页可滞留 ~14GB）。以上行为均可在配置 `rag_ocr_coreml` / `rag_ocr_preprocess` 中关闭。
 
 ### Hybrid 智能分片
 
@@ -630,13 +630,13 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 9 个原子工具与能力工具的注册、`AliasTool` 委派、`update_working_checkpoint` /
 `start_long_term_update` / `skill_save` 的行为与路径穿越防护。
 
-近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**。
+近期补充的回归测试：首次 ingest 不再死锁（全新知识库）、`shell_run` 超时不留孤儿进程、`web_scan` 协议白名单、损坏 config 回退、`skill_load` 路径穿越防护、配置迁移不再改写用户显式设置、**「终止对话」在流式与工具链中途立即生效**、**向量化失败不再泄漏 worker 线程**、**`_JsonStore.reload` 不再丢弃防抖窗口内的写入**、**manifest 并发合并与有意删除**、**LPT 分片不产生空片**、**OCR 路由的 CoreML 门控与暗色页反色**。
 
 内核专项回归：`max_turns` 是「每次 run()」而非会话累计、reask 不掉最终轮、周期性 CONSOLIDATE 真的折叠、旧轮折叠后无悬挂 `tool` 消息、长任务 prompt 峰值不越过 30k。工具/RAG 专项：`skill_save` 后索引被标脏并能召回、`code_run` 超时关闭缓冲区、删除的知识库文件不再被 Step 7 复活、mtime 被保留的内容变更能被重新同步。
 
 失败自动恢复专项（`tests/test_failure_recovery.py`，14 例）：步骤失败后想收尾被失败感知的反思门拦回、失败放宽提醒预算（8 vs 2）、首次失败即要求换方案、原样重试被点名禁止、连续失败提示诊断换方案、防过早 blocked 守卫及其上限、成功后计数清零、失败上下文跨自动续跑段保留（续跑段锚点仍带上一错误）。复查修复专项（`tests/test_review_fixes.py`，19 例）：MCP 写队列、图谱确认/类型校验/clear 清队列、WorkMemory 淘汰强制落盘、plan patch 目标语义、抽取结果归一化、config 类型收敛与原子写、取消立即中断 code_run/shell_run、CJK 按字符截断、checkpoint 显式失败等。第十一轮专项（`tests/test_full_review_fixes.py`，5 例）：ingest errors 保持列表、WorkMemory LRU 并发安全、code_run 护栏非路径参数、超时后泄漏线程自行退出且全局流恢复。第十二轮专项（`tests/test_round12_fixes.py`，24 例）：OCR 两种 EP 注入路径与 rapidocr 1.2.x 降级、graph_memory 畸形 JSON 归一化、skills 原子写/唯一目录/损坏修复落盘且不吞后续写入、skill_index 畸形 skill.json 不致命、BOM frontmatter、空 ATX 标题不吞行、`> ~/...` 重定向判风险、MCP 重启清理残留等。
 
-当前共 594 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`，`test_ocr_engine` 依赖 `rapidocr-onnxruntime`；未安装这些可选依赖时报环境错误，不影响其余测试）。
+当前共 619 个用例全部通过（`test_rag_full_pipeline` 的 13 例依赖 `python-pptx`；未安装这些可选依赖时报环境错误，不影响其余测试）。
 
 > UI 相关测试（`test_bridge.py` / `test_integration.py` / `test_ui_flow.py`）依赖 `pytest-qt` 提供的 `qapp` fixture；未安装时这三个文件的用例会在 setup 阶段报错，其余测试不受影响。
 
@@ -854,6 +854,33 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 152 | `_work_memory` 的 `move_to_end` 在锁外调用 | 与锁内 `popitem` 并发修改 OrderedDict → RuntimeError / 条目错乱 | 命中/新建/淘汰三者同锁 |
 | 153 | code_run 护栏对非 str/PathLike 的 `open()` 参数走 `realpath("")`（=cwd） | 绕过前缀检查后炸出与根因无关的底层 TypeError，模型无法自纠 | 明确报 `open() expects a path (str/PathLike)` |
 | 154 | UI 不校验 `request_timeout ≤ 0` / `temperature < 0` | timeout=0 → httpx 立即超时，所有请求必失败且无提示 | 钳到合法下限 + 复位输入框 + 状态栏点名 |
+
+### 第十三轮：RAG 主线同步（向量库 / OCR / 切片 / 调度）
+
+对照 Base-Aug-Agent 主线对 RAG 子系统做了一次完整同步，详见[软件设计文档
+§15](docs/软件设计文档.md)。两侧自 #88 起分叉，主线又积累了约 130 个 RAG 提交；
+本轮把其中仍然成立、本工程尚未吸收的部分全部移植过来（主线自身已修掉的
+一次性诊断脚本、线程数自适应的实时阶段等已过时项不收）。
+
+| # | 领域 | 移植内容 |
+|---|------|---------|
+| 197 | 向量库 | `@_store_op` 在途操作计数：`clear()`/`close()`/`reload()` 先排空在途 add/search 再动表（旧实现与在途写并发会打到已 drop 的表）；`close()` 不再调用 `.cpu()`（ONNX 无该方法）；`_fts_failed` 让建索引失败后不再每轮检索重试 |
+| 198 | 向量库 | `search_fts` 空查询短路；BM25 原始分 `s/(1+s)` 归一化进 `score`（旧实现把 BM25=15 当余弦 1.0 塞进 `1-s²/2`，纯关键词候选集体排末尾）；`search` 的 `where` 加 `prefilter=True`（定向检索不再被先截断再筛） |
+| 199 | 向量库 | reranker 状态机：close 后拒绝加载、加载完成撞 close 置 `failed`（旧实现状态卡在 `loading` 让重排静默失效）；`_get_reranker` 锁内重查 + `timeout=5s` 等加载 |
+| 200 | 向量库 | `_embed_chunks` 改为**按文本长度降序分桶**（padding 归零）+ 自适应子批 1-5 + 激活形状预算钳制 + 8GB RSS 软墙 + 子批级进度日志。主线上 32 条混杂批 309s ≈ 40 tok/s，同模型「长度排序 + 8-12 条/批」可达 ~2000 tok/s |
+| 201 | OCR | rapidocr **3.x 优先**（模型目录与 docling 共享、支持 CoreML EP、懒加载），1.x 经 `ocr_engine` 注入 CoreML 回退；Apple Silicon 上用 `params={"EngineConfig.onnxruntime.use_coreml": True}`，Intel/非 Apple 直接用 CPU EP |
+| 202 | OCR | 暗色主题页自动反色（黑底白字/灰字在原模型上几乎检不出文本框——大面积漏检的根因）；`_pixmap_is_blank` 跳过纯色/空白扫描页（每页省 2-5s）；`_ocr_image_cached` 兼容 3.x 的 `RapidOCROutput.txts` 与 1.x 的 `(result, elapse)` |
+| 203 | OCR | 引擎**周期回收**（每 50 页）+ **每页从单例取用**：CoreML/ORT 按形状保留的原生缓存在真实扫描页上实测 ~35MB/页，400 页滞留 ~14GB；页末释放局部引用让任意 worker 的回收都全局生效。单页 OCR 后同步 `store_shrink(100)` + `gc.collect()` |
+| 204 | 调度 | `_shard_files_balanced` LPT 负载均衡分片（旧连续切片在 9 文件 4 worker 时第 4 片为空，慢书扎堆拉长尾延迟）；写入批量 20 → 200（LanceDB fragment 碎片）；`stats["chunks"]` 改记本次写入量 + 新增 `chunks_total` |
+| 205 | 同步 | `_ManifestLock`（flock 跨进程 + 线程锁 + TLS 重入计数）+ `_save_manifest` **读改写合并**：UI 与 agent 两个实例并发同步不再互相抹掉对方的 manifest 条目；`clear_knowledge_base` 删 manifest 也持锁 |
+| 206 | 同步 | Markdown 缓存 sidecar（`*.md.meta.json`）记录「缓存文件名 → 原始文档名」，`ensure_digests` 按 sidecar → md_path → 文件名反推的优先级解析；`build_and_store_digest` 支持传入预计算的 digest/chapters（批量重刷不再算两遍）并存完整 doc_name |
+| 207 | 清理 | `_cleanup_deleted_files` 逐文件 try/except 隔离 + 失败保留 manifest 条目（旧实现无条件 pop，「下次重试」永不成立，失败文件的向量永久残留）；删除范围补齐 rel_path / source 全键 + sidecar |
+| 208 | 解析 | 旧版二进制格式（`.doc`/`.xls`/`.ppt`）移出 `SUPPORTED_EXTENSIONS` 与 `EXTENSION_DEPS`（解析必然失败，保留只制造「已支持」的假象并白装依赖），直接调用时给出「另存为」的可行动提示 |
+| 209 | 依赖 | OCR 从 `EXTENSION_DEPS` 的静态项改为 `check_dependencies` 检测到图片版 PDF 时**动态升级**为必需（「未装」与「装了但加载失败」在依赖层无法区分，统一 optional 会让两者都只产出无差别提示）；pyproject 的 ocr extra 改 `rapidocr>=3.10`、rag extra 加 `model2vec>=0.3` |
+
+回归测试：`tests/test_rag_sync_round13.py`（18 例）覆盖 manifest 锁的合并/removed/
+重入/异常释放、LPT 分片不产生空片且大文件摊开、OCR 路由的 CoreML 门控与 3.x/1.x
+回退、暗色页反色与正常页不误触发、回收边界与批量常量。
 
 ### 第十二轮：全量代码重审（OCR 失效 / 竞态 / 加载校验 / 性能）
 

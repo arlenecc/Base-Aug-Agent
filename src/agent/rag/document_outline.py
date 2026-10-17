@@ -113,25 +113,59 @@ class Chapter:
 # Markdown headings
 # ---------------------------------------------------------------------------
 
+def _find_headings(markdown: str) -> List[Tuple[int, str, int, int]]:
+    """逐行扫描找出 Markdown 标题，**跳过围栏代码块内的 ``#``**。
+
+    返回 ``[(level, title, start, end)]``（start/end 为原文绝对偏移）。
+    围栏代码块里的 shell/Python 注释（``# comment``、``#!/bin/bash``）会被
+    误认为标题，把代码样本切成假章节——hybrid_chunker 已做了同样的围栏跳过，
+    这里补齐（否则目录 digest 会被代码注释污染）。
+    """
+    results: List[Tuple[int, str, int, int]] = []
+    in_fence = False
+    fence_marker = ""
+    offset = 0
+    for line in markdown.splitlines(keepends=True):
+        stripped = line.strip()
+        if not in_fence:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = True
+                fence_marker = stripped[:3]
+                offset += len(line)
+                continue
+        else:
+            # 只有同一种围栏才能闭合（``` 不能被 ~~~ 闭合，反之亦然）。
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            offset += len(line)
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            results.append((
+                len(m.group(1)), m.group(2).strip(),
+                offset + m.start(), offset + m.end(),
+            ))
+        offset += len(line)
+    return results
+
+
 def extract_chapters(markdown: str) -> List[Chapter]:
     """Split Markdown into chapters at ``#`` heading boundaries."""
     if not markdown or not markdown.strip():
         return []
 
-    headings = list(_HEADING_RE.finditer(markdown))
+    headings = _find_headings(markdown)
     chapters: List[Chapter] = []
 
     if headings:
-        prefix = markdown[: headings[0].start()].strip()
+        prefix = markdown[: headings[0][2]].strip()
         if prefix:
             chapters.append(Chapter(0, "前言", prefix))
 
-    for i, m in enumerate(headings):
-        level = len(m.group(1))
-        title = m.group(2).strip()
-        start = m.end()
-        end = headings[i + 1].start() if i + 1 < len(headings) else len(markdown)
-        body = markdown[start:end].strip()
+    for i, (level, title, _start, end) in enumerate(headings):
+        next_start = headings[i + 1][2] if i + 1 < len(headings) else len(markdown)
+        body = markdown[end:next_start].strip()
         if body or title:
             chapters.append(Chapter(level, title, body))
 

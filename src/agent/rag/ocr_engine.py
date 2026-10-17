@@ -418,8 +418,10 @@ def preprocess_for_ocr(
     1. **Scale normalisation** — short side < ``_MIN_SHORT_SIDE`` is upscaled,
        long side > ``_MAX_LONG_SIDE`` is downscaled, so the detector always
        sees text at a sane size.
-    2. **Grayscale + CLAHE** — adaptive histogram equalisation lifts faint
-       scans and evens out lighting gradients that break text detection.
+    2. **Grayscale + dark-theme inversion + CLAHE** — predominantly dark pages
+       (dark mode e-books, night-mode scans) are inverted to white-background
+       first; adaptive histogram equalisation then lifts faint scans and evens
+       out lighting gradients that break text detection.
     3. **Unsharp mask** — restores edge definition lost to the resample.
     4. *(optional)* **Adaptive binarisation** — helps clean black-and-white
        scans, but harms screenshots / colour figures, hence off by default.
@@ -462,8 +464,23 @@ def preprocess_for_ocr(
         if not enhance:
             return work
 
-        # ---- 2. grayscale + CLAHE ----
+        # ---- 2. grayscale + 暗色主题反色 + CLAHE ----
         gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+        # 2a. 暗色主题自动反色（#100-#101）：RapidOCR 的 det/rec 模型在白底
+        # 黑字、高对比度样本上训练，黑底白字/灰字的暗色主题页（电子书暗色
+        # 模式、夜间模式扫描）几乎检不出任何文本框——「一大片页面检测不到
+        # 文字」的根因。页面整体偏暗（p50 < 100 且 p95 < 160，即 95% 像素
+        # 都是暗色调，符合「深色背景 + 少量浅色文字」的特征）时反色为白底
+        # 深字。插图占比大的正常页 p95 会远超 160，不会误触发。
+        # 反色之后再进 CLAHE——CLAHE 的局部对比度增强同时覆盖了低对比度
+        # 页面的拉伸需求（与主线 _ocr_normalize 的两步分位数拉伸等价）。
+        try:
+            import numpy as np
+            p50, p95 = np.percentile(gray, (50, 95))
+            if p50 < 100 and p95 < 160:
+                gray = 255 - gray
+        except Exception:
+            pass
         try:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)

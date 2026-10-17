@@ -12,3 +12,5 @@ venv/
 *.sqlite3
 BaseAgent.iconset/
 generated-images/
+# 主线参考副本（RAG 同步的基准仓库，非本工程资产）
+Base-Aug-Agent/

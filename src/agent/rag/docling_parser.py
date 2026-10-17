@@ -83,7 +83,14 @@ def is_supported(ext: str) -> bool:
 
 
 def _get_converter():
-    """Lazily build and cache the docling DocumentConverter singleton."""
+    """Lazily build and cache the docling DocumentConverter singleton.
+
+    管线降配（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
+    accelerator 强制 CPU + 限 4 线程。docling 2.x 在 macOS 上默认
+    device='auto' → MPS（torch Metal 后端），其缓存分配器只增不放——
+    实测同步图多的书时 RSS 可涨到 30GB+ 且不回落（#116 根因之一）。
+    CPU 模式下布局/表格模型对文本为主的文档足够快，且内存有界。
+    """
     global _converter, _converter_unavailable
     if _converter is not None:
         return _converter
@@ -95,7 +102,30 @@ def _get_converter():
         try:
             from docling.document_converter import DocumentConverter
 
-            converter = DocumentConverter()
+            converter = None
+            try:
+                from docling.datamodel.accelerator_options import (
+                    AcceleratorDevice,
+                    AcceleratorOptions,
+                )
+                from docling.datamodel.base_models import InputFormat
+                from docling.datamodel.pipeline_options import PdfPipelineOptions
+                from docling.document_converter import PdfFormatOption
+
+                pdf_opts = PdfPipelineOptions()
+                pdf_opts.accelerator_options = AcceleratorOptions(
+                    num_threads=4, device=AcceleratorDevice.CPU
+                )
+                converter = DocumentConverter(
+                    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
+                )
+                logger.info("docling DocumentConverter initialized (PDF 管线强制 CPU 加速)")
+            except Exception as e:
+                # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
+                # 降配入口就用默认构造——正确性不受影响，只是 macOS 上
+                # MPS 缓存可能再次推高内存。
+                logger.info("docling 管线降配不可用（%s），使用默认配置", e)
+                converter = DocumentConverter()
             _converter = converter
             logger.info("docling DocumentConverter initialized (global singleton)")
             return converter
@@ -106,7 +136,7 @@ def _get_converter():
         except Exception as e:
             # 只在**缺失**时永久禁用。瞬时错误（模型下载中断、磁盘抖动、
             # OOM）绝不能置位 —— 那会让本进程后续所有同步都静默降级到轻量
-            # 解析器，即使原因早已消失也不自愈。
+            # 解析器，即使原因早已消失了也不自愈。
             logger.warning("failed to init docling converter (will retry): %s", e)
             return None
 
@@ -130,7 +160,13 @@ def extract_markdown(filepath: str) -> Optional[str]:
     # pure-scan PDF (no text layer at all) is better served by the dedicated
     # RapidOCR path in parsers.py which reuses the shared engine.  Detect that
     # case cheaply and delegate.
-    if suffix == ".pdf" and _is_scan_pdf(path):
+    #
+    # 混合型 PDF（文本层 + 大量图片页）同样要拦下：docling 对它们跑全量
+    # 管线（布局模型 + TableFormer + 逐页 OCR），单本耗时 40-70 分钟；而
+    # parsers.py 的 PyMuPDF + RapidOCR 路径逐页流式处理（共享单例引擎 +
+    # CoreML 加速 + 归一化），快数倍且内存有界（#116：实测 2 本图多的书
+    # 触发 30GB+ 内存与 2 小时同步）。
+    if suffix == ".pdf" and (_is_scan_pdf(path) or _pdf_is_image_heavy(path)):
         return None
 
     converter = _get_converter()
@@ -178,5 +214,68 @@ def _is_scan_pdf(path: Path) -> bool:
                 if doc[i].get_text("text").strip():
                     return False
         return True
+    except Exception:
+        return False
+
+
+# 图片页占比超过该阈值的 PDF 不进 docling：采样窗口内「docling 会为之
+# 付出逐页位图处理代价」的页越多，其全量管线（逐页布局/表格/OCR，torch
+# MPS 内存只增不放）越失控，交给 parsers.py 的 PyMuPDF+RapidOCR 路径
+# （CoreML、共享单例、有界内存）更合适。
+#
+# 「会付出位图代价」的页 = 纯图页，或嵌入图片占页面面积 ≥15% 的文本页。
+# 实测（#116）：中文电子书常见「每页文本层 + 满页背景图」的排版，纯图页
+# 占比判定为 0%，但 docling 对每个位图区域都跑 OCR——单本 225-280 页
+# 耗时 37-74 分钟、进程 RSS 涨到 36GB；而文本层直读只需数秒。
+_IMAGE_HEAVY_PROBE_PAGES = 20
+_IMAGE_HEAVY_RATIO = 0.3
+_IMAGE_SIGNIFICANT_AREA_RATIO = 0.15
+
+
+def _pdf_is_image_heavy(path: Path) -> bool:
+    """Detect whether a PDF would make docling pay for per-page bitmap work.
+
+    采样前 ``_IMAGE_HEAVY_PROBE_PAGES`` 页，统计以下两类页面占比：
+      1. 纯图页（无文本层且嵌有图片）——docling 整页 OCR；
+      2. 嵌有显著图片（面积 ≥ ``_IMAGE_SIGNIFICANT_AREA_RATIO`` × 页面）的
+         文本页——典型如满页背景图/花边的中文电子书，docling 的 auto OCR
+         仍会对位图区域逐页推理。
+
+    占比达到 ``_IMAGE_HEAVY_RATIO`` 即判定为图片重。只开一次文档、只读前
+    几页，开销毫秒级。与 ``_is_scan_pdf``（全无文本层）互补。
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return False
+    try:
+        with fitz.open(str(path)) as doc:
+            n = min(_IMAGE_HEAVY_PROBE_PAGES, doc.page_count)
+            if n == 0:
+                return False
+            costly = 0
+            for i in range(n):
+                page = doc[i]
+                text = page.get_text("text").strip()
+                images = page.get_images(full=True)
+                if not text:
+                    if images:
+                        costly += 1
+                    continue
+                # 文本页：只有显著大图才计入（页角小 logo 不会让 docling
+                # 变慢到失控，不值得为它放弃 docling 的版面分析质量）。
+                page_area = abs(page.rect)
+                if page_area <= 0:
+                    continue
+                for img in images:
+                    try:
+                        rects = page.get_image_rects(img[0])
+                    except Exception:
+                        continue
+                    if any(abs(r) >= _IMAGE_SIGNIFICANT_AREA_RATIO * page_area
+                           for r in rects):
+                        costly += 1
+                        break
+            return costly / n >= _IMAGE_HEAVY_RATIO
     except Exception:
         return False
