@@ -357,11 +357,12 @@ class SyncKnowledgeWorker(QThread):
     sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
-                 force: bool = False):
+                 force: bool = False, rerank_model: str = ""):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
+        self._rerank_model = rerank_model
         self._force = force
         self._engine: Optional[RAGEngine] = None
         # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
@@ -426,11 +427,17 @@ class SyncKnowledgeWorker(QThread):
         emit_stats = None
         emit_error = None
         try:
-            self._engine = RAGEngine(
+            # rerank_model 空则不传 key：显式传 None 会覆盖 engine 的默认值
+            # （INT8 v2-m3），导致 TextCrossEncoder(None) 崩溃（#131）。
+            _engine_kwargs = dict(
                 workspace=self._workspace,
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
             )
+            if self._rerank_model:
+                # 非空 = 显式转发 config.rag_rerank_model，配置可覆盖。
+                _engine_kwargs["rerank_model"] = self._rerank_model
+            self._engine = RAGEngine(**_engine_kwargs)
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
                 force=self._force,
@@ -1235,6 +1242,9 @@ class MainWindow(QMainWindow):
             ws, kb,
             embedding_model=self.config.rag_embedding_model,
             force=force,
+            # 显式转发配置（#131）：config.rag_rerank_model 此前是死代码，
+            # 没有任何调用点传给引擎，实际加载的一直是 engine 旧默认值。
+            rerank_model=self.config.rag_rerank_model,
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)

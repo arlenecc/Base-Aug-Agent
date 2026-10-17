@@ -15,7 +15,7 @@ from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, normalize_markdown
 from .chunker import chunk_documents
 from .document_outline import build_digest
-from .vector_store import VectorStore
+from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +352,11 @@ class RAGEngine:
         chunk_overlap: int = 80,
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
-        rerank_model: str = "BAAI/bge-reranker-base",
+        # 默认用 INT8 量化版 bge-reranker-v2-m3（~570MB，多语种/中文精排）。
+        # 旧默认 "BAAI/bge-reranker-base" 是 fp32 ~1.04GB 且非量化——两个真实
+        # 调用点（tools/base.py、ui/main_window.py）都不传 rerank_model，
+        # 这个默认值就是实际加载的模型（#131）。
+        rerank_model: str = DEFAULT_RERANK_MODEL,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
     ):
         self._workspace = workspace

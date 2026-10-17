@@ -265,6 +265,10 @@ class ToolRegistry:
                 workspace=self.config.workspace,
                 knowledge_base=kb,
                 embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                # 不转发 config.rag_rerank_model 的话，engine 的本地默认值会
+                # 赢——曾因此实际加载 fp32 bge-reranker-base 而非配置声明的
+                # INT8 v2-m3（#131）。
+                rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8"),
             )
             self._rag_engine = engine
 

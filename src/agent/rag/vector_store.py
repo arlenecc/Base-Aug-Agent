@@ -135,6 +135,12 @@ class FastEmbedEmbeddingFunction:
                     self._model = TextEmbedding(
                         model_name=self._model_name,
                         cache_dir=cache_dir,
+                        # 显式锁死 CPU EP（不依赖 fastembed 的默认行为——它
+                        # 只自动选 CUDA、从不选 CoreML，行为变更时会静默漂移）。
+                        # nomic 走 CoreML EP 已实测失败（41% 节点不支持、
+                        # 分桶小批次复现 SIGKILL×3），CPU EP + 长度分桶才是
+                        # 本机最优路径（#126 验证依据之一），见项目记忆「失败路」。
+                        providers=["CPUExecutionProvider"],
                         # ORT intra-op 线程数：默认值在本机实测与 4 相当
                         # （57 vs 63 tok/s），留一半核心给 OCR/解析 worker。
                         # 嵌入吞吐的主要杠杆是长度分桶（见 _embed_chunks），
@@ -1414,11 +1420,20 @@ class VectorStore:
 
             def _load():
                 try:
-                    # 走默认 CPU EP。不启用 CoreML EP：cross-encoder 输入是
-                    # 变长 (query, doc) 序列，attention 的动态 shape 在 CoreML
-                    # 上频繁 fallback 反而更慢；INT8 权重在 CPU EP 上有原生
-                    # int8 算子加速。
-                    reranker = TextCrossEncoder(self._rerank_model)
+                    # 显式锁死 CPU EP：不依赖 fastembed 默认行为（只自动选
+                    # CUDA、从不选 CoreML）。cross-encoder 输入是变长 (query,
+                    # doc) 序列，attention 动态 shape 在 CoreML 上频繁 fallback
+                    # 反而更慢；INT8 权重在 CPU EP 上有原生 int8 算子加速。
+                    # cache_dir 必须显式传持久目录：fastembed 默认用系统临时
+                    # 目录（/var/folders/.../T/fastembed_cache），macOS 会定期
+                    # 清理 → 每次都重新下载几百 MB（与 nomic 曾重下同型 bug）。
+                    reranker = TextCrossEncoder(
+                        self._rerank_model,
+                        cache_dir=os.path.join(
+                            os.path.expanduser("~"), ".cache", "fastembed"
+                        ),
+                        providers=["CPUExecutionProvider"],
+                    )
                     if getattr(self, "_closed", False):
                         # close() 已经执行：不要再把数百 MB 模型写回实例
                         # （旧实现会让 close 之后的实例「复活」持有权重）。
