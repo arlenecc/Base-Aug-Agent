@@ -41,6 +41,9 @@ rag = [
     # 缺失时自动回退 nomic 适配器（慢但正确）。
     "model2vec>=0.3",
     "docling>=2.0.0",
+    # docling OCR 首选引擎：Apple Vision 框架（macOS 原生，系统级加速）。
+    # docling 的 auto 探测 ocrmac 优先、rapidocr 回退；不可用时静默跳过。
+    "ocrmac>=1.0.1",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
     # CoreML EP（Apple Silicon OCR/推理加速）需要官方 wheel 内置的

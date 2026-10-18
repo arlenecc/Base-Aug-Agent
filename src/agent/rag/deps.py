@@ -426,6 +426,17 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                         "统一文档解析引擎 docling（可选，未安装时回退按格式解析）",
                         required=False)
             )
+        # docling OCR 首选引擎（Apple Vision）。仅当 docling 可用且知识库含
+        # PDF 时要求（docling 缺失时走 PyMuPDF+RapidOCR 兜底，用不到 ocrmac）。
+        # 必须进 missing_required 而非 missing_optional：auto 探测下缺失 ocrmac
+        # 会**静默**回退 rapidocr（逐框前向比 Vision 整页识别慢一个量级），
+        # required 让 ensure_dependencies 自动安装、装失败则阻断同步并给出
+        # 明确提示——杜绝静默降级（2026-10 用户要求）。
+        if ".pdf" in exts and not _is_importable("ocrmac"):
+            report.missing_required.append(
+                DepSpec("ocrmac", "ocrmac",
+                        "docling 的 Apple Vision OCR 引擎（缺失时自动安装，避免回退 rapidocr）")
+            )
 
     # ---- chonkie: optional semantic chunking (falls back to recursive chunker) ----
     # 依赖轻量，缺失时随同步自动安装。
