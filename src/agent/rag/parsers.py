@@ -52,6 +52,7 @@ SUPPORTED_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst",
     ".csv", ".tsv",
     ".html", ".htm",
+    ".tex", ".latex",
 }
 # 旧版二进制格式（.doc/.xls/.ppt）不在支持列表：python-docx/openpyxl/
 # python-pptx 与 docling 均只支持 OOXML，解析必然失败（extract_text 对它们
@@ -80,6 +81,7 @@ def extract_text(filepath: str) -> str:
         ".txt": "纯文本", ".md": "Markdown", ".markdown": "Markdown", ".rst": "reStructuredText",
         ".csv": "CSV 表格", ".tsv": "TSV 表格",
         ".html": "HTML 网页", ".htm": "HTML 网页",
+        ".tex": "LaTeX 文档", ".latex": "LaTeX 文档",
     }
     label = _PARSER_LABELS.get(suffix, suffix)
     logger.debug("    解析文件类型: %s (%s)", path.name, label)
@@ -123,6 +125,21 @@ def extract_text(filepath: str) -> str:
         return _extract_csv(path)
     elif suffix in (".html", ".htm"):
         return _extract_html(path)
+    elif suffix in (".tex", ".latex"):
+        # LaTeX 没有 Python 侧轻量解析器，只走 pandoc（engine 管线在 pandoc
+        # 可用时已优先路由到这里；extract_text 直调是 pandoc 缺失的兜底）。
+        from .pandoc_parser import convert_document, is_pandoc_available
+        md = convert_document(str(path))
+        if md and md.strip():
+            return md
+        if is_pandoc_available():
+            raise ValueError(
+                "LaTeX → Markdown 转换失败（pandoc 已安装但未产出文本），"
+                "请确认文件是完整的 LaTeX 源文档"
+            )
+        raise ValueError(
+            "LaTeX 解析需要 pandoc（未检测到）。请安装：brew install pandoc"
+        )
     else:
         raise ValueError(f"Unsupported format: {suffix}")
 

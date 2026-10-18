@@ -47,6 +47,12 @@ class AgentConfig:
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # fastembed ONNX reranker
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
+    # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
+    #   - "docling"：默认，版面理解 + ocrmac(Apple Vision) OCR
+    #   - "marker"：marker-pdf 2.x（surya OCR，服务端进程架构）
+    # 主引擎不可用（未安装/导入失败）时自动回退到另一引擎；单文件转换
+    # 失败仍走 parsers.py 的轻量兜底，行为与 #133 之前一致。
+    rag_pdf_engine: str = "docling"
 
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
@@ -64,13 +70,15 @@ class AgentConfig:
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio")
     _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
-                   "rag_embedding_model", "rag_rerank_model", "browser_endpoint")
+                   "rag_embedding_model", "rag_rerank_model", "browser_endpoint",
+                   "rag_pdf_engine")
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base 故意不在其中：它本来就可以为空（表示「用 workspace 下的
     # 默认目录」）。
     _NON_EMPTY_STR_FIELDS = ("base_url", "model", "workspace",
-                             "rag_embedding_model", "rag_rerank_model")
+                             "rag_embedding_model", "rag_rerank_model",
+                             "rag_pdf_engine")
 
     @classmethod
     def _coerce(cls, name: str, value):

@@ -73,6 +73,10 @@ EXTENSION_DEPS: Dict[str, List[DepSpec]] = {
     ".tsv": [],
     ".html": [DepSpec("bs4", "beautifulsoup4", "HTML 解析")],
     ".htm":  [DepSpec("bs4", "beautifulsoup4", "HTML 解析")],
+    # LaTeX 只走 pandoc（系统二进制，非 pip 依赖，无法在此检查/安装）；
+    # 缺失时 parsers.extract_text 给出「brew install pandoc」提示。
+    ".tex":   [],
+    ".latex": [],
 }
 
 # Core RAG infrastructure (always checked, always required)

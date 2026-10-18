@@ -54,6 +54,10 @@ rag = [
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
 # 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
 ocr = ["rapidocr>=3.10"]
+# marker-pdf：与 docling 并行的 PDF→Markdown 引擎（#134），经
+# rag_pdf_engine 配置切换。会连带拉 PyTorch（~2GB+）+ surya OCR 模型，
+# 故独立 extra，不进默认 rag 组；未安装时自动回退 docling。
+marker = ["marker-pdf>=2.0.0"]
 # All optional features
 #all = ["base-agent[test,rag,ocr]"]
 

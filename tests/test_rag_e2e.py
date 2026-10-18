@@ -609,7 +609,10 @@ class TestRAGEngine:
         """Search for embedding model information."""
         engine.ingest(force=True)
 
-        results = engine.search("嵌入模型有哪些")
+        # top_k 拉满覆盖全库切片：确定性测试嵌入（MD5）不带语义信号，
+        # CSV 切片能否进 top-3 纯属切片布局运气（fix_hard_wraps 断行拼接
+        # 会改变段落边界），top_k >= 总切片数后断言与布局无关。
+        results = engine.search("嵌入模型有哪些", top_k=10)
         assert len(results) >= 1
         combined = " ".join(r["text"] for r in results)
         # Should find model names from the CSV

@@ -357,12 +357,13 @@ class SyncKnowledgeWorker(QThread):
     sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
-                 force: bool = False, rerank_model: str = ""):
+                 force: bool = False, rerank_model: str = "", pdf_engine: str = "docling"):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
         self._rerank_model = rerank_model
+        self._pdf_engine = pdf_engine or "docling"
         self._force = force
         self._engine: Optional[RAGEngine] = None
         # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
@@ -437,6 +438,8 @@ class SyncKnowledgeWorker(QThread):
             if self._rerank_model:
                 # 非空 = 显式转发 config.rag_rerank_model，配置可覆盖。
                 _engine_kwargs["rerank_model"] = self._rerank_model
+            # PDF 主引擎（docling|marker，#134），配置可切换。
+            _engine_kwargs["pdf_engine"] = self._pdf_engine
             self._engine = RAGEngine(**_engine_kwargs)
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -1245,6 +1248,8 @@ class MainWindow(QMainWindow):
             # 显式转发配置（#131）：config.rag_rerank_model 此前是死代码，
             # 没有任何调用点传给引擎，实际加载的一直是 engine 旧默认值。
             rerank_model=self.config.rag_rerank_model,
+            # PDF 主引擎（docling|marker，#134）。
+            pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)

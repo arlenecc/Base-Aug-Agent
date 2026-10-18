@@ -12,9 +12,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
-from .cleaner import clean_text, normalize_markdown
+from .cleaner import clean_text, fix_hard_wraps, normalize_markdown
 from .chunker import chunk_documents
-from .document_outline import build_digest
+from .document_outline import build_digest, build_toc
+from .pandoc_parser import (
+    PANDOC_EBOOK_EXTS,
+    PANDOC_SUPPORTED_EXTENSIONS,
+    build_chapter_chunks,
+    convert_document,
+    convert_ebook,
+    is_pandoc_available,
+)
 from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
 
 logger = logging.getLogger(__name__)
@@ -273,22 +281,56 @@ def _escape_like(s: str) -> str:
     return s.replace("'", "''")
 
 
-def _extract_with_docling(filepath: str) -> tuple:
-    """Extract text, preferring docling (Markdown output).
+def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tuple:
+    """Extract text, preferring the configured Markdown engine (docling/marker).
 
     Returns ``(text, is_markdown)`` where ``is_markdown`` is True when the
-    text came from docling and is already well-formed Markdown (so the
-    caller can skip clean/normalize).  When docling is unavailable or
-    unsuitable for the format, falls back to the per-format parsers.
-    """
-    try:
-        from .docling_parser import extract_markdown
+    text came from a Markdown engine (so the caller can skip clean/normalize).
 
-        markdown = extract_markdown(filepath)
+    回退链（两层，语义不同，勿合并）：
+      1. 配置的主引擎「不可用」（未安装/导入失败）→ 尝试另一个 Markdown
+         引擎。配置指向一个没有安装的引擎时，不该直接掉到轻量解析器而
+         浪费另一个重型引擎。
+      2. 主引擎「可用但单文件转换失败」→ 走 parsers.py 的轻量兜底，与
+         #133 之前的语义一致。故意不跨引擎兜底：mid-ingest 冷启动另一个
+         重型引擎（可能触发模型下载）会把个别坏文件放大成整库同步的
+         长时间停顿。
+    """
+    if pdf_engine == "marker":
+        try:
+            from .marker_parser import (extract_markdown as _extract_primary,
+                                        is_marker_available as _primary_available)
+        except Exception:
+            _extract_primary, _primary_available = None, None
+        try:
+            from .docling_parser import extract_markdown as _extract_alt
+        except Exception:
+            _extract_alt = None
+    else:
+        try:
+            from .docling_parser import (extract_markdown as _extract_primary,
+                                         is_docling_available as _primary_available)
+        except Exception:
+            _extract_primary, _primary_available = None, None
+        try:
+            from .marker_parser import extract_markdown as _extract_alt
+        except Exception:
+            _extract_alt = None
+
+    if _extract_primary is not None and _primary_available is not None \
+            and _primary_available():
+        markdown = _extract_primary(filepath)
         if markdown is not None:
             return markdown, True
-    except Exception:
-        pass
+        # 主引擎可用但该文件转换失败 → 只走轻量兜底（见 docstring）。
+        return extract_text(filepath), False
+
+    # 主引擎不可用（未安装/导入失败）→ 另一个 Markdown 引擎顶上；它若同样
+    # 不可用，extract_markdown 会立即返回 None，开销可忽略。
+    if _extract_alt is not None:
+        markdown = _extract_alt(filepath)
+        if markdown is not None:
+            return markdown, True
     return extract_text(filepath), False
 
 
@@ -358,6 +400,7 @@ class RAGEngine:
         # 这个默认值就是实际加载的模型（#131）。
         rerank_model: str = DEFAULT_RERANK_MODEL,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
+        pdf_engine: str = "docling",
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -372,6 +415,9 @@ class RAGEngine:
         self._overlap_percent = overlap_percent
         self._rerank_model = rerank_model
         self._parallel_workers = max(1, int(parallel_workers))
+        # PDF 主引擎（docling|marker）。未知值一律回退 docling，避免配置
+        # 笔误把整库同步打到意外的路径上。
+        self._pdf_engine = pdf_engine if pdf_engine in ("docling", "marker") else "docling"
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出
@@ -624,14 +670,42 @@ class RAGEngine:
                         _flush_logs(fname)
                         try:
                             # ---- 1. 解析文件 ----
-                            # 优先用 docling 统一解析（直接输出 Markdown），
-                            # 不可用时回退到按格式的轻量解析器。
+                            # 路由优先级：pandoc（epub 系电子书/docx/html/LaTeX）
+                            # → 配置的 PDF 主引擎（docling/marker）→ 轻量解析器。
+                            # pandoc 返回 None（不可用/转换失败）时逐级回退，与
+                            # marker 模式的兜底语义一致。
                             _log("    ├─ 解析文件: %s", fname)
                             _flush_logs(f"解析: {fname}")
-                            text, is_markdown = _extract_with_docling(filepath)
+                            suffix = os.path.splitext(filepath)[1].lower()
+                            ebook_toc: Optional[list] = None  # 非 None = epub 系章节切块路径
+                            ebook_chapters: Optional[list] = None  # 锚点精确切分的章节文本
+                            pandoc_md: Optional[str] = None
+                            if suffix in PANDOC_SUPPORTED_EXTENSIONS and is_pandoc_available():
+                                md: Optional[str] = None
+                                try:
+                                    if suffix in PANDOC_EBOOK_EXTS:
+                                        _log("    ├─ pandoc 电子书转换: %s", fname)
+                                        result = convert_ebook(filepath)
+                                        if result is not None:
+                                            md, ebook_toc, ebook_chapters = result
+                                    else:
+                                        _log("    ├─ pandoc 文档转换: %s", fname)
+                                        md = convert_document(filepath)
+                                except Exception as e:
+                                    logger.warning("    ├─ ⚠ pandoc 转换异常，回退默认解析: %s: %s", fname, e)
+                                    ebook_toc, ebook_chapters = None, None
+                                if md and md.strip():
+                                    # --wrap=none 下段落已是单行；fix_hard_wraps 仍
+                                    # 清理残留 <br>/NBSP，并对老电子书源修断行。
+                                    pandoc_md = fix_hard_wraps(md)
+                            if pandoc_md is not None:
+                                text, is_markdown = pandoc_md, True
+                            else:
+                                text, is_markdown = _extract_with_pdf_engine(filepath, self._pdf_engine)
                             t_extract = time.monotonic() - t0
                             _log("    ├─ 解析完成: %s (提取 %d 字符, 耗时 %.2fs%s)",
-                                 fname, len(text), t_extract, " [docling]" if is_markdown else "")
+                                 fname, len(text), t_extract,
+                                 f" [{self._pdf_engine}]" if is_markdown else "")
                             _flush_logs(f"解析完成: {fname}")
                         except Exception as e:
                             msg = f"{os.path.basename(filepath)}: {e}"
@@ -716,15 +790,27 @@ class RAGEngine:
                             # 只存目录结构（标题层级），不做逐章摘要。
                             # 放在空文本检查之后：空内容不该生成一份
                             # "# 目录\n\n文件名" 的空 digest 入库。
+                            # epub 系：优先用 ebooklib 读出的目录树作为缩略版
+                            # （书自身的 TOC 比 Markdown 标题提取更准）；TOC 为空
+                            # （解析失败/无目录）时回退 Markdown 标题提取。
                             try:
-                                self.build_and_store_digest(
-                                    # 传相对路径而非 basename：documents 表的
-                                    # doc_id 以它为输入，basename 会让不同目录
-                                    # 下的同名文件互相覆盖/误删。
-                                    rel_path,
-                                    cleaned,
-                                    md_path=md_path,
-                                )
+                                if ebook_toc:
+                                    self.build_and_store_digest(
+                                        rel_path,
+                                        cleaned,
+                                        md_path=md_path,
+                                        digest="# 目录\n\n" + build_toc(ebook_toc),
+                                        chapters=ebook_toc,
+                                    )
+                                else:
+                                    self.build_and_store_digest(
+                                        # 传相对路径而非 basename：documents 表的
+                                        # doc_id 以它为输入，basename 会让不同目录
+                                        # 下的同名文件互相覆盖/误删。
+                                        rel_path,
+                                        cleaned,
+                                        md_path=md_path,
+                                    )
                                 _log("    ├─ 文档缩略版本已生成: %s", fname)
                             except Exception as e:
                                 logger.warning("    ├─ ⚠ 缩略版本生成失败: %s: %s", fname, e)
@@ -734,19 +820,56 @@ class RAGEngine:
                             _flush_logs(f"切片: {fname}")
                             c_hash = _content_hash(cleaned)
                             cleaned_len = len(cleaned)
-                            doc_chunks = chunk_documents(
-                                [{"source": filepath, "text": cleaned}],
-                                chunk_size=self._chunk_size,
-                                chunk_overlap=self._chunk_overlap,
-                                min_chunk_size=self._min_chunk_size,
-                                overlap_percent=self._overlap_percent,
-                                # 把引擎的 EF（可能是注入的自定义 EF）透传给
-                                # 语义切片，避免它另起一份本地 ONNX 模型。
-                                embedding_function=self._custom_ef,
-                            )
+                            if ebook_toc is not None:
+                                # 电子书章节切块：优先 pandoc 锚点精确切分
+                                # （epub 内容文档边界 + TOC 权威标题，无启发式）；
+                                # 无法精确切分（TOC 读不到/锚点不足）时回退到
+                                # 原有的标题层级启发式；超长章节交给
+                                # chunk_documents 兜底（保证不超嵌入模型上下文）。
+                                def _split_oversized(section_text: str) -> List[str]:
+                                    return [c["text"] for c in chunk_documents(
+                                        [{"source": filepath, "text": section_text}],
+                                        chunk_size=self._chunk_size,
+                                        chunk_overlap=self._chunk_overlap,
+                                        min_chunk_size=self._min_chunk_size,
+                                        overlap_percent=self._overlap_percent,
+                                        embedding_function=self._custom_ef,
+                                    )]
+
+                                _max_chars = max(self._chunk_size * 2, 1200)
+                                if ebook_chapters:
+                                    chunk_texts: List[str] = []
+                                    for chapter_text in ebook_chapters:
+                                        if len(chapter_text) > _max_chars:
+                                            chunk_texts.extend(_split_oversized(chapter_text))
+                                        else:
+                                            chunk_texts.append(chapter_text)
+                                else:
+                                    chunk_texts = build_chapter_chunks(
+                                        cleaned,
+                                        None,  # 启发式回退不使用 TOC 标题匹配
+                                        max_chars=_max_chars,
+                                        oversized_split=_split_oversized,
+                                    )
+                                doc_chunks = [
+                                    {"source": filepath, "chunk_index": i, "text": t}
+                                    for i, t in enumerate(chunk_texts)
+                                ]
+                            else:
+                                doc_chunks = chunk_documents(
+                                    [{"source": filepath, "text": cleaned}],
+                                    chunk_size=self._chunk_size,
+                                    chunk_overlap=self._chunk_overlap,
+                                    min_chunk_size=self._min_chunk_size,
+                                    overlap_percent=self._overlap_percent,
+                                    # 把引擎的 EF（可能是注入的自定义 EF）透传给
+                                    # 语义切片，避免它另起一份本地 ONNX 模型。
+                                    embedding_function=self._custom_ef,
+                                )
                             t_chunk_end = time.monotonic()
                             _log(
-                                "    ├─ 文档切片: %s → %d 个切片 (每片约 %d tokens, 重叠 %d tokens, 耗时 %.2fs)",
+                                "    ├─ 文档切片%s: %s → %d 个切片 (每片约 %d tokens, 重叠 %d tokens, 耗时 %.2fs)",
+                                "(章节)" if ebook_toc is not None else "",
                                 fname, len(doc_chunks), self._chunk_size, self._chunk_overlap,
                                 t_chunk_end - t_chunk,
                             )
@@ -1391,6 +1514,12 @@ class RAGEngine:
             release_converter()
         except Exception as e:
             logger.debug("RAG: release_converter error: %s", e)
+        # marker 的 surya 服务端子进程（VLM 布局/识别模型常驻其中）。
+        try:
+            from .marker_parser import release_converter
+            release_converter()
+        except Exception as e:
+            logger.debug("RAG: release marker converter error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.

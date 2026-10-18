@@ -3,9 +3,121 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
+
+# 行内 <br> 变体（<br>、<br/>、<br />）——在通用标签剥离之前先替换为空格，
+# 否则 "第一行<br>第二行" 剥标签后变成 "第一行第二行"（单词粘连）。
+_BR_RE = re.compile(r'<br\s*/?>', re.IGNORECASE)
+
+# 常见命名 HTML 实体（含缺分号的写法，如 "  &nbsp" / "&mdash"）。
+# 只匹配已知实体名——任意 `&[a-zA-Z]+` 会把 "R&D labs" 里的 "&D" 误吃掉。
+_ENTITY_NAMES = (
+    "nbsp|mdash|ndash|amp|lt|gt|quot|apos|hellip|copy|reg|trade|deg|times|divide"
+    "|ldquo|rdquo|lsquo|rsquo|laquo|raquo|bull|middot|plusmn|times"
+    "|larr|rarr|uarr|darr|harr|lceil|rceil|lfloor|rfloor"
+    "|alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|sigma|phi|omega"
+    "|infin|ne|le|ge|asymp|equiv|sub|sup|cap|cup|int|sum|prod|radic|part"
+    "|aacute|eacute|iacute|oacute|uacute|agrave|egrave|agrav|ccedil|uuml|ouml|auml"
+    "|szlig|ntilde|atilde|ocirc|acirc|ecirc|icirc|ucirc|yuml"
+)
+_ENTITY_RE = re.compile(r'&(?:%s);?' % _ENTITY_NAMES, re.IGNORECASE)
+
+# 句末标点：中文句号/问号/叹号 + 英文 . ? !，允许后跟闭引号/闭括号。
+# fix_hard_wraps 用它判断一行是否「句子真正结束」——不是句末的换行是
+# 硬断行，应与下一行拼回一段。
+_SENTENCE_END_RE = re.compile(r'[。！？!?…."][”’」』》）)】\]"\']*$')
+
+# Markdown 结构行：标题/列表/引用/表格/围栏/缩进代码/水平线。
+# 这些行的换行是结构性的，fix_hard_wraps 不得把它们与上下行拼接。
+_MD_STRUCTURE_RE = re.compile(
+    r'^(?:\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,9}[.)]\s|>\s?>?|\|'
+    r'|```|~~~|(?:-{3,}|\*{3,}|_{3,})\s*$)'
+    r'|\s{4,}\S)'
+)
+
+# 含竖线的行（Markdown 表格行、_extract_csv 输出的 "a | b | c" 行）一律视为
+# 结构行：表格/CSV 的换行是数据边界，拼接会把整张表粘成一行并改变切片边界。
+_PIPE_LINE_RE = re.compile(r'\|')
+
+
+def fix_hard_wraps(text: str) -> str:
+    """修复硬断行：非句末换行拼回空格，句末换行保留为段落/句子边界。
+
+    电子书（epub/mobi/html 源）与 OCR 文本普遍存在「每行 ~40 字符的排版
+    断行」——句中被 \n 截断，检索切片会在句中分裂。规则（按用户要求）：
+      - <br> 变体 → 空格（在拼接前先处理，避免剥标签后单词粘连）；
+      - 不以句号/问号/叹号结尾的换行 → 空格（拼回同一段）；
+      - 句末换行保留（\n\n 段落边界保持不变）。
+
+    Markdown 结构行（标题 #、列表 -/1.、引用 >、表格 |、代码围栏、缩进
+    代码、水平线）的换行是结构性的，原样保留不参与拼接；围栏代码块内部
+    逐字保留。
+    """
+    if not text:
+        return ""
+    # 硬回车归一：CRLF/CR → LF；不换行空格（pandoc 实体转换残留）→ 空格。
+    text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\u00a0', ' ')
+    # 行内 <br> → 空格（围栏内行在循环里逐行处理，不会误伤代码块）。
+    # 注意：这里只在非围栏上下文安全，先做全局替换再靠下方围栏逻辑无法
+    # 恢复——因此采用逐行扫描，围栏内跳过 _BR_RE。
+    lines = text.split('\n')
+    out: List[str] = []
+    buf: Optional[str] = None  # 正在累积的段落（跨行拼接中）
+    in_fence = False
+    fence_marker = ""
+
+    def _flush() -> None:
+        nonlocal buf
+        if buf is not None:
+            out.append(buf)
+            buf = None
+
+    for line in lines:
+        stripped = line.strip()
+        # 围栏开关：``` / ~~~（只有同种围栏能闭合）。
+        if not in_fence and (stripped.startswith('```') or stripped.startswith('~~~')):
+            _flush()
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            continue
+
+        # 空行 = 段落边界。
+        if not stripped:
+            _flush()
+            out.append('')
+            continue
+
+        # Markdown 结构行 / 表格与 CSV 数据行：原样保留，且打断当前段落拼接。
+        if _MD_STRUCTURE_RE.match(line) or _MD_STRUCTURE_RE.match(stripped) \
+                or _PIPE_LINE_RE.search(stripped):
+            _flush()
+            out.append(_BR_RE.sub(' ', stripped).strip())
+            continue
+
+        # 普通段落行：先清行内 <br>、gfm 硬换行标记（行尾反斜杠）与残留
+        # HTML 实体（pandoc 只转换合法实体，畸形实体如 "&mdash" 会原样透传）。
+        s = _BR_RE.sub(' ', stripped).strip()
+        s = _ENTITY_RE.sub(' ', s)
+        s = re.sub(r'\\$', '', s).strip()
+        if buf is None:
+            buf = s
+        else:
+            buf = buf + ' ' + s
+        if _SENTENCE_END_RE.search(s):
+            _flush()
+
+    _flush()
+    # 连续 3+ 空行收敛为 1 个空行（段落间距）。
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
 
 
 def clean_text(text: str) -> str:
@@ -14,6 +126,12 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     logger.debug("      清洗文本: 原始 %d 字符", len(text))
+
+    # 0. 硬回车归一：CRLF/CR → LF（后续步骤统一按 \n 处理）。
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # 0.5 行内 <br> → 空格（必须在通用标签剥离之前，否则单词粘连）。
+    text = _BR_RE.sub(' ', text)
 
     # 1. Remove entire script/style blocks (including their content)
     text = re.sub(r'<script[^>]*>[\s\S]*?</script>', ' ', text, flags=re.IGNORECASE)
@@ -26,8 +144,8 @@ def clean_text(text: str) -> str:
     # 3. Remove remaining HTML/XML tags
     text = re.sub(r'<[^>]+>', ' ', text)
 
-    # 4. Remove HTML entities
-    text = re.sub(r'&[a-zA-Z]+;', ' ', text)
+    # 4. Remove HTML entities（含缺分号的已知实体名，如 "&nbsp" "&mdash"）
+    text = _ENTITY_RE.sub(' ', text)
     text = re.sub(r'&#\d+;', ' ', text)
     text = re.sub(r'&#x[0-9a-fA-F]+;', ' ', text)
 
@@ -40,8 +158,8 @@ def clean_text(text: str) -> str:
     # 7. Remove control characters except common whitespace (\n, \t, \r)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
 
-    # 8. Replace various Unicode whitespace with normal space
-    text = re.sub(r'[\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]', ' ', text)
+    # 8. Replace various Unicode whitespace with normal space（含 \u00a0 NBSP）
+    text = re.sub(r'[\u00a0\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]', ' ', text)
 
     # 9. Remove zero-width characters
     text = re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]', '', text)
@@ -74,6 +192,9 @@ def clean_text(text: str) -> str:
         cleaned_lines.append(stripped)
 
     text = '\n'.join(cleaned_lines)
+
+    # 11.5 修复硬断行：非句末换行拼回空格（电子书/OCR 的排版断行）。
+    text = fix_hard_wraps(text)
 
     # 12. Collapse 3+ consecutive newlines into 2
     text = re.sub(r'\n{3,}', '\n\n', text)

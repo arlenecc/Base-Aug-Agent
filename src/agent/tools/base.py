@@ -269,6 +269,9 @@ class ToolRegistry:
                 # 赢——曾因此实际加载 fp32 bge-reranker-base 而非配置声明的
                 # INT8 v2-m3（#131）。
                 rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8"),
+                # PDF 主引擎（docling|marker，#134）：同 #131 的教训，
+                # 必须显式转发配置，否则永远用 engine 本地默认 docling。
+                pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
             )
             self._rag_engine = engine
 
