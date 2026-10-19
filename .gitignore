@@ -12,3 +12,4 @@ venv/
 *.sqlite3
 BaseAgent.iconset/
 generated-images/
+models/
