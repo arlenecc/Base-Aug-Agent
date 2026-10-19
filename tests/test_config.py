@@ -175,6 +175,42 @@ def test_default_max_tokens_is_32768():
     assert cfg.max_context_tokens == 32768
 
 
+def test_aux_defaults_are_16384_ctx_and_05_temp():
+    """辅助模型默认加载参数：上下文 16384、temp 0.5，其它参数不变。"""
+    cfg = AgentConfig()
+    assert cfg.aux_max_context_tokens == 16384
+    assert cfg.aux_temperature == 0.5
+    assert cfg.aux_max_tokens == 2048
+    assert cfg.aux_top_p == 0.95
+    assert cfg.aux_min_p == 0.05
+    assert cfg.aux_top_k == 20
+    assert cfg.aux_repetition_penalty == 1.0
+
+
+def test_migrate_aux_legacy_temperature(tmp_path):
+    """旧配置里的 aux_temperature=0.2（旧默认）升级到 0.5；
+    用户显式调过的值必须保留。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"aux_temperature": 0.2}))
+    assert AgentConfig.load(str(p)).aux_temperature == 0.5
+
+    p2 = tmp_path / "c2.json"
+    p2.write_text(json.dumps({"aux_temperature": 0.7}))
+    assert AgentConfig.load(str(p2)).aux_temperature == 0.7
+
+
+def test_migrate_aux_context_floor(tmp_path):
+    """aux_max_context_tokens 是后加字段：旧配置默认 16384；
+    被设成比生成长度还小的非法值时兜底回 16384。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({}))
+    assert AgentConfig.load(str(p)).aux_max_context_tokens == 16384
+
+    p2 = tmp_path / "c2.json"
+    p2.write_text(json.dumps({"aux_max_context_tokens": 512}))
+    assert AgentConfig.load(str(p2)).aux_max_context_tokens == 16384
+
+
 def test_ensure_workspace_creates_dir(tmp_path):
     cfg = AgentConfig(workspace=str(tmp_path / "ws"))
     cfg.ensure_workspace()

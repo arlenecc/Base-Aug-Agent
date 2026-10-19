@@ -96,33 +96,38 @@ def test_aux_factory_builds_local_backend_with_aux_sampling(tmp_path):
         aux_top_k=7,
         aux_repetition_penalty=1.3,
         aux_request_timeout=33.0,
+        aux_max_context_tokens=8192,
         # 主模型参数必须被盖掉，不能被辅助模型读到。
         temperature=0.9,
         max_tokens=9999,
+        max_context_tokens=32768,
         top_p=0.11,
     )
     backend = create_aux_llm_backend(cfg)
     try:
-        assert isinstance(backend, MLXLanguageBackend)
-        view = backend.config
-        assert view.temperature == 0.15
-        assert view.max_tokens == 1234
-        assert view.top_p == 0.5
-        assert view.min_p == 0.02
-        assert view.top_k == 7
-        assert view.repetition_penalty == 1.3
-        assert view.request_timeout == 33.0
-        # 本地推理参数原样保留（与主模型共用同一套硬件约束）。
-        assert view.max_context_tokens == cfg.max_context_tokens
-        assert view.local_model_threads == cfg.local_model_threads
-        # 原始 config 不被视图污染。
-        assert cfg.temperature == 0.9
-        assert cfg.max_tokens == 9999
-        # 视图是实时的：改完 aux_* 参数立即生效，不用重新加载模型。
-        cfg.aux_temperature = 1.5
-        cfg.aux_max_tokens = 42
-        assert view.temperature == 1.5
-        assert view.max_tokens == 42
+            assert isinstance(backend, MLXLanguageBackend)
+            view = backend.config
+            assert view.temperature == 0.15
+            assert view.max_tokens == 1234
+            # 辅助模型用自己的上下文窗口（默认 16384），不跟主模型共用。
+            assert view.max_context_tokens == 8192
+            assert view.top_p == 0.5
+            assert view.min_p == 0.02
+            assert view.top_k == 7
+            assert view.repetition_penalty == 1.3
+            assert view.request_timeout == 33.0
+            # 硬件约束类参数仍与主模型共用。
+            assert view.local_model_threads == cfg.local_model_threads
+            # 原始 config 不被视图污染。
+            assert cfg.temperature == 0.9
+            assert cfg.max_tokens == 9999
+            # 视图是实时的：改完 aux_* 参数立即生效，不用重新加载模型。
+            cfg.aux_temperature = 1.5
+            cfg.aux_max_tokens = 42
+            cfg.aux_max_context_tokens = 512
+            assert view.temperature == 1.5
+            assert view.max_tokens == 42
+            assert view.max_context_tokens == 512
     finally:
         backend.close()
 

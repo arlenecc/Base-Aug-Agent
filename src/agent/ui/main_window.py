@@ -1277,7 +1277,7 @@ class MainWindow(QMainWindow):
         cfg = self.config
         return {
             "max_tokens_edit": getattr(cfg, "aux_max_tokens", 2048),
-            "temp_edit": getattr(cfg, "aux_temperature", 0.2),
+            "temp_edit": getattr(cfg, "aux_temperature", 0.5),
             "top_p_edit": getattr(cfg, "aux_top_p", 0.95),
             "min_p_edit": getattr(cfg, "aux_min_p", 0.05),
             "top_k_edit": getattr(cfg, "aux_top_k", 20),

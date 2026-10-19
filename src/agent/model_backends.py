@@ -891,6 +891,7 @@ class _AuxConfigView:
     _SAMPLING_MAP = {
         "temperature": "aux_temperature",
         "max_tokens": "aux_max_tokens",
+        "max_context_tokens": "aux_max_context_tokens",
         "top_p": "aux_top_p",
         "min_p": "aux_min_p",
         "top_k": "aux_top_k",

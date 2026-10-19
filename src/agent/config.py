@@ -39,8 +39,11 @@ class AgentConfig:
     aux_llm_vlm_handler: str = "mtmd"
     # 辅助模型独立采样参数（不与主模型共用——主模型要的是生成质量，
     # 辅助模型要的是快与稳，温度/生成长度都不同）。
-    aux_temperature: float = 0.2
+    aux_temperature: float = 0.5
     aux_max_tokens: int = 2048
+    # 辅助模型的上下文窗口。只做摘要/归纳等轻量子任务，不需要主模型那么大的
+    # 窗口，默认 16384——足够容纳主对话的历史分片，又不至于把 KV 缓存占满。
+    aux_max_context_tokens: int = 16384
     aux_top_p: float = 0.95
     aux_min_p: float = 0.05
     aux_top_k: int = 20
@@ -131,7 +134,7 @@ class AgentConfig:
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
         "onnx_threads", "rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
-        "aux_max_tokens", "aux_top_k",
+        "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
     )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
@@ -289,6 +292,15 @@ class AgentConfig:
         # so the shrink threshold follows the model's actual window.
         if self.max_context_tokens < 8192:
             self.max_context_tokens = self.max_tokens
+        # 辅助模型默认温度 0.2 → 0.5：只重写仍是旧默认的值，用户显式调过的
+        # 温度不动（沿用上面 max_tokens 的迁移先例）。
+        if self.aux_temperature == 0.2:
+            self.aux_temperature = 0.5
+        # aux_max_context_tokens 是后加的字段：旧配置走 dataclass 默认 16384；
+        # 这里只兜「被设成比生成长度还小」的非法值，避免 llama.cpp n_ctx 之类
+        # 把窗口卡死。
+        if self.aux_max_context_tokens < 2048:
+            self.aux_max_context_tokens = 16384
 
         if self.llm_mode not in ("local", "openai"):
             self.llm_mode = "local"
