@@ -11,10 +11,38 @@ from agent.llm_client import LLMClient
 from agent.model_backends import (
     MLXLanguageBackend,
     _TaggedOutputParser,
+    _coerce_param,
+    _template_messages,
     create_llm_backend,
     discover_local_models,
     resolve_model_path,
 )
+
+# XML 工具调用标签：用字符拼接构造，源码里不出现完整标签。
+_LT, _GT = chr(60), chr(62)
+_TC = _LT + "tool_call" + _GT
+_TCE = _LT + "/tool_call" + _GT
+_FN = _LT + "function="
+_FE = _LT + "/function" + _GT
+_PA = _LT + "parameter="
+_PE = _LT + "/parameter" + _GT
+
+
+def _xml_tool_call(name, **params):
+    """构造 qwen3.5-agentic-coder 格式的单个 XML 工具调用。"""
+    body = _FN + name + ">\n"
+    for k, v in params.items():
+        body += _PA + k + ">\n" + str(v) + "\n" + _PE + "\n"
+    return _TC + "\n" + body + _FE + "\n" + _TCE
+
+
+def _feed(parser, text, step=3):
+    """按固定步长喂流，模拟 token 级别的分片。"""
+    events = []
+    for i in range(0, len(text), step):
+        events.extend(parser.feed(text[i : i + step]))
+    events.extend(parser.finish())
+    return events
 
 
 def test_tagged_parser_splits_reasoning_content_and_tool_call():
@@ -37,6 +65,157 @@ def test_tagged_parser_splits_reasoning_content_and_tool_call():
     assert call["function"]["name"] == "file_read"
     assert json.loads(call["function"]["arguments"]) == {"path": "a.txt"}
     assert call["id"].startswith("call_")
+
+
+def test_tagged_parser_parses_xml_tool_call_with_parameters():
+    """qwen3.5-agentic-coder 用 XML 工具调用（见模型自带 chat_template.jinja）。
+
+    旧实现只会 json.loads，XML payload 必然解析失败 → tool_calls 恒为空 →
+    task_plan 永不被调用 → 任务计划面板一直空着。
+    """
+    raw = (
+        "先想一下。\n"
+        + _xml_tool_call("task_plan", op="create", goal="整理项目结构")
+    )
+    parser = _TaggedOutputParser()
+    events = _feed(parser, raw, step=5)
+
+    assert len(parser.tool_calls) == 1, f"tool_calls={parser.tool_calls}"
+    call = parser.tool_calls[0]
+    assert call["function"]["name"] == "task_plan"
+    args = json.loads(call["function"]["arguments"])
+    assert args == {"op": "create", "goal": "整理项目结构"}
+    # 工具调用段本身不应泄漏进对话区
+    content = "".join(e.content for e in events if e.type == "content")
+    assert content == "先想一下。\n"
+
+
+def test_tagged_parser_xml_tool_call_closer_split_across_chunks():
+    """闭合标签跨 chunk 拆分时仍要能解析出工具调用。
+
+    旧实现在 tool 模式下把整段 buffer 倒进 _tool_buffer 后清空，跨 chunk 的
+    闭合标签永远等不到——tool_calls 恒为空。
+    """
+    raw = _xml_tool_call("task_plan", op="get")
+    # 步长 1：闭合标签必然被拆成多片
+    parser = _TaggedOutputParser()
+    _feed(parser, raw, step=1)
+    assert len(parser.tool_calls) == 1, f"tool_calls={parser.tool_calls}"
+    assert json.loads(parser.tool_calls[0]["function"]["arguments"]) == {"op": "get"}
+
+
+def test_tagged_parser_xml_multiple_functions_in_one_block():
+    """同一个 tool_call 块里的多个 <function>（并行调用）都要解析出来。"""
+    raw = (
+        _TC + "\n"
+        + _FN + "task_plan>\n" + _PA + "op>\nget\n" + _PE + "\n" + _FE + "\n"
+        + _FN + "file_read>\n" + _PA + "path>\na.txt\n" + _PE + "\n" + _FE + "\n"
+        + _TCE
+    )
+    parser = _TaggedOutputParser()
+    _feed(parser, raw, step=4)
+    names = [c["function"]["name"] for c in parser.tool_calls]
+    assert names == ["task_plan", "file_read"], names
+
+
+def test_tagged_parser_xml_typed_parameters():
+    """XML 参数值是纯文本，需还原成 bool / 数字 / list / dict。"""
+    raw = _xml_tool_call(
+        "task_plan",
+        op="create",
+        steps=json.dumps(["a", "b"], ensure_ascii=False),
+        retries=3,
+        enabled="true",
+        disabled="false",
+        ratio=1.5,
+    )
+    parser = _TaggedOutputParser()
+    _feed(parser, raw, step=6)
+    assert len(parser.tool_calls) == 1
+    args = json.loads(parser.tool_calls[0]["function"]["arguments"])
+    assert args["steps"] == ["a", "b"]
+    assert args["retries"] == 3
+    assert args["enabled"] is True
+    assert args["disabled"] is False
+    assert args["ratio"] == 1.5
+    assert args["op"] == "create"
+
+
+def test_tagged_parser_json_tool_call_still_works():
+    """回归：原有 JSON 工具调用格式必须继续可用。"""
+    raw = (
+        _TC + "\n"
+        + json.dumps({"name": "file_read", "arguments": {"path": "a.txt"}})
+        + "\n" + _TCE
+    )
+    parser = _TaggedOutputParser()
+    _feed(parser, raw, step=1)
+    assert len(parser.tool_calls) == 1
+    call = parser.tool_calls[0]
+    assert call["function"]["name"] == "file_read"
+    assert json.loads(call["function"]["arguments"]) == {"path": "a.txt"}
+
+
+def test_coerce_param_scalar_and_container():
+    assert _coerce_param("create") == "create"
+    assert _coerce_param("true") is True
+    assert _coerce_param("false") is False
+    assert _coerce_param("123") == 123
+    assert _coerce_param("1.5") == 1.5
+    assert _coerce_param('["a", "b"]') == ["a", "b"]
+    assert _coerce_param('{"k": 1}') == {"k": 1}
+    assert _coerce_param("") == ""
+    assert _coerce_param("  普通文本  ") == "普通文本"
+
+
+def test_template_messages_restores_arguments_as_mapping():
+    """agent 历史里 arguments 是 JSON 字符串；qwen3.5 模板按 mapping 渲染，
+    字符串会让参数整段消失。_template_messages 负责还原成 dict。"""
+    history = [
+        {"role": "user", "content": "帮我制定一个计划"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1_0",
+                    "type": "function",
+                    "function": {
+                        "name": "task_plan",
+                        "arguments": '{"op": "create", "goal": "g"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1_0", "name": "task_plan", "content": "ok"},
+    ]
+    normalized = _template_messages(history)
+
+    args = normalized[1]["tool_calls"][0]["function"]["arguments"]
+    assert args == {"op": "create", "goal": "g"}
+    # 原始历史不被改写（agent 内部仍需 JSON 字符串形状）
+    assert history[1]["tool_calls"][0]["function"]["arguments"] == '{"op": "create", "goal": "g"}'
+    # 非 tool_calls 消息原样通过
+    assert normalized[0] == {"role": "user", "content": "帮我制定一个计划"}
+
+
+def test_template_messages_keeps_malformed_arguments_untouched():
+    """解析不了的 arguments 字符串保持原样，不让模板渲染炸掉。"""
+    history = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c",
+                    "type": "function",
+                    "function": {"name": "x", "arguments": "{不是合法 JSON"},
+                }
+            ],
+        }
+    ]
+    normalized = _template_messages(history)
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == "{不是合法 JSON"
 
 
 def test_resolve_model_path_accepts_project_relative_directory():

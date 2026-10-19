@@ -20,6 +20,14 @@ from .llm_client import LLMClient, LLMError, StreamEvent
 
 logger = logging.getLogger(__name__)
 
+# XML 工具调用的闭合标签，用字符拼接而非字面量，规避部分工具链对 XML 片段的
+# 误判；同时让 _xml_tool_calls 的正参保持可读。
+_LT = chr(60)
+_GT = chr(62)
+FE_RE = _LT + "/function" + _GT
+PE_RE = _LT + "/parameter" + _GT
+FN_RE = _LT + "function" + _GT
+
 LLM_BACKENDS = ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
 # 辅助模型（#140）只支持进程内直载：没有网络端点可配。
 AUX_LLM_BACKENDS = ("mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
@@ -94,6 +102,72 @@ def discover_local_models(models_dir: str = "models", backend: str = "") -> List
     return sorted(found)
 
 
+def _coerce_param(raw: str) -> Any:
+    """把 XML ``<parameter>`` 的文本值转成合适的 Python 标量/容器。
+
+    模型的工具参数在 XML 里全是纯文本，而工具侧期望的是 dict/list/number/bool
+    （见 ``parse_args`` 之后的 JSON 反序列化）。所以：
+    - ``true`` / ``false`` → bool；
+    - 能 ``json.loads`` 的（``["a","b"]``、``{"k":1}``、``123``、``1.5``）→ 对应
+      容器/数字；
+    - 其余保持字符串（含首尾空白已剥离）。
+
+    只认字面量，绝不 ``eval``——那会把模型输出当代码执行。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    # 标量与容器都要；字符串 "abc" 经 json.loads 会失败走到上面，所以能解析
+    # 成功的都是非字符串类型。
+    return obj
+
+
+def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把 agent 历史消息适配成 chat template 友好的形状。
+
+    agent 内部（以及 OpenAI 兼容 API）里 ``tool_calls[*].function.arguments``
+    是 **JSON 字符串**。但 qwen3.5-agentic-coder 的模板渲染历史时判的是
+    ``tool_call.arguments is mapping`` ——字符串会让整个参数段被静默丢掉，
+    模型下一轮看到的就是「调了 task_plan 但没有任何参数」，任务计划自然建不
+    出来。这里在送模板前把 arguments 还原成 dict。
+    """
+    out: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        copied = dict(msg)
+        calls = copied.get("tool_calls")
+        if calls:
+            normalized = []
+            for tc in calls:
+                if not isinstance(tc, dict):
+                    normalized.append(tc)
+                    continue
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    fn = dict(fn)
+                    raw = fn.get("arguments")
+                    if isinstance(raw, str) and raw.strip():
+                        try:
+                            fn["arguments"] = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
+                            pass  # 保持原样，让模板/服务端自己处理
+                    tc = {**tc, "function": fn}
+                normalized.append(tc)
+            copied["tool_calls"] = normalized
+        out.append(copied)
+    return out
+
+
 class _TaggedOutputParser:
     """Turn local-model text tags into reasoning/content/tool StreamEvents."""
 
@@ -107,35 +181,102 @@ class _TaggedOutputParser:
         self.tool_calls: List[Dict[str, Any]] = []
 
     @staticmethod
-    def _tool_call(payload: str) -> Optional[Dict[str, Any]]:
+    def _xml_tool_calls(payload: str) -> List[Dict[str, Any]]:
+        """解析 XML 工具调用 payload，返回 OpenAI 形状的 tool_call dict 列表。
+
+        格式（qwen3.5-agentic-coder，见模型自带 chat_template.jinja）：一个块
+        里可有多个 ``<function>``（并行调用），所以返回列表。任何一步不匹配都
+        安静返回 ``[]``，由调用方决定是否再试 JSON 解析。
+        """
+        text = payload.strip().strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].lstrip()
+        if "<function" not in text:
+            return []
+
+        calls: List[Dict[str, Any]] = []
+        # 两个正则都必须带闭合标签：漏掉闭合标签时 (.*?) 会匹配到空串，
+        # 参数整段丢失——表现为「工具被调用了但没有任何参数」。
+        # FE_RE / PE_RE 自身已含结尾的 '>'，不要再补一个。
+        fn_re = r"<function\s*=\s*([^>\s]+)\s*>(.*?)\s*" + FE_RE
+        param_re = r"<parameter\s*=\s*([^>\s]+)\s*>(.*?)\s*" + PE_RE
+        for fm in re.finditer(fn_re, text, re.DOTALL):
+            name = fm.group(1).strip()
+            body = fm.group(2)
+            if not name:
+                continue
+            args: Dict[str, Any] = {}
+            for pm in re.finditer(param_re, body, re.DOTALL):
+                key = pm.group(1).strip()
+                if not key:
+                    continue
+                args[key] = _coerce_param(pm.group(2))
+            calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            )
+        return calls
+
+    @staticmethod
+    def _json_tool_calls(payload: str) -> List[Dict[str, Any]]:
+        """解析 JSON 工具调用 payload（单对象或对象数组）。"""
         raw = payload.strip().strip("`").strip()
         if raw.startswith("json"):
             raw = raw[4:].lstrip()
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("本地模型返回了无法解析的 tool_call: %s", raw[:300])
-            return None
-        if isinstance(obj, list):
-            obj = obj[0] if obj else None
-        if not isinstance(obj, dict):
-            return None
-        if isinstance(obj.get("function"), dict):
-            function = obj["function"]
-            name = function.get("name", "")
-            arguments = function.get("arguments", {})
-        else:
-            name = obj.get("name", obj.get("tool", ""))
-            arguments = obj.get("arguments", obj.get("parameters", {}))
-        if not name:
-            return None
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
-        return {
-            "id": str(obj.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
-            "type": "function",
-            "function": {"name": str(name), "arguments": arguments},
-        }
+            return []
+        objs = obj if isinstance(obj, list) else [obj]
+        calls: List[Dict[str, Any]] = []
+        for item in objs:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("function"), dict):
+                function = item["function"]
+                name = function.get("name", "")
+                arguments = function.get("arguments", {})
+            else:
+                name = item.get("name", item.get("tool", ""))
+                arguments = item.get("arguments", item.get("parameters", {}))
+            if not name:
+                continue
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            calls.append(
+                {
+                    "id": str(item.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+                    "type": "function",
+                    "function": {"name": str(name), "arguments": arguments},
+                }
+            )
+        return calls
+
+    @classmethod
+    def _parse_tool_calls(cls, payload: str) -> List[Dict[str, Any]]:
+        """按「XML 优先、JSON 兜底」解析一个块的 payload。"""
+        calls = cls._xml_tool_calls(payload)
+        if calls:
+            return calls
+        calls = cls._json_tool_calls(payload)
+        if calls:
+            return calls
+        logger.warning("本地模型返回了无法解析的 tool_call: %s", payload[:300])
+        return []
+
+    def _emit_tool_calls(self) -> None:
+        """把 ``_tool_buffer`` 里攒下的 payload 解析成 tool_calls。"""
+        payload = self._tool_buffer
+        self._tool_buffer = ""
+        if not payload.strip():
+            return
+        self.tool_calls.extend(self._parse_tool_calls(payload))
 
     def feed(self, text: str) -> Iterator[StreamEvent]:
         self._buffer += text or ""
@@ -145,26 +286,30 @@ class _TaggedOutputParser:
                 idx = self._buffer.find(closer)
                 if idx < 0:
                     if self._mode == "tool":
-                        self._tool_buffer += self._buffer
-                        self._buffer = ""
+                        # 只把「不可能是闭合标签前缀」的部分搬进 _tool_buffer，
+                        # 尾部按 closer 长度留悬念。旧实现整段倒空后清空 buffer，
+                        # 于是跨 chunk 的闭合标签永远等不到——tool_calls 恒为空，
+                        # 任务计划面板也就一直是空的。
+                        keep = max(len(closer) - 1, 0)
+                        move = max(0, len(self._buffer) - keep)
+                        if move:
+                            self._tool_buffer += self._buffer[:move]
+                            self._buffer = self._buffer[move:]
                     else:
                         keep = max(len(closer) - 1, 0)
                         safe = self._buffer[:-keep] if keep and len(self._buffer) > keep else ""
                         if safe:
                             yield StreamEvent("reasoning", content=safe)
                             self._buffer = self._buffer[len(safe):]
-                        break
-                    continue
+                    break
                 before = self._buffer[:idx]
                 self._buffer = self._buffer[idx + len(closer):]
-                if self._mode == "reasoning" and before:
-                    yield StreamEvent("reasoning", content=before)
-                elif self._mode == "tool":
+                if self._mode == "reasoning":
+                    if before:
+                        yield StreamEvent("reasoning", content=before)
+                else:
                     self._tool_buffer += before
-                    call = self._tool_call(self._tool_buffer)
-                    if call is not None:
-                        self.tool_calls.append(call)
-                    self._tool_buffer = ""
+                    self._emit_tool_calls()
                 self._mode = "content"
                 continue
 
@@ -191,9 +336,7 @@ class _TaggedOutputParser:
     def finish(self) -> Iterator[StreamEvent]:
         if self._mode == "tool":
             self._tool_buffer += self._buffer
-            call = self._tool_call(self._tool_buffer)
-            if call is not None:
-                self.tool_calls.append(call)
+            self._emit_tool_calls()
         elif self._buffer:
             event_type = "reasoning" if self._mode == "reasoning" else "content"
             yield StreamEvent(event_type, content=self._buffer)
@@ -252,12 +395,34 @@ class MLXLanguageBackend(_LazyLocalBackend):
             logger.info("MLX-LM 加载完成: %s", self.model_path)
 
     def _prompt(self, messages: List[Dict[str, Any]], tools) -> Any:
-        kwargs: Dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        # enable_thinking 不能缺省：qwen3.x 系模板里
+        #   {%- if enable_thinking is defined and enable_thinking is false %}
+        # 缺省时走 else 分支，照样输出 "<think>\n" 开头，思考过程正常。
+        # 但有些模板反过来（缺省 = 关闭思考），所以显式传 True 更稳；
+        # 老 tokenizer 不认识该参数时 TypeError 会被下面的兜底吃掉。
+        kwargs: Dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": True,
+        }
         if tools:
             kwargs["tools"] = tools
+        # arguments 还原成 dict：模板按 mapping 渲染历史 tool_calls 的参数。
+        messages = _template_messages(messages)
         try:
             return self._tokenizer.apply_chat_template(messages, **kwargs)
         except TypeError:
+            # 模板不接受 tools / enable_thinking：逐个退掉再试，避免一次
+            # TypeError 把两个参数一起丢掉（工具定义一丢，模型就再也
+            # 不会调 task_plan，任务计划面板永远空着）。
+            for extra in ("enable_thinking", "tools"):
+                if extra in kwargs:
+                    pruned = dict(kwargs)
+                    pruned.pop(extra)
+                    try:
+                        return self._tokenizer.apply_chat_template(messages, **pruned)
+                    except TypeError:
+                        continue
             kwargs.pop("tools", None)
             return self._tokenizer.apply_chat_template(messages, **kwargs)
 
@@ -528,6 +693,7 @@ class ONNXLanguageBackend(_LazyLocalBackend):
         kwargs = {"tokenize": False, "add_generation_prompt": True}
         if tools:
             kwargs["tools"] = tools
+        messages = _template_messages(messages)
         try:
             return owner.apply_chat_template(messages, **kwargs)
         except TypeError:
