@@ -1270,24 +1270,17 @@ class RAGEngine:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results
 
-    def search_formatted(
+    def format_results(
         self,
-        query: str,
-        top_k: int = 3,
-        source: Optional[str] = None,
+        results: List[Dict[str, Any]],
         max_chars_per_result: int = 1500,
         max_total_chars: int = 8000,
     ) -> str:
-        """Search and return formatted results as a string.
+        """把检索结果格式化为可直接喂给主模型的字符串（辅助模型归纳的退化路径）。
 
-        Each result's text is truncated to ``max_chars_per_result`` and the
-        total output is capped at ``max_total_chars`` to avoid blowing up the
-        LLM context window with oversized chunks (some documents produce very
-        long chunks, which previously caused ``exceed_context_size_error``).
-
-        ``source`` 为可选文档名过滤（定向检索某本书）。
+        每条结果文本截断到 ``max_chars_per_result``，整体上限 ``max_total_chars``，
+        避免超长分片撑爆主模型上下文（曾导致 ``exceed_context_size_error``）。
         """
-        results = self.search(query, top_k, source=source)
         if not results:
             return "（知识库中未找到相关内容）"
 
@@ -1309,6 +1302,26 @@ class RAGEngine:
                 lines.append("…（结果过长，已截断）")
                 break
         return "\n".join(lines)
+
+    def search_formatted(
+        self,
+        query: str,
+        top_k: int = 3,
+        source: Optional[str] = None,
+        max_chars_per_result: int = 1500,
+        max_total_chars: int = 8000,
+    ) -> str:
+        """Search and return formatted results as a string.
+
+        Each result's text is truncated to ``max_chars_per_result`` and the
+        total output is capped at ``max_total_chars`` to avoid blowing up the
+        LLM context window with oversized chunks (some documents produce very
+        long chunks, which previously caused ``exceed_context_size_error``).
+
+        ``source`` 为可选文档名过滤（定向检索某本书）。
+        """
+        results = self.search(query, top_k, source=source)
+        return self.format_results(results, max_chars_per_result, max_total_chars)
 
     # ------------------------------------------------------------------
     # Meta-context + Targeted RAG (文档缩略版本)

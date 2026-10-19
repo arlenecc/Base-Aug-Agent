@@ -740,6 +740,102 @@ class TestRAGTools:
         assert "切片数" in result.output
         assert "已索引文件" in result.output
 
+    def test_rag_search_condenses_with_aux(self):
+        """reranker 结果应先送辅助模型归纳，再交给主模型（#RAG 浓缩流程）。"""
+        from src.agent.tools.rag_tool import RagSearchTool
+
+        class _Ev:
+            def __init__(self, t, c=""):
+                self.type = t
+                self.content = c
+
+        class _FakeEngine:
+            def search(self, query, top_k=3, source=None):
+                return [
+                    {"source": "doc_a.txt", "score": 0.9, "text": "A" * 500},
+                    {"source": "doc_b.txt", "score": 0.8, "text": "B" * 500},
+                ]
+
+            def format_results(self, results, *a, **k):
+                return "RAW:" + str(len(results))
+
+        class _FakeAux:
+            def __init__(self, reply):
+                self._reply = reply
+
+            def chat_stream(self, messages, tools=None, temperature=0.2):
+                yield _Ev("content", self._reply)
+                yield _Ev("done")
+
+        condensed = "浓缩后的要点（保留来源 doc_a / doc_b）。"
+        tool = RagSearchTool(_FakeEngine(), aux_llm_getter=lambda: _FakeAux(condensed))
+        res = tool.run(query="测试问题")
+        assert res.success is True
+        # 主模型拿到的是辅助模型归纳后的文本，而非原始分片格式。
+        assert res.output == condensed
+        assert "RAW:" not in res.output
+
+    def test_rag_search_falls_back_when_no_aux(self):
+        """辅助模型不可用（getter 返回 None）时退化为原始分片格式。"""
+        from src.agent.tools.rag_tool import RagSearchTool
+
+        class _FakeEngine:
+            def search(self, query, top_k=3, source=None):
+                return [{"source": "doc_a.txt", "score": 0.9, "text": "A" * 100}]
+
+            def format_results(self, results, *a, **k):
+                return "RAW FORMATTED"
+
+        tool = RagSearchTool(_FakeEngine(), aux_llm_getter=lambda: None)
+        res = tool.run(query="测试")
+        assert res.success is True
+        assert res.output == "RAW FORMATTED"
+
+    def test_rag_search_falls_back_on_aux_error(self):
+        """辅助模型调用抛错时退化为原始分片格式，不让检索整体失败。"""
+        from src.agent.tools.rag_tool import RagSearchTool
+
+        class _FakeEngine:
+            def search(self, query, top_k=3, source=None):
+                return [{"source": "doc_a.txt", "score": 0.9, "text": "x"}]
+
+            def format_results(self, results, *a, **k):
+                return "RAW"
+
+        class _BadAux:
+            def chat_stream(self, messages, tools=None, temperature=0.2):
+                raise RuntimeError("boom")
+
+        tool = RagSearchTool(_FakeEngine(), aux_llm_getter=lambda: _BadAux())
+        res = tool.run(query="q")
+        assert res.success is True
+        assert res.output == "RAW"
+
+    def test_rag_search_condensed_truncated_to_2000(self):
+        """辅助模型未遵守字数限制时，结果强制截断到 2000 字符。"""
+        from src.agent.tools.rag_tool import RagSearchTool
+
+        class _Ev:
+            def __init__(self, t, c=""):
+                self.type = t
+                self.content = c
+
+        class _FakeEngine:
+            def search(self, query, top_k=3, source=None):
+                return [{"source": "doc.txt", "score": 0.9, "text": "y"}]
+
+            def format_results(self, results, *a, **k):
+                return "RAW"
+
+        class _LongAux:
+            def chat_stream(self, messages, tools=None, temperature=0.2):
+                yield _Ev("content", "z" * 3000)
+                yield _Ev("done")
+
+        tool = RagSearchTool(_FakeEngine(), aux_llm_getter=lambda: _LongAux())
+        res = tool.run(query="q")
+        assert len(res.output) == 2000
+
     def test_rag_ingest_tool(self, engine):
         from src.agent.tools.rag_tool import RagIngestTool
         tool = RagIngestTool(engine)

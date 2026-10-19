@@ -192,7 +192,12 @@ class Agent:
         self.aux_llm = aux_llm
         self.config = config
         self.callbacks = callbacks
-        self.tools = tool_registry or ToolRegistry(config=config, callbacks=callbacks)
+        self.tools = tool_registry or ToolRegistry(
+            config=config, callbacks=callbacks,
+            # 用 getter 而非快照：辅助模型可能在 agent 构造后才加载/切换，必须
+            # 在每次 RAG 检索时读「当前」实例（见 RagSearchTool._condense_with_aux）。
+            aux_llm_getter=lambda: self.aux_llm,
+        )
         self.skills = skills or SkillManager(
             path=os.path.join(config.workspace, ".agent", "skills.json"),
             skills_dir=os.path.join(config.workspace, ".agent", "skills"),

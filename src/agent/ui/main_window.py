@@ -788,6 +788,10 @@ class MainWindow(QMainWindow):
         # 启动自动加载期间：加载失败只记日志不弹窗（开机就弹模态框很吵，
         # 而且用户还没看到界面，点了也不知道在回应什么）。
         self._model_autoloading: bool = False
+        # 切换主模型模式（本地/OpenAI）时若 agent 正在对话，无法安全重建，
+        # 先记下、等本轮结束（_on_finished）再应用，避免把正在跑的 worker 的
+        # 后端换掉导致崩溃。
+        self._pending_mode_sync: bool = False
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         # 流式文本的攒批缓冲（见 _on_content / _flush_stream_buffer）。
@@ -1361,8 +1365,11 @@ class MainWindow(QMainWindow):
         self.config_window_btn.clicked.connect(self._on_open_config_window)
         self.log_window_btn.clicked.connect(self._on_open_log_window)
         # 模式二选一 + 本地模型类型变化 → 刷新面板可见性与可用性。
-        self.llm_mode_local_radio.toggled.connect(self._update_model_controls)
-        self.llm_mode_openai_radio.toggled.connect(self._update_model_controls)
+        # 切换主模型模式（本地 / OpenAI 兼容）：不仅要切面板可见性，更要让
+        # agent 实际使用的后端跟着切——否则「设了本地模式」只是换了显示，
+        # 对话仍走旧的 LLMClient（#140 用户反馈的真 bug）。
+        self.llm_mode_local_radio.toggled.connect(self._on_mode_changed)
+        self.llm_mode_openai_radio.toggled.connect(self._on_mode_changed)
         self.llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.aux_llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.reranker_backend_combo.currentTextChanged.connect(self._update_model_controls)
@@ -1400,8 +1407,13 @@ class MainWindow(QMainWindow):
         # 模式二选一：本地 / OpenAI 兼容接口。llm_backend 为 openai 时一律
         # 视为接口模式（旧配置迁移后两者应已自洽，见 AgentConfig._migrate）。
         local_mode = getattr(self.config, "llm_mode", "local") != "openai"
+        # setChecked 会同步触发 _on_mode_changed；初始化阶段不应触发「重建
+        # agent / 自动加载模型」（会让 autoload 跳过失效、并在 _rebuild_agent
+        # 之前就重复建后端）。setChecked 是同步发射，包住这两行即可。
+        self._suppress_mode_change = True
         self.llm_mode_local_radio.setChecked(local_mode)
         self.llm_mode_openai_radio.setChecked(not local_mode)
+        self._suppress_mode_change = False
         # 本地模式下按配置值选中「模型类型」；接口模式下该项被禁用，
         # 仍显示一个合理值（mlx_lm）以免下拉框空白。
         backend_value = self.config.llm_backend
@@ -1718,24 +1730,87 @@ class MainWindow(QMainWindow):
             self._set_attached_image("")
         self._refresh_model_buttons()
 
+    def _on_mode_changed(self, checked: bool) -> None:
+        # 初始化阶段 _apply_config_to_widgets 的 setChecked 也会触发本函数，
+        # 此时不应重建 agent / 自动加载模型（见 _apply_config_to_widgets）。
+        if getattr(self, "_suppress_mode_change", False):
+            return
+        if not checked:
+            return
+        # 主模型模式被切换（本地 ↔ OpenAI 兼容接口）。
+        # 关键修复（#140 用户反馈）：切换模式必须让 agent 实际使用的后端跟着
+        # 变，否则「设了本地模式」只是换了面板显示，对话仍走旧的 LLMClient。
+        # 两个 radio 都会发 toggled，但只有「被选中」的那次 checked=True 需要
+        # 处理，另一个 radio 发的是 False，已在上面 return 忽略，避免一次点击
+        # 触发两次重建。
+        # 先把模式写进 config 并持久化：否则重启又回到旧模式（迁移逻辑会按
+        # llm_backend 反推，OpenAI 用户永远不会「切到本地」生效）。
+        self._gather_config_from_widgets()
+        try:
+            self.config.save(CONFIG_PATH)
+        except Exception as e:  # pragma: no cover - 防御
+            logger.warning("UI: 保存模式失败: %s", e)
+        self._update_model_controls()
+        if self._busy or self._is_worker_running(self._worker):
+            # 对话进行中无法安全重建 agent：标记延迟到本轮结束（_on_finished）
+            # 再应用，避免把正在跑的 worker 的后端换掉导致崩溃。
+            self._pending_mode_sync = True
+            self.status_label.setText(
+                "对话结束后将切换到" + ("本地模型" if self.llm_mode_local_radio.isChecked() else "OpenAI 接口")
+            )
+            return
+        self._apply_mode_sync()
+
+    def _apply_mode_sync(self) -> None:
+        """按当前选中的模式，让 agent 的后端真正生效。"""
+        if self.llm_mode_local_radio.isChecked():
+            # 本地模式：agent 改用本地后端（懒加载，下次对话即落地本地模型）。
+            # 若本地模型尚未读进内存，按「默认加载」的用户预期自动开始加载——
+            # 与启动自动加载一致，也避免「设了本地模式却还在走旧后端」的困惑。
+            # 测试环境（BASE_AGENT_SKIP_MODEL_AUTOLOAD=1）只切后端不真正读数
+            # GB 权重，否则套件会在每个切换模式的用例上卡死。
+            self._rebuild_agent()
+            if not self._is_model_loaded("main") and not os.environ.get(AUTOLOAD_SKIP_ENV):
+                self._on_load_model("main")
+        else:
+            # OpenAI 兼容接口：轻量切回 LLMClient（无本地权重可载）。
+            self._rebuild_agent()
+
     def _refresh_model_buttons(self) -> None:
         """按「是否已加载 / 是否可操作」刷新加载/卸载按钮。
 
         辅助模型的按钮**不受主模型模式影响**：辅助模型只支持本地直载，主模型
         选 OpenAI 接口时它照样要能加载/卸载（见 _build_config_widgets 里它放在
         模式面板之外的注释）。
+
+        模型加载成功后，加载按钮文案变「重新加载」、背景变绿，直观表示「模型
+        已就绪可用」（见用户反馈）。
         """
+        # 模型就绪用的绿色高亮样式。
+        GREEN = "background-color:#22c55e;color:#ffffff;"
         local_mode = self.llm_mode_local_radio.isChecked()
         for role, load_btn, unload_btn in (
             ("main", self.llm_load_btn, self.llm_unload_btn),
             ("aux", self.aux_llm_load_btn, self.aux_llm_unload_btn),
         ):
             loaded = self._is_model_loaded(role)
+            if not local_mode and role == "main":
+                # 接口模式下主模型是网络端点，没有「本地权重」可加载/卸载：
+                # 按钮无意义，禁用并改文案，避免误导用户以为本地模型已就绪。
+                load_btn.setEnabled(False)
+                unload_btn.setEnabled(False)
+                load_btn.setText("接口模式")
+                unload_btn.setText("—")
+                load_btn.setStyleSheet("")
+                unload_btn.setStyleSheet("")
+                continue
             # 主模型在接口模式下没有本地模型可载；辅助模型永远可以操作。
             usable = (local_mode or role == "aux") and not self._model_busy.get(role, False)
             load_btn.setEnabled(usable)
             unload_btn.setEnabled(usable)
             load_btn.setText("重新加载" if loaded else "加载模型")
+            # 已加载：背景变绿，代表模型可用；未加载：恢复默认样式。
+            load_btn.setStyleSheet(GREEN if loaded else "")
             load_btn.setToolTip(
                 f"把当前配置的{'主' if role == 'main' else '辅助'}模型加载到内存备用"
                 if not loaded
@@ -2846,6 +2921,11 @@ class MainWindow(QMainWindow):
         cls = "t" if getattr(result, "success", True) else "sys"
         self._append_chat(f'<p class="{cls}">↳ <b>{self._escape(name)}</b> → {self._escape(snippet)}</p>')
         self._append_log(f"[tool-end] {name} success={getattr(result,'success',True)} :: {out[:4000]}")
+        # task_plan 变更后立即刷新右上面板：不依赖 600ms 轮询，避免「新计划写盘了
+        # 但面板还停在旧计划 / 多次更新只看到最后一帧」的问题（#计划面板）。轮询
+        # 仍作为兜底。
+        if name == "task_plan":
+            self._poll_task_plan()
 
     def _on_log(self, line: str) -> None:
         self._append_log(line)
@@ -2915,6 +2995,10 @@ class MainWindow(QMainWindow):
         # 同步进行中不要让「就绪」覆盖掉同步进度文案。
         if not self._sync_busy:
             self.status_label.setText("就绪")
+        # 对话进行中切换了主模型模式：现在 agent 空闲，应用那次延迟的模式切换。
+        if self._pending_mode_sync and not self._sync_busy:
+            self._pending_mode_sync = False
+            self._apply_mode_sync()
         # Join the worker thread before dropping our reference. bridge.finished
         # is emitted from the worker's `finally`, so run() has already returned
         # and wait() returns near-instantly -- but without it, dropping the last
@@ -3213,6 +3297,16 @@ class MainWindow(QMainWindow):
         self.speed_label.setText("0.0 tok/s")
         if self._agent is not None:
             self._agent.reset()
+        # 新对话 = 新任务：清掉上一轮残留的任务计划，避免面板一直停在「多次以前
+        # 的计划」（模型并非每次都会主动 task_plan clear）。文件删了，下一轮若仍需
+        # 计划，模型会重新 create；右上面板立即复位成「无计划」。
+        try:
+            from ..planner import clear_plan
+            clear_plan(self.config.workspace)
+            self._plan_rendered = ""  # 强制下一次轮询/刷新重绘为「无计划」
+            self._poll_task_plan()
+        except Exception:
+            pass
 
     @staticmethod
     def _escape(text: str) -> str:

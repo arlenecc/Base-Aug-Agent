@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base import Tool, ToolResult, ToolRegistry
 
@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..rag.engine import RAGEngine
+
+# RAG 检索结果送辅助模型归纳时，给辅助模型的输入上限（字符）。辅助模型上下文
+# 有限，原始分片过长时先截断再交给它，避免撑爆辅助模型。
+_AUX_INPUT_MAX_CHARS = 12000
+# 辅助模型归纳后交给主模型的浓缩文本上限（字符）——用户要求 2000 字以内。
+_CONDENSED_MAX_CHARS = 2000
 
 
 class RagSearchTool(Tool):
@@ -38,8 +44,12 @@ class RagSearchTool(Tool):
     }
     destructive = False
 
-    def __init__(self, engine: "RAGEngine"):
+    def __init__(self, engine: "RAGEngine", aux_llm_getter: Optional[Any] = None):
         self._engine = engine
+        # aux_llm_getter(): 读取「当前」辅助模型后端（可能为 None，例如辅助模型
+        # 未加载、或主模型用 OpenAI 接口模式）。用 getter 而非直接存引用，才能
+        # 在辅助模型运行期加载/切换后拿到最新实例。
+        self._aux_llm_getter = aux_llm_getter
 
     def bind(self, config: Any, registry: ToolRegistry) -> None:
         pass
@@ -67,13 +77,74 @@ class RagSearchTool(Tool):
             query[:80], top_k, source[:80],
         )
         try:
-            results = self._engine.search_formatted(
-                query, top_k=top_k, source=source or None,
-            )
-            return ToolResult(success=True, output=results)
+            results = self._engine.search(query, top_k=top_k, source=source or None)
         except Exception as e:
             logger.error("❌ RAG 搜索失败: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"知识库搜索失败: {e}")
+
+        if not results:
+            return ToolResult(success=True, output="（知识库中未找到相关内容）")
+
+        # 新流程（用户需求）：reranker 排序后的全部文本分片先送辅助模型归纳整理，
+        # 浓缩到 2000 字以内再交给主模型，减轻主模型上下文压力。辅助模型不可用
+        # 时退化为原始截断格式（保底不丢检索结果）。
+        condensed = self._condense_with_aux(query, results)
+        if condensed is not None:
+            return ToolResult(success=True, output=condensed)
+        return ToolResult(success=True, output=self._engine.format_results(results))
+
+    def _condense_with_aux(self, query: str, results: List[Dict[str, Any]]) -> Optional[str]:
+        """把检索到的所有文本分片送辅助模型归纳，浓缩到 _CONDENSED_MAX_CHARS 以内。
+
+        返回浓缩文本；辅助模型不可用 / 调用失败 / 返回空时返回 None，由调用方
+        退化为原始格式化输出。
+        """
+        if self._aux_llm_getter is None:
+            return None
+        aux = self._aux_llm_getter()
+        if aux is None:
+            return None
+
+        chunks = []
+        for r in results:
+            src = os.path.basename(r.get("source", "") or "")
+            text = (r.get("text", "") or "").strip()
+            if text:
+                chunks.append(f"[来源: {src}]\n{text}")
+        raw = "\n\n".join(chunks)
+        if not raw.strip():
+            return None
+        if len(raw) > _AUX_INPUT_MAX_CHARS:
+            raw = raw[:_AUX_INPUT_MAX_CHARS] + "\n…（原文过长，已截断）"
+
+        prompt = (
+            "以下是针对用户问题从知识库检索到的若干文本分片（已按相关度重排序）。"
+            "请对全部内容进行归纳整理，保留核心观点、关键事实与重要信息，剔除冗余"
+            "和无关细节，并将全部内容浓缩精简到 2000 字以内。请保留每条要点的来源"
+            "标注。直接输出整理后的内容，不要加前言、不要解释过程。\n\n"
+            f"用户问题：{query}\n\n检索到的文本分片：\n{raw}"
+        )
+        messages = [
+            {"role": "system", "content": "你是严谨的信息提炼助手，擅长把多段长文本浓缩为精炼、保真的要点。"},
+            {"role": "user", "content": prompt},
+        ]
+        out: List[str] = []
+        try:
+            for ev in aux.chat_stream(messages, tools=None, temperature=0.2):
+                if ev.type == "content":
+                    out.append(ev.content)
+                elif ev.type == "done":
+                    break
+        except Exception as e:
+            logger.error("❌ RAG 辅助模型归纳整理失败，回退原始分片: %s", e)
+            return None
+        text = "".join(out).strip()
+        if not text:
+            return None
+        # 保险：辅助模型未遵守字数限制时强制截断（按字符）。
+        if len(text) > _CONDENSED_MAX_CHARS:
+            text = text[:_CONDENSED_MAX_CHARS]
+        return text
 
 
 class RagOutlineTool(Tool):

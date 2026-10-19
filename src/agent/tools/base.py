@@ -62,9 +62,12 @@ class Tool:
 
 
 class ToolRegistry:
-    def __init__(self, config: AgentConfig, callbacks: "Any"):
+    def __init__(self, config: AgentConfig, callbacks: "Any", aux_llm_getter: "Any" = None):
         self.config = config
         self.callbacks = callbacks
+        # 读取「当前」辅助模型后端的回调（可为 None）。RAG 检索结果会先送辅助
+        # 模型归纳整理再交给主模型；辅助模型缺失时退化为原始分片。
+        self._aux_llm_getter = aux_llm_getter
         self.config.ensure_workspace()
         self._tools: Dict[str, Tool] = {}
         # 保护 _tools / _mcp_clients：MCP 工具由后台线程注册，而 agent 线程
@@ -285,7 +288,7 @@ class ToolRegistry:
             self._rag_engine = engine
 
             registered = []
-            for t in [RagSearchTool(engine), RagStatusTool(engine), RagIngestTool(engine),
+            for t in [RagSearchTool(engine, aux_llm_getter=self._aux_llm_getter), RagStatusTool(engine), RagIngestTool(engine),
                       RagOutlineTool(engine)]:
                 if t.name not in self._tools:
                     t.bind(self.config, self)

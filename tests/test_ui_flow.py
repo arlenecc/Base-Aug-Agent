@@ -191,6 +191,50 @@ def _install_fake_model_factory(monkeypatch, mw, sink):
     return _make
 
 
+def test_switching_mode_radio_switches_active_backend(qtbot, tmp_path, monkeypatch):
+    """切模式 radio 必须让对话框实际用的后端跟着切（#140 的 bug：切到本地模式
+    仍走 OpenAI 接口，因为 radio 只换了面板显示，没动 agent 的后端）。"""
+    import agent.ui.main_window as mw
+
+    created = []
+    def _fake_create(config):
+        tag = getattr(config, "llm_backend", "openai")
+
+        class _B:
+            def __init__(self, t, c):
+                self.tag = t
+                self.config = c
+                self._model_obj = None
+                self._closed = False
+            def _ensure_loaded(self):
+                self._model_obj = object()
+            def close(self):
+                self._closed = True
+                self._model_obj = None
+        b = _B(tag, config)
+        created.append(tag)
+        return b
+    monkeypatch.setattr(mw, "create_llm_backend", _fake_create)
+    monkeypatch.setattr(mw, "create_aux_llm_backend", _fake_create)
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    # 默认本地模式：对话框用的是本地后端（懒加载）。
+    assert win.config.llm_mode == "local"
+    assert win._agent.llm.tag == "mlx_lm"
+
+    # 切到接口模式：agent 必须切回 LLMClient（openai 标记）。
+    win.llm_mode_openai_radio.setChecked(True)
+    assert win.config.llm_mode == "openai"
+    assert win._agent.llm.tag == "openai"
+
+    # 再切回本地模式：agent 必须切回本地后端，而不是残留接口客户端。
+    win.llm_mode_local_radio.setChecked(True)
+    assert win.config.llm_mode == "local"
+    assert win._agent.llm.tag == "mlx_lm"
+
+
 def test_load_and_unload_local_model(qtbot, tmp_path, monkeypatch):
     """加载模型把权重读进内存并交给 agent；卸载后 agent 换回新后端。"""
     import agent.ui.main_window as mw
@@ -215,12 +259,15 @@ def test_load_and_unload_local_model(qtbot, tmp_path, monkeypatch):
     assert win._llm is loaded
     assert win._agent.llm is loaded           # agent 直接指向热后端
     assert win.llm_load_btn.text() == "重新加载"
+    # 加载成功：按钮背景变绿，代表模型已就绪可用（用户反馈）。
+    assert "#22c55e" in win.llm_load_btn.styleSheet()
 
     win._on_unload_model("main")
     assert not win._is_model_loaded("main")
     assert loaded._closed                     # 旧的被关掉释放内存
     assert win._agent.llm is not loaded       # agent 拿到了全新的后端
     assert win.llm_load_btn.text() == "加载模型"
+    assert win.llm_load_btn.styleSheet() == ""  # 卸载后恢复默认样式（不再绿色）
 
 
 def test_aux_model_is_loaded_and_wired_into_agent(qtbot, tmp_path, monkeypatch):
@@ -479,6 +526,44 @@ def test_clear_chat_resets_history(qtbot, tmp_path, monkeypatch):
     win._agent._history.append({"role": "user", "content": "x"})
     win._on_clear_chat()
     assert win.chat_view.toPlainText() == ""
+
+
+def test_task_plan_tool_refreshes_plan_panel(qtbot, tmp_path, monkeypatch):
+    """task_plan 工具执行后，右上面板立即反映最新计划（不依赖 600ms 轮询），
+    且清空对话会清掉上一轮残留的计划。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    def tc(name, args):
+        return {"id": "c1", "function": {"name": name, "arguments": json.dumps(args)}}
+
+    scripts = [
+        [_evt("done", tool_calls=[tc("task_plan", {"op": "create", "goal": "任务A", "steps": ["a", "b"]})])],
+        [_evt("content", "已创建"), _evt("done")],
+        [_evt("done", tool_calls=[tc("task_plan", {"op": "update", "index": 1, "status": "done"})])],
+        [_evt("content", "ok"), _evt("done")],
+    ]
+    llm = _ScriptedLLM(scripts)
+    win._agent.llm = llm
+    win._agent.max_iterations = 5
+
+    win.send_editor.setPlainText("做任务A")
+    win._on_send()
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+    text = win.plan_view.toPlainText()
+    assert "任务A" in text
+    assert "0/2" in text  # 刚创建，全部 pending
+
+    win.send_editor.setPlainText("继续")
+    win._on_send()
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+    text = win.plan_view.toPlainText()
+    assert "✓" in text  # 第一步已标记完成
+    assert "1/2" in text
+
+    # 清空对话应清掉残留计划，面板回到「无计划」。
+    win._on_clear_chat()
+    assert "无计划" in win.plan_view.toPlainText() or "未制定计划" in win.plan_view.toPlainText()
 
 
 # ---------------------------------------------------------------------------
