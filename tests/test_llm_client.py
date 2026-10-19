@@ -162,6 +162,57 @@ def test_chat_stream_emits_reasoning_content():
     assert content == "answer"
 
 
+def test_chat_stream_emits_reasoning_field():
+    """部分 OpenAI 兼容服务用 delta.reasoning（而非 reasoning_content）。"""
+    chunks = [
+        {"choices": [{"delta": {"reasoning": "rc"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "ans"}, "index": 0, "finish_reason": "stop"}]},
+    ]
+    resp = _FakeResponse(_sse_lines(*chunks))
+    client = _make_client([("POST", "/chat/completions", resp)])
+
+    events = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert reasoning == "rc"
+    assert content == "ans"
+
+
+def test_chat_stream_extracts_think_tags_from_content():
+    """本地推理模型把思考塞进 content 的 <think>…</think>：应捞到「思考过程」面板。"""
+    chunks = [
+        {"choices": [{"delta": {"content": "<think>让我想想"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "该怎么回答</think>直接说答案"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "。", "index": 0, "finish_reason": "stop"}}]},
+    ]
+    resp = _FakeResponse(_sse_lines(*chunks))
+    client = _make_client([("POST", "/chat/completions", resp)])
+
+    events = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert reasoning == "让我想想该怎么回答"
+    assert content == "直接说答案。"
+
+
+def test_chat_stream_think_tags_split_across_chunks():
+    """<think> 标签跨 chunk 拆分时仍能正确分离思考与正式回复。"""
+    chunks = [
+        {"choices": [{"delta": {"content": "<thi"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "nk>思考"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "</think>答"}, "index": 0}]},
+        {"choices": [{"delta": {"content": "案", "finish_reason": "stop"}, "index": 0}]},
+    ]
+    resp = _FakeResponse(_sse_lines(*chunks))
+    client = _make_client([("POST", "/chat/completions", resp)])
+
+    events = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert reasoning == "思考"
+    assert content == "答案"
+
+
 # ---------------------------------------------------------------------------
 # chat_stream: tool_calls accumulation across deltas
 # ---------------------------------------------------------------------------

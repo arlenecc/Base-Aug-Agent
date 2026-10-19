@@ -67,6 +67,9 @@ class LLMClient:
         self.min_p = min_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        # <think>…</think> 跨 chunk 的解析状态（见 _split_think / _flush_think）。
+        self._think_in = False
+        self._think_pending = ""
         # Use a structured timeout so that streaming reads have a per-chunk
         # deadline.  A plain `timeout=float` applies only to the *whole*
         # request (and, for streaming, once the first byte arrives, an idle
@@ -210,6 +213,9 @@ class LLMClient:
         tool_acc: Dict[int, Dict[str, Any]] = {}
         final_usage: Dict[str, int] = {}
         final_finish_reason = ""
+        # 每轮对话重置 <think> 解析状态（client 实例跨调用复用）。
+        self._think_in = False
+        self._think_pending = ""
 
         with self._http.stream("POST", url, headers=self._headers(), content=json.dumps(payload)) as resp:
             if resp.status_code >= 400:
@@ -256,13 +262,20 @@ class LLMClient:
                 if fr:
                     final_finish_reason = fr
 
-                rc = delta.get("reasoning_content")
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     yield StreamEvent("reasoning", content=rc)
 
                 ct = delta.get("content")
                 if ct:
-                    yield StreamEvent("content", content=ct)
+                    # 本地推理模型（Qwen3 / DeepSeek-R1 经 Ollama 等）常把思考过程
+                    # 放在 content 的 <think>…</think> 标签里，而非独立 reasoning 字段。
+                    # 拆出来单独送「思考过程」面板，避免思考与正式回复混进对话区。
+                    for r_text, c_text in self._split_think(ct):
+                        if r_text:
+                            yield StreamEvent("reasoning", content=r_text)
+                        if c_text:
+                            yield StreamEvent("content", content=c_text)
 
                 for tc in delta.get("tool_calls", []) or []:
                     idx = tc.get("index", 0)
@@ -286,12 +299,77 @@ class LLMClient:
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
 
+        # 流结束：把 <think> 缓冲里残留的尾部（模型被截断、未闭合等）落盘。
+        for r_text, c_text in self._flush_think():
+            if r_text:
+                yield StreamEvent("reasoning", content=r_text)
+            if c_text:
+                yield StreamEvent("content", content=c_text)
+
         yield StreamEvent(
             "done",
             tool_calls=[tool_acc[k] for k in sorted(tool_acc)],
             usage=final_usage,
             finish_reason=final_finish_reason,
         )
+
+    # ------------------------------------------------------------------
+    # <think>…</think> 思考片段提取（本地推理模型常把思考塞进 content）
+    # ------------------------------------------------------------------
+    _THINK_OPEN = "<think>"
+    _THINK_CLOSE = "</think>"
+
+    def _split_think(self, text):
+        """把 content 增量里 <think>…</think> 包裹的推理拆出来。
+
+        返回 [(reasoning_text, content_text), ...]（空串表示对应部分为空）。
+        跨 chunk 的标签通过 _think_pending 缓冲处理，避免把 '<thi' 之类误判成
+        未闭合标签；_think_in 记录当前是否处于思考区间内。
+        """
+        self._think_pending += text
+        buf = self._think_pending
+        results = []
+        i = 0
+        n = len(buf)
+        while i < n:
+            if self._think_in:
+                close = self._THINK_CLOSE
+                j = buf.find(close, i)
+                if j == -1:
+                    # 还没遇到闭合标签：留出末尾可能拆分标签的字符先缓冲。
+                    keep = len(close) - 1
+                    emit_len = max(0, n - i - keep)
+                    if emit_len > 0:
+                        results.append((buf[i:i + emit_len], ""))
+                    self._think_pending = buf[i + emit_len:]
+                    break
+                results.append((buf[i:j], ""))
+                self._think_in = False
+                i = j + len(close)
+            else:
+                open_ = self._THINK_OPEN
+                j = buf.find(open_, i)
+                if j == -1:
+                    keep = len(open_) - 1
+                    emit_len = max(0, n - i - keep)
+                    if emit_len > 0:
+                        results.append(("", buf[i:i + emit_len]))
+                    self._think_pending = buf[i + emit_len:]
+                    break
+                results.append(("", buf[i:j]))
+                self._think_in = True
+                i = j + len(open_)
+        return results
+
+    def _flush_think(self):
+        """流结束时的尾缓冲落盘；返回 [(reasoning_text, content_text), ...]。"""
+        pending = self._think_pending
+        self._think_pending = ""
+        if not pending:
+            return []
+        if self._think_in:
+            return [(pending, "")]
+        return [("", pending)]
 
     # ------------------------------------------------------------------
     def close(self) -> None:
