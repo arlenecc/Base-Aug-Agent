@@ -2,7 +2,7 @@
 
 The measured numbers are persisted so future backend-switching logic (and the
 user) can consult them instead of re-guessing: 每次测速结果按 ``kind`` 覆盖写入
-``~/.base-agent/model_benchmark.json``，UI 的「测速对比」按钮会展示建议。
+``~/.base-agent/model_benchmark.json``。
 """
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def benchmark_embeddings(
     ]
     texts = [seeds[i % len(seeds)] + f" 样本 {i}" for i in range(max(1, batch_size))]
 
-    mlx = MLXEmbeddingFunction(mlx_path, batch_size=batch_size, max_length=512)
+    mlx = MLXEmbeddingFunction(mlx_path, batch_size=batch_size, max_length=8192)
     started = time.perf_counter()
     mlx_warm = mlx.embed_documents(texts)
     mlx_load = time.perf_counter() - started
@@ -139,7 +139,7 @@ def benchmark_embedding_batch_sizes(
     else:
         corpus = base
 
-    backends = [("mlx", lambda: MLXEmbeddingFunction(mlx_path, batch_size=8, max_length=512))]
+    backends = [("mlx", lambda: MLXEmbeddingFunction(mlx_path, batch_size=8, max_length=8192))]
     try:
         backends.append(
             ("fastembed_cpu", lambda: FastEmbedEmbeddingFunction(model_name=fastembed_model, threads=threads))
@@ -253,8 +253,8 @@ def benchmark_rerankers(
             **_summary(durations, len(documents)),
         }
 
-    mlx = _measure(lambda: MLXReranker(mlx_path, batch_size=batch_size, max_length=512))
-    direct = _measure(lambda: ONNXReranker(onnx_path, threads=threads, max_length=512))
+    mlx = _measure(lambda: MLXReranker(mlx_path, batch_size=batch_size, max_length=8192))
+    direct = _measure(lambda: ONNXReranker(onnx_path, threads=threads, max_length=8192))
     fast = _measure(lambda: FastEmbedReranker(fastembed_model, threads=threads))
 
     result: Dict[str, Any] = {

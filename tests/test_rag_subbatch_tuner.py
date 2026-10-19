@@ -13,7 +13,8 @@
 - RSS 软墙（#129）：force_down 无闩锁降档，超 8GB 避让、回墙下即停
 - 预热丢弃：首个完整窗口（含模型加载）不参与判定
 - 形状预算：_shape_cap_size 对超长文本钳制子批条数（替代绝对 RSS 阈值，
-  后者在真实同步进程基线 6-10GB 下必然误触发并卡死在下限——#126 修订）
+  后者在真实同步进程基线 6-10GB 下必然误触发并卡死在下限——#126 修订）；
+  但最低保 2 条、不夹到 1（#139），并按后端取预算（mlx=4@8192、onnx=2@8192）
 
 度量 ops = n × max_len²，测试直接以确定性 (n, max_len, dt) 驱动，
 score = Σops / Σdt，无真实模型依赖。
@@ -300,12 +301,14 @@ def test_first_window_discarded_as_warmup():
 # ---------------------------------------------------------------------------
 
 def test_shape_cap_clamps_long_texts():
-    """激活 ∝ size × max_len²，预算 6M：2000 字符 → 1 条，1732 → 2，1414 → 3。"""
-    assert _shape_cap_size(5, 2000) == 1
+    """激活 ∝ size × max_len²，预算 6M：1732 → 2、1414 → 3，但不再夹到 1。"""
     assert _shape_cap_size(5, 1732) == 2
     assert _shape_cap_size(5, 1414) == 3
-    assert _shape_cap_size(2, 2000) == 1   # 起始尺寸对最长文本也会收缩
-    assert _shape_cap_size(1, 2000) == 1
+    assert _shape_cap_size(2, 2000) == 2   # 起始尺寸对最长文本也会收缩
+    assert _shape_cap_size(1, 2000) == 1   # 请求只有 1 条时不放大
+    # 超长文本：预算早已不够，最低保 2 条（#139 禁止夹到 1）
+    assert _shape_cap_size(5, 2000) == 2
+    assert _shape_cap_size(16, 8192) == 2  # 默认后端 6M 预算在 8192 也保底 2
 
 
 def test_shape_cap_leaves_short_texts_alone():
@@ -314,6 +317,16 @@ def test_shape_cap_leaves_short_texts_alone():
     assert _shape_cap_size(5, 500) == 5
     assert _shape_cap_size(2, 50) == 2
     assert _shape_cap_size(5, 0) == 5      # 边界：零长文本不钳制
+
+
+def test_shape_cap_is_backend_aware():
+    """预算按后端取：mlx=4@8192、onnx=2@8192，默认后端保底 2。"""
+    assert _shape_cap_size(16, 8192, "mlx") == 4
+    assert _shape_cap_size(16, 8192, "onnx") == 2
+    assert _shape_cap_size(16, 8192) == 2        # 未知后端：6M 预算 → 0 → 保底 2
+    assert _shape_cap_size(16, 2048, "onnx") == 16   # 预算允许 35，但请求只有 16
+    # 下限永远是 2，不会因为预算大而抬到请求值以上
+    assert _shape_cap_size(1, 8192, "mlx") == 1
 
 
 # ---------------------------------------------------------------------------

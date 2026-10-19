@@ -20,13 +20,18 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
-    QStatusBar, QFileDialog, QCheckBox,
+    QStatusBar, QFileDialog, QCheckBox, QScrollArea, QGroupBox,
+    QRadioButton, QFrame,
 )
 
 from ..agent import Agent, AgentCallbacks
 from ..config import AgentConfig
 from ..llm_client import LLMClient, LLMError
-from ..model_backends import create_llm_backend, discover_local_models
+from ..model_backends import (
+    create_aux_llm_backend,
+    create_llm_backend,
+    discover_local_models,
+)
 from ..skills import Skill
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
@@ -35,6 +40,49 @@ from ..rag.engine import RAGEngine
 CONFIG_PATH = os.path.expanduser("~/.base-agent/config.json")
 
 logger = logging.getLogger(__name__)
+
+# 本地模型类型的 (显示名, 配置值)（#140）。配置值是 model_backends 认识的名字，
+# 显示名面向用户：llama_cpp 在 UI 上叫 GGUF，MLX 按 LM/VLM 分开。
+LOCAL_LLM_TYPES = (
+    ("MLX-LM", "mlx_lm"),
+    ("MLX-VLM", "mlx_vlm"),
+    ("ONNX", "onnx"),
+    ("GGUF", "llama_cpp"),
+)
+# RAG 后端显示名（#140）：llama_cpp → GGUF，其余保持原名（与配置文件一致）。
+RAG_BACKENDS = (
+    ("fastembed", "fastembed"),
+    ("mlx", "mlx"),
+    ("onnx", "onnx"),
+    ("GGUF", "llama_cpp"),
+)
+# 默认模型路径（#140 用户定参）：本地模式未指定时启动即加载这两个。
+DEFAULT_MAIN_MODEL_PATH = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
+DEFAULT_AUX_MODEL_PATH = "models/Qwen3.5-2B-MLX-4bit"
+# 启动时自动把默认模型加载备用。测试里置 1 跳过：加载数 GB 权重会让套件变成
+# 分钟级，且 CI 上多半没有对应运行时（见 tests/conftest.py）。
+AUTOLOAD_SKIP_ENV = "BASE_AGENT_SKIP_MODEL_AUTOLOAD"
+
+
+def _fill_backend_combo(combo: QComboBox, items) -> None:
+    """用 (显示名, 配置值) 填充下拉框，配置值存在 itemData 里。"""
+    combo.clear()
+    for label, value in items:
+        combo.addItem(label, value)
+
+
+def _combo_backend_value(combo: QComboBox) -> str:
+    """取下拉框当前选中项的配置值（不是显示名）。"""
+    data = combo.currentData()
+    return str(data) if data is not None else combo.currentText().strip()
+
+
+def _select_combo_backend(combo: QComboBox, value: str) -> None:
+    """按配置值选中下拉框；找不到就留在第一项。"""
+    for i in range(combo.count()):
+        if str(combo.itemData(i)) == (value or "").strip():
+            combo.setCurrentIndex(i)
+            return
 
 # RAG / sync 相关模块的 logger 名称前缀，用于 UI 日志面板过滤
 # 覆盖 RAG 全链路：同步引擎、向量库、解析器、清洗器、切片器、依赖检查、工具调用
@@ -564,83 +612,50 @@ class InstallDepsWorker(QThread):
             self.deps_finished.emit(None)
 
 
-class BenchmarkWorker(QThread):
-    """Runs the local-model benchmark off the UI thread.
+# ===========================================================================
+# Worker: loads a local model's weights in the background (#140)
+# ===========================================================================
 
-    测速会加载 Embedding/Reranker 权重（MLX 约 137MB、ONNX 约 300MB）并做多轮
-    推理，同步跑在 UI 线程上会冻住事件循环数十秒。信号名同样不覆写 Qt 内置的
-    ``finished``（原因见 SyncKnowledgeWorker 注释）。
+
+class LoadModelWorker(QThread):
+    """在后台线程把本地模型权重读进内存。
+
+    为什么必须放后台：MLX/GGUF/ONNX 的权重加载是数秒到数十秒量级，放进 UI
+    线程会让配置窗口在整个加载期间无响应（连「取消」都点不了）。
+
+    信号命名同样避开 QThread 内置的 ``finished``（见 SyncKnowledgeWorker 的
+    注释）：这里用 ``load_done`` / ``load_failed``。
     """
 
-    bench_progress = pyqtSignal(str)
-    bench_finished = pyqtSignal(list)
-    bench_failed = pyqtSignal(str)
+    # payload: dict(role, signature, llm, detail)
+    load_done = pyqtSignal(object)
+    load_failed = pyqtSignal(str, str)  # role, detail
 
-    def __init__(
-        self,
-        *,
-        kind: str = "all",
-        rounds: int = 3,
-        threads: int = 4,
-        embedding_batch_size: int = 8,
-        rerank_batch_size: int = 16,
-        embedding_path: str = "",
-        embedding_model: str = "",
-        rerank_path: str = "",
-        rerank_model: str = "",
-    ):
+    def __init__(self, role: str, signature: tuple, config: Any):
         super().__init__()
-        self._kind = kind
-        self._rounds = rounds
-        self._threads = threads
-        self._embedding_batch_size = embedding_batch_size
-        self._rerank_batch_size = rerank_batch_size
-        self._embedding_path = embedding_path
-        self._embedding_model = embedding_model
-        self._rerank_path = rerank_path
-        self._rerank_model = rerank_model
+        self._role = role
+        self._signature = signature
+        self._config = config
 
     def run(self) -> None:  # type: ignore[override]
+        role = self._role
         try:
-            from ..model_benchmark import (
-                benchmark_embeddings,
-                benchmark_rerankers,
-                save_result,
+            if role == "aux":
+                llm = create_aux_llm_backend(self._config)
+            else:
+                llm = create_llm_backend(self._config)
+            # 建好对象只是懒加载壳子，权重还没读。这里主动 _ensure_loaded()
+            # 把「加载」这件事做完，按钮的语义才是真的「加载模型」。
+            ensure = getattr(llm, "_ensure_loaded", None)
+            if callable(ensure):
+                ensure()
+            detail = getattr(llm, "model_path", "") or getattr(llm, "model", "")
+            self.load_done.emit(
+                {"role": role, "signature": self._signature,
+                 "llm": llm, "detail": str(detail)}
             )
-
-            results = []
-            if self._kind in ("embedding", "all"):
-                self.bench_progress.emit("正在测速 Embedding 后端（本地 MLX vs fastembed CPU）…")
-                kwargs: Dict[str, Any] = {
-                    "batch_size": self._embedding_batch_size,
-                    "rounds": self._rounds,
-                    "threads": self._threads,
-                }
-                if self._embedding_path:
-                    kwargs["mlx_path"] = self._embedding_path
-                if self._embedding_model:
-                    kwargs["fastembed_model"] = self._embedding_model
-                results.append(benchmark_embeddings(**kwargs))
-            if self._kind in ("reranker", "all"):
-                self.bench_progress.emit("正在测速 Reranker 后端（本地 ONNX vs fastembed CPU）…")
-                kwargs = {
-                    "batch_size": self._rerank_batch_size,
-                    "rounds": self._rounds,
-                    "threads": self._threads,
-                }
-                if self._rerank_path:
-                    kwargs["onnx_path"] = self._rerank_path
-                if self._rerank_model:
-                    kwargs["fastembed_model"] = self._rerank_model
-                results.append(benchmark_rerankers(**kwargs))
-            for item in results:
-                try:
-                    save_result(item)
-                except OSError as e:
-                    logger.warning("测速结果保存失败: %s", e)
-            self.bench_finished.emit(results)
         except Exception as e:
-            self.bench_failed.emit(f"{type(e).__name__}: {e}")
+            self.load_failed.emit(role, f"{type(e).__name__}: {e}")
 
 
 # ===========================================================================
@@ -677,6 +692,68 @@ class SendEditor(QPlainTextEdit):
 
 
 # ===========================================================================
+# Secondary windows (config / log)
+# ===========================================================================
+
+
+class ConfigWindow(QWidget):
+    """配置窗口：承载原本挤在主窗口顶部的配置区。
+
+    控件仍然由 MainWindow 创建并持有（见 ``MainWindow._build_config_widgets``），
+    这里只提供容器，因此所有既有的读写/联动逻辑无需改动。
+    """
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.setWindowTitle("配置")
+        # #140 之后配置窗口是两个分区、约 8 行：420px 高度会立刻出滚动条，
+        # 调到 640 让默认可见范围内能看完 Agent 模型配置区。
+        self.resize(1180, 640)
+        self._main = main
+        container = QWidget(self)
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        main._build_config_widgets(lay)
+        # 窗口变矮时出滚动条，行布局不会被压坏。
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        # 关闭只是隐藏：配置控件是 MainWindow 的属性，销毁窗口会连带销毁
+        # 那些控件（QWidget 析构会带走子控件），之后主窗口再访问就崩了。
+        self.hide()
+        event.ignore()
+
+
+class LogWindow(QWidget):
+    """日志窗口：承载原本在主窗口右侧的日志区（同样由 MainWindow 持有控件）。"""
+
+    def __init__(self, main: "MainWindow"):
+        super().__init__()
+        self.setWindowTitle("日志")
+        self.resize(980, 640)
+        self._main = main
+        container = QWidget(self)
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
+        main._build_log_widgets(lay)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(container)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.hide()
+        event.ignore()
+
+
+# ===========================================================================
 # Main window
 # ===========================================================================
 
@@ -697,7 +774,20 @@ class MainWindow(QMainWindow):
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
-        self._bench_worker: Optional[BenchmarkWorker] = None
+        # 本地模型注册表（#140）：_llm 是 agent 正在用的主模型后端，_aux_llm
+        # 是辅助模型后端。两者都由 UI 持有并负责 close()。签名记录「这个对象
+        # 是用哪份配置建出来的」，配置变了才重建——否则每次应用配置都要重新
+        # 读数 GB 权重。
+        self._llm_signature: Optional[tuple] = None
+        self._aux_llm: Optional[Any] = None
+        self._aux_llm_signature: Optional[tuple] = None
+        self._model_workers: Dict[str, LoadModelWorker] = {}
+        # 每个角色独立的忙碌标志：主模型和辅助模型可以同时加载（各自一个
+        # worker），共用一个标志会让第二个加载请求被直接跳过。
+        self._model_busy: Dict[str, bool] = {"main": False, "aux": False}
+        # 启动自动加载期间：加载失败只记日志不弹窗（开机就弹模态框很吵，
+        # 而且用户还没看到界面，点了也不知道在回应什么）。
+        self._model_autoloading: bool = False
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         # 流式文本的攒批缓冲（见 _on_content / _flush_stream_buffer）。
@@ -721,6 +811,14 @@ class MainWindow(QMainWindow):
         self._log_poll_timer = QTimer()
         self._log_poll_timer.setInterval(100)  # 100ms
         self._log_poll_timer.timeout.connect(self._poll_sync_logs)
+        # 任务计划轮询：计划由 agent 线程写入 <workspace>/.agent/task_plan.json，
+        # 轮询读取比往工具链里插回调更稳（不依赖工具执行路径，计划被外部
+        # 改动时也能跟上）。只在渲染文本变化时才重绘。
+        self._plan_poll_timer = QTimer()
+        self._plan_poll_timer.setInterval(600)
+        self._plan_poll_timer.timeout.connect(self._poll_task_plan)
+        self._plan_rendered = ""
+        self._plan_poll_timer.start()
         # Pending skill suggestion — cached when the agent emits
         # on_skill_suggested during a run, and shown as a dialog AFTER the
         # run finishes. Showing a modal dialog during streaming would block
@@ -730,10 +828,18 @@ class MainWindow(QMainWindow):
         self._pending_image_path: str = ""
 
         self._build_ui()
+        # 配置/日志搬进独立窗口：必须在 _wire_signals / _apply_config_to_widgets
+        # 之前构建，因为它们要连接和填充这些窗口里的控件。
+        self.config_window = ConfigWindow(self)
+        self.log_window = LogWindow(self)
         self._wire_signals()
         self._setup_log_bridge()
         self._apply_config_to_widgets()
         self._rebuild_agent()
+        # 启动即加载默认模型（#140 用户要求）。放在 _rebuild_agent 之后：
+        # 先把懒加载后端交给 agent，再由后台线程把权重读进同一个对象，
+        # agent 无需重建即可用上热模型。
+        self._autoload_default_models()
         self._restore_geometry()
 
     # ------------------------------------------------------------------
@@ -746,17 +852,19 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
 
-        # Top config strip (~1/6 height) + main area below.
-        main_split = QSplitter(Qt.Orientation.Vertical)
-        # 保存引用以便持久化分割比例（见 _save_geometry）。
-        self._main_split = main_split
-        outer.addWidget(main_split)
+        # 顶栏：对话相关操作靠左，窗口级操作（配置 / 日志）靠右。
+        outer.addLayout(self._build_top_bar())
 
-        main_split.addWidget(self._build_config_panel())
-        main_split.addWidget(self._build_body_panel())
-        main_split.setStretchFactor(0, 1)
-        main_split.setStretchFactor(1, 5)
-        main_split.setSizes([260, 580])
+        # 主体：左 = 对话（顶到底），右 = 任务计划 / 思考过程。
+        body_split = QSplitter(Qt.Orientation.Horizontal)
+        # 保存引用以便持久化分割比例（见 _save_geometry）。
+        self._main_split = body_split
+        outer.addWidget(body_split, 1)
+        body_split.addWidget(self._build_chat_panel())
+        body_split.addWidget(self._build_side_panel())
+        body_split.setStretchFactor(0, 3)
+        body_split.setStretchFactor(1, 1)
+        body_split.setSizes([900, 380])
 
         # Status bar with progress
         self.status = QStatusBar()
@@ -769,205 +877,45 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status.addWidget(self.status_label)
 
-    def _build_config_panel(self) -> QWidget:
-        box = QWidget()
-        lay = QVBoxLayout(box)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        self.base_url_edit = QLineEdit(placeholderText="https://api.openai.com/v1")
-        self.api_key_edit = QLineEdit(placeholderText="sk-...", echoMode=QLineEdit.EchoMode.Password)
-        self.model_combo = QComboBox(editable=True)
-        self.model_combo.setMinimumWidth(180)
-        self.fetch_btn = QPushButton("获取模型")
-        self.llm_backend_combo = QComboBox()
-        self.llm_backend_combo.addItems(["openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp"])
-        self.llm_model_path_edit = QLineEdit(placeholderText="本地主模型目录或 .onnx/.gguf 文件")
-        self.llm_model_path_btn = QPushButton("…")
-        self.llm_model_path_btn.setFixedWidth(28)
-        self.embedding_backend_combo = QComboBox()
-        self.embedding_backend_combo.addItems(["fastembed", "mlx", "onnx", "llama_cpp"])
-        self.embedding_model_edit = QLineEdit()
-        self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
-        self.embedding_model_path_btn = QPushButton("…")
-        self.embedding_model_path_btn.setFixedWidth(28)
-        self.reranker_backend_combo = QComboBox()
-        self.reranker_backend_combo.addItems(["fastembed", "mlx", "onnx", "disabled"])
-        self.reranker_model_edit = QLineEdit()
-        self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
-        self.reranker_model_path_btn = QPushButton("…")
-        self.reranker_model_path_btn.setFixedWidth(28)
-        self.reranker_enabled_check = QCheckBox("启用精排")
-        self.temp_edit = QLineEdit("0.7")
-        self.temp_edit.setFixedWidth(60)
-        self.max_tokens_edit = QLineEdit("32768")
-        self.max_tokens_edit.setFixedWidth(80)
-        self.top_p_edit = QLineEdit("0.95")
-        self.top_p_edit.setFixedWidth(60)
-        self.min_p_edit = QLineEdit("0.05")
-        self.min_p_edit.setFixedWidth(60)
-        self.top_k_edit = QLineEdit("20")
-        self.top_k_edit.setFixedWidth(60)
-        self.repeat_penalty_edit = QLineEdit("1.0")
-        self.repeat_penalty_edit.setFixedWidth(60)
-        self.timeout_edit = QLineEdit("120")
-        self.timeout_edit.setFixedWidth(60)
-        self.workspace_edit = QLineEdit()
-        self.workspace_btn = QPushButton("…")
-        self.workspace_btn.setFixedWidth(28)
-        self.knowledge_base_edit = QLineEdit(placeholderText="（可选）知识库目录")
-        self.knowledge_base_btn = QPushButton("…")
-        self.knowledge_base_btn.setFixedWidth(28)
-        self.connect_btn = QPushButton("应用配置")
-        self.connect_btn.setStyleSheet("font-weight:600;")
+    def _build_top_bar(self) -> QHBoxLayout:
+        """窗口顶栏：左为对话操作，右为「日志」「配置」两个窗口入口。"""
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
         self.clear_btn = QPushButton("清空对话")
         self.stop_btn = QPushButton("终止对话")
         self.stop_btn.setEnabled(False)
-
-        # Row 0: 主模型后端 | 远程模型名 | 获取/扫描模型
-        row0 = QHBoxLayout()
-        row0.setSpacing(8)
-        row0.addWidget(QLabel("主模型后端"))
-        row0.addWidget(self.llm_backend_combo)
-        row0.addWidget(QLabel("模型"))
-        row0.addWidget(self.model_combo, 2)
-        row0.addWidget(self.fetch_btn)
-        row0.addWidget(QLabel("本地路径"))
-        row0.addWidget(self.llm_model_path_edit, 3)
-        row0.addWidget(self.llm_model_path_btn)
-        lay.addLayout(row0)
-
-        # Row 0b: OpenAI-compatible 网络参数（本地后端下自动禁用）。
-        row0b = QHBoxLayout()
-        row0b.setSpacing(8)
-        row0b.addWidget(QLabel("Base URL"))
-        row0b.addWidget(self.base_url_edit, 3)
-        row0b.addWidget(QLabel("API Key"))
-        row0b.addWidget(self.api_key_edit, 2)
-        lay.addLayout(row0b)
-
-        # Row 1: 上下文长度 | 温度 | top_p | min_p | top_k | 重复惩罚 | 超时(秒) | 应用配置
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        row1.addWidget(QLabel("context"))
-        row1.addWidget(self.max_tokens_edit)
-        row1.addWidget(QLabel("Temp"))
-        row1.addWidget(self.temp_edit)
-        row1.addWidget(QLabel("top_p"))
-        row1.addWidget(self.top_p_edit)
-        row1.addWidget(QLabel("min_p"))
-        row1.addWidget(self.min_p_edit)
-        row1.addWidget(QLabel("top_k"))
-        row1.addWidget(self.top_k_edit)
-        row1.addWidget(QLabel("repeat-penalty"))
-        row1.addWidget(self.repeat_penalty_edit)
-        row1.addWidget(QLabel("超时(秒)"))
-        row1.addWidget(self.timeout_edit)
-        row1.addStretch(1)
-        row1.addWidget(self.connect_btn)
-        lay.addLayout(row1)
-
-        # Row 2: 工作目录 | … | 知识库目录 | … | 停止
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        row2.addWidget(QLabel("工作目录"))
-        row2.addWidget(self.workspace_edit, 1)
-        row2.addWidget(self.workspace_btn)
-        row2.addWidget(QLabel("知识库"))
-        row2.addWidget(self.knowledge_base_edit, 1)
-        row2.addWidget(self.knowledge_base_btn)
-        self.sync_knowledge_btn = QPushButton("同步知识")
-        self.sync_knowledge_btn.setToolTip(
-            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
-            "左键：增量同步（只处理新增/修改的文件）\n"
-            "右键：强制全量重新处理"
-        )
-        # Right-click context menu: force full reprocess (ignores manifest).
-        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
-        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
-        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
-        row2.addWidget(self.sync_knowledge_btn)
-        # Stop-sync button: enabled only while a sync is running. Cancels
-        # the ingest after the current file completes (cooperative cancel).
-        self.stop_sync_btn = QPushButton("停止同步")
-        self.stop_sync_btn.setEnabled(False)
-        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
-        row2.addWidget(self.stop_sync_btn)
-        lay.addLayout(row2)
-
-        row3 = QHBoxLayout()
-        row3.setSpacing(8)
-        row3.addWidget(QLabel("Embedding"))
-        row3.addWidget(self.embedding_backend_combo)
-        row3.addWidget(QLabel("模型/目录名"))
-        row3.addWidget(self.embedding_model_edit, 2)
-        row3.addWidget(QLabel("本地路径"))
-        row3.addWidget(self.embedding_model_path_edit, 3)
-        row3.addWidget(self.embedding_model_path_btn)
-        lay.addLayout(row3)
-
-        row4 = QHBoxLayout()
-        row4.setSpacing(8)
-        row4.addWidget(QLabel("Reranker"))
-        row4.addWidget(self.reranker_backend_combo)
-        row4.addWidget(QLabel("模型/目录名"))
-        row4.addWidget(self.reranker_model_edit, 2)
-        row4.addWidget(QLabel("本地路径"))
-        row4.addWidget(self.reranker_model_path_edit, 3)
-        row4.addWidget(self.reranker_model_path_btn)
-        row4.addWidget(self.reranker_enabled_check)
-        lay.addLayout(row4)
-
-        # Row 5: 本地后端测速对比。结果写入 ~/.base-agent/model_benchmark.json，
-        # 作为后续在 fastembed / 本地后端之间切换的依据。
-        row5 = QHBoxLayout()
-        row5.setSpacing(8)
-        self.benchmark_btn = QPushButton("测速对比")
-        self.benchmark_btn.setToolTip(
-            "对比「本地直载后端」与「fastembed CPU 量化版」的吞吐与一致性\n"
-            "Embedding: models/nomic-embed-text-v1.5-mlx vs nomic-ai/nomic-embed-text-v1.5-Q\n"
-            "Reranker: models/bge-reranker-v2-m3-ONNX vs BAAI/bge-reranker-v2-m3-int8\n"
-            "结果保存到 ~/.base-agent/model_benchmark.json"
-        )
-        self.benchmark_label = QLabel("")
-        self.benchmark_label.setStyleSheet("color:#6b7280;")
-        row5.addWidget(QLabel("本地后端"))
-        row5.addWidget(self.benchmark_btn)
-        row5.addWidget(self.benchmark_label, 1)
-        lay.addLayout(row5)
-
-        return box
-
-    def _build_body_panel(self) -> QWidget:
-        hsplit = QSplitter(Qt.Orientation.Horizontal)
-
-        # Left column: chat / send / thinking
-        left = QWidget()
-        llay = QVBoxLayout(left)
-        llay.setContentsMargins(0, 0, 0, 0)
-        llay.setSpacing(4)
-
-        # chat header with controls
-        chat_header = QHBoxLayout()
-        chat_header.setSpacing(8)
-        chat_header.addWidget(QLabel("对话"))
         self.attach_image_btn = QPushButton("附加图片…")
         self.attach_image_btn.setToolTip("为下一条消息附加一张本地图片（本地 VLM 后端）")
         self.attached_image_label = QLabel("")
         self.attached_image_label.setStyleSheet("color:#6b7280;")
-        chat_header.addWidget(self.attach_image_btn)
-        chat_header.addWidget(self.attached_image_label)
         self.attach_clear_btn = QPushButton("×")
         self.attach_clear_btn.setFixedWidth(28)
         self.attach_clear_btn.setToolTip("取消附加图片")
         self.attach_clear_btn.setVisible(False)
-        chat_header.addWidget(self.attach_clear_btn)
-        chat_header.addStretch(1)
-        chat_header.addWidget(self.clear_btn)
-        chat_header.addWidget(self.stop_btn)
-        llay.addLayout(chat_header)
+        self.log_window_btn = QPushButton("日志")
+        self.log_window_btn.setToolTip("打开日志窗口（RAG 同步、工具、检索日志）")
+        self.config_window_btn = QPushButton("配置")
+        self.config_window_btn.setToolTip("打开配置窗口（模型后端、路径、知识库、测速）")
 
-        # chat view
+        bar.addWidget(QLabel("对话"))
+        bar.addWidget(self.attach_image_btn)
+        bar.addWidget(self.attached_image_label)
+        bar.addWidget(self.attach_clear_btn)
+        bar.addStretch(1)
+        bar.addWidget(self.clear_btn)
+        bar.addWidget(self.stop_btn)
+        bar.addSpacing(12)
+        bar.addWidget(self.log_window_btn)
+        bar.addWidget(self.config_window_btn)
+        return bar
+
+    def _build_chat_panel(self) -> QWidget:
+        """左栏：对话区（顶到底）→ tokens 计数（居中）→ 发送区（最底部）。"""
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
         self.chat_view = QTextEdit()
         self.chat_view.setReadOnly(True)
         # 关闭撤销栈：流式渲染会做数千次 insertText，每一条都会压进
@@ -979,71 +927,422 @@ class MainWindow(QMainWindow):
         self.chat_view.document().setDefaultStyleSheet(
             ".u{color:#2563eb}.a{color:#059669}.t{color:#7c3aed}.sys{color:#9ca3af}"
         )
-        llay.addWidget(self.chat_view, 3)
+        lay.addWidget(self.chat_view, 1)
 
-        # send
+        # tokens 计数：放在发送框/按钮上方，居中显示。
+        self.speed_label = QLabel("0.0 tok/s")
+        self.speed_label.setStyleSheet("color:#6b7280;")
+        self.token_label = QLabel("总计 0 tokens")
+        self.token_label.setStyleSheet("color:#6b7280;")
+        tokens_row = QHBoxLayout()
+        tokens_row.addStretch(1)
+        tokens_row.addWidget(self.speed_label)
+        tokens_row.addWidget(QLabel("|"))
+        tokens_row.addWidget(self.token_label)
+        tokens_row.addStretch(1)
+        lay.addLayout(tokens_row)
+
         send_row = QHBoxLayout()
         self.send_editor = SendEditor()
         self.send_editor.setFixedHeight(64)
         self.send_editor.setPlaceholderText("输入消息…  (Enter 发送 / Shift+Enter 换行)")
         send_row.addWidget(self.send_editor)
-        send_col = QVBoxLayout()
         self.send_btn = QPushButton("发送")
         self.send_btn.setFixedHeight(64)
         self.send_btn.setStyleSheet("font-weight:600;")
-        send_col.addWidget(self.send_btn)
-        send_row.addLayout(send_col)
-        llay.addLayout(send_row)
+        send_row.addWidget(self.send_btn)
+        lay.addLayout(send_row)
+        return panel
 
-        # thinking
+    def _build_side_panel(self) -> QWidget:
+        """右栏：上 = 任务计划清单，下 = 思考过程（原右侧日志位）。"""
+        split = QSplitter(Qt.Orientation.Vertical)
+        self._side_split = split
+
+        plan = QWidget()
+        play = QVBoxLayout(plan)
+        play.setContentsMargins(0, 0, 0, 0)
+        play.setSpacing(4)
+        plan_header = QHBoxLayout()
+        plan_header.addWidget(QLabel("任务计划"))
+        self.plan_status_label = QLabel("无计划")
+        self.plan_status_label.setStyleSheet("color:#6b7280;")
+        plan_header.addStretch(1)
+        plan_header.addWidget(self.plan_status_label)
+        play.addLayout(plan_header)
+        self.plan_view = QTextEdit()
+        self.plan_view.setReadOnly(True)
+        self.plan_view.setUndoRedoEnabled(False)
+        # setMaximumBlockCount 在 QTextDocument 上，不在 QTextEdit 上。
+        self.plan_view.document().setMaximumBlockCount(500)
+        self.plan_view.setPlaceholderText("任务制定计划后，这里显示目标与每一步的执行情况")
+        play.addWidget(self.plan_view, 1)
+        split.addWidget(plan)
+
+        think = QWidget()
+        tlay = QVBoxLayout(think)
+        tlay.setContentsMargins(0, 0, 0, 0)
+        tlay.setSpacing(4)
         think_header = QHBoxLayout()
         think_header.addWidget(QLabel("思考过程"))
-        self.speed_label = QLabel("0.0 tok/s")
-        self.speed_label.setStyleSheet("color:#6b7280;")
-        self.token_label = QLabel("总计 0 tokens")
-        self.token_label.setStyleSheet("color:#6b7280;")
         think_header.addStretch(1)
-        think_header.addWidget(self.speed_label)
-        think_header.addWidget(QLabel("|"))
-        think_header.addWidget(self.token_label)
-        llay.addLayout(think_header)
+        tlay.addLayout(think_header)
+        font = self._mono_font()
         self.think_view = QPlainTextEdit()
         self.think_view.setReadOnly(True)
         # 同 chat_view：只读展示区不需要撤销栈（流式写入量极大）。
         self.think_view.setUndoRedoEnabled(False)
-        font = QFont("Menlo")
-        font.setStyleHint(QFont.StyleHint.Monospace)
         self.think_view.setFont(font)
         # 防止单次超长流式推理导致内存无限增长（每轮运行前会 clear()）。
         self.think_view.setMaximumBlockCount(10000)
-        llay.addWidget(self.think_view, 2)
+        tlay.addWidget(self.think_view, 1)
+        split.addWidget(think)
 
-        hsplit.addWidget(left)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 2)
+        split.setSizes([240, 360])
 
-        # Right column: log
-        right = QWidget()
-        rlay = QVBoxLayout(right)
-        rlay.setContentsMargins(0, 0, 0, 0)
-        rlay.setSpacing(4)
+        host = QWidget()
+        hlay = QVBoxLayout(host)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.addWidget(split)
+        return host
+
+    @staticmethod
+    def _mono_font() -> QFont:
+        font = QFont("Menlo")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        return font
+
+    def _build_log_widgets(self, lay: QVBoxLayout) -> None:
+        """构建日志区（现在住在独立日志窗口里）。"""
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("日志"))
         self.log_clear_btn = QPushButton("清空")
         self.log_clear_btn.setFixedWidth(60)
         log_header.addStretch(1)
         log_header.addWidget(self.log_clear_btn)
-        rlay.addLayout(log_header)
+        lay.addLayout(log_header)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setUndoRedoEnabled(False)
-        self.log_view.setFont(font)
+        self.log_view.setFont(self._mono_font())
         self.log_view.setMaximumBlockCount(5000)  # 限制日志行数，防止内存无限增长
-        rlay.addWidget(self.log_view, 1)
-        hsplit.addWidget(right)
+        lay.addWidget(self.log_view, 1)
 
-        hsplit.setStretchFactor(0, 2)
-        hsplit.setStretchFactor(1, 1)
-        hsplit.setSizes([820, 420])
-        return hsplit
+    # 采样参数行的规格：(标签, 基础属性名, 宽度, 兜底值)。前缀 "" = 主模型，
+    # "aux_" = 辅助模型——两套控件同名不同前缀，处理逻辑可完全复用。
+    _SAMPLING_SPECS = (
+        ("context", "max_tokens_edit", 80, "32768"),
+        ("Temp", "temp_edit", 60, "0.7"),
+        ("top_p", "top_p_edit", 60, "0.95"),
+        ("min_p", "min_p_edit", 60, "0.05"),
+        ("top_k", "top_k_edit", 60, "20"),
+        ("repeat-penalty", "repeat_penalty_edit", 60, "1.0"),
+        ("超时(秒)", "timeout_edit", 60, "120"),
+    )
+
+    def _build_config_widgets(self, lay: QVBoxLayout) -> None:
+        """构建配置区控件（现在住在独立配置窗口里）。
+
+        控件依旧挂在 MainWindow 上（``self.xxx``），这样
+        ``_apply_config_to_widgets`` / ``_gather_config_from_widgets`` /
+        ``_update_model_controls`` 等处理函数一行都不用改。
+
+        布局分两个区（#140）：
+          ① Agent 模型配置 —— 主模型（本地 / OpenAI 兼容二选一）+ 辅助模型；
+             辅助模型在模式面板**之外**常驻可见，不随主模型模式切换而隐藏；
+          ② 知识同步配置 —— 目录、Embedding、Reranker。
+        """
+        # --- OpenAI 兼容接口专用 ---
+        self.base_url_edit = QLineEdit(placeholderText="https://api.openai.com/v1")
+        self.api_key_edit = QLineEdit(placeholderText="sk-...", echoMode=QLineEdit.EchoMode.Password)
+        self.model_combo = QComboBox(editable=True)
+        self.model_combo.setMinimumWidth(180)
+        self.fetch_btn = QPushButton("获取模型")
+        # --- RAG ---
+        self.embedding_backend_combo = QComboBox()
+        _fill_backend_combo(self.embedding_backend_combo, RAG_BACKENDS)
+        self.embedding_model_edit = QLineEdit()
+        self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
+        self.embedding_model_path_btn = QPushButton("选择")
+        # 精排始终启用，没有 disabled 选项；要临时关掉靠配置文件的
+        # rag_rerank_enabled=false（会退化为向量距离排序）。
+        self.reranker_backend_combo = QComboBox()
+        _fill_backend_combo(self.reranker_backend_combo, RAG_BACKENDS[:3])
+        self.reranker_model_edit = QLineEdit()
+        self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
+        self.reranker_model_path_btn = QPushButton("选择")
+        # --- 目录 / 动作 ---
+        self.workspace_edit = QLineEdit()
+        self.workspace_btn = QPushButton("选择")
+        self.knowledge_base_edit = QLineEdit(placeholderText="（可选）知识库目录")
+        self.knowledge_base_btn = QPushButton("选择")
+        # 注意：「清空对话」「终止对话」属于对话操作，已移到主窗口顶栏，
+        # 不随配置区进入配置窗口。
+
+        # ==================================================================
+        # 分区一：Agent 模型配置
+        # ==================================================================
+        agent_group = QGroupBox("Agent 模型配置")
+        agent_lay = QVBoxLayout(agent_group)
+        agent_lay.setSpacing(6)
+
+        # 主模型模式：本地 / OpenAI 兼容接口，二选一。
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(12)
+        mode_row.addWidget(QLabel("主模型模式"))
+        self.llm_mode_local_radio = QRadioButton("本地模式")
+        self.llm_mode_openai_radio = QRadioButton("OpenAI 兼容接口")
+        self.llm_mode_local_radio.setToolTip(
+            "进程内直载本地权重（MLX-LM / MLX-VLM / ONNX / GGUF），无需网络"
+        )
+        self.llm_mode_openai_radio.setToolTip("连接 OpenAI 兼容的 /chat/completions 接口")
+        mode_row.addWidget(self.llm_mode_local_radio)
+        mode_row.addWidget(self.llm_mode_openai_radio)
+        mode_row.addStretch(1)
+        agent_lay.addLayout(mode_row)
+
+        # --- 本地模式面板：只放主模型 ---
+        self.local_mode_panel = QWidget()
+        local_lay = QVBoxLayout(self.local_mode_panel)
+        local_lay.setContentsMargins(0, 0, 0, 0)
+        local_lay.setSpacing(6)
+
+        self._add_local_model_block(
+            local_lay, "主模型",
+            combo_attr="llm_backend_combo",
+            path_attr="llm_model_path_edit",
+            btn_attr="llm_model_path_btn",
+            picker=self._on_pick_llm_model,
+            placeholder="本地主模型目录或 .onnx/.gguf 文件",
+            path_value=self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH,
+        )
+        self._add_sampling_row(
+            local_lay, "", self._main_sampling_defaults(),
+            buttons=(
+                ("加载模型", "llm_load_btn", "load:main",
+                 "把当前配置的主模型加载到内存备用"),
+                ("卸载", "llm_unload_btn", "unload:main",
+                 "卸载已加载的主模型，释放内存"),
+            ),
+        )
+        agent_lay.addWidget(self.local_mode_panel)
+
+        # --- OpenAI 兼容接口面板：只放主模型的远程连接 ---
+        self.openai_mode_panel = QWidget()
+        openai_lay = QVBoxLayout(self.openai_mode_panel)
+        openai_lay.setContentsMargins(0, 0, 0, 0)
+        openai_lay.setSpacing(6)
+
+        remote_row = QHBoxLayout()
+        remote_row.setSpacing(8)
+        remote_row.addWidget(QLabel("Base URL"))
+        remote_row.addWidget(self.base_url_edit, 3)
+        remote_row.addWidget(QLabel("API Key"))
+        remote_row.addWidget(self.api_key_edit, 2)
+        remote_row.addWidget(QLabel("模型"))
+        remote_row.addWidget(self.model_combo, 2)
+        remote_row.addWidget(self.fetch_btn)
+        openai_lay.addLayout(remote_row)
+
+        self._add_sampling_row(
+            openai_lay, "", self._main_sampling_defaults(),
+            buttons=(("应用配置", "connect_btn", "apply", None),),
+        )
+        # connect_btn 由 _add_sampling_row 创建，这里补上强调样式。
+        self.connect_btn.setStyleSheet("font-weight:600;")
+        agent_lay.addWidget(self.openai_mode_panel)
+
+        # --- 辅助模型：独立于主模型模式，常驻可见 ---
+        # 辅助模型只支持本地直载，与「主模型选本地还是接口」无关：主模型走
+        # OpenAI 接口时，摘要有个小模型在本地跑反而更划算。所以它放在两个
+        # 模式面板**之外**，是 agent_lay 的常驻子节点，不随模式切换隐藏。
+        # 分隔线把「主模型」与「辅助模型」在视觉上也切开，避免误以为辅助
+        # 模型隶属于本地模式。
+        aux_sep = QFrame()
+        aux_sep.setFrameShape(QFrame.Shape.HLine)
+        aux_sep.setFrameShadow(QFrame.Shadow.Sunken)
+        agent_lay.addWidget(aux_sep)
+
+        self._add_local_model_block(
+            agent_lay, "辅助模型",
+            combo_attr="aux_llm_backend_combo",
+            path_attr="aux_llm_model_path_edit",
+            btn_attr="aux_llm_model_path_btn",
+            picker=self._on_pick_aux_llm_model,
+            placeholder="本地辅助模型目录或 .onnx/.gguf 文件",
+            path_value=getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH,
+        )
+        self._add_sampling_row(
+            agent_lay, "aux_", self._aux_sampling_defaults(),
+            buttons=(
+                ("加载模型", "aux_llm_load_btn", "load:aux",
+                 "把当前配置的辅助模型加载到内存备用"),
+                ("卸载", "aux_llm_unload_btn", "unload:aux",
+                 "卸载已加载的辅助模型，释放内存"),
+            ),
+        )
+
+        lay.addWidget(agent_group)
+
+        # ==================================================================
+        # 分区二：知识同步配置
+        # ==================================================================
+        kb_group = QGroupBox("知识同步配置")
+        kb_lay = QVBoxLayout(kb_group)
+        kb_lay.setSpacing(6)
+
+        # Row 1: 工作目录 | 知识库目录 | 应用配置
+        # 「应用配置」在规格里只出现在接口模式行末，但本地模式用户同样要能
+        # 应用工作目录 / RAG 设置（同步知识按钮只覆盖 RAG，不覆盖 workspace）。
+        # 这里放一个同功能的副本，避免本地模式下没有应用入口。
+        dir_row = QHBoxLayout()
+        dir_row.setSpacing(8)
+        dir_row.addWidget(QLabel("工作目录"))
+        dir_row.addWidget(self.workspace_edit, 1)
+        dir_row.addWidget(self.workspace_btn)
+        dir_row.addWidget(QLabel("知识库"))
+        dir_row.addWidget(self.knowledge_base_edit, 1)
+        dir_row.addWidget(self.knowledge_base_btn)
+        self.kb_apply_btn = QPushButton("应用配置")
+        self.kb_apply_btn.setStyleSheet("font-weight:600;")
+        self.kb_apply_btn.setToolTip("应用工作目录 / 知识库 / Embedding / Reranker 设置")
+        self.kb_apply_btn.clicked.connect(self._on_apply_config)
+        dir_row.addWidget(self.kb_apply_btn)
+        kb_lay.addLayout(dir_row)
+
+        # Row 2: Embedding 后端 | 模型名 | 本地路径 | 同步知识
+        emb_row = QHBoxLayout()
+        emb_row.setSpacing(8)
+        emb_row.addWidget(QLabel("Embedding"))
+        emb_row.addWidget(self.embedding_backend_combo)
+        emb_row.addWidget(QLabel("模型/目录名"))
+        emb_row.addWidget(self.embedding_model_edit, 2)
+        emb_row.addWidget(QLabel("本地路径"))
+        emb_row.addWidget(self.embedding_model_path_edit, 3)
+        emb_row.addWidget(self.embedding_model_path_btn)
+        self.sync_knowledge_btn = QPushButton("同步知识")
+        self.sync_knowledge_btn.setToolTip(
+            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
+            "左键：增量同步（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理"
+        )
+        # Right-click context menu: force full reprocess (ignores manifest).
+        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
+        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
+        emb_row.addWidget(self.sync_knowledge_btn)
+        kb_lay.addLayout(emb_row)
+
+        # Row 3: Reranker 后端 | 模型名 | 本地路径 | 停止同步
+        rerank_row = QHBoxLayout()
+        rerank_row.setSpacing(8)
+        rerank_row.addWidget(QLabel("Reranker"))
+        rerank_row.addWidget(self.reranker_backend_combo)
+        rerank_row.addWidget(QLabel("模型/目录名"))
+        rerank_row.addWidget(self.reranker_model_edit, 2)
+        rerank_row.addWidget(QLabel("本地路径"))
+        rerank_row.addWidget(self.reranker_model_path_edit, 3)
+        rerank_row.addWidget(self.reranker_model_path_btn)
+        # Stop-sync button: enabled only while a sync is running. Cancels
+        # the ingest after the current file completes (cooperative cancel).
+        self.stop_sync_btn = QPushButton("停止同步")
+        self.stop_sync_btn.setEnabled(False)
+        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
+        rerank_row.addWidget(self.stop_sync_btn)
+        kb_lay.addLayout(rerank_row)
+
+        lay.addWidget(kb_group)
+
+    # ------------------------------------------------------------------
+    # config widget builders
+    # ------------------------------------------------------------------
+    def _main_sampling_defaults(self) -> Dict[str, Any]:
+        return {
+            "max_tokens_edit": self.config.max_tokens,
+            "temp_edit": self.config.temperature,
+            "top_p_edit": self.config.top_p,
+            "min_p_edit": self.config.min_p,
+            "top_k_edit": self.config.top_k,
+            "repeat_penalty_edit": self.config.repetition_penalty,
+            "timeout_edit": self.config.request_timeout,
+        }
+
+    def _aux_sampling_defaults(self) -> Dict[str, Any]:
+        cfg = self.config
+        return {
+            "max_tokens_edit": getattr(cfg, "aux_max_tokens", 2048),
+            "temp_edit": getattr(cfg, "aux_temperature", 0.2),
+            "top_p_edit": getattr(cfg, "aux_top_p", 0.95),
+            "min_p_edit": getattr(cfg, "aux_min_p", 0.05),
+            "top_k_edit": getattr(cfg, "aux_top_k", 20),
+            "repeat_penalty_edit": getattr(cfg, "aux_repetition_penalty", 1.0),
+            "timeout_edit": getattr(cfg, "aux_request_timeout", 120.0),
+        }
+
+    def _add_local_model_block(
+        self, lay: QVBoxLayout, title: str, *,
+        combo_attr: str, path_attr: str, btn_attr: str,
+        picker, placeholder: str, path_value: str,
+    ) -> None:
+        """一行「模型类型 + 本地路径 + 选择」，上方带一个小标题。"""
+        label = QLabel(title)
+        label.setStyleSheet("font-weight:600;")
+        lay.addWidget(label)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        combo = QComboBox()
+        _fill_backend_combo(combo, LOCAL_LLM_TYPES)
+        combo.setToolTip(
+            "MLX-LM：Apple Silicon 文本模型；MLX-VLM：多模态；"
+            "ONNX：ONNX Runtime；GGUF：llama.cpp"
+        )
+        setattr(self, combo_attr, combo)
+        edit = QLineEdit(path_value, placeholderText=placeholder)
+        setattr(self, path_attr, edit)
+        btn = QPushButton("选择")
+        btn.clicked.connect(picker)
+        setattr(self, btn_attr, btn)
+
+        row.addWidget(QLabel("模型类型"))
+        row.addWidget(combo)
+        row.addWidget(QLabel("本地路径"))
+        row.addWidget(edit, 3)
+        row.addWidget(btn)
+        lay.addLayout(row)
+
+    def _add_sampling_row(self, lay: QVBoxLayout, prefix: str,
+                          defaults: Dict[str, Any], buttons=()) -> None:
+        """一行采样参数 + 尾部按钮。
+
+        ``prefix`` 为 ``""``（主模型）或 ``"aux_"``（辅助模型）：属性名 =
+        前缀 + 基础名，于是 ``temp_edit`` 与 ``aux_temp_edit`` 共用一套处理
+        代码，不会出现两套逻辑各自漂移。
+
+        ``buttons`` 每项 ``(文本, 属性名, 动作, 提示)``，动作用
+        ``"load:main"`` / ``"unload:aux"`` / ``"apply"`` 表示。
+        """
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for label, base, width, fallback in self._SAMPLING_SPECS:
+            edit = QLineEdit(str(defaults.get(base, fallback)))
+            edit.setFixedWidth(width)
+            setattr(self, prefix + base, edit)
+            row.addWidget(QLabel(label))
+            row.addWidget(edit)
+        row.addStretch(1)
+        for text, attr, action, tip in buttons:
+            btn = QPushButton(text)
+            if tip:
+                btn.setToolTip(tip)
+            btn.clicked.connect(
+                lambda _=False, a=action: self._on_model_action(a)
+            )
+            setattr(self, attr, btn)
+            row.addWidget(btn)
+        lay.addLayout(row)
 
     # ------------------------------------------------------------------
     # wiring
@@ -1054,12 +1353,18 @@ class MainWindow(QMainWindow):
         self.workspace_btn.clicked.connect(self._on_pick_workspace)
         self.knowledge_base_btn.clicked.connect(self._on_pick_knowledge_base)
         self.llm_model_path_btn.clicked.connect(self._on_pick_llm_model)
+        self.aux_llm_model_path_btn.clicked.connect(self._on_pick_aux_llm_model)
         self.embedding_model_path_btn.clicked.connect(self._on_pick_embedding_model)
         self.reranker_model_path_btn.clicked.connect(self._on_pick_reranker_model)
-        self.benchmark_btn.clicked.connect(self._on_run_benchmark)
         self.attach_image_btn.clicked.connect(self._on_pick_chat_image)
         self.attach_clear_btn.clicked.connect(self._on_clear_attached_image)
+        self.config_window_btn.clicked.connect(self._on_open_config_window)
+        self.log_window_btn.clicked.connect(self._on_open_log_window)
+        # 模式二选一 + 本地模型类型变化 → 刷新面板可见性与可用性。
+        self.llm_mode_local_radio.toggled.connect(self._update_model_controls)
+        self.llm_mode_openai_radio.toggled.connect(self._update_model_controls)
         self.llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
+        self.aux_llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.reranker_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.reranker_backend_combo.currentTextChanged.connect(self._on_reranker_backend_changed)
         self.model_combo.activated.connect(self._on_model_combo_activated)
@@ -1092,39 +1397,77 @@ class MainWindow(QMainWindow):
     def _apply_config_to_widgets(self) -> None:
         self.base_url_edit.setText(self.config.base_url)
         self.api_key_edit.setText(self.config.api_key)
-        self.llm_backend_combo.setCurrentText(self.config.llm_backend)
-        self.llm_model_path_edit.setText(self.config.llm_model_path)
-        self.embedding_backend_combo.setCurrentText(self.config.rag_embedding_backend)
+        # 模式二选一：本地 / OpenAI 兼容接口。llm_backend 为 openai 时一律
+        # 视为接口模式（旧配置迁移后两者应已自洽，见 AgentConfig._migrate）。
+        local_mode = getattr(self.config, "llm_mode", "local") != "openai"
+        self.llm_mode_local_radio.setChecked(local_mode)
+        self.llm_mode_openai_radio.setChecked(not local_mode)
+        # 本地模式下按配置值选中「模型类型」；接口模式下该项被禁用，
+        # 仍显示一个合理值（mlx_lm）以免下拉框空白。
+        backend_value = self.config.llm_backend
+        if backend_value == "openai":
+            backend_value = "mlx_lm"
+        _select_combo_backend(self.llm_backend_combo, backend_value)
+        _select_combo_backend(
+            self.aux_llm_backend_combo, getattr(self.config, "aux_llm_backend", "mlx_lm")
+        )
+        self.llm_model_path_edit.setText(
+            self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH
+        )
+        self.aux_llm_model_path_edit.setText(
+            getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH
+        )
+        _select_combo_backend(
+            self.embedding_backend_combo, self.config.rag_embedding_backend
+        )
         self.embedding_model_edit.setText(self.config.rag_embedding_model)
         self.embedding_model_path_edit.setText(self.config.rag_embedding_model_path)
-        self.reranker_backend_combo.setCurrentText(self.config.rag_rerank_backend)
+        _select_combo_backend(self.reranker_backend_combo, self.config.rag_rerank_backend)
         self.reranker_model_edit.setText(self.config.rag_rerank_model)
         self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
-        self.reranker_enabled_check.setChecked(self.config.rag_rerank_enabled)
         if self.config.model:
             self.model_combo.setEditText(self.config.model)
-        self.temp_edit.setText(str(self.config.temperature))
-        self.max_tokens_edit.setText(str(self.config.max_tokens))
-        self.top_p_edit.setText(str(self.config.top_p))
-        self.min_p_edit.setText(str(self.config.min_p))
-        self.top_k_edit.setText(str(self.config.top_k))
-        self.repeat_penalty_edit.setText(str(self.config.repetition_penalty))
-        self.timeout_edit.setText(str(self.config.request_timeout))
+        self._apply_sampling_to_widgets("")
+        self._apply_sampling_to_widgets("aux_")
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
         self._update_model_controls()
-        self._refresh_benchmark_label()
+
+    def _apply_sampling_to_widgets(self, prefix: str) -> None:
+        """把 config 里的采样参数写回控件。prefix "" = 主模型，"aux_" = 辅助。"""
+        cfg = self.config
+        values = {
+            "max_tokens_edit": getattr(cfg, prefix + "max_tokens"),
+            "temp_edit": getattr(cfg, prefix + "temperature"),
+            "top_p_edit": getattr(cfg, prefix + "top_p"),
+            "min_p_edit": getattr(cfg, prefix + "min_p"),
+            "top_k_edit": getattr(cfg, prefix + "top_k"),
+            "repeat_penalty_edit": getattr(cfg, prefix + "repetition_penalty"),
+            "timeout_edit": getattr(cfg, prefix + "request_timeout"),
+        }
+        for base, value in values.items():
+            getattr(self, prefix + base).setText(str(value))
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
         self.config.api_key = self.api_key_edit.text().strip()
         self.config.model = self.model_combo.currentText().strip()
-        self.config.llm_backend = self.llm_backend_combo.currentText().strip() or "openai"
+        # 模式与后端必须一起落盘：接口模式下 llm_backend 恒为 openai（否则
+        # 重启后本地路径字段被忽略，用户看到的模式与实际行为相反）。
+        local_mode = self.llm_mode_local_radio.isChecked()
+        self.config.llm_mode = "local" if local_mode else "openai"
+        self.config.llm_backend = (
+            _combo_backend_value(self.llm_backend_combo) if local_mode else "openai"
+        )
         self.config.llm_model_path = (
-            self.llm_model_path_edit.text().strip() or self.config.llm_model_path
+            self.llm_model_path_edit.text().strip() or DEFAULT_MAIN_MODEL_PATH
+        )
+        self.config.aux_llm_backend = _combo_backend_value(self.aux_llm_backend_combo)
+        self.config.aux_llm_model_path = (
+            self.aux_llm_model_path_edit.text().strip() or DEFAULT_AUX_MODEL_PATH
         )
         self.config.rag_embedding_backend = (
-            self.embedding_backend_combo.currentText().strip() or "fastembed"
+            _combo_backend_value(self.embedding_backend_combo) or "fastembed"
         )
         self.config.rag_embedding_model = (
             self.embedding_model_edit.text().strip() or self.config.rag_embedding_model
@@ -1133,7 +1476,7 @@ class MainWindow(QMainWindow):
             self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
         )
         self.config.rag_rerank_backend = (
-            self.reranker_backend_combo.currentText().strip() or "fastembed"
+            _combo_backend_value(self.reranker_backend_combo) or "fastembed"
         )
         self.config.rag_rerank_model = (
             self.reranker_model_edit.text().strip() or self.config.rag_rerank_model
@@ -1141,7 +1484,7 @@ class MainWindow(QMainWindow):
         # MLX 交叉编码器是目录，ONNX 是文件，两者各存一份：切换后端时不必
         # 重新粘贴路径（见 _reranker_path_for_backend）。
         path_value = self.reranker_model_path_edit.text().strip()
-        if self.reranker_backend_combo.currentText().strip() == "mlx":
+        if self.config.rag_rerank_backend == "mlx":
             self.config.rag_rerank_mlx_model_path = (
                 path_value or self.config.rag_rerank_mlx_model_path
             )
@@ -1149,50 +1492,8 @@ class MainWindow(QMainWindow):
             self.config.rag_rerank_model_path = (
                 path_value or self.config.rag_rerank_model_path
             )
-        self.config.rag_rerank_enabled = self.reranker_enabled_check.isChecked()
-        try:
-            # 范围钳制 [0, 2]：负数/超范围的值会被服务端直接拒绝，报错难懂。
-            self.config.temperature = max(0.0, min(2.0, float(self.temp_edit.text().strip() or "0.7")))
-        except ValueError:
-            self.config.temperature = 0.7
-        try:
-            # 下限 1：负数/0 会让 LLM 请求直接被服务端拒绝，报错信息难懂。
-            self.config.max_tokens = max(1, int(self.max_tokens_edit.text().strip() or "32768"))
-        except ValueError:
-            self.config.max_tokens = 32768
-        # Keep max_context_tokens in sync with max_tokens: the shrink threshold
-        # should track the model's actual context window. If the user has
-        # explicitly set a different max_context_tokens via config.json, only
-        # override when it was smaller than the new max_tokens (i.e. the old
-        # 4096 budget that's now too small).
-        if self.config.max_context_tokens < self.config.max_tokens:
-            self.config.max_context_tokens = self.config.max_tokens
-        try:
-            # top_p ∈ (0, 1]：0 会导致无候选 token 可选，>1 被服务端拒绝。
-            self.config.top_p = max(0.0001, min(1.0, float(self.top_p_edit.text().strip() or "0.95")))
-        except ValueError:
-            self.config.top_p = 0.95
-        try:
-            # min_p ∈ [0, 1)：负数无意义且会被拒绝。
-            self.config.min_p = max(0.0, min(0.999, float(self.min_p_edit.text().strip() or "0.05")))
-        except ValueError:
-            self.config.min_p = 0.05
-        try:
-            # top_k >= 0：负数会让采样逻辑崩溃或被服务端拒绝。
-            self.config.top_k = max(0, int(self.top_k_edit.text().strip() or "20"))
-        except ValueError:
-            self.config.top_k = 20
-        try:
-            # repetition_penalty >= 1：小于 1 会反向惩罚（越重复越鼓励），>2 输出退化。
-            self.config.repetition_penalty = max(1.0, min(2.0, float(self.repeat_penalty_edit.text().strip() or "1.0")))
-        except ValueError:
-            self.config.repetition_penalty = 1.0
-        try:
-            # 下限 1 秒：0/负数会让 httpx 在发请求前就超时，表现为所有对话
-            # 立刻失败且看不出原因。
-            self.config.request_timeout = max(1.0, float(self.timeout_edit.text().strip() or "120"))
-        except ValueError:
-            self.config.request_timeout = 120.0
+        self._gather_sampling_from_widgets("")
+        self._gather_sampling_from_widgets("aux_")
         ws = self.workspace_edit.text().strip()
         if ws:
             self.config.workspace = ws
@@ -1203,6 +1504,69 @@ class MainWindow(QMainWindow):
             # the box even when the user hasn't explicitly set a path.
             kb = os.path.join(self.config.workspace, "knowledge_base")
         self.config.knowledge_base = kb
+
+    def _gather_sampling_from_widgets(self, prefix: str) -> None:
+        """从控件读采样参数写进 config。prefix "" = 主模型，"aux_" = 辅助。
+
+        两套控件同名不同前缀，校验规则完全一致——重复利用同一段代码，
+        避免主/辅助两套阈值各自漂移（比如辅助模型的 top_p 忘了夹 (0,1]）。
+        """
+        def _edit(base: str) -> str:
+            return getattr(self, prefix + base).text().strip()
+
+        try:
+            # 范围钳制 [0, 2]：负数/超范围的值会被服务端直接拒绝，报错难懂。
+            temperature = max(0.0, min(2.0, float(_edit("temp_edit") or "0.7")))
+        except ValueError:
+            temperature = 0.7
+        try:
+            # 下限 1：负数/0 会让 LLM 请求直接被服务端拒绝，报错信息难懂。
+            max_tokens = max(1, int(_edit("max_tokens_edit") or "32768"))
+        except ValueError:
+            max_tokens = 32768
+        try:
+            # top_p ∈ (0, 1]：0 会导致无候选 token 可选，>1 被服务端拒绝。
+            top_p = max(0.0001, min(1.0, float(_edit("top_p_edit") or "0.95")))
+        except ValueError:
+            top_p = 0.95
+        try:
+            # min_p ∈ [0, 1)：负数无意义且会被拒绝。
+            min_p = max(0.0, min(0.999, float(_edit("min_p_edit") or "0.05")))
+        except ValueError:
+            min_p = 0.05
+        try:
+            # top_k >= 0：负数会让采样逻辑崩溃或被服务端拒绝。
+            top_k = max(0, int(_edit("top_k_edit") or "20"))
+        except ValueError:
+            top_k = 20
+        try:
+            # repetition_penalty >= 1：小于 1 会反向惩罚（越重复越鼓励），>2 输出退化。
+            repeat = max(1.0, min(2.0, float(_edit("repeat_penalty_edit") or "1.0")))
+        except ValueError:
+            repeat = 1.0
+        try:
+            # 下限 1 秒：0/负数会让 httpx 在发请求前就超时，表现为所有对话
+            # 立刻失败且看不出原因。
+            timeout = max(1.0, float(_edit("timeout_edit") or "120"))
+        except ValueError:
+            timeout = 120.0
+
+        setattr(self.config, prefix + "temperature", temperature)
+        setattr(self.config, prefix + "max_tokens", max_tokens)
+        setattr(self.config, prefix + "top_p", top_p)
+        setattr(self.config, prefix + "min_p", min_p)
+        setattr(self.config, prefix + "top_k", top_k)
+        setattr(self.config, prefix + "repetition_penalty", repeat)
+        setattr(self.config, prefix + "request_timeout", timeout)
+
+        if not prefix:
+            # Keep max_context_tokens in sync with max_tokens: the shrink
+            # threshold should track the model's actual context window. If the
+            # user has explicitly set a different max_context_tokens via
+            # config.json, only override when it was smaller than the new
+            # max_tokens (i.e. the old 4096 budget that's now too small).
+            if self.config.max_context_tokens < max_tokens:
+                self.config.max_context_tokens = max_tokens
 
     def _release_old_agent_async(self, old_agent) -> None:
         """在后台线程释放旧 agent 的重资源（见 _rebuild_agent 的注释）。
@@ -1240,28 +1604,40 @@ class MainWindow(QMainWindow):
             # ONNX/OCR 模型（数百 MB）——配了多个 server 时是十几秒的界面冻结。
             # 交给后台线程处理；新 agent 的创建不依赖旧资源，可以同时进行。
             self._release_old_agent_async(old_agent)
-        old_llm = getattr(self, "_llm", None)
-        if old_llm is not None:
-            try:
-                old_llm.close()
-            except Exception:
-                pass
-        # 构造失败时必须清空引用：旧 agent / llm 已在上面被 close()，
-        # 继续持有它们会让 _on_send 用一套已关闭的 httpx 连接池和 MCP 客户端
-        # 发起新一轮对话，报出与真实原因无关的二次错误。
-        self._llm = None
+        # 注意这里**不再无条件 close() 旧 llm**：_ensure_main_llm() 会按签名
+        # 判断要不要重建——配置没变就复用手里那个已加载权重的后端。旧实现每次
+        # 重建都 close + create，用户点一次「应用配置」就要重新读数 GB 权重。
+        # 构造失败时必须清空引用：旧 agent 已在上面被异步关闭，继续持有它会让
+        # _on_send 用一套已关闭的 MCP 客户端发起新一轮对话，报出与真实原因无关
+        # 的二次错误。
         self._agent = None
         new_llm = None
+        new_aux = None
         try:
-            new_llm = create_llm_backend(self.config)
-            new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
+            new_llm = self._ensure_main_llm()
+            # 辅助模型是可选增强：路径不存在 / 运行时缺失时不能把整个 agent 拖垮
+            # （摘要退回主模型即可），所以这里单独兜异常。
+            try:
+                new_aux = self._ensure_aux_llm()
+            except Exception as e:
+                new_aux = None
+                logger.warning("UI: 辅助模型不可用，摘要将退回主模型: %s", e)
+            new_agent = Agent(
+                llm=new_llm, config=self.config, callbacks=self._callbacks,
+                aux_llm=new_aux,
+            )
             new_agent.max_iterations = self.config.max_iterations
         except Exception as e:
             # new_llm 已建好但 Agent 构造失败 → 必须关掉它，否则每次失败
             # 泄漏一个 httpx 连接池。
-            if new_llm is not None:
+            if new_llm is not None and new_llm is not getattr(self, "_llm", None):
                 try:
                     new_llm.close()
+                except Exception:
+                    pass
+            if new_aux is not None and new_aux is not getattr(self, "_aux_llm", None):
+                try:
+                    new_aux.close()
                 except Exception:
                     pass
             self._on_error(f"无法创建 agent: {e}")
@@ -1313,22 +1689,58 @@ class MainWindow(QMainWindow):
             self.knowledge_base_edit.setText(d)
 
     def _update_model_controls(self, *_args) -> None:
-        remote = self.llm_backend_combo.currentText() == "openai"
-        self.base_url_edit.setEnabled(remote)
-        self.api_key_edit.setEnabled(remote)
-        self.llm_model_path_edit.setEnabled(not remote)
-        self.llm_model_path_btn.setEnabled(not remote)
-        self.fetch_btn.setText("获取模型" if remote else "扫描本地")
-        multimodal = self.llm_backend_combo.currentText() in ("mlx_vlm", "onnx", "llama_cpp")
+        local_mode = self.llm_mode_local_radio.isChecked()
+        # 面板级切换：本地模式显示「模型类型+本地路径」两套（主/辅），
+        # 接口模式显示 Base URL / API Key / 模型下拉。
+        self.local_mode_panel.setVisible(local_mode)
+        self.openai_mode_panel.setVisible(not local_mode)
+        self.fetch_btn.setEnabled(not local_mode)
+        self.fetch_btn.setText("获取模型" if not local_mode else "扫描本地")
+
+        backend = _combo_backend_value(self.llm_backend_combo)
+        aux_backend = _combo_backend_value(self.aux_llm_backend_combo)
+        # GGUF 是文件、其余是目录：文件对话框的过滤器与「需要文件」的校验
+        # 都依赖这个区分（见 _on_pick_llm_model / resolve_model_path）。
+        self.llm_model_path_edit.setPlaceholderText(
+            "本地主模型 .gguf 文件" if backend == "llama_cpp"
+            else "本地主模型目录或 .onnx/.gguf 文件"
+        )
+        self.aux_llm_model_path_edit.setPlaceholderText(
+            "本地辅助模型 .gguf 文件" if aux_backend == "llama_cpp"
+            else "本地辅助模型目录或 .onnx/.gguf 文件"
+        )
+        # 多模态后端才能附加图片；mlx_lm 是纯文本。
+        multimodal = local_mode and backend in ("mlx_vlm", "onnx", "llama_cpp")
         self.attach_image_btn.setEnabled(multimodal)
         # 切到不支持视觉的后端时必须丢弃待发图片：否则 [image:...] 标记会以
         # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
         if not multimodal and self._pending_image_path:
             self._set_attached_image("")
-        rerank_disabled = self.reranker_backend_combo.currentText() == "disabled"
-        self.reranker_enabled_check.setEnabled(not rerank_disabled)
-        if rerank_disabled:
-            self.reranker_enabled_check.setChecked(False)
+        self._refresh_model_buttons()
+
+    def _refresh_model_buttons(self) -> None:
+        """按「是否已加载 / 是否可操作」刷新加载/卸载按钮。
+
+        辅助模型的按钮**不受主模型模式影响**：辅助模型只支持本地直载，主模型
+        选 OpenAI 接口时它照样要能加载/卸载（见 _build_config_widgets 里它放在
+        模式面板之外的注释）。
+        """
+        local_mode = self.llm_mode_local_radio.isChecked()
+        for role, load_btn, unload_btn in (
+            ("main", self.llm_load_btn, self.llm_unload_btn),
+            ("aux", self.aux_llm_load_btn, self.aux_llm_unload_btn),
+        ):
+            loaded = self._is_model_loaded(role)
+            # 主模型在接口模式下没有本地模型可载；辅助模型永远可以操作。
+            usable = (local_mode or role == "aux") and not self._model_busy.get(role, False)
+            load_btn.setEnabled(usable)
+            unload_btn.setEnabled(usable)
+            load_btn.setText("重新加载" if loaded else "加载模型")
+            load_btn.setToolTip(
+                f"把当前配置的{'主' if role == 'main' else '辅助'}模型加载到内存备用"
+                if not loaded
+                else "模型已加载，点击可按当前配置重新加载"
+            )
 
     @staticmethod
     def _dialog_start(value: str) -> str:
@@ -1340,7 +1752,7 @@ class MainWindow(QMainWindow):
         return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "..", "models")
 
     def _on_pick_llm_model(self) -> None:
-        backend = self.llm_backend_combo.currentText()
+        backend = _combo_backend_value(self.llm_backend_combo)
         start = self._dialog_start(self.llm_model_path_edit.text())
         if backend == "llama_cpp":
             path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF 主模型", start, "GGUF (*.gguf);;所有文件 (*)")
@@ -1351,8 +1763,20 @@ class MainWindow(QMainWindow):
         if path:
             self.llm_model_path_edit.setText(path)
 
+    def _on_pick_aux_llm_model(self) -> None:
+        backend = _combo_backend_value(self.aux_llm_backend_combo)
+        start = self._dialog_start(self.aux_llm_model_path_edit.text())
+        if backend == "llama_cpp":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF 辅助模型", start, "GGUF (*.gguf);;所有文件 (*)")
+        elif backend == "onnx":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 ONNX 辅助模型", start, "ONNX (*.onnx);;所有文件 (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "选择本地辅助模型目录", start)
+        if path:
+            self.aux_llm_model_path_edit.setText(path)
+
     def _on_pick_embedding_model(self) -> None:
-        backend = self.embedding_backend_combo.currentText()
+        backend = _combo_backend_value(self.embedding_backend_combo)
         start = self._dialog_start(self.embedding_model_path_edit.text())
         if backend == "llama_cpp":
             path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF Embedding 模型", start, "GGUF (*.gguf);;所有文件 (*)")
@@ -1389,6 +1813,97 @@ class MainWindow(QMainWindow):
             self.reranker_model_path_edit.setText(path)
 
     # ------------------------------------------------------------------
+    # secondary windows
+    # ------------------------------------------------------------------
+    def _on_open_config_window(self) -> None:
+        window = getattr(self, "config_window", None)
+        if window is None:
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_open_log_window(self) -> None:
+        window = getattr(self, "log_window", None)
+        if window is None:
+            return
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    # ------------------------------------------------------------------
+    # task plan panel
+    # ------------------------------------------------------------------
+    _PLAN_ICONS = {
+        "pending": "○",
+        "in_progress": "▶",
+        "done": "✓",
+        "blocked": "✕",
+    }
+    _PLAN_COLORS = {
+        "pending": "#6b7280",
+        "in_progress": "#2563eb",
+        "done": "#059669",
+        "blocked": "#dc2626",
+    }
+
+    def _poll_task_plan(self) -> None:
+        """读取 agent 写入的 task_plan.json 并刷新右上面板（仅在变化时重绘）。"""
+        if getattr(self, "_closed", False):
+            return
+        try:
+            from ..planner import load_plan
+
+            plan = load_plan(self.config.workspace)
+        except Exception:
+            return
+        html = self._render_plan_html(plan)
+        if html == self._plan_rendered:
+            return
+        self._plan_rendered = html
+        self.plan_view.setHtml(html)
+        if plan is None:
+            self.plan_status_label.setText("无计划")
+        else:
+            done = sum(1 for s in plan.steps if s.status == "done")
+            self.plan_status_label.setText(f"{done}/{len(plan.steps)} 完成")
+
+    def _render_plan_html(self, plan) -> str:
+        """把计划渲染成带状态标记与目标/进度标题的 HTML。"""
+        if plan is None:
+            return '<div style="color:#9ca3af">（当前任务未制定计划）</div>'
+        goal = self._escape(getattr(plan, "goal", "") or "")
+        steps = list(getattr(plan, "steps", []) or [])
+        done = sum(1 for s in steps if s.status == "done")
+        lines = [
+            f'<div style="font-weight:600;margin-bottom:4px">目标：{goal}</div>',
+            f'<div style="color:#6b7280;margin-bottom:6px">'
+            f'进度 {done}/{len(steps)}</div>',
+        ]
+        current_marked = False
+        for i, step in enumerate(steps, 1):
+            status = step.status if step.status in self._PLAN_ICONS else "pending"
+            text = self._escape(step.text or "")
+            note = self._escape(step.note or "")
+            icon = self._PLAN_ICONS[status]
+            color = self._PLAN_COLORS[status]
+            # 正在进行的步骤：加粗 + 底色标记（只标第一个，避免多个
+            # in_progress 时整屏高亮）。注意 QTextDocument 的 HTML 导入只认
+            # background-color，简写 background 会被丢掉。
+            highlight = ""
+            if status == "in_progress" and not current_marked:
+                current_marked = True
+                highlight = "font-weight:600;background-color:#eff6ff;"
+            suffix = f'<span style="color:#6b7280"> — {note}</span>' if note else ""
+            lines.append(
+                f'<div style="{highlight}color:{color};padding:1px 2px">'
+                f'{icon} {i}. {text}{suffix}</div>'
+            )
+        if steps and done == len(steps):
+            lines.append('<div style="color:#059669;margin-top:6px">全部步骤已完成</div>')
+        return "".join(lines)
+
+    # ------------------------------------------------------------------
     # attached image (local VLM backends)
     # ------------------------------------------------------------------
     def _on_pick_chat_image(self) -> None:
@@ -1416,111 +1931,246 @@ class MainWindow(QMainWindow):
     def _on_clear_attached_image(self) -> None:
         self._set_attached_image("")
 
-    # ------------------------------------------------------------------
-    # local backend benchmark
-    # ------------------------------------------------------------------
-    def _refresh_benchmark_label(self) -> None:
-        """Show the last stored benchmark verdict next to the button."""
-        try:
-            from ..model_benchmark import recommend, result_for
-
-            embedding = result_for("embedding")
-            reranker = result_for("reranker")
-        except Exception as e:
-            self.benchmark_label.setText(f"测速记录读取失败: {e}")
-            return
-        if embedding is None and reranker is None:
-            self.benchmark_label.setText("尚无测速记录")
-            return
-        parts = []
-        if embedding is not None:
-            parts.append(recommend(embedding))
-        if reranker is not None:
-            parts.append(recommend(reranker))
-        self.benchmark_label.setText(" ｜ ".join(parts))
-
-    def _on_run_benchmark(self) -> None:
-        if self._is_worker_running(self._bench_worker):
-            return
-        # 测速会加载数 GB 级权重并占满 CPU：与 agent 推理或知识库同步并发跑，
-        # 两边都会互相拖慢，测出来的数字也没有参考价值。
-        if self._busy or self._is_worker_running(self._worker):
-            QMessageBox.warning(
-                self, "正在运行", "Agent 正在运行，请先点击「终止对话」停止当前任务，再测速。"
-            )
-            return
-        if (self._sync_busy or self._is_worker_running(self._sync_worker)
-                or self._is_worker_running(self._deps_worker)):
-            QMessageBox.warning(
-                self, "正在同步", "知识库同步/依赖安装进行中，请等待其完成，再测速。"
-            )
-            return
-        self.benchmark_btn.setEnabled(False)
-        self.status_label.setText("正在测速本地后端…")
-        self.progress.setRange(0, 0)
-        self._bench_worker = BenchmarkWorker(
-            kind="all",
-            rounds=3,
-            threads=max(1, int(getattr(self.config, "onnx_threads", 4))),
-            embedding_batch_size=max(1, int(getattr(self.config, "rag_embedding_batch_size", 8))),
-            rerank_batch_size=max(1, int(getattr(self.config, "rag_rerank_batch_size", 16))),
-            embedding_path=self.embedding_model_path_edit.text().strip(),
-            embedding_model=self.embedding_model_edit.text().strip(),
-            rerank_path=self.reranker_model_path_edit.text().strip(),
-            rerank_model=self.reranker_model_edit.text().strip(),
-        )
-        self._bench_worker.bench_progress.connect(self._on_benchmark_progress)
-        self._bench_worker.bench_finished.connect(self._on_benchmark_finished)
-        self._bench_worker.bench_failed.connect(self._on_benchmark_failed)
-        self._bench_worker.finished.connect(self._bench_worker.deleteLater)
-        self._bench_worker.start()
-
-    def _on_benchmark_progress(self, msg: str) -> None:
-        self._append_log(f"[bench] {msg}")
-        self.status_label.setText(msg)
-
-    def _on_benchmark_finished(self, results: list) -> None:
-        self._bench_worker = None
-        self.benchmark_btn.setEnabled(True)
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        try:
-            from ..model_benchmark import recommend, summarize
-
-            lines = []
-            for item in results or []:
-                lines.append(summarize(item))
-                suggestion = recommend(item)
-                if suggestion:
-                    lines.append(f"  → {suggestion}")
-            text = "\n".join(lines) or "（无结果）"
-        except Exception as e:
-            text = f"结果渲染失败: {e}"
-        for line in (text.splitlines() or [text]):
-            self._append_log(f"[bench] {line}")
-        self._refresh_benchmark_label()
-        self.status_label.setText("测速完成（结果已保存）")
-        QMessageBox.information(self, "本地后端测速对比", text)
-
-    def _on_benchmark_failed(self, error: str) -> None:
-        self._bench_worker = None
-        self.benchmark_btn.setEnabled(True)
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self.status_label.setText("测速失败")
-        self._append_log(f"[bench] 测速失败: {error}")
-        QMessageBox.critical(
-            self, "测速失败",
-            f"本地后端测速失败：\n{error}\n\n"
-            "请确认已安装对应运行时（mlx / onnxruntime / fastembed）且模型路径存在。",
-        )
-
     def _on_model_combo_activated(self, _index: int) -> None:
-        if self.llm_backend_combo.currentText() == "openai":
+        # 本地模式下「模型」下拉是扫描本地目录的结果，选中即回填本地路径。
+        if self.llm_mode_openai_radio.isChecked():
             return
         value = self.model_combo.currentText().strip()
         if os.path.exists(os.path.expanduser(value)):
             self.llm_model_path_edit.setText(value)
+
+    # ------------------------------------------------------------------
+    # 本地模型加载 / 卸载（#140）
+    # ------------------------------------------------------------------
+    def _model_signature(self, role: str) -> tuple:
+        """当前配置对应的模型签名。
+
+        签名变化 = 用户换了模型类型或路径 → 手里那个后端对象已经过期，必须
+        重建。用它做「要不要重建」的判据，比每次都比较一堆字段可靠。
+        """
+        if role == "aux":
+            return ("aux", _combo_backend_value(self.aux_llm_backend_combo),
+                    self.aux_llm_model_path_edit.text().strip())
+        if self.llm_mode_openai_radio.isChecked():
+            return ("openai", self.base_url_edit.text().strip(),
+                    self.model_combo.currentText().strip())
+        return ("local", _combo_backend_value(self.llm_backend_combo),
+                self.llm_model_path_edit.text().strip())
+
+    def _loaded_model(self, role: str):
+        return self._llm if role == "main" else self._aux_llm
+
+    def _is_model_loaded(self, role: str) -> bool:
+        """已把权重读进内存（不只是建了懒加载对象）。"""
+        llm = self._loaded_model(role)
+        if llm is None or getattr(llm, "_closed", False):
+            return False
+        # 本地后端的 _model_obj/_llama 在权重读入后才有值；LLMClient 没有
+        # 权重可载，视为始终就绪。
+        return not hasattr(llm, "_ensure_loaded") or any(
+            getattr(llm, attr, None) is not None
+            for attr in ("_model_obj", "_llama", "_session")
+        )
+
+    def _on_model_action(self, action: str) -> None:
+        """加载模型 / 卸载 / 应用配置 的统一入口。"""
+        if action == "apply":
+            self._on_apply_config()
+            return
+        verb, _, role = action.partition(":")
+        if verb == "load":
+            self._on_load_model(role)
+        elif verb == "unload":
+            self._on_unload_model(role)
+
+    def _on_load_model(self, role: str) -> None:
+        """把当前配置的模型加载到内存备用（后台线程，避免 UI 冻结）。"""
+        if self._model_busy.get(role, False):
+            QMessageBox.information(
+                self, "请稍候", "正在处理另一个模型操作。"
+            )
+            return
+        if self._busy or self._is_worker_running(self._worker):
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再加载模型。",
+            )
+            return
+        if self._sync_busy or self._is_worker_running(self._sync_worker):
+            QMessageBox.warning(self, "正在同步", "知识库同步进行中，请先停止或等待完成。")
+            return
+        # 先把控件里的值收进 config：加载必须用「用户刚填的」参数，而不是上
+        # 一次应用配置留下的旧值——否则改了路径/采样参数却加载了旧模型。
+        self._gather_config_from_widgets()
+        if role == "main" and self.config.llm_mode == "openai":
+            QMessageBox.information(
+                self, "接口模式", "OpenAI 兼容接口模式无需加载本地模型，请直接「应用配置」。"
+            )
+            return
+        signature = self._model_signature(role)
+        label = "主模型" if role == "main" else "辅助模型"
+        self._model_busy[role] = True
+        self._refresh_model_buttons()
+        self.status_label.setText(f"正在加载{label}…")
+        self._append_log(f"[model] 开始加载{label}: {signature[2] or '(未填路径)'}")
+        worker = LoadModelWorker(
+            role=role, signature=signature, config=self.config
+        )
+        self._model_workers[role] = worker
+        worker.load_done.connect(self._on_model_loaded)
+        worker.load_failed.connect(self._on_model_load_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_unload_model(self, role: str) -> None:
+        """卸载已加载的模型，释放内存。"""
+        if self._model_busy.get(role, False):
+            QMessageBox.information(self, "请稍候", "正在处理另一个模型操作。")
+            return
+        if self._busy or self._is_worker_running(self._worker):
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再卸载模型。",
+            )
+            return
+        llm = self._loaded_model(role)
+        label = "主模型" if role == "main" else "辅助模型"
+        if llm is None:
+            QMessageBox.information(self, "未加载", f"{label}尚未加载。")
+            return
+        # agent 正持有这个对象：直接 close() 会让下一轮对话撞上「后端已关闭」。
+        # 必须先把它从 agent 上摘下来、换一个全新的懒加载对象，再关旧的。
+        try:
+            llm.close()
+        except Exception as e:  # pragma: no cover - 防御
+            logger.warning("UI: %s 卸载异常: %s", label, e)
+        if role == "main":
+            self._llm = None
+            self._llm_signature = None
+            if self._agent is not None:
+                self._agent.llm = self._ensure_main_llm()
+        else:
+            self._aux_llm = None
+            self._aux_llm_signature = None
+            if self._agent is not None:
+                self._agent.aux_llm = self._ensure_aux_llm()
+        self._refresh_model_buttons()
+        self._append_log(f"[model] {label} 已卸载")
+        self.status_label.setText(f"{label}已卸载")
+
+    def _on_model_loaded(self, payload: dict) -> None:
+        """后台加载完成：换上热后端，并让正在用的 agent 指向它。"""
+        role = payload.get("role", "main")
+        self._model_busy[role] = False
+        if not any(self._model_busy.values()):
+            self._model_autoloading = False
+        llm = payload.get("llm")
+        signature = payload.get("signature")
+        label = "主模型" if role == "main" else "辅助模型"
+        try:
+            if llm is None:
+                raise LLMError("加载返回了空后端")
+            # 加载期间用户可能又改了指令：签名变了就别装上去，免得装错模型。
+            if signature != self._model_signature(role):
+                try:
+                    llm.close()
+                except Exception:
+                    pass
+                self.status_label.setText(f"{label}配置已变更，未采用本次加载结果")
+                self._append_log(f"[model] {label} 加载期间配置已变更，结果丢弃")
+                return
+            previous = self._loaded_model(role)
+            if previous is not None and previous is not llm:
+                try:
+                    previous.close()
+                except Exception:
+                    pass
+            if role == "main":
+                self._llm = llm
+                self._llm_signature = signature
+                if self._agent is not None:
+                    self._agent.llm = llm
+            else:
+                self._aux_llm = llm
+                self._aux_llm_signature = signature
+                if self._agent is not None:
+                    self._agent.aux_llm = llm
+            self._append_log(f"[model] {label} 已加载: {payload.get('detail', '')}")
+            self.status_label.setText(f"{label}已加载")
+        except Exception as e:
+            QMessageBox.critical(self, f"{label}加载失败", f"{type(e).__name__}: {e}")
+            self.status_label.setText(f"{label}加载失败")
+        finally:
+            self._refresh_model_buttons()
+
+    def _on_model_load_failed(self, role: str, detail: str) -> None:
+        self._model_busy[role] = False
+        if not any(self._model_busy.values()):
+            self._model_autoloading = False
+        label = "主模型" if role == "main" else "辅助模型"
+        self.status_label.setText(f"{label}加载失败")
+        self._append_log(f"[model] {label} 加载失败: {detail}")
+        # 启动自动加载失败不弹窗：开机就弹模态框很吵，用户也还没看到界面。
+        if not self._model_autoloading:
+            QMessageBox.critical(self, f"{label}加载失败", detail)
+        self._refresh_model_buttons()
+
+    def _ensure_main_llm(self):
+        """取主模型后端：配置没变就复用手里那个（权重保持热），变了才重建。
+
+        复用是关键：MLX/GGUF 的权重加载要数秒到数十秒，如果每次
+        ``_rebuild_agent`` 都新建一个，用户点一次「应用配置」就得重新读一遍
+        数 GB 权重。
+        """
+        signature = self._model_signature("main")
+        current = getattr(self, "_llm", None)
+        if current is not None and not getattr(current, "_closed", False):
+            if getattr(self, "_llm_signature", None) == signature:
+                return current
+            try:
+                current.close()
+            except Exception:
+                pass
+        self._llm = create_llm_backend(self.config)
+        self._llm_signature = signature
+        return self._llm
+
+    def _ensure_aux_llm(self):
+        """取辅助模型后端（语义同 ``_ensure_main_llm``）。"""
+        signature = self._model_signature("aux")
+        current = getattr(self, "_aux_llm", None)
+        if current is not None and not getattr(current, "_closed", False):
+            if getattr(self, "_aux_llm_signature", None) == signature:
+                return current
+            try:
+                current.close()
+            except Exception:
+                pass
+        self._aux_llm = create_aux_llm_backend(self.config)
+        self._aux_llm_signature = signature
+        return self._aux_llm
+
+    def _autoload_default_models(self) -> None:
+        """启动时把默认模型加载到内存（#140 用户要求：软件启动即默认加载）。
+
+        在后台线程做：权重加载要数秒到数十秒，放进 ``__init__`` 会让窗口半天
+        弹不出来。测试环境通过 ``BASE_AGENT_SKIP_MODEL_AUTOLOAD=1`` 跳过
+        （见 tests/conftest.py）——否则套件会真的去读数 GB 权重。
+        """
+        if os.environ.get(AUTOLOAD_SKIP_ENV):
+            return
+        self._model_autoloading = True
+        try:
+            if not self._is_model_loaded("main"):
+                self._on_load_model("main")
+            if not self._is_model_loaded("aux"):
+                self._on_load_model("aux")
+        finally:
+            # 同步启动的 worker 会在事件循环里跑完，这里先复位标志会让失败
+            # 弹窗——但只要 worker 还没结束就把标志留着，由 _on_model_loaded
+            # 在最后一个 worker 完成时统一复位。
+            if not any(self._model_busy.values()):
+                self._model_autoloading = False
 
     @staticmethod
     def _is_worker_running(worker) -> bool:
@@ -1864,7 +2514,10 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_fetch_models(self) -> None:
-        backend = self.llm_backend_combo.currentText().strip() or "openai"
+        backend = (
+            "openai" if self.llm_mode_openai_radio.isChecked()
+            else _combo_backend_value(self.llm_backend_combo)
+        )
         if backend != "openai":
             models = discover_local_models("models", backend)
             configured = self.llm_model_path_edit.text().strip()
@@ -2073,9 +2726,13 @@ class MainWindow(QMainWindow):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
         self.connect_btn.setEnabled(not busy)
+        self.kb_apply_btn.setEnabled(not busy)
         self.clear_btn.setEnabled(not busy)
         self.workspace_btn.setEnabled(not busy)
         self.knowledge_base_btn.setEnabled(not busy)
+        # 模型加载/卸载按钮（#140）：与「应用配置」同纪律——agent 在跑时禁用，
+        # 否则重建/换后端会让正在执行的 AgentWorker 撞上已关闭的后端。
+        self._refresh_model_buttons()
         # 「获取模型」「同步知识」有各自的忙碌态：agent 一轮结束不能把它们
         # 解锁（它们的 worker 可能还在跑，再点一次会覆盖 worker 引用）。
         self.fetch_btn.setEnabled(not (busy or self._fetch_busy))
@@ -2585,7 +3242,9 @@ class MainWindow(QMainWindow):
             geo = _as_bytes(s.value("ui/geometry"))
             if geo:
                 self.restoreGeometry(geo)
-            state = _as_bytes(s.value("ui/splitter"))
+            # 旧版存的是「配置区/主体」的垂直分割状态，现在 _main_split 是
+            # 水平分割（对话 / 右栏），换 key 避免拿旧状态去 restore 新布局。
+            state = _as_bytes(s.value("ui/body_splitter"))
             if state and hasattr(self, "_main_split"):
                 self._main_split.restoreState(state)
         except Exception as e:
@@ -2597,7 +3256,7 @@ class MainWindow(QMainWindow):
             s = QSettings()
             s.setValue("ui/geometry", self.saveGeometry())
             if hasattr(self, "_main_split"):
-                s.setValue("ui/splitter", self._main_split.saveState())
+                s.setValue("ui/body_splitter", self._main_split.saveState())
         except Exception as e:
             logger.debug("UI: save geometry failed: %s", e)
 
@@ -2616,11 +3275,24 @@ class MainWindow(QMainWindow):
         """
         # 本方法末尾会清空模块级 _LOG_HANDLER（见那里的注释）。
         global _LOG_HANDLER
-        # --- 停止日志轮询定时器
-        try:
-            self._log_poll_timer.stop()
-        except Exception:
-            pass
+        self._closed = True
+        # --- 停止日志轮询定时器与任务计划轮询定时器
+        for timer_name in ("_log_poll_timer", "_plan_poll_timer"):
+            try:
+                getattr(self, timer_name).stop()
+            except Exception:
+                pass
+        # --- 收掉配置 / 日志窗口：它们对关闭是 hide，这里显式清理，避免应用
+        # 退出后 Qt 才析构时去碰已释放的控件。
+        for window_name in ("config_window", "log_window"):
+            window = getattr(self, window_name, None)
+            if window is None:
+                continue
+            try:
+                window.deleteLater()
+            except Exception:
+                pass
+            setattr(self, window_name, None)
         # --- AgentWorker: cancel the agent run and join the thread.
         # Without this, closing the window during an agent run leaves the
         # worker thread alive; its bridge.finished/error/content signals
@@ -2645,10 +3317,6 @@ class MainWindow(QMainWindow):
         if self._shutdown_worker(self._deps_worker, "deps",
                                  wait_ms=2000, term_wait_ms=1000):
             self._deps_worker = None
-        # --- BenchmarkWorker: loads model weights, give it a bit more time.
-        if self._shutdown_worker(self._bench_worker, "bench",
-                                 wait_ms=3000, term_wait_ms=1000):
-            self._bench_worker = None
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:
             try:

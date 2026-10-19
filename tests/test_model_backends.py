@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from agent.config import AgentConfig
 from agent.llm_client import LLMClient
 from agent.model_backends import (
@@ -59,11 +61,79 @@ def test_discover_local_models_filters_by_backend(tmp_path):
 
 
 def test_factory_preserves_openai_backend():
-    backend = create_llm_backend(AgentConfig())
+    # 显式指定 openai：默认值现在是本地 MLX（#140），但接口模式仍可用。
+    cfg = AgentConfig(llm_mode="openai", llm_backend="openai")
+    backend = create_llm_backend(cfg)
     try:
         assert isinstance(backend, LLMClient)
     finally:
         backend.close()
+
+
+def test_factory_defaults_to_local_mlx_backend():
+    """#140：默认本地模式 + MLX-LM，且是懒加载（不读权重）。"""
+    cfg = AgentConfig()
+    assert cfg.llm_mode == "local"
+    backend = create_llm_backend(cfg)
+    try:
+        assert isinstance(backend, MLXLanguageBackend)
+        assert backend._model_obj is None
+    finally:
+        backend.close()
+
+
+def test_aux_factory_builds_local_backend_with_aux_sampling(tmp_path):
+    """辅助工厂只建本地后端，并把 aux_* 采样参数映射到标准字段名。"""
+    from agent.model_backends import aux_sampling_config, create_aux_llm_backend
+
+    cfg = AgentConfig(
+        aux_llm_backend="mlx_lm",
+        aux_llm_model_path=str(tmp_path),
+        aux_temperature=0.15,
+        aux_max_tokens=1234,
+        aux_top_p=0.5,
+        aux_min_p=0.02,
+        aux_top_k=7,
+        aux_repetition_penalty=1.3,
+        aux_request_timeout=33.0,
+        # 主模型参数必须被盖掉，不能被辅助模型读到。
+        temperature=0.9,
+        max_tokens=9999,
+        top_p=0.11,
+    )
+    backend = create_aux_llm_backend(cfg)
+    try:
+        assert isinstance(backend, MLXLanguageBackend)
+        view = backend.config
+        assert view.temperature == 0.15
+        assert view.max_tokens == 1234
+        assert view.top_p == 0.5
+        assert view.min_p == 0.02
+        assert view.top_k == 7
+        assert view.repetition_penalty == 1.3
+        assert view.request_timeout == 33.0
+        # 本地推理参数原样保留（与主模型共用同一套硬件约束）。
+        assert view.max_context_tokens == cfg.max_context_tokens
+        assert view.local_model_threads == cfg.local_model_threads
+        # 原始 config 不被视图污染。
+        assert cfg.temperature == 0.9
+        assert cfg.max_tokens == 9999
+        # 视图是实时的：改完 aux_* 参数立即生效，不用重新加载模型。
+        cfg.aux_temperature = 1.5
+        cfg.aux_max_tokens = 42
+        assert view.temperature == 1.5
+        assert view.max_tokens == 42
+    finally:
+        backend.close()
+
+    # 辅助后端不接受 openai：没有网络端点可配。
+    with pytest.raises(Exception):
+        create_aux_llm_backend(AgentConfig(aux_llm_backend="openai"))
+
+    # 缺省字段时视图有兜底值，不会 AttributeError。
+    bare = AgentConfig(aux_llm_backend="mlx_lm")
+    view = aux_sampling_config(bare)
+    assert view.max_tokens == bare.aux_max_tokens
 
 
 def test_factory_builds_lazy_mlx_backend_without_loading_weights(tmp_path):
@@ -174,3 +244,188 @@ def test_benchmark_result_roundtrip_and_recommendation(tmp_path):
     # 只快但向量不一致 → 必须回归，不能直接建议切换。
     risky = dict(embedding, min_vector_cosine_alignment=0.5)
     assert "回归检索质量" in recommend(risky)
+
+
+def test_reranker_max_length_follows_model_position_embeddings(tmp_path):
+    """bge-reranker-v2-m3 是 8192，旧版 base 只有 512，不能一刀切。"""
+    from agent.rag.model_backends import _model_max_length
+
+    v2 = tmp_path / "v2-m3"
+    v2.mkdir()
+    (v2 / "config.json").write_text(json.dumps({"max_position_embeddings": 8194}))
+    assert _model_max_length(v2) == 8192
+
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(json.dumps({"max_position_embeddings": 514}))
+    assert _model_max_length(base) == 512
+
+    # config 缺失/非法时退回保守的 512，而不是无限放大。
+    assert _model_max_length(tmp_path / "missing") == 512
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "config.json").write_text("{ not json")
+    assert _model_max_length(broken) == 512
+
+
+def test_reranker_batch_shrinks_with_sequence_length():
+    """交叉编码器注意力 O(L²)：长序列必须降批，否则内存被打爆。"""
+    from agent.rag.model_backends import _rerank_batch_for
+
+    assert _rerank_batch_for(16, 128) == 16
+    assert _rerank_batch_for(16, 512) == 16   # chunk 默认 500 tokens 的常态
+    assert _rerank_batch_for(16, 1024) == 8
+    assert _rerank_batch_for(16, 2048) == 4
+    assert _rerank_batch_for(16, 8192) == 1
+    # 预算内永远至少跑 1 条。
+    assert _rerank_batch_for(4, 99999) == 1
+
+
+def test_onnx_reranker_splits_long_batches_without_losing_rows():
+    """token 预算切批后，每一行都要被打分且顺序不变。"""
+    import threading
+
+    import numpy as np
+
+    from agent.rag import model_backends as mb
+
+    class _FakeTokenizer:
+        def __call__(self, queries, docs, **kwargs):
+            rows = len(docs)
+            # seq=3000 → 预算 8192 只允许 2 条一批，5 条会被切成 2+2+1。
+            ids = np.tile(np.arange(3000, dtype=np.int64), (rows, 1))
+            return {"input_ids": ids, "attention_mask": np.ones_like(ids)}
+
+    class _Input:
+        def __init__(self, name):
+            self.name = name
+
+    class _FakeSession:
+        def get_inputs(self):
+            return [_Input("input_ids"), _Input("attention_mask")]
+
+        def run(self, _names, feeds):
+            rows = feeds["input_ids"]
+            assert rows.shape[0] <= 2, rows.shape
+            # 输出行号，便于核对覆盖与顺序。
+            return [np.arange(rows.shape[0], dtype=np.float32).reshape(-1, 1)]
+
+    reranker = mb.ONNXReranker.__new__(mb.ONNXReranker)
+    reranker._session = _FakeSession()
+    reranker._tokenizer = _FakeTokenizer()
+    reranker._lock = threading.RLock()
+    reranker._max_length = 8192
+    reranker._threads = 4
+
+    scores = reranker.rerank("q", ["a", "b", "c", "d", "e"], batch_size=5)
+    assert scores == [0.0, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_config_default_rerank_length_covers_v2_m3(tmp_path):
+    cfg = AgentConfig()
+    assert cfg.rag_rerank_max_length == 8192
+    # 合法范围内的自定义值必须保留（真正的上限由各模型 config 夹紧）。
+    # 注意：钳制发生在 load()→_migrate()，直接构造不触发。
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"rag_rerank_max_length": 1024}))
+    assert AgentConfig.load(str(path)).rag_rerank_max_length == 1024
+    path.write_text(json.dumps({"rag_rerank_max_length": 0}))
+    assert AgentConfig.load(str(path)).rag_rerank_max_length == 8
+
+
+def test_embedding_max_length_follows_model_position_embeddings(tmp_path):
+    """NomicBERT 旋转式取 n_positions=8192；bge-small 绝对位置取 512；缺失保守 512。"""
+    from agent.rag.model_backends import _model_max_length
+
+    nomic = tmp_path / "nomic"
+    nomic.mkdir()
+    (nomic / "config.json").write_text(
+        json.dumps({"n_positions": 8192, "max_position_embeddings": 2048})
+    )
+    assert _model_max_length(nomic) == 8192
+
+    bge = tmp_path / "bge"
+    bge.mkdir()
+    (bge / "config.json").write_text(json.dumps({"max_position_embeddings": 514}))
+    assert _model_max_length(bge) == 512
+
+    # config 缺失/非法时退回保守的 512，而不是放大到旋转式上限。
+    assert _model_max_length(tmp_path / "missing") == 512
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "config.json").write_text("{ not json")
+    assert _model_max_length(broken) == 512
+
+
+def test_embedding_batch_shrinks_with_sequence_length():
+    """Embedding 按后端取形状预算：mlx 放 B=4@8192，onnx 放 B=2@8192。"""
+    from agent.rag.model_backends import _embedding_batch_for
+
+    # 默认（无后端）沿用 6M：长切片预算早已不够，保底 2 条、不再夹到 1（#139）。
+    assert _embedding_batch_for(100, 8192) == 2
+    assert _embedding_batch_for(100, 2048) == 2
+
+    # MLX 走 flash attention（O(S)），可放到 B=4@8192，短切片不受限。
+    assert _embedding_batch_for(100, 8192, "mlx") == 4
+    assert _embedding_batch_for(100, 2048, "mlx") == 71       # 300M//2048²
+    assert _embedding_batch_for(100, 1024, "mlx") == 100       # 远未到预算
+
+    # ONNX(CPU) 物化注意力（O(S²)），放到 B=2@8192，@2048 约 35 批（fp32 ~7GB 顶）。
+    assert _embedding_batch_for(100, 8192, "onnx") == 2
+    assert _embedding_batch_for(100, 2048, "onnx") == 35       # 150M//2048²
+    assert _embedding_batch_for(8, 512, "onnx") == 8           # 默认切片常态不受限
+
+    # 极小/非法序列长不崩，但下限仍是 2（除非请求本身只有 1 条）。
+    assert _embedding_batch_for(4, 99999, "mlx") == 2
+    assert _embedding_batch_for(1, 99999, "mlx") == 1
+
+
+def test_onnx_embedding_function_splits_long_batches_without_losing_rows():
+    """token 预算切批后，每一行都要被嵌入且顺序不变。"""
+    import threading
+
+    import numpy as np
+
+    from agent.rag import model_backends as mb
+
+    class _FakeTokenizer:
+        def __call__(self, batch, **kwargs):
+            rows = len(batch)
+            ids = np.tile(np.arange(3000, dtype=np.int64), (rows, 1))  # seq=3000
+            return {"input_ids": ids, "attention_mask": np.ones_like(ids)}
+
+    class _Input:
+        def __init__(self, name):
+            self.name = name
+
+    class _FakeSession:
+        def get_inputs(self):
+            return [_Input("input_ids"), _Input("attention_mask")]
+
+        def run(self, _names, feeds):
+            rows = feeds["input_ids"]
+            # ONNX 预算 150M、seq=3000 → 内批上限 16；batch_size=8 故实际 ≤8。
+            assert 1 <= rows.shape[0] <= 8, rows.shape
+            return [np.zeros((rows.shape[0], 4), dtype=np.float32)]  # 4 维假向量
+
+    ef = mb.ONNXEmbeddingFunction.__new__(mb.ONNXEmbeddingFunction)
+    ef._session = _FakeSession()
+    ef._tokenizer = _FakeTokenizer()
+    ef._lock = threading.RLock()
+    ef._max_length = 8192
+    ef._batch_size = 8
+    ef._document_prefix = ""
+    ef._query_prefix = ""
+
+    vectors = ef._embed(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"])
+    assert len(vectors) == 10                # 10 行全部被嵌入，无遗漏
+    assert all(len(v) == 4 for v in vectors) # 形状正确
+
+
+def test_config_default_embedding_length_8192(tmp_path):
+    cfg = AgentConfig()
+    assert cfg.rag_embedding_max_length == 8192
+    # 非正值被拉到下限 8，不会把 tokenizer 的 max_length 置成 0/负。
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"rag_embedding_max_length": 0}))
+    assert AgentConfig.load(str(path)).rag_embedding_max_length == 8

@@ -269,7 +269,7 @@ class ToolRegistry:
                 embedding_model_path=getattr(self.config, "rag_embedding_model_path", ""),
                 embedding_threads=getattr(self.config, "onnx_threads", 4),
                 embedding_batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
-                embedding_max_length=getattr(self.config, "rag_embedding_max_length", 512),
+                embedding_max_length=getattr(self.config, "rag_embedding_max_length", 8192),
                 chunk_size=getattr(self.config, "rag_chunk_size", 500),
                 chunk_overlap=getattr(self.config, "rag_chunk_overlap", 50),
                 rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8"),
@@ -278,7 +278,7 @@ class ToolRegistry:
                 rerank_mlx_model_path=getattr(self.config, "rag_rerank_mlx_model_path", ""),
                 rerank_threads=getattr(self.config, "onnx_threads", 4),
                 rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
-                rerank_max_length=getattr(self.config, "rag_rerank_max_length", 512),
+                rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),
                 rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
                 pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
             )
@@ -346,7 +346,7 @@ class ToolRegistry:
                 model_path=getattr(self.config, "rag_embedding_model_path", ""),
                 threads=getattr(self.config, "onnx_threads", 4),
                 batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
-                max_length=getattr(self.config, "rag_embedding_max_length", 512),
+                max_length=getattr(self.config, "rag_embedding_max_length", 8192),
             )
             from ..skill_retriever import SkillRetriever
             retriever = SkillRetriever(

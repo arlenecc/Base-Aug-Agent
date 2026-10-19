@@ -259,9 +259,13 @@ def test_migrate_keeps_explicitly_small_budget(tmp_path):
 
 def test_local_model_defaults_are_parallel_not_forced():
     cfg = AgentConfig()
-    assert cfg.llm_backend == "openai"
+    # #140：默认本地模式 + MLX-LM 主模型，启动即加载；辅助模型同样本地 MLX。
+    assert cfg.llm_mode == "local"
+    assert cfg.llm_backend == "mlx_lm"
     assert cfg.llm_model_path.endswith("qwen3.5-4b-agentic-coder-v4-4bit-mlx")
-    # 主模型仍是网络端点（不被强制本地化），RAG 两个模型默认走本地 MLX。
+    assert cfg.aux_llm_backend == "mlx_lm"
+    assert cfg.aux_llm_model_path.endswith("Qwen3.5-2B-MLX-4bit")
+    # 主模型默认本地化，RAG 两个模型默认也走本地 MLX。
     assert cfg.rag_embedding_backend == "mlx"
     assert cfg.rag_embedding_model_path.endswith("nomic-embed-text-v1.5-mlx")
     assert cfg.rag_rerank_backend == "mlx"
@@ -270,6 +274,44 @@ def test_local_model_defaults_are_parallel_not_forced():
     assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
     assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
     assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+
+
+def test_llm_mode_and_backend_stay_coherent():
+    """模式与后端必须自洽：接口模式 ⇒ openai；本地模式 ⇒ 非 openai（#140）。"""
+    # 接口模式下 llm_backend 被强制成 openai。
+    cfg = AgentConfig(llm_mode="openai", llm_backend="mlx_lm")
+    cfg._migrate()
+    assert cfg.llm_mode == "openai"
+    assert cfg.llm_backend == "openai"
+    # 本地模式却配了 openai：按本地模式修正，回退 mlx_lm（否则本地路径字段
+    # 被忽略，配置窗口显示的模式与实际行为相反）。
+    cfg = AgentConfig(llm_mode="local", llm_backend="openai")
+    cfg._migrate()
+    assert cfg.llm_mode == "local"
+    assert cfg.llm_backend == "mlx_lm"
+    # 未知模式退回本地。
+    cfg = AgentConfig(llm_mode="bogus")
+    cfg._migrate()
+    assert cfg.llm_mode == "local"
+
+
+def test_legacy_config_without_llm_mode_infers_from_backend(tmp_path):
+    """旧配置没有 llm_mode：不能把一直用 OpenAI 接口的用户静默切到本地（#140）。"""
+    p = tmp_path / "legacy.json"
+    p.write_text(json.dumps({
+        "llm_backend": "openai",
+        "base_url": "https://api.example.com/v1",
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.llm_mode == "openai"
+    assert cfg.llm_backend == "openai"
+
+    # 旧配置本就是本地后端 → 推为本地模式。
+    p2 = tmp_path / "legacy-local.json"
+    p2.write_text(json.dumps({"llm_backend": "mlx_lm"}))
+    cfg2 = AgentConfig.load(str(p2))
+    assert cfg2.llm_mode == "local"
+    assert cfg2.llm_backend == "mlx_lm"
 
 
 def test_local_model_config_round_trip(tmp_path):
@@ -313,7 +355,12 @@ def test_invalid_local_backend_values_fall_back(tmp_path):
         "onnx_threads": 0,
     }))
     cfg = AgentConfig.load(str(p))
-    assert cfg.llm_backend == "openai"
+    # 非法后端 + 无 llm_mode：按本地模式推断，后端回退到新的默认值 mlx_lm
+    # （旧行为是回退 openai，但默认模式已经是本地，回退到 openai 反而自相矛盾）。
+    assert cfg.llm_mode == "local"
+    assert cfg.llm_backend == "mlx_lm"
     assert cfg.rag_embedding_backend == "fastembed"
     assert cfg.rag_rerank_backend == "fastembed"
     assert cfg.onnx_threads == 1
+    # 辅助后端非法 → mlx_lm（只支持本地直载，没有 openai 这一档）。
+    assert cfg.aux_llm_backend == "mlx_lm"

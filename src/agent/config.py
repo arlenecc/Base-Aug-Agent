@@ -16,13 +16,36 @@ class AgentConfig:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    # 主模型两种工作方式（UI 顶层二选一，#140）：
+    #   - "local"：进程内直载本地权重，模型类型由 llm_backend 细分
+    #     （mlx_lm / mlx_vlm / onnx / llama_cpp）；
+    #   - "openai"：OpenAI 兼容接口，此时 llm_backend 恒为 "openai"，
+    #     本地路径字段被忽略。
+    # 默认本地模式 + 默认加载 models/qwen3.5-4b-agentic-coder-v4-4bit-mlx。
+    llm_mode: str = "local"  # local | openai
     # 主模型既可使用 OpenAI-compatible 网络端点，也可在应用进程内直接加载。
     # 本地后端均为懒加载，应用配置时不会在 UI 线程同步读入数 GB 权重。
-    llm_backend: str = "openai"  # openai | mlx_lm | mlx_vlm | onnx | llama_cpp
+    llm_backend: str = "mlx_lm"  # openai | mlx_lm | mlx_vlm | onnx | llama_cpp
     llm_model_path: str = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
     llm_vision_projection_path: str = ""  # GGUF VLM 的 mmproj/clip 文件
     llm_chat_format: str = ""
     llm_vlm_handler: str = "mtmd"
+    # 辅助模型（#140）：只支持本地直载，供上下文摘要等轻量子任务使用，
+    # 避免为一次摘要把主模型的推理队列占住。默认 Qwen3.5-2B-MLX-4bit。
+    aux_llm_backend: str = "mlx_lm"  # mlx_lm | mlx_vlm | onnx | llama_cpp
+    aux_llm_model_path: str = "models/Qwen3.5-2B-MLX-4bit"
+    aux_llm_vision_projection_path: str = ""
+    aux_llm_chat_format: str = ""
+    aux_llm_vlm_handler: str = "mtmd"
+    # 辅助模型独立采样参数（不与主模型共用——主模型要的是生成质量，
+    # 辅助模型要的是快与稳，温度/生成长度都不同）。
+    aux_temperature: float = 0.2
+    aux_max_tokens: int = 2048
+    aux_top_p: float = 0.95
+    aux_min_p: float = 0.05
+    aux_top_k: int = 20
+    aux_repetition_penalty: float = 1.0
+    aux_request_timeout: float = 120.0
     local_model_threads: int = 4
     local_model_batch_size: int = 512
     local_gpu_layers: int = -1
@@ -63,16 +86,26 @@ class AgentConfig:
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16
-    rag_embedding_max_length: int = 512
-    rag_rerank_backend: str = "mlx"  # mlx | fastembed | onnx | disabled
+    # nomic-embed-text-v1.5 是旋转位置编码，训练长度 2048、靠 RoPE 外推到
+    # n_positions=8192（本地 MLX 权重 config 即如此）；绝对位置嵌入模型（如
+    # bge-small-zh，512）会在后端加载时按自己 config 夹紧。默认按 nomic 设 8192。
+    rag_embedding_max_length: int = 8192
+    rag_rerank_backend: str = "mlx"  # mlx | fastembed | onnx（UI 无 disabled 项）
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
     rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
     # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，
     # 这样在 UI 里切换后端不必重新粘贴路径。
     rag_rerank_mlx_model_path: str = "models/bge-reranker-v2-m3-mlx-mxfp8"
     rag_rerank_batch_size: int = 16
-    rag_rerank_max_length: int = 512
+    # bge-reranker-v2-m3 的位置嵌入上限是 8192（本地 MLX/ONNX 权重 config 均为
+    # 8194，fastembed tokenizer 本身截断在 8192）。旧版 bge-reranker-base 只有
+    # 512，各后端加载时会按自己的 config.json 夹紧，所以这里按 v2-m3 设上限。
+    rag_rerank_max_length: int = 8192
+    # 精排默认启用且 UI 不再暴露开关（下拉框已无 disabled）。这里保留字段，
+    # 便于在配置文件里手动写 rag_rerank_enabled=false 临时关掉精排——
+    # 此时 _rerank_backend 会被置为 disabled，检索退化为向量距离排序。
     rag_rerank_enabled: bool = True
+
     rag_auto_ingest: bool = True
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
     #   - "docling"：默认，版面理解 + ocrmac(Apple Vision) OCR
@@ -98,13 +131,20 @@ class AgentConfig:
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
         "onnx_threads", "rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
+        "aux_max_tokens", "aux_top_k",
     )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
-                     "request_timeout", "context_shrink_ratio")
+                     "request_timeout", "context_shrink_ratio",
+                     "aux_temperature", "aux_top_p", "aux_min_p",
+                     "aux_repetition_penalty", "aux_request_timeout")
     _STR_FIELDS = (
         "base_url", "api_key", "model", "workspace", "knowledge_base",
+        "llm_mode",
         "llm_backend", "llm_model_path", "llm_vision_projection_path",
         "llm_chat_format", "llm_vlm_handler",
+        "aux_llm_backend", "aux_llm_model_path",
+        "aux_llm_vision_projection_path", "aux_llm_chat_format",
+        "aux_llm_vlm_handler",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path",
@@ -114,7 +154,9 @@ class AgentConfig:
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (
-        "base_url", "model", "workspace", "llm_backend", "llm_model_path",
+        "base_url", "model", "workspace", "llm_mode",
+        "llm_backend", "llm_model_path",
+        "aux_llm_backend", "aux_llm_model_path",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path",
@@ -199,6 +241,11 @@ class AgentConfig:
             if coerced is not None:
                 kwargs[k] = coerced
         cfg = cls(**kwargs)
+        # llm_mode 是后加字段（#140）：旧配置里没有它。此时不能直接用
+        # dataclass 默认的 "local"——那会把一个一直用 OpenAI 接口的老用户
+        # 静默切到本地 MLX。按旧配置里真实生效的 llm_backend 反推模式。
+        if "llm_mode" not in data:
+            cfg.llm_mode = "openai" if cfg.llm_backend == "openai" else "local"
         cfg._migrate()
         return cfg
 
@@ -243,8 +290,21 @@ class AgentConfig:
         if self.max_context_tokens < 8192:
             self.max_context_tokens = self.max_tokens
 
+        if self.llm_mode not in ("local", "openai"):
+            self.llm_mode = "local"
         if self.llm_backend not in ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp"):
             self.llm_backend = "openai"
+        # 模式与后端必须自洽：OpenAI 接口模式下 llm_backend 只能是 openai；
+        # 本地模式下绝不可能是 openai（否则路径字段被忽略、模型 silently
+        # 走网络，用户在配置窗口看到的「本地模式」与实际行为相反）。
+        if self.llm_mode == "openai":
+            self.llm_backend = "openai"
+        elif self.llm_backend == "openai":
+            self.llm_mode = "local"
+            self.llm_backend = "mlx_lm"
+        # 辅助模型只支持本地直载：没有网络端点可配，非法值一律回退 mlx_lm。
+        if self.aux_llm_backend not in ("mlx_lm", "mlx_vlm", "onnx", "llama_cpp"):
+            self.aux_llm_backend = "mlx_lm"
         if self.rag_embedding_backend not in ("fastembed", "mlx", "onnx", "llama_cpp"):
             self.rag_embedding_backend = "fastembed"
         if self.rag_rerank_backend not in ("fastembed", "mlx", "onnx", "disabled"):

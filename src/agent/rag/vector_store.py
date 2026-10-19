@@ -237,7 +237,7 @@ def get_or_create_embedding_function(
     model_path: str = "",
     threads: int = 4,
     batch_size: int = 8,
-    max_length: int = 512,
+    max_length: int = 8192,
 ):
     """Return a shared embedding adapter for the selected local backend."""
     backend = (backend or "fastembed").lower()
@@ -283,7 +283,7 @@ def get_or_create_embedding_function(
 #   - 起步 16：直接落在 MLX 的拐点上，省掉从 2 一路爬 24 档的试探开销；
 #   - 上限 64：32-96 已无收益，64 是收益与安全的水位（未测更大批的内存）；
 #   - 下限 2：低于 4 吞吐掉到最优的 50-69%，但保留 2 作为极端内存压力下的
-#     避让位（形状预算还能进一步钳到 1，见 _shape_cap_size）。
+#     避让位（形状预算同样以此为止，见 _shape_cap_size，不再夹到 1）。
 # 步长 2：范围扩大到 [2,64] 后步长 1 要爬 31 档才到顶，爬山期过长。
 _SUBBATCH_MIN = 2
 _SUBBATCH_MAX = 64
@@ -301,25 +301,36 @@ _SUBBATCH_RSS_LIMIT = 8.0  # GB
 # 的：回到最优尺寸后 probe 会重新验证，验证不过自然回退。
 _SUBBATCH_RECOVER = 0.95
 # 形状预算（#126 修订）：嵌入激活 ∝ 子批条数 × 批内最长序列²（attention 项
-# 主导）。基准标定：size8 × 1311² ≈ 13.75M 单位 ≈ 4.7GB 激活（≈0.34GB/M
-# 单位）——预算 6M 单位把瞬时激活压在 ~2GB。不用绝对 RSS 阈值：真实同步
-# 进程基线本就有 6-10GB（OCR 原生缓存、LanceDB 等），绝对阈值会在首个子批
-# 就触发降档并永久卡死在下限（实测「子批很快降到 1」的根因）。形状预算
-# 只对超长文本钳制条数，与进程里其它组件的内存正交。
-_SUBBATCH_SHAPE_BUDGET = 6_000_000  # 条 × 字符²
+# 主导，对会物化注意力的 ONNX/CPU 路径成立）。预算按后端取（见
+# model_backends._EMBEDDING_SHAPE_BUDGET）：mlx 走 flash attention（O(S)）
+# 放到 B=4@8192，onnx 物化注意力（O(S²)）放到 B=2@8192，其它沿用 6M。不用
+# 绝对 RSS 阈值：真实同步进程基线本就有 6-10GB（OCR 原生缓存、LanceDB 等），
+# 绝对阈值会在首个子批就触发降档并永久卡死在下限（实测「子批很快降到 1」的
+# 根因）。形状预算只对超长文本钳制条数，与进程里其它组件的内存正交；但它
+# **不再把子批夹到 1**——最低保 2 条（见 _shape_cap_size），避免单条长切片
+# 的吞吐塌陷与固定成本摊不薄。
 
 
-def _shape_cap_size(size: int, max_len: int) -> int:
+def _shape_cap_size(size: int, max_len: int, backend: Optional[str] = None) -> int:
     """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。
 
-    这是**内存硬约束**，可以压到 ``_SUBBATCH_MIN`` 以下（超长文本时到 1）：
-    调优器的下限管的是「状态机探索范围」，形状预算管的是「单批不能超过多少
-    激活」，二者语义不同——内存安全优先于下限。
+    这是**内存硬约束**，但**不再夹到 1**：最低保 2 条，与调优器的探索下限
+    ``_SUBBATCH_MIN`` 对齐，两者不再互相打架。单条长切片会把吞吐打到最优的
+    50-69%，且模型加载 / ONNX 会话初始化的固定成本被单条摊得极薄；实测
+    int8 ONNX @8192 B=2 内存可接受，故下探到 2 为止。请求本身不足 2 条时
+    按请求返回，不会为了凑下限而放大批次。
+
+    预算按后端取：mlx 走 flash attention（O(S)）可放到 B=4@8192；onnx(CPU)
+    物化注意力（O(S²)）放到 B=2@8192；其它后端沿用 6M。
     """
     if max_len <= 0:
         return size
-    budget = _SUBBATCH_SHAPE_BUDGET // (max_len * max_len)
-    return max(1, min(size, budget))
+    from .model_backends import (
+        _EMBEDDING_SHAPE_BUDGET,
+        _EMBEDDING_SHAPE_BUDGET_DEFAULT,
+    )
+    budget = _EMBEDDING_SHAPE_BUDGET.get(backend, _EMBEDDING_SHAPE_BUDGET_DEFAULT)
+    return min(size, max(_SUBBATCH_MIN, budget // (max_len * max_len)))
 
 
 # 每个窗口聚合的子批数：太小易被单批噪声带偏，太大响应迟钝。
@@ -359,8 +370,9 @@ class _SubBatchTuner:
 
     内存安全双保险（#126/#129）：
       ① 形状预算：_embed_chunks 组装每个子批时按 ``_shape_cap_size`` 钳制
-         条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小。绝对 RSS
-         阈值在真实同步进程（基线 6-10GB）必然误触发，曾导致永久卡死。
+         条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小，但最低保
+         2 条、不夹到 1（吞吐保护，见 #139）。绝对 RSS 阈值在真实同步进程
+         （基线 6-10GB）必然误触发，曾导致永久卡死。
       ② RSS 软墙 8GB（无闩锁，2026-10 用户定参保留 8GB）：超墙每子批
          force_down 降 1 档（步长 2），回墙下即停，恢复交给 monitor 恢复
          分支——旧 5GB 闩锁版是「降到下限再也不回去」的根因。调优器 report()
@@ -567,13 +579,13 @@ class VectorStore:
         embedding_model_path: str = "",
         embedding_threads: int = 4,
         embedding_batch_size: int = 8,
-        embedding_max_length: int = 512,
+        embedding_max_length: int = 8192,
         rerank_backend: str = "fastembed",
         rerank_model_path: str = "",
         rerank_mlx_model_path: str = "",
         rerank_threads: int = 4,
         rerank_batch_size: int = 16,
-        rerank_max_length: int = 512,
+        rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
     ):
         self._persist_dir = persist_dir
@@ -1123,9 +1135,11 @@ class VectorStore:
         随子批增大单调变差，size2 双优）。长度分桶后 padding 已归零。
 
         形状预算（#126 修订）：每个子批组装时按 ``_shape_cap_size`` 钳制
-        条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小，把瞬时激活
-        压在 ~2GB。不再使用绝对 RSS 阈值——真实同步进程基线 6-10GB，绝对
-        阈值会误触发并永久卡死在下限。
+        条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小。预算按后端
+        取——mlx 走 flash attention 放到 B=4@8192，onnx 物化注意力放到
+        B=2@8192（详见 ``_EMBEDDING_SHAPE_BUDGET``）；但**最低保 2 条、不
+        夹到 1**（#139，单条长切片吞吐塌陷且固定成本摊不薄）。不再使用绝对
+        RSS 阈值——真实同步进程基线 6-10GB，绝对阈值会误触发并永久卡死在下限。
 
         关键优化：**按文本长度排序分桶**（#122）。fastembed 的批内所有序列
         padding 到批内最长——长度混杂的批 padding 浪费 2-4 倍算力（实测
@@ -1152,7 +1166,7 @@ class VectorStore:
             # 形状预算钳制（#126 修订）：激活 ∝ 条数 × 批内最长序列²，对
             # 超长文本收缩本子批条数，把瞬时激活压在 ~2GB（常量注释含标定）。
             # 降序分桶下切片首条即批内最长，钳制后 report() 收到实际条数。
-            size = _shape_cap_size(size, len(texts[order[sub_start]]))
+            size = _shape_cap_size(size, len(texts[order[sub_start]]), self._embedding_backend)
             idxs = order[sub_start:sub_start + size]
             _t_sub = _time.monotonic()
             sub_vectors = self._ef([texts[i] for i in idxs])

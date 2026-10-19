@@ -183,8 +183,13 @@ class Agent:
         callbacks: AgentCallbacks,
         tool_registry: Optional[ToolRegistry] = None,
         skills: Optional[SkillManager] = None,
+        aux_llm: Optional["Any"] = None,
     ):
         self.llm = llm  # object with chat_stream(messages, tools, temperature)
+        # 辅助模型（#140）：轻量子任务（上下文摘要）专用，与主模型分离，
+        # 避免一次摘要把主模型的推理队列占住。可为 None（退化为用主模型）。
+        # 同样由 UI 持有并负责 close()，agent 不关它。
+        self.aux_llm = aux_llm
         self.config = config
         self.callbacks = callbacks
         self.tools = tool_registry or ToolRegistry(config=config, callbacks=callbacks)
@@ -550,17 +555,35 @@ class Agent:
     def _summarize_via_llm(self, prompt: str) -> str:
         """Call the LLM (non-interactive, no tools) to produce a summary.
         Uses a low temperature for determinism. Reuses chat_stream so the
-        same client/transport is used."""
+        same client/transport is used.
+
+        优先走辅助模型（#140）：摘要是轻量子任务，用小模型更快，也不会占住
+        主模型的推理队列。辅助模型缺失或不可用时退回主模型——摘要失败最坏
+        只是上下文不收缩，不能让整轮对话崩掉。
+        """
         messages = [
             {"role": "system", "content": "你是精确的对话摘要器，用中文输出要点列表，不加前言和解释。"},
             {"role": "user", "content": prompt},
         ]
+        target = self.aux_llm if self.aux_llm is not None else self.llm
         out: List[str] = []
-        for ev in self.llm.chat_stream(messages, tools=None, temperature=0.2):
-            if ev.type == "content":
-                out.append(ev.content)
-            elif ev.type == "done":
-                break
+        try:
+            for ev in target.chat_stream(messages, tools=None, temperature=0.2):
+                if ev.type == "content":
+                    out.append(ev.content)
+                elif ev.type == "done":
+                    break
+        except Exception as e:
+            if target is self.llm:
+                raise
+            self._log(f"[context] 辅助模型摘要失败，回退主模型: {e}")
+            target = self.llm
+            out = []
+            for ev in target.chat_stream(messages, tools=None, temperature=0.2):
+                if ev.type == "content":
+                    out.append(ev.content)
+                elif ev.type == "done":
+                    break
         return "".join(out).strip()
 
     def _append_summary_to_memory(self, summary: str, reason: str) -> None:

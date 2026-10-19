@@ -88,7 +88,7 @@ def _embedding_options(config: AgentConfig) -> dict:
         "embedding_model_path": getattr(config, "rag_embedding_model_path", ""),
         "embedding_threads": getattr(config, "onnx_threads", 4),
         "embedding_batch_size": getattr(config, "rag_embedding_batch_size", 8),
-        "embedding_max_length": getattr(config, "rag_embedding_max_length", 512),
+        "embedding_max_length": getattr(config, "rag_embedding_max_length", 8192),
     }
 
 

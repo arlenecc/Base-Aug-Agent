@@ -96,7 +96,7 @@ class GraphMemoryStore:
         embedding_model_path: str = "",
         embedding_threads: int = 4,
         embedding_batch_size: int = 8,
-        embedding_max_length: int = 512,
+        embedding_max_length: int = 8192,
     ):
         self._path = path
         self._vector_dir = path + ".vectors"

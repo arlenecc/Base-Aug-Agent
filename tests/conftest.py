@@ -13,6 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
+# 启动时不要把默认本地模型加载进内存（#140）：加载数 GB 权重会让整个套件
+# 变成分钟级，而且 CI 上多半没有对应的 MLX/llama.cpp 运行时。
+# MainWindow._autoload_default_models 读这个变量决定是否跳过。
+os.environ.setdefault("BASE_AGENT_SKIP_MODEL_AUTOLOAD", "1")
+
 
 # ---------------------------------------------------------------------------
 # Fake embedding function — deterministic, no network, no model download.

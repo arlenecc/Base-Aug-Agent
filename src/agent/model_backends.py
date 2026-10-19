@@ -21,6 +21,8 @@ from .llm_client import LLMClient, LLMError, StreamEvent
 logger = logging.getLogger(__name__)
 
 LLM_BACKENDS = ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
+# 辅助模型（#140）只支持进程内直载：没有网络端点可配。
+AUX_LLM_BACKENDS = ("mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
 
 
 class LLMBackend(Protocol):
@@ -870,3 +872,73 @@ def create_llm_backend(config: Any) -> LLMBackend:
     if backend == "llama_cpp":
         return LlamaCppBackend(path, config)
     raise LLMError(f"未知主模型后端: {backend}; 可选值: {', '.join(LLM_BACKENDS)}")
+
+
+class _AuxConfigView:
+    """实时读取 ``aux_*`` 参数的配置视图（#140）。
+
+    本地后端统一用 ``getattr(self.config, "top_p")`` 这套名字读采样参数。
+    辅助模型要用自己的一套——主模型重生成质量、辅助模型重快与稳，温度与
+    生成长度都不同——所以这里造一个视图，而不是去改每个后端类的读取代码
+    （那样很容易在某个后端里漏改，悄悄读到主模型的值）。
+
+    **必须是实时的，不能是快照**：用户在配置窗口改完辅助模型的 Temp /
+    context 再点「应用配置」，快照里的值还是旧的——参数看起来没生效。
+    这里每次属性访问都回到源 config 现读，改完即生效、无需重新加载模型。
+    """
+
+    # 标准字段名 → 辅助模型的源字段名。
+    _SAMPLING_MAP = {
+        "temperature": "aux_temperature",
+        "max_tokens": "aux_max_tokens",
+        "top_p": "aux_top_p",
+        "min_p": "aux_min_p",
+        "top_k": "aux_top_k",
+        "repetition_penalty": "aux_repetition_penalty",
+        "request_timeout": "aux_request_timeout",
+        # GGUF VLM 的 mmproj / chat format / handler（见 LlamaCppBackend）。
+        "llm_vision_projection_path": "aux_llm_vision_projection_path",
+        "llm_chat_format": "aux_llm_chat_format",
+        "llm_vlm_handler": "aux_llm_vlm_handler",
+    }
+
+    def __init__(self, config: Any):
+        object.__setattr__(self, "_src", config)
+
+    def __getattr__(self, name: str):
+        # 只有不在实例字典里的名字才会走到这里；_src 在字典里，不会递归。
+        src = object.__getattribute__(self, "_src")
+        mapped = self._SAMPLING_MAP.get(name)
+        if mapped is not None:
+            return getattr(src, mapped)
+        return getattr(src, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        # 后端偶尔会往 config 上挂东西（罕见，但存在）：转写到源 config，
+        # 否则写进视图就丢了。
+        src = object.__getattribute__(self, "_src")
+        mapped = self._SAMPLING_MAP.get(name)
+        setattr(src, mapped or name, value)
+
+
+def aux_sampling_config(config: Any) -> Any:
+    """返回把 ``aux_*`` 参数映射到标准字段名的实时配置视图（#140）。"""
+    return _AuxConfigView(config)
+
+
+def create_aux_llm_backend(config: Any) -> LLMBackend:
+    """辅助模型后端（#140）：进程内直载，无网络端点。"""
+    backend = str(getattr(config, "aux_llm_backend", "mlx_lm") or "mlx_lm").lower()
+    if backend not in AUX_LLM_BACKENDS:
+        raise LLMError(
+            f"未知辅助模型后端: {backend}; 可选值: {', '.join(AUX_LLM_BACKENDS)}"
+        )
+    path = getattr(config, "aux_llm_model_path", "")
+    view = aux_sampling_config(config)
+    if backend == "mlx_lm":
+        return MLXLanguageBackend(path, view)
+    if backend == "mlx_vlm":
+        return MLXVLMBackend(path, view)
+    if backend == "onnx":
+        return ONNXLanguageBackend(path, view)
+    return LlamaCppBackend(path, view)

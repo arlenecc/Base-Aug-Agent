@@ -21,10 +21,86 @@ from ..model_backends import resolve_model_path
 logger = logging.getLogger(__name__)
 
 EMBEDDING_BACKENDS = ("fastembed", "mlx", "onnx", "llama_cpp")
-RERANKER_BACKENDS = ("fastembed", "mlx", "onnx", "disabled")
+# UI 下拉只提供前三项；"disabled" 仅由配置文件的 rag_rerank_enabled=false
+# 间接产生（见 VectorStore.__init__），create_reranker_backend 仍容错处理。
+RERANKER_BACKENDS = ("fastembed", "mlx", "onnx")
 
 _DEFAULT_DOC_PREFIX = "search_document: "
 _DEFAULT_QUERY_PREFIX = "search_query: "
+
+# bge-reranker-v2-m3 的位置嵌入上限是 8192（本地 MLX/ONNX 权重的 config 均为
+# max_position_embeddings=8194，fastembed 侧 tokenizer 本身就截断在 8192），
+# 旧版 bge-reranker-base 只有 512；embedding 侧 nomic-embed-text-v1.5 是旋转
+# 位置编码，训练长度 2048、靠 RoPE 外推到 n_positions=8192。三类上限都按各自
+# 模型 config 现算，不写死：请求值超过模型上限时夹回去，避免把超出位置嵌入的
+# token 喂进网络（ONNX 侧不会报错，只会静默给出无意义结果）。
+_RERANK_DEFAULT_MAX_LENGTH = 8192
+_RERANK_UNKNOWN_MAX_LENGTH = 512
+_EMBEDDING_DEFAULT_MAX_LENGTH = 8192
+_EMBEDDING_UNKNOWN_MAX_LENGTH = 512
+_RERANK_BATCH_TOKEN_BUDGET = 8192
+# 嵌入批收缩：与 reranker 同理，但按后端分开标定（单位「条 × 字符²」，与
+# VectorStore._shape_cap_size 同口径）。
+#   mlx  : 走 flash attention，注意力不物化 [B,H,S,S]，内存 ∝ 条数 × S（O(S)），
+#         故可放大——300M → B=4@8192，全 S 区间激活 ≤ ~2GB。
+#   onnx : CPU 会物化注意力分数+概率两个 [B,H,S,S]，内存 ∝ 条数 × S²（O(S²)），
+#         150M → B=2@8192；实际多为 int8（更低），即便误用 fp16 也仅 ~3.5GB，
+#         用户确认可接受（fp32 会到 ~2 倍、约 14GB，不推荐）。
+#   其它 : 沿用原 6M（fastembed 内部自管批，且默认 500 切片不触发）。
+_EMBEDDING_SHAPE_BUDGET = {
+    "mlx": 300_000_000,
+    "onnx": 150_000_000,
+}
+_EMBEDDING_SHAPE_BUDGET_DEFAULT = 6_000_000
+
+
+def _model_max_length(model_dir: Any, default: int = _RERANK_UNKNOWN_MAX_LENGTH) -> int:
+    """按模型 config 算可截断上限。
+
+    旋转式位置编码（NomicBERT）：``max_position_embeddings`` 只是「训练长度」
+    （nomic=2048），真实序列上限是 ``n_positions``（nomic=8192，靠 RoPE 外推）
+    —— 直接读它。绝对位置嵌入（XLM-R / bge 系列）：位置表是硬上限，留 2 个
+    特殊 token 位取 ``max_position_embeddings - 2``。config 缺失则退回保守默认。
+    """
+    try:
+        config_path = Path(model_dir) / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    n_positions = int(config.get("n_positions") or 0)
+    if n_positions > 0:
+        return max(8, n_positions)
+    value = int(config.get("max_position_embeddings") or 0)
+    if value > 0:
+        return max(8, value - 2)
+    return default
+
+
+def _rerank_batch_for(batch_size: int, seq_len: int,
+                      budget: int = _RERANK_BATCH_TOKEN_BUDGET) -> int:
+    """Shrink the batch so ``batch * seq_len`` stays within the token budget."""
+    size = max(1, int(batch_size))
+    if seq_len and int(seq_len) > 0:
+        size = min(size, max(1, budget // int(seq_len)))
+    return size
+
+
+def _embedding_batch_for(batch_size: int, seq_len: int, backend: str = "") -> int:
+    """Embedding 版批收缩（与 reranker 同机制，但按后端取预算）。
+
+    ``backend`` 为 "mlx" / "onnx" 时用各自标定预算，否则用默认 6M。
+    返回「不超过请求 batch_size 且不超过形状预算允许的最大条数」。
+
+    下限 **2 条**：内存硬约束可以把批压得很小，但不夹到 1——单条长切片吞吐
+    塌到最优的 50-69%，模型加载 / 会话初始化的固定成本也被单条摊得极薄；
+    实测 int8 ONNX @8192 B=2 内存可接受，故下探到 2 为止。请求本身只有 1
+    条时仍返回 1，不会为了凑下限而放大批次。
+    """
+    size = max(1, int(batch_size))
+    if seq_len and int(seq_len) > 0:
+        budget = _EMBEDDING_SHAPE_BUDGET.get(backend, _EMBEDDING_SHAPE_BUDGET_DEFAULT)
+        size = min(size, max(2, budget // (int(seq_len) * int(seq_len))))
+    return size
 
 
 def _normalize_rows(values):
@@ -64,13 +140,15 @@ class MLXEmbeddingFunction:
         model_path: str,
         *,
         batch_size: int = 8,
-        max_length: int = 512,
+        max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
         document_prefix: str = _DEFAULT_DOC_PREFIX,
         query_prefix: str = _DEFAULT_QUERY_PREFIX,
     ):
         self._model_path = resolve_model_path(model_path)
         self._batch_size = max(1, int(batch_size))
-        self._max_length = max(8, int(max_length))
+        # 请求值先记下，模型加载后按 config 的位置/旋转上限夹紧（见 _model_max_length）。
+        self._max_length_requested = max(8, int(max_length))
+        self._max_length = self._max_length_requested
         self._document_prefix = document_prefix
         self._query_prefix = query_prefix
         self._model = None
@@ -89,6 +167,15 @@ class MLXEmbeddingFunction:
             config_path = Path(self._model_path) / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
             self._model_type = str(config.get("model_type", ""))
+            # 截断长度不得超过模型上限（NomicBERT 旋转式取 n_positions=8192，
+            # 绝对位置嵌入取 max_position_embeddings-2），否则越界序列会被静默忽略。
+            ceiling = _model_max_length(self._model_path)
+            self._max_length = min(self._max_length_requested, ceiling)
+            if self._max_length < self._max_length_requested:
+                logger.info(
+                    "MLX Embedding 截断长度按模型上限夹紧: %d → %d",
+                    self._max_length_requested, self._max_length,
+                )
             if self._model_type == "nomic_bert":
                 self._model, self._processor = self._load_nomic(config)
                 self._generate = None
@@ -253,30 +340,45 @@ class MLXEmbeddingFunction:
                         max_length=self._max_length,
                         return_tensors="np",
                     )
-                    token_types = encoded.get("token_type_ids")
-                    values = self._model(
-                        mx.array(encoded["input_ids"]),
-                        mx.array(encoded["attention_mask"]),
-                        mx.array(token_types) if token_types is not None else None,
-                    )
-                    mx.eval(values)
-                    values = np.asarray(values, dtype=np.float32)
+                    ids = np.asarray(encoded["input_ids"])
+                    # 长切片下按 token 预算二次切批：注意力 O(L²)，直接把
+                    # batch×L² 的激活全展开会把显存/统一内存打爆。
+                    inner = _embedding_batch_for(len(batch), ids.shape[1], "mlx")
+                    for offset in range(0, len(batch), inner):
+                        token_types = encoded.get("token_type_ids")
+                        chunk_tt = None
+                        if token_types is not None:
+                            chunk_tt = mx.array(
+                                np.asarray(token_types)[offset:offset + inner]
+                            )
+                        values = self._model(
+                            mx.array(ids[offset:offset + inner]),
+                            mx.array(
+                                np.asarray(encoded["attention_mask"])[offset:offset + inner]
+                            ),
+                            chunk_tt,
+                        )
+                        mx.eval(values)
+                        outputs.extend(np.asarray(values, dtype=np.float32).tolist())
                 else:
                     import mlx.core as mx
 
-                    values = self._generate(
-                        self._model,
-                        self._processor,
-                        batch,
-                        max_length=self._max_length,
-                        padding=True,
-                        truncation=True,
-                    )
-                    if hasattr(values, "text_embeds"):
-                        values = values.text_embeds
-                    mx.eval(values)
-                    values = _normalize_rows(np.asarray(values))
-                outputs.extend(values.tolist())
+                    # 非 nomic 路径：generate 内部完成 tokenize，按 max_length
+                    # 预估序列长收缩子批（保守上界），保证 O(L²) 内存可控。
+                    inner = _embedding_batch_for(len(batch), self._max_length, "mlx")
+                    for offset in range(0, len(batch), inner):
+                        values = self._generate(
+                            self._model,
+                            self._processor,
+                            batch[offset:offset + inner],
+                            max_length=self._max_length,
+                            padding=True,
+                            truncation=True,
+                        )
+                        if hasattr(values, "text_embeds"):
+                            values = values.text_embeds
+                        mx.eval(values)
+                        outputs.extend(_normalize_rows(np.asarray(values)).tolist())
             return outputs
 
     def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
@@ -316,14 +418,16 @@ class ONNXEmbeddingFunction:
         *,
         threads: int = 4,
         batch_size: int = 8,
-        max_length: int = 512,
+        max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
         document_prefix: str = _DEFAULT_DOC_PREFIX,
         query_prefix: str = _DEFAULT_QUERY_PREFIX,
     ):
         self._model_file, self._model_dir = _find_onnx(model_path)
         self._threads = max(1, int(threads))
         self._batch_size = max(1, int(batch_size))
-        self._max_length = max(8, int(max_length))
+        # 模型加载后按 config 的位置/旋转上限夹紧（见 _model_max_length）。
+        self._max_length_requested = max(8, int(max_length))
+        self._max_length = self._max_length_requested
         self._document_prefix = document_prefix
         self._query_prefix = query_prefix
         self._session = None
@@ -351,6 +455,16 @@ class ONNXEmbeddingFunction:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self._model_dir, local_files_only=True, trust_remote_code=False
             )
+            # ONNX 图是动态序列长，超长输入不会报错、只会给出无意义向量，所以
+            # 必须按位置/旋转上限夹紧（NomicBERT 旋转式 → n_positions=8192，
+            # 绝对位置嵌入 → max_position_embeddings-2）。
+            ceiling = _model_max_length(self._model_dir)
+            self._max_length = min(self._max_length_requested, ceiling)
+            if self._max_length < self._max_length_requested:
+                logger.info(
+                    "ONNX Embedding 截断长度按模型上限夹紧: %d → %d",
+                    self._max_length_requested, self._max_length,
+                )
             logger.info("ONNX Embedding 加载完成(CPU): %s", self._model_file)
 
     def _embed(self, texts: List[str]) -> List[List[float]]:
@@ -371,19 +485,27 @@ class ONNXEmbeddingFunction:
                     max_length=self._max_length,
                     return_tensors="np",
                 )
-                feeds = {
-                    key: np.asarray(value, dtype=np.int64)
-                    for key, value in encoded.items()
-                    if key in names
-                }
-                outputs = self._session.run(None, feeds)
-                values = np.asarray(outputs[0])
-                if values.ndim == 3:
-                    mask = np.asarray(encoded["attention_mask"], dtype=np.float32)[..., None]
-                    values = (values * mask).sum(axis=1) / np.maximum(mask.sum(axis=1), 1e-12)
-                elif values.ndim != 2:
-                    raise RuntimeError(f"不支持的 ONNX Embedding 输出形状: {values.shape}")
-                all_values.extend(_normalize_rows(values).tolist())
+                ids = np.asarray(encoded["input_ids"])
+                # 长切片下按 token 预算二次切批（注意力 O(L²)）。
+                inner = _embedding_batch_for(len(batch), ids.shape[1], "onnx")
+                for offset in range(0, len(batch), inner):
+                    chunk = {
+                        key: np.asarray(value, dtype=np.int64)[offset:offset + inner]
+                        for key, value in encoded.items()
+                        if key in names
+                    }
+                    outputs = self._session.run(None, chunk)
+                    values = np.asarray(outputs[0])
+                    if values.ndim == 3:
+                        mask = np.asarray(
+                            encoded["attention_mask"], dtype=np.float32
+                        )[offset:offset + inner, ..., None]
+                        values = (values * mask).sum(axis=1) / np.maximum(
+                            mask.sum(axis=1), 1e-12
+                        )
+                    elif values.ndim != 2:
+                        raise RuntimeError(f"不支持的 ONNX Embedding 输出形状: {values.shape}")
+                    all_values.extend(_normalize_rows(values).tolist())
         return all_values
 
     def __call__(self, input: List[str]) -> List[List[float]]:
@@ -634,10 +756,14 @@ def _build_xlm_roberta_reranker(config: Dict[str, Any]):
 class MLXReranker:
     """Direct MLX cross-encoder reranker (XLM-RoBERTa sequence classification)."""
 
-    def __init__(self, model_path: str, *, batch_size: int = 16, max_length: int = 512):
+    def __init__(self, model_path: str, *, batch_size: int = 16,
+                 max_length: int = _RERANK_DEFAULT_MAX_LENGTH):
         self._model_path = resolve_model_path(model_path)
         self._batch_size = max(1, int(batch_size))
-        self._max_length = max(8, int(max_length))
+        # 请求值先记下，模型加载后按 config.json 的位置嵌入上限夹紧
+        # （bge-reranker-v2-m3 → 8192，bge-reranker-base → 512）。
+        self._max_length_requested = max(8, int(max_length))
+        self._max_length = self._max_length_requested
         self._model = None
         self._tokenizer = None
         self._lock = threading.RLock()
@@ -663,6 +789,15 @@ class MLXReranker:
             config_path = Path(self._model_path) / "config.json"
             config = _json.loads(config_path.read_text(encoding="utf-8"))
             model = _build_xlm_roberta_reranker(config)
+            # 截断长度不得超过模型的位置嵌入数，否则 query+doc 拼接过长时
+            # token 越界（MX 索引直接报错，不会静默出错）。
+            ceiling = _model_max_length(self._model_path)
+            self._max_length = min(self._max_length_requested, ceiling)
+            if self._max_length < self._max_length_requested:
+                logger.info(
+                    "MLX Reranker 截断长度按模型上限夹紧: %d → %d（max_position_embeddings）",
+                    self._max_length_requested, self._max_length,
+                )
             weights = mx.load(str(Path(self._model_path) / "model.safetensors"))
             # 丢弃 MLX 侧不存在的 HF 残留键（如 roberta.embeddings.position_ids）。
             expected = {key for key, _ in tree_flatten(model.parameters())}
@@ -708,9 +843,16 @@ class MLXReranker:
                     max_length=self._max_length,
                     return_tensors="np",
                 )
-                logits = self._model(mx.array(np.asarray(encoded["input_ids"])))
-                mx.eval(logits)
-                scores.extend(float(value) for value in np.asarray(logits).reshape(-1))
+                ids = np.asarray(encoded["input_ids"])
+                # 长切片下按 token 预算二次切批：注意力 O(L²)，直接把
+                # batch×L² 的激活全展开会把显存/统一内存打爆。
+                inner = _rerank_batch_for(len(batch), ids.shape[1])
+                for offset in range(0, len(batch), inner):
+                    logits = self._model(mx.array(ids[offset:offset + inner]))
+                    mx.eval(logits)
+                    scores.extend(
+                        float(value) for value in np.asarray(logits).reshape(-1)
+                    )
         return scores
 
     def name(self) -> str:
@@ -730,10 +872,13 @@ class MLXReranker:
 class ONNXReranker:
     """Direct CPU-only ONNX cross-encoder using a local Transformers tokenizer."""
 
-    def __init__(self, model_path: str, *, threads: int = 4, max_length: int = 512):
+    def __init__(self, model_path: str, *, threads: int = 4,
+                 max_length: int = _RERANK_DEFAULT_MAX_LENGTH):
         self._model_file, self._model_dir = _find_onnx(model_path)
         self._threads = max(1, int(threads))
-        self._max_length = max(8, int(max_length))
+        # 模型加载后按 config.json 的位置嵌入上限夹紧（见 MLXReranker）。
+        self._max_length_requested = max(8, int(max_length))
+        self._max_length = self._max_length_requested
         self._session = None
         self._tokenizer = None
         self._lock = threading.RLock()
@@ -761,6 +906,15 @@ class ONNXReranker:
         self._tokenizer = AutoTokenizer.from_pretrained(
             self._model_dir, local_files_only=True, trust_remote_code=False
         )
+        # ONNX 图是动态序列长，超长输入不会报错、只会给出无意义分数，所以必须
+        # 按位置嵌入上限夹紧：bge-reranker-v2-m3 → 8192，base → 512。
+        ceiling = _model_max_length(self._model_dir)
+        self._max_length = min(self._max_length_requested, ceiling)
+        if self._max_length < self._max_length_requested:
+            logger.info(
+                "ONNX Reranker 截断长度按模型上限夹紧: %d → %d（max_position_embeddings）",
+                self._max_length_requested, self._max_length,
+            )
         logger.info("ONNX Reranker 加载完成(CPU): %s", self._model_file)
 
     def rerank(self, query: str, documents: Iterable[str], batch_size: int = 16, **kwargs):
@@ -781,13 +935,17 @@ class ONNXReranker:
                     max_length=self._max_length,
                     return_tensors="np",
                 )
-                feeds = {
-                    key: np.asarray(value, dtype=np.int64)
-                    for key, value in encoded.items()
-                    if key in input_names
-                }
-                output = np.asarray(self._session.run(None, feeds)[0]).reshape(-1)
-                scores.extend(float(value) for value in output)
+                ids = np.asarray(encoded["input_ids"])
+                # 长切片下按 token 预算二次切批（注意力 O(L²)，CPU 上尤甚）。
+                inner = _rerank_batch_for(len(batch), ids.shape[1])
+                for offset in range(0, len(batch), inner):
+                    chunk = {
+                        key: np.asarray(value[offset:offset + inner], dtype=np.int64)
+                        for key, value in encoded.items()
+                        if key in input_names
+                    }
+                    output = np.asarray(self._session.run(None, chunk)[0]).reshape(-1)
+                    scores.extend(float(value) for value in output)
         return scores
 
     def close(self) -> None:
@@ -846,7 +1004,7 @@ def create_embedding_backend(
     *,
     threads: int = 4,
     batch_size: int = 8,
-    max_length: int = 512,
+    max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
 ):
     backend = (backend or "fastembed").lower()
     if backend == "mlx":
@@ -887,7 +1045,7 @@ def create_reranker_backend(
     model_path: str,
     *,
     threads: int = 4,
-    max_length: int = 512,
+    max_length: int = _RERANK_DEFAULT_MAX_LENGTH,
     batch_size: int = 16,
     mlx_model_path: str = "",
 ):

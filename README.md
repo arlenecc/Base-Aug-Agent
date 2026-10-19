@@ -26,27 +26,34 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ [Base URL] [API Key] [模型] [获取模型]                    Row 0  │
-│ [上下文长度] [温度] [top_p] [min_p] [top_k] [重复惩罚] [超时] [应用配置] │
-│ [工作目录] [知识库] [同步知识] [停止同步]                   Row 2  │
-├──────────────────────────────┬───────────────────────────────────┤
-│ [对话] — [清空对话] [终止对话] │ 思考过程 / 日志                    │
-│                              │                                   │
-│ 对话内容...                   │ 推理过程实时显示...                 │
-│                              │ 知识同步进度实时显示...              │
-│                              │ 检索过程日志实时显示...              │
-├──────────────────────────────┴───────────────────────────────────┤
+│ 对话 [附加图片…]                [清空对话] [终止对话] [日志] [配置] │ 顶栏
+├─────────────────────────────────┬────────────────────────────────┤
+│                                 │ 任务计划            1/3 完成    │
+│                                 ├────────────────────────────────┤
+│ 对话内容…                        │ 目标：…                        │
+│                                 │ ▶ 2. 进行中的步骤（高亮标记）    │
+│                                 │                                │
+│ （一直顶到最上面）                │ 思考过程                       │
+│                                 │ 推理过程实时显示…                │
+│                                 │                                │
+│              0.0 tok/s | 总计 0 tokens                            │
+├─────────────────────────────────┴────────────────────────────────┤
 │ 输入框                                               [发送]      │
 ├──────────────────────────────────────────────────────────────────┤
-│ [状态栏]                                   [进度条] [token 速度]  │
+│ [状态栏]                                   [进度条]               │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+- **「配置」**（右上角）：打开独立配置窗口，模型后端 / 路径 / 知识库 / 采样参数都在里面
+- **「日志」**（右上角）：打开独立日志窗口，RAG 同步、工具调用、检索日志都进这里
+- **任务计划**（右上）：任务调用 `task_plan` 制定计划后显示目标与每一步状态（○ 待办 / ▶ 进行中 / ✓ 完成 / ✕ 阻塞），进行中的步骤加粗 + 底色标记，标题右侧显示 `已完成/总数`
+- **tokens 计数**：`tok/s | 总计 N tokens`，在发送框上方居中
+
 **按钮说明**：
-- 「同步知识」：增量同步知识库（右键可强制全量重处理）
-- 「停止同步」：仅在同步进行中启用，协作式取消（完成当前文件/批次后退出）
+- 「同步知识」（配置窗口）：增量同步知识库（右键可强制全量重处理）
+- 「停止同步」（配置窗口）：仅在同步进行中启用，协作式取消（完成当前文件/批次后退出）
 - 「终止对话」：终止当前 agent 对话（完成当前工具后退出）
-- 「应用配置」：在 agent 运行期间会被阻止，需先终止当前对话
+- 「应用配置」（配置窗口）：在 agent 运行期间会被阻止，需先终止当前对话
 
 ## 快速开始
 
@@ -165,21 +172,26 @@ pip install -e ".[local-gguf]"   # llama-cpp-python
 
 | 配置键 | 默认 | 说明 |
 |--------|------|------|
-| `llm_backend` | `openai` | `openai` / `mlx_lm` / `mlx_vlm` / `onnx` / `llama_cpp` |
+| `llm_mode` | `local` | `local` / `openai`——主模型顶层二选一（#140）。`local` = 进程内直载本地权重；`openai` = OpenAI 兼容接口（此时 `llm_backend` 恒为 `openai`，本地路径字段被忽略） |
+| `llm_backend` | `mlx_lm` | 本地模式下的模型类型：`mlx_lm` / `mlx_vlm` / `onnx` / `llama_cpp`（UI 显示为 MLX-LM / MLX-VLM / ONNX / GGUF）；接口模式下恒为 `openai` |
 | `llm_model_path` | `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx` | 本地主模型目录或 `.onnx`/`.gguf` 文件 |
-| `rag_embedding_backend` | `mlx` | `mlx` / `fastembed` / `onnx` / `llama_cpp` |
+| `aux_llm_backend` / `aux_llm_model_path` | `mlx_lm` / `models/Qwen3.5-2B-MLX-4bit` | 辅助模型（#140）：只支持本地直载，供上下文摘要等轻量子任务使用，不占主模型推理队列 |
+| `aux_temperature` / `aux_max_tokens` / `aux_top_p` / `aux_min_p` / `aux_top_k` / `aux_repetition_penalty` / `aux_request_timeout` | `0.2` / `2048` / `0.95` / `0.05` / `20` / `1.0` / `120` | 辅助模型独立采样参数（与主模型分开——主模型重质量，辅助模型重快与稳）。改完即生效，无需重新加载模型 |
+| `rag_embedding_backend` | `mlx` | `mlx` / `fastembed` / `onnx` / `llama_cpp`（UI 显示 GGUF） |
 | `rag_embedding_model_path` | `models/nomic-embed-text-v1.5-mlx` | 本地 Embedding 权重 |
-| `rag_rerank_backend` | `mlx` | `mlx` / `fastembed` / `onnx` / `disabled` |
+| `rag_rerank_backend` | `mlx` | `mlx` / `fastembed` / `onnx`（UI 显示 GGUF；精排默认启用，无 disabled 选项） |
 | `rag_rerank_model_path` | `models/bge-reranker-v2-m3-ONNX/model_quantized.onnx` | 本地 ONNX Reranker 文件 |
 | `rag_rerank_mlx_model_path` | `models/bge-reranker-v2-m3-mlx-mxfp8` | 本地 MLX Reranker 目录（与 ONNX 分开保存，切换后端不用重贴路径） |
 | `onnx_threads` / `local_model_threads` | `4` | CPU 推理线程数 |
 | `rag_embedding_batch_size` / `rag_rerank_batch_size` | `16` / `16` | 批大小；Embedding 夹在 `[2, 64]`（MLX 实测 2→88、8→152、16→178、32→205、64→205、128→190 条/s） |
+| `rag_embedding_max_length` | `8192` | 嵌入截断长度，按 nomic-embed-text-v1.5 的真实上限设（旋转式位置编码：`n_positions=8192`，训练长度仅 2048，靠 RoPE 外推）；绝对位置嵌入模型（如 bge-small-zh，512）按 config 自动夹回。各后端加载时按 `_model_max_length` 夹紧 |
+| `rag_rerank_max_length` | `8192` | 精排截断长度，按 bge-reranker-v2-m3 的位置嵌入上限设；各后端按自己的 config.json 夹紧（旧版 base → 512）。长切片下按 token 预算自动收缩批大小（注意力 O(L²)） |
 
-本地模型全部**懒加载**：应用配置时只读路径，权重在首次推理时才载入。Embedding 权重在 RAG / 知识图谱 / 技能检索之间按「后端 + 路径 + 线程 + 批大小」共享同一份进程级单例，不会重复占用内存。本地模型没有原生 tool calling，`<think>` 与 `<tool_call>` 由 `_TaggedOutputParser` 从纯文本解析成标准事件。
+本地模型全部**懒加载**：应用配置时只读路径，权重在首次推理或点「加载模型」时才载入。配置窗口的「加载模型」在后台线程把权重读进内存备用，「卸载」释放它（agent 会换到一个全新的懒加载后端，不会撞上「后端已关闭」）。应用配置时若模型类型/路径没变，会**复用已加载权重的后端**，不会每次重新读数 GB。Embedding 权重在 RAG / 知识图谱 / 技能检索之间按「后端 + 路径 + 线程 + 批大小」共享同一份进程级单例，不会重复占用内存。本地模型没有原生 tool calling，`<think>` 与 `<tool_call>` 由 `_TaggedOutputParser` 从纯文本解析成标准事件。
 
 ### 测速对比
 
-界面「本地后端 → 测速对比」按钮会对比本地直载后端与 fastembed CPU 量化版，结果写入 `~/.base-agent/model_benchmark.json` 并在按钮旁给出切换建议；也可命令行跑：
+界面已移除测速入口，改用命令行跑，结果写入 `~/.base-agent/model_benchmark.json`：
 
 ```bash
 python -m src.agent.model_benchmark --save     # 测速并保存
@@ -275,10 +287,10 @@ MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：
 
 ### 关键设计
 
-- **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5-Q`（Q4 量化版，~137MB），通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。768 维向量，量化后 4x 更小，质量无损。首次下载后离线可用。
+- **嵌入模型**：`nomic-ai/nomic-embed-text-v1.5-Q`（Q4 量化版，~137MB），通过 FastEmbed (ONNX Runtime) 本地推理，无需 GPU、无需 HuggingFace 网络、无需 PyTorch。768 维向量，量化后 4x 更小，质量无损。首次下载后离线可用。截断长度默认 **8192**（旋转式位置编码 `n_positions=8192` 外推上限，训练长度仅 2048），本地 MLX/ONNX 后端加载时按各自模型 config 夹紧（绝对位置嵌入模型自动降到其上限）。
 - **向量数据库**：LanceDB（本地 Lance 列式格式），轻量、零配置、支持高效向量检索。向量归一化为单位长度后用 L2 距离模拟余弦相似度。每切片同时存入 embedding 向量、完整原文、来源文件名、切片编号，并开启 BM25 全文索引（原生 FTS + jieba 预分词）。
 - **混合检索**：向量相似度 + BM25 关键词并行检索（各取 top_k×4 候选），按 (source, chunk_index) 合并去重，兼顾语义召回与精确关键词命中（中文经 jieba 分词）。
-- **重排序**：BGE Reranker (`BAAI/bge-reranker-base`)，对混合候选精排，提升召回精度。无重排序依赖时自动回退到距离排序。
+- **重排序**：BGE Reranker (`BAAI/bge-reranker-v2-m3-int8`)，默认启用（UI 已移除关闭入口），对混合候选精排，提升召回精度；依赖不可用时自动回退到距离排序。如需彻底关闭，在配置文件写 `rag_rerank_enabled: false`。截断长度 `rag_rerank_max_length` 默认 **8192**（v2-m3 的真实上限），各后端加载时按自己的 `max_position_embeddings` 夹紧——旧版 bge-reranker-base 只有 512，切到它时会自动夹回 512。
 - **相似度过滤**：rerank 后过滤语义相似度 < 0.7 的结果（不相关的切片不发回模型），最终返回 ≤ 3 条最相关切片（含完整原文与来源信息）。
 
 ### Meta-context + Targeted RAG（动态按需检索）
@@ -759,7 +771,12 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 130 | OCR 回收周期 20 页是凭水位倒推的估计值（~35MB/页 × 20 ≈ 0.7GB），热重建成本当时按冷启动 ~6s 估，偏保守 | 周期过紧白白增加重建频率，或过松累积缓存 | 系统扫描 N=10..100 × 真实 200dpi 页：热重建仅 1-2s/次（冷启动 3-4s 只发生一次），峰值足迹各 N 持平 ~5.2GB（压缩器吸收缓存增长，peak_cmprs 随 N 线性涨），N 对 400 页书总耗时影响仅 1-3%；定 N=50：单代水位 ~1.8GB、重建摊销 ~0.5%，速度与内存的实测平衡点 |
 | 131 | 重排序三处与设计意图脱节：① 两个真实调用点都不传 rerank_model，实际吃 engine.py 旧默认 `BAAI/bge-reranker-base`（fp32 ~1.04GB 非量化），而非设计声明的 INT8 v2-m3（~570MB）；② `TextCrossEncoder` 未传 cache_dir，fastembed 默认下到系统临时目录（macOS 定期清理 → 重复下载，与 #121 同型）；③ 未显式传 providers，EP 选择依赖 fastembed 默认行为 | 加载的模型比预期大一倍且非量化；模型缓存被系统清理后重复下载 | engine.py 默认改为 `DEFAULT_RERANK_MODEL`（BAAI/bge-reranker-v2-m3-int8，与 deps.py 缓存判定、设计文档对齐）；TextCrossEncoder 显式传持久 cache_dir（~/.cache/fastembed）+ `providers=["CPUExecutionProvider"]`（与嵌入模型同款锁死）；目录映射核实：catalog 名 → onnx-community/bge-reranker-v2-m3-ONNX 的 onnx/model_int8.onnx；用已缓存小型 cross-encoder 实测验证 CPU 锁死生效 |
 | 132 | 重排延迟实测：v2-m3-int8（568M）在本机 CPU 逐对 ~0.55s/对是地板（批并行无收益——CPU EP 单序列已吃满多核；threads ±10% 噪声；截断 512 对 top3 常规场景无收益，已放弃）；agent LLM 自主传 top_k=5 → 40 条候选 ≈ 23s，交互不可接受 | LLM 自选大 top_k 放大重排延迟 | rag_search 工具 top_k 封顶 3（LLM 传 5 被钳到 3 → 24 条 ≈ 14s），schema 描述同步「上限 3」；进一步降耗的备选杠杆（候选池减半 multiplier 4→2、异步重排）留观察后决定 |
+| 136 | 精排截断长度写死 512（`rag_rerank_max_length` 默认值 + 各后端硬编码），而 bge-reranker-v2-m3 的真实上限是 8192（本地 MLX/ONNX 权重 `max_position_embeddings=8194`，fastembed tokenizer 本身就截断在 8192）：query+chunk 拼超过 512 tokens 的部分被静默丢弃。实测同一文档关键结论在尾部时，截断 512 得分 -8.81（低于 0.7 阈值会被过滤掉）vs 完整 8192 得分 +1.75——即「相关文档被截成不相关」。#132 曾以「对 top3 常规场景无收益」放弃放大，但那只覆盖了短 chunk | 长切片（默认 500 tokens + query 后常超 512）的尾部内容不参与精排打分，排序与阈值过滤双失真 | 默认改为 8192；各后端加载时按自己 config.json 的 `max_position_embeddings` 夹紧（`_model_max_length`，config 缺失退回 512）——旧版 bge-reranker-base（514）切过去自动夹回 512，不会把越界位置喂进网络；长序列下按 token 预算收缩批大小（`_rerank_batch_for`，8192 token/批：512→16、1024→8、2048→4、8192→1），避免注意力 O(L²) 把内存打爆；MLX/ONNX  rerank 按行切片保证覆盖与顺序；新增 4 项回归测试 |
+| 137 | 嵌入截断长度同样写死 512（`rag_embedding_max_length` 默认值 + MLX/ONNX/向量库单例键硬编码），而 nomic-embed-text-v1.5 真实上限是 8192（旋转式位置编码 `n_positions=8192`，训练长度 2048 靠 RoPE 外推）——512 下长切片尾部语义被丢弃。reranker 的「按模型夹紧 + token 预算切批」机制只覆盖了精排，没覆盖嵌入 | 长切片（默认 500 tokens 切片、语义分块上限 800 tokens）嵌入时尾部不参与向量，召回与图谱抽取质量双失真 | 把同一套机制平移到嵌入：默认 8192；`_model_max_length` 增强为「旋转式取 n_positions、绝对位置取 max_position_embeddings-2」（nomic→8192、bge-small-zh→512、缺失→512）；MLX/ONNX 嵌入后端加载时夹紧并打日志；长切片下按 token 预算收缩批大小（`_embedding_batch_for`，与 reranker 同预算 8192 token/批）。实测对照：本地 MLX NomicBERT 图 vs fastembed 官方 ONNX 导出——短文本对齐 0.966（量化基线差），长文本 4056 tokens 下 fast↔mlx8192=0.887、fast↔mlx2048=0.730、mlx2048↔mlx8192=0.829，证明 8192 外推没有掉质量且显著找回被截断内容；config/engine/graph_memory/memory/tools 默认值同步 8192；新增 4 项回归测试 |
+| 138 | #137 把嵌入收缩预算设成和 reranker 一样的「8192 token/批」，对 ONNX(CPU，物化注意力、内存 O(S²))偏激进——8192 时直接夹到 1，但 MLX 走 flash attention（内存 O(S)）实际远没到顶；而 ONNX 实际加载多为 int8 量化，即便误用 fp16 涨到 ~7GB 也可接受 | 长切片下 MLX 吞吐被不必要地压到单条、ONNX 也过保守 | 嵌入批收缩改为**后端感知**（`_EMBEDDING_SHAPE_BUDGET`）：`mlx=300M` → B=4@8192（flash 下 ~1GB），`onnx=150M` → B=2@8192（fp32 注意力 ~7GB 顶、int8 更低）；`VectorStore._shape_cap_size` 同步按 `self._embedding_backend` 取预算，使 RAG 入库主路径也受益；无/未知后端沿用 6M 保守值。两套约束（调优器形状预算 + 嵌入函数内部 `_embedding_batch_for`）现在用同一组后端预算，8192 时 MLX=4、ONNX=2，默认 500 切片均不受影响；回归测试更新为后端感知 |
+| 139 | 上一轮后端感知预算仍沿袭 #126 的「内存安全优先于下限」语义：超长文本下 `budget // max_len²` 可能算成 0，子批被**夹到 1 条**。单条长切片会把吞吐打到最优的 50-69%（实测低于 4 条即明显掉），且模型加载 / ONNX 会话初始化的固定成本被单条摊得极薄——纯亏 | 超长切片（>1732 字符）入库时子批恒为 1，吞吐塌陷且调优器无法在可行域内爬山 | `_shape_cap_size` 与 `_embedding_batch_for` 的形状预算**下限改为 2 条**（与调优器探索下限 `_SUBBATCH_MIN` 对齐，两者不再互相打架）：`min(size, max(_SUBBATCH_MIN, budget // max_len²))`。请求本身不足 2 条时按请求返回，不为凑下限放大批次（单条直调仍为 1）。副作用：未知/默认后端在 >1732 字符切片上从 1 条变 2 条——int8 ONNX @8192 B=2 实测内存可接受；调优器 report() 收到的仍是钳制后实际条数 |
 | 135 | 子批区间 1-5 / 初始 2 是 fastembed(ONNX CPU) 时代的标定（「子批增大吞吐单调变差」）。MLX 直载后曲线反转：短切片 2→88、8→152、16→178、32→205、64→205、128→190 条/s；长切片（~1200 字符）与子批数无关（1-16 均 13.2 条/s）。原区间把吞吐锁在最优的 50-69% | 默认后端换成 MLX 后自适应器仍按旧曲线取小批，白白损失一半吞吐 | 区间改为 **2-64、初始 16、步长 2**（用户定参），RSS 软墙保留 8GB；`rag_embedding_batch_size` 默认 8→16 并夹 `[2,64]`；形状预算仍可把单批压到 1（内存硬约束优先于下限）；子批测试改为常量驱动（改档位不改测试）；实测 96 条语料 batch 8→16：173→211 条/s（+22%） |
+| 140 | 配置窗口原本是一长条平铺行：主模型后端、远程模型名、Base URL/API Key、采样参数、目录、Embedding、Reranker 全挤在一起，「本地 vs 接口」只是下拉框里的一项，加载/更换模型没有显式入口，也没有辅助模型 | 配置项语义混杂、找不到该点哪里；主模型一换就要重新读数 GB 权重；轻量子任务（上下文摘要）只能占用主模型的推理队列 | 配置窗口重构成**两个分区**：① **Agent 模型配置**——主模型模式二选一（本地 / OpenAI 兼容接口，默认本地）；本地模式两行（模型类型 MLX-LM/MLX-VLM/ONNX/GGUF + 本地路径 + 选择；采样参数 + **加载模型** + **卸载**），接口模式两行（Base URL / API Key / 模型 + 获取模型；采样参数 + 应用配置）；下方**辅助模型**同本地模式结构、独立采样参数。② **知识同步配置**——目录；Embedding（后端 + 模型名 + 本地路径 + 同步知识）；Reranker（后端 + 模型名 + 本地路径 + 停止同步）。`llama_cpp` 在 UI 上一律改名 **GGUF**，Embedding 下拉补齐 GGUF 项。启动即默认加载主/辅模型（后台线程，`BASE_AGENT_SKIP_MODEL_AUTOLOAD=1` 可跳过）；「加载模型」主动把权重读进内存并直接交给 agent，「卸载」释放后给 agent 换新懒加载后端；**按签名复用**已加载权重，应用配置不再重复读数 GB；加载期间配置变更则丢弃陈旧结果；辅助模型参数改为**实时视图**（`_AuxConfigView`），改完即生效无需重载。辅助模型接入 agent 的上下文摘要，失败自动回退主模型。默认主模型 `qwen3.5-4b-agentic-coder-v4-4bit-mlx`、辅助 `Qwen3.5-2B-MLX-4bit`；旧配置无 `llm_mode` 时按 `llm_backend` 反推，不会把 OpenAI 用户静默切到本地 |
 
 ## 部署
 

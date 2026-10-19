@@ -57,6 +57,374 @@ def _flush_reason(win):
     win._flush_reason_buffer()
 
 
+# ---------------------------------------------------------------------------
+# 配置窗口两分区 + 本地模型加载/卸载（#140）
+# ---------------------------------------------------------------------------
+
+def _section_titles(win):
+    from PyQt6.QtWidgets import QGroupBox
+
+    return [w.title() for w in win.config_window.findChildren(QGroupBox)]
+
+
+def test_config_window_has_two_sections(qtbot, tmp_path, monkeypatch):
+    """配置窗口分成「Agent 模型配置」与「知识同步配置」两个区。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    titles = _section_titles(win)
+    assert "Agent 模型配置" in titles
+    assert "知识同步配置" in titles
+
+    # 默认本地模式：本地面板可见、接口面板隐藏。
+    assert win.llm_mode_local_radio.isChecked()
+    assert not win.llm_mode_openai_radio.isChecked()
+    assert win.local_mode_panel.isVisibleTo(win.config_window)
+    assert not win.openai_mode_panel.isVisibleTo(win.config_window)
+
+    # 切到接口模式：面板互换，Base URL / API Key 可用。
+    win.llm_mode_openai_radio.setChecked(True)
+    assert not win.local_mode_panel.isVisibleTo(win.config_window)
+    assert win.openai_mode_panel.isVisibleTo(win.config_window)
+    win.llm_mode_local_radio.setChecked(True)
+    assert win.local_mode_panel.isVisibleTo(win.config_window)
+
+
+def test_config_window_default_models(qtbot, tmp_path, monkeypatch):
+    """主/辅模型默认填 #140 指定的两个本地模型，类型默认 MLX-LM。"""
+    from agent.ui.main_window import (
+        DEFAULT_AUX_MODEL_PATH, DEFAULT_MAIN_MODEL_PATH, _combo_backend_value,
+    )
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    assert _combo_backend_value(win.llm_backend_combo) == "mlx_lm"
+    assert _combo_backend_value(win.aux_llm_backend_combo) == "mlx_lm"
+    assert win.llm_model_path_edit.text() == DEFAULT_MAIN_MODEL_PATH
+    assert win.aux_llm_model_path_edit.text() == DEFAULT_AUX_MODEL_PATH
+
+
+def test_backend_combo_shows_gguf_but_stores_llama_cpp(qtbot, tmp_path, monkeypatch):
+    """下拉框显示 GGUF，落到 config 的仍是 llama_cpp（#140 仅改名）。"""
+    from agent.ui.main_window import _combo_backend_value
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    labels = [win.llm_backend_combo.itemText(i) for i in range(win.llm_backend_combo.count())]
+    assert "GGUF" in labels
+    assert "llama_cpp" not in labels
+    assert labels[:2] == ["MLX-LM", "MLX-VLM"]
+
+    win.llm_backend_combo.setCurrentIndex(labels.index("GGUF"))
+    assert _combo_backend_value(win.llm_backend_combo) == "llama_cpp"
+
+    emb_labels = [
+        win.embedding_backend_combo.itemText(i)
+        for i in range(win.embedding_backend_combo.count())
+    ]
+    assert "GGUF" in emb_labels
+    win.embedding_backend_combo.setCurrentIndex(emb_labels.index("GGUF"))
+    assert _combo_backend_value(win.embedding_backend_combo) == "llama_cpp"
+
+
+def test_mode_and_sampling_round_trip(qtbot, tmp_path, monkeypatch):
+    """模式、主/辅采样参数都能正确读写 config。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    win.llm_mode_openai_radio.setChecked(True)
+    win.base_url_edit.setText("https://api.example.com/v1")
+    win.api_key_edit.setText("k")
+    win.temp_edit.setText("0.3")
+    win.max_tokens_edit.setText("4096")
+    win.aux_temp_edit.setText("0.11")
+    win.aux_max_tokens_edit.setText("777")
+    win.aux_top_p_edit.setText("0.42")
+    win._on_apply_config()
+
+    assert win.config.llm_mode == "openai"
+    assert win.config.llm_backend == "openai"
+    assert win.config.temperature == 0.3
+    assert win.config.max_tokens == 4096
+    assert win.config.aux_temperature == 0.11
+    assert win.config.aux_max_tokens == 777
+    assert win.config.aux_top_p == 0.42
+
+    # 切回本地模式 + 换 GGUF 类型：后端必须是 llama_cpp 而非 openai。
+    win.llm_mode_local_radio.setChecked(True)
+    labels = [win.llm_backend_combo.itemText(i) for i in range(win.llm_backend_combo.count())]
+    win.llm_backend_combo.setCurrentIndex(labels.index("GGUF"))
+    win._on_apply_config()
+    assert win.config.llm_mode == "local"
+    assert win.config.llm_backend == "llama_cpp"
+
+
+class _FakeLocalBackend:
+    """最小本地后端：有 _ensure_loaded / close，权重用一个属性表示。"""
+
+    def __init__(self, config, marker=""):
+        self.config = config
+        self.model_path = marker or "fake-model"
+        self._model_obj = None
+        self._closed = False
+        self.ensure_calls = 0
+
+    def _ensure_loaded(self):
+        self.ensure_calls += 1
+        self._model_obj = object()
+
+    def close(self):
+        self._closed = True
+        self._model_obj = None
+
+
+def _install_fake_model_factory(monkeypatch, mw, sink):
+    def _make(config):
+        backend = _FakeLocalBackend(config)
+        sink.append(backend)
+        return backend
+
+    monkeypatch.setattr(mw, "create_llm_backend", _make)
+    monkeypatch.setattr(mw, "create_aux_llm_backend", _make)
+    return _make
+
+
+def test_load_and_unload_local_model(qtbot, tmp_path, monkeypatch):
+    """加载模型把权重读进内存并交给 agent；卸载后 agent 换回新后端。"""
+    import agent.ui.main_window as mw
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    created = []
+    _install_fake_model_factory(monkeypatch, mw, created)
+    # 关掉启动自动加载的干扰：这里手动驱动。
+    monkeypatch.setattr(win, "_autoload_default_models", lambda: None)
+
+    assert not win._is_model_loaded("main")
+
+    win._on_load_model("main")
+    qtbot.waitUntil(lambda: not win._model_busy.get("main", False), timeout=5000)
+
+    assert len(created) == 1
+    loaded = created[0]
+    assert loaded.ensure_calls == 1          # 权重真的被加载了
+    assert win._is_model_loaded("main")
+    assert win._llm is loaded
+    assert win._agent.llm is loaded           # agent 直接指向热后端
+    assert win.llm_load_btn.text() == "重新加载"
+
+    win._on_unload_model("main")
+    assert not win._is_model_loaded("main")
+    assert loaded._closed                     # 旧的被关掉释放内存
+    assert win._agent.llm is not loaded       # agent 拿到了全新的后端
+    assert win.llm_load_btn.text() == "加载模型"
+
+
+def test_aux_model_is_loaded_and_wired_into_agent(qtbot, tmp_path, monkeypatch):
+    """辅助模型独立加载，并被 agent 用作摘要后端。"""
+    import agent.ui.main_window as mw
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    created = []
+    _install_fake_model_factory(monkeypatch, mw, created)
+    monkeypatch.setattr(win, "_autoload_default_models", lambda: None)
+
+    win._on_load_model("aux")
+    qtbot.waitUntil(lambda: not win._model_busy.get("aux", False), timeout=5000)
+
+    aux = created[-1]
+    assert aux.ensure_calls == 1
+    assert win._aux_llm is aux
+    assert win._agent.aux_llm is aux
+
+    win._on_unload_model("aux")
+    assert aux._closed
+    assert win._agent.aux_llm is not aux
+
+
+def test_load_model_rejects_stale_config_change(qtbot, tmp_path, monkeypatch):
+    """加载期间用户改了路径：结果丢弃，不装错模型。"""
+    import agent.ui.main_window as mw
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    created = []
+    _install_fake_model_factory(monkeypatch, mw, created)
+    monkeypatch.setattr(win, "_autoload_default_models", lambda: None)
+
+    # 拦截 worker：在「加载完成」前改掉路径，模拟加载期间配置变更。
+    original = mw.LoadModelWorker
+
+    class _SlowWorker(original):
+        def run(self):
+            win.llm_model_path_edit.setText("models/另一个模型")
+            super().run()
+
+    monkeypatch.setattr(mw, "LoadModelWorker", _SlowWorker)
+    win._on_load_model("main")
+    qtbot.waitUntil(lambda: not win._model_busy.get("main", False), timeout=5000)
+
+    # 陈旧结果被丢弃：新加载出来的对象已关闭，且没有顶替掉 agent 在用的后端。
+    assert created[-1]._closed
+    assert win._llm is not created[-1]
+    assert win._agent.llm is not created[-1]
+
+
+def test_summarize_prefers_aux_llm_and_falls_back(qtbot, tmp_path, monkeypatch):
+    """上下文摘要优先用辅助模型；辅助模型失败时回退主模型。"""
+    from agent.agent import Agent
+    from agent.config import AgentConfig
+
+    class _Recording:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.fail = fail
+            self.calls = 0
+
+        def chat_stream(self, messages, tools=None, temperature=0.7):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("辅助模型挂了")
+            return iter([_evt("content", f"summary-by-{self.name}"),
+                         _evt("done", usage={})])
+
+    monkeypatch.setattr(mw_mod := __import__("agent.ui.main_window", fromlist=["x"]),
+                        "create_llm_backend", lambda cfg: _Recording("main"))
+    monkeypatch.setattr(mw_mod, "create_aux_llm_backend",
+                        lambda cfg: _Recording("aux"))
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    aux = _Recording("aux")
+    main = _Recording("main")
+    agent = Agent(llm=main, config=win.config, callbacks=win._callbacks, aux_llm=aux)
+    assert agent._summarize_via_llm("一些旧对话").startswith("summary-by-aux")
+    assert aux.calls == 1 and main.calls == 0
+
+    broken = _Recording("aux", fail=True)
+    agent.aux_llm = broken
+    out = agent._summarize_via_llm("一些旧对话")
+    assert out.startswith("summary-by-main")
+    assert broken.calls == 1 and main.calls == 1
+
+    # 没有辅助模型时直接用主模型。
+    agent.aux_llm = None
+    assert agent._summarize_via_llm("x").startswith("summary-by-main")
+
+
+def test_aux_model_block_is_independent_of_main_mode(qtbot, tmp_path, monkeypatch):
+    """辅助模型常驻可见：主模型切到 OpenAI 接口模式时它不跟着消失（#140）。"""
+    import agent.ui.main_window as mw
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    # 用假后端，避免测试真的去读 2B 权重。
+    created = []
+    _install_fake_model_factory(monkeypatch, mw, created)
+    monkeypatch.setattr(win, "_autoload_default_models", lambda: None)
+
+    # 本地模式：主/辅都可见。
+    assert win.local_mode_panel.isVisibleTo(win.config_window)
+    assert not win.openai_mode_panel.isVisibleTo(win.config_window)
+    assert win.aux_llm_backend_combo.isVisibleTo(win.config_window)
+    assert win.aux_llm_model_path_edit.isVisibleTo(win.config_window)
+    assert win.aux_llm_load_btn.isVisibleTo(win.config_window)
+    assert win.aux_llm_unload_btn.isVisibleTo(win.config_window)
+    assert win.aux_llm_load_btn.isEnabled()
+
+    # 切到接口模式：主模型的本地控件藏起来，辅助模型**仍在**且可操作。
+    win.llm_mode_openai_radio.setChecked(True)
+    assert not win.local_mode_panel.isVisibleTo(win.config_window)
+    assert win.openai_mode_panel.isVisibleTo(win.config_window)
+    assert win.aux_llm_backend_combo.isVisibleTo(win.config_window)
+    assert win.aux_llm_model_path_edit.isVisibleTo(win.config_window)
+    assert win.aux_llm_load_btn.isVisibleTo(win.config_window)
+    assert win.aux_llm_load_btn.isEnabled()
+    # 主模型的本地控件在接口模式下整个面板被隐藏。
+    assert not win.llm_model_path_btn.isVisibleTo(win.config_window)
+    assert not win.llm_backend_combo.isVisibleTo(win.config_window)
+
+    # 接口模式下辅助模型照样能加载（后台线程，勿阻塞 UI）。
+    win._on_load_model("aux")
+    qtbot.waitUntil(lambda: not win._model_busy.get("aux", False), timeout=5000)
+    assert win._is_model_loaded("aux")
+
+    win.llm_mode_local_radio.setChecked(True)
+    assert win.local_mode_panel.isVisibleTo(win.config_window)
+    assert win.aux_llm_load_btn.isVisibleTo(win.config_window)
+
+
+# ---------------------------------------------------------------------------
+# 布局重构：配置/日志独立窗口 + 右栏任务计划
+# ---------------------------------------------------------------------------
+
+def test_config_and_log_live_in_own_windows(qtbot, tmp_path, monkeypatch):
+    """配置区与日志区搬进独立窗口，主窗口顶栏只留入口按钮。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    assert win.log_view.parentWidget() is not None
+    # 日志控件必须挂在日志窗口里，而不是主窗口中央部件。
+    assert win.log_view.window() is win.log_window
+    # 配置控件同理：base_url 输入框属于配置窗口。
+    assert win.base_url_edit.window() is win.config_window
+
+    # 顶栏按钮能唤出窗口（关闭是 hide，不会销毁控件）。
+    win._on_open_config_window()
+    win._on_open_log_window()
+    assert win.config_window.isVisible()
+    assert win.log_window.isVisible()
+
+    # 主窗口仍持有对话 / 发送 / 思考 / 计划四个视图。
+    for attr in ("chat_view", "send_editor", "think_view", "plan_view"):
+        assert getattr(win, attr) is not None
+    assert win.plan_view.window() is win
+    assert win.think_view.window() is win
+
+
+def test_task_plan_panel_tracks_steps(qtbot, tmp_path, monkeypatch):
+    """任务制定计划后右上面板显示目标、进度，并标记进行中的步骤。"""
+    from agent.planner import PlanStep, TaskPlan, save_plan
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    # 面板由 600ms 定时器轮询刷新，测试里直接调用一次而不是等定时器。
+    win._poll_task_plan()
+    assert "未制定计划" in win.plan_view.toPlainText()
+
+    save_plan(win.config.workspace, TaskPlan(
+        goal="重构主窗口布局",
+        steps=[
+            PlanStep(text="拆分配置区", status="done"),
+            PlanStep(text="迁移思考区", status="in_progress", note="进行中"),
+            PlanStep(text="接入计划面板", status="pending"),
+        ],
+    ))
+    win._poll_task_plan()
+
+    text = win.plan_view.toPlainText()
+    assert "重构主窗口布局" in text
+    assert "进度 1/3" in text
+    assert "✓ 1. 拆分配置区" in text
+    assert "▶ 2. 迁移思考区" in text
+    assert "○ 3. 接入计划面板" in text
+    assert win.plan_status_label.text() == "1/3 完成"
+    # 进行中的步骤只有一个被高亮标记（QTextDocument 会把一个 div 拆成
+    # block + span 两处 style，所以精确计数只能看渲染源串）。
+    from agent.planner import load_plan
+
+    plan = load_plan(win.config.workspace)
+    assert win._render_plan_html(plan).count("background-color:#eff6ff") == 1
+    assert "background-color:#eff6ff" in win.plan_view.toHtml()
+
+
 def test_send_streams_content_into_chat(qtbot, tmp_path, monkeypatch):
     win = _make_window(tmp_path, monkeypatch)
     qtbot.addWidget(win)
