@@ -390,6 +390,11 @@ class RAGEngine:
         knowledge_base: str = "",
         embedding_model: str = "",
         embedding_function: Any = None,
+        embedding_backend: str = "fastembed",
+        embedding_model_path: str = "",
+        embedding_threads: int = 4,
+        embedding_batch_size: int = 8,
+        embedding_max_length: int = 512,
         chunk_size: int = 800,
         chunk_overlap: int = 80,
         min_chunk_size: int = 100,
@@ -399,6 +404,13 @@ class RAGEngine:
         # 调用点（tools/base.py、ui/main_window.py）都不传 rerank_model，
         # 这个默认值就是实际加载的模型（#131）。
         rerank_model: str = DEFAULT_RERANK_MODEL,
+        rerank_backend: str = "fastembed",
+        rerank_model_path: str = "",
+        rerank_mlx_model_path: str = "",
+        rerank_threads: int = 4,
+        rerank_batch_size: int = 16,
+        rerank_max_length: int = 512,
+        rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         pdf_engine: str = "docling",
     ):
@@ -408,12 +420,24 @@ class RAGEngine:
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
         self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5-Q"
+        self._embedding_backend = embedding_backend
+        self._embedding_model_path = embedding_model_path
+        self._embedding_threads = max(1, int(embedding_threads))
+        self._embedding_batch_size = max(1, int(embedding_batch_size))
+        self._embedding_max_length = max(8, int(embedding_max_length))
         self._custom_ef = embedding_function  # for testing injection
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
         self._rerank_model = rerank_model
+        self._rerank_backend = rerank_backend
+        self._rerank_model_path = rerank_model_path
+        self._rerank_mlx_model_path = rerank_mlx_model_path
+        self._rerank_threads = max(1, int(rerank_threads))
+        self._rerank_batch_size = max(1, int(rerank_batch_size))
+        self._rerank_max_length = max(8, int(rerank_max_length))
+        self._rerank_enabled = bool(rerank_enabled)
         self._parallel_workers = max(1, int(parallel_workers))
         # PDF 主引擎（docling|marker）。未知值一律回退 docling，避免配置
         # 笔误把整库同步打到意外的路径上。
@@ -1550,6 +1574,18 @@ class RAGEngine:
                         embedding_model=self._embedding_model,
                         rerank_model=self._rerank_model,
                         embedding_function=self._custom_ef,
+                        embedding_backend=self._embedding_backend,
+                        embedding_model_path=self._embedding_model_path,
+                        embedding_threads=self._embedding_threads,
+                        embedding_batch_size=self._embedding_batch_size,
+                        embedding_max_length=self._embedding_max_length,
+                        rerank_backend=self._rerank_backend,
+                        rerank_model_path=self._rerank_model_path,
+                        rerank_mlx_model_path=self._rerank_mlx_model_path,
+                        rerank_threads=self._rerank_threads,
+                        rerank_batch_size=self._rerank_batch_size,
+                        rerank_max_length=self._rerank_max_length,
+                        rerank_enabled=self._rerank_enabled,
                     )
         return self._store
 

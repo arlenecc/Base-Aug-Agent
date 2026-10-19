@@ -81,6 +81,17 @@ def _work_memory(config: AgentConfig) -> WorkMemory:
 _LONG_MEMORY_SINGLETON_ATTR = "_long_memory_instance"
 
 
+def _embedding_options(config: AgentConfig) -> dict:
+    return {
+        "embedding_model": getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+        "embedding_backend": getattr(config, "rag_embedding_backend", "fastembed"),
+        "embedding_model_path": getattr(config, "rag_embedding_model_path", ""),
+        "embedding_threads": getattr(config, "onnx_threads", 4),
+        "embedding_batch_size": getattr(config, "rag_embedding_batch_size", 8),
+        "embedding_max_length": getattr(config, "rag_embedding_max_length", 512),
+    }
+
+
 def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> Optional[LongTermMemory]:
     """Return the singleton LongTermMemory, creating it on first access.
 
@@ -102,10 +113,9 @@ def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> Optional[
         existing = getattr(registry, _LONG_MEMORY_SINGLETON_ATTR, None)
         if existing is not None:
             return existing
-        emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
         lm = LongTermMemory(
             path=os.path.join(config.workspace, ".agent", "long_memory.json"),
-            embedding_model=emb,
+            **_embedding_options(config),
         )
         setattr(registry, _LONG_MEMORY_SINGLETON_ATTR, lm)
         return lm
@@ -118,10 +128,9 @@ def _long_memory(config: AgentConfig) -> LongTermMemory:
     when done.  In the normal tool/agent path, use _get_long_memory() instead
     so the singleton is reused and properly released on shutdown().
     """
-    emb = getattr(config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q")
     return LongTermMemory(
         path=os.path.join(config.workspace, ".agent", "long_memory.json"),
-        embedding_model=emb,
+        **_embedding_options(config),
     )
 
 

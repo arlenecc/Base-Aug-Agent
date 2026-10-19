@@ -88,10 +88,24 @@ class GraphMemoryStore:
     still works — ``search`` just falls back to keyword matching.
     """
 
-    def __init__(self, path: str, embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"):
+    def __init__(
+        self,
+        path: str,
+        embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q",
+        embedding_backend: str = "fastembed",
+        embedding_model_path: str = "",
+        embedding_threads: int = 4,
+        embedding_batch_size: int = 8,
+        embedding_max_length: int = 512,
+    ):
         self._path = path
         self._vector_dir = path + ".vectors"
         self._embedding_model_name = embedding_model
+        self._embedding_backend = embedding_backend
+        self._embedding_model_path = embedding_model_path
+        self._embedding_threads = max(1, int(embedding_threads))
+        self._embedding_batch_size = max(1, int(embedding_batch_size))
+        self._embedding_max_length = max(8, int(embedding_max_length))
         self._lock = threading.Lock()
         self._vec_lock = threading.Lock()  # protects vector-index lazy init
         # backfill 的独立非阻塞锁：防止并发重复回填（_vec_lock 保护的是
@@ -186,7 +200,14 @@ class GraphMemoryStore:
                 self._db = lancedb.connect(self._vector_dir)
                 # Share the process-wide ONNX model with RAG's VectorStore
                 # to avoid loading a second ~137MB copy.
-                self._ef = get_or_create_embedding_function(self._embedding_model_name)
+                self._ef = get_or_create_embedding_function(
+                    self._embedding_model_name,
+                    backend=self._embedding_backend,
+                    model_path=self._embedding_model_path,
+                    threads=self._embedding_threads,
+                    batch_size=self._embedding_batch_size,
+                    max_length=self._embedding_max_length,
+                )
                 if "observations" in self._db.table_names():
                     self._table = self._db.open_table("observations")
                 self._vec_ready = True

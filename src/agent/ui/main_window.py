@@ -20,12 +20,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
-    QStatusBar, QFileDialog,
+    QStatusBar, QFileDialog, QCheckBox,
 )
 
 from ..agent import Agent, AgentCallbacks
 from ..config import AgentConfig
 from ..llm_client import LLMClient, LLMError
+from ..model_backends import create_llm_backend, discover_local_models
 from ..skills import Skill
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
@@ -357,13 +358,15 @@ class SyncKnowledgeWorker(QThread):
     sync_progress = pyqtSignal(int, int, str)  # done, total, current_file
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
-                 force: bool = False, rerank_model: str = "", pdf_engine: str = "docling"):
+                 force: bool = False, rerank_model: str = "", pdf_engine: str = "docling",
+                 model_options: Optional[Dict[str, Any]] = None):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
         self._rerank_model = rerank_model
         self._pdf_engine = pdf_engine or "docling"
+        self._model_options = dict(model_options or {})
         self._force = force
         self._engine: Optional[RAGEngine] = None
         # 日志缓冲区：子线程写入，主线程在 _poll_sync_logs 中消费。
@@ -435,6 +438,7 @@ class SyncKnowledgeWorker(QThread):
                 knowledge_base=self._knowledge_base,
                 embedding_model=self._embedding_model,
             )
+            _engine_kwargs.update(self._model_options)
             if self._rerank_model:
                 # 非空 = 显式转发 config.rag_rerank_model，配置可覆盖。
                 _engine_kwargs["rerank_model"] = self._rerank_model
@@ -560,6 +564,85 @@ class InstallDepsWorker(QThread):
             self.deps_finished.emit(None)
 
 
+class BenchmarkWorker(QThread):
+    """Runs the local-model benchmark off the UI thread.
+
+    测速会加载 Embedding/Reranker 权重（MLX 约 137MB、ONNX 约 300MB）并做多轮
+    推理，同步跑在 UI 线程上会冻住事件循环数十秒。信号名同样不覆写 Qt 内置的
+    ``finished``（原因见 SyncKnowledgeWorker 注释）。
+    """
+
+    bench_progress = pyqtSignal(str)
+    bench_finished = pyqtSignal(list)
+    bench_failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        kind: str = "all",
+        rounds: int = 3,
+        threads: int = 4,
+        embedding_batch_size: int = 8,
+        rerank_batch_size: int = 16,
+        embedding_path: str = "",
+        embedding_model: str = "",
+        rerank_path: str = "",
+        rerank_model: str = "",
+    ):
+        super().__init__()
+        self._kind = kind
+        self._rounds = rounds
+        self._threads = threads
+        self._embedding_batch_size = embedding_batch_size
+        self._rerank_batch_size = rerank_batch_size
+        self._embedding_path = embedding_path
+        self._embedding_model = embedding_model
+        self._rerank_path = rerank_path
+        self._rerank_model = rerank_model
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from ..model_benchmark import (
+                benchmark_embeddings,
+                benchmark_rerankers,
+                save_result,
+            )
+
+            results = []
+            if self._kind in ("embedding", "all"):
+                self.bench_progress.emit("正在测速 Embedding 后端（本地 MLX vs fastembed CPU）…")
+                kwargs: Dict[str, Any] = {
+                    "batch_size": self._embedding_batch_size,
+                    "rounds": self._rounds,
+                    "threads": self._threads,
+                }
+                if self._embedding_path:
+                    kwargs["mlx_path"] = self._embedding_path
+                if self._embedding_model:
+                    kwargs["fastembed_model"] = self._embedding_model
+                results.append(benchmark_embeddings(**kwargs))
+            if self._kind in ("reranker", "all"):
+                self.bench_progress.emit("正在测速 Reranker 后端（本地 ONNX vs fastembed CPU）…")
+                kwargs = {
+                    "batch_size": self._rerank_batch_size,
+                    "rounds": self._rounds,
+                    "threads": self._threads,
+                }
+                if self._rerank_path:
+                    kwargs["onnx_path"] = self._rerank_path
+                if self._rerank_model:
+                    kwargs["fastembed_model"] = self._rerank_model
+                results.append(benchmark_rerankers(**kwargs))
+            for item in results:
+                try:
+                    save_result(item)
+                except OSError as e:
+                    logger.warning("测速结果保存失败: %s", e)
+            self.bench_finished.emit(results)
+        except Exception as e:
+            self.bench_failed.emit(f"{type(e).__name__}: {e}")
+
+
 # ===========================================================================
 # Keyed plain text editor: Enter sends, Shift+Enter newline
 # ===========================================================================
@@ -608,12 +691,13 @@ class MainWindow(QMainWindow):
         self.config.ensure_workspace()
         self._bridge = Bridge()
         self._callbacks = BridgeCallbacks(self._bridge)
-        self._llm: Optional[LLMClient] = None
+        self._llm: Optional[Any] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
+        self._bench_worker: Optional[BenchmarkWorker] = None
         self._deps_cancelled: bool = False  # True if user cancelled during deps check
         self._streaming_assistant = False  # True while appending content to current assistant bubble
         # 流式文本的攒批缓冲（见 _on_content / _flush_stream_buffer）。
@@ -643,6 +727,7 @@ class MainWindow(QMainWindow):
         # the UI event loop and prevent content/reasoning chunks from
         # rendering, making the app look frozen.
         self._pending_skill: Optional[Skill] = None
+        self._pending_image_path: str = ""
 
         self._build_ui()
         self._wire_signals()
@@ -671,7 +756,7 @@ class MainWindow(QMainWindow):
         main_split.addWidget(self._build_body_panel())
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 5)
-        main_split.setSizes([140, 700])
+        main_split.setSizes([260, 580])
 
         # Status bar with progress
         self.status = QStatusBar()
@@ -695,6 +780,24 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox(editable=True)
         self.model_combo.setMinimumWidth(180)
         self.fetch_btn = QPushButton("获取模型")
+        self.llm_backend_combo = QComboBox()
+        self.llm_backend_combo.addItems(["openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp"])
+        self.llm_model_path_edit = QLineEdit(placeholderText="本地主模型目录或 .onnx/.gguf 文件")
+        self.llm_model_path_btn = QPushButton("…")
+        self.llm_model_path_btn.setFixedWidth(28)
+        self.embedding_backend_combo = QComboBox()
+        self.embedding_backend_combo.addItems(["fastembed", "mlx", "onnx", "llama_cpp"])
+        self.embedding_model_edit = QLineEdit()
+        self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
+        self.embedding_model_path_btn = QPushButton("…")
+        self.embedding_model_path_btn.setFixedWidth(28)
+        self.reranker_backend_combo = QComboBox()
+        self.reranker_backend_combo.addItems(["fastembed", "mlx", "onnx", "disabled"])
+        self.reranker_model_edit = QLineEdit()
+        self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
+        self.reranker_model_path_btn = QPushButton("…")
+        self.reranker_model_path_btn.setFixedWidth(28)
+        self.reranker_enabled_check = QCheckBox("启用精排")
         self.temp_edit = QLineEdit("0.7")
         self.temp_edit.setFixedWidth(60)
         self.max_tokens_edit = QLineEdit("32768")
@@ -721,17 +824,27 @@ class MainWindow(QMainWindow):
         self.stop_btn = QPushButton("终止对话")
         self.stop_btn.setEnabled(False)
 
-        # Row 0: Base URL | API Key | 模型 | 获取模型
+        # Row 0: 主模型后端 | 远程模型名 | 获取/扫描模型
         row0 = QHBoxLayout()
         row0.setSpacing(8)
-        row0.addWidget(QLabel("Base URL"))
-        row0.addWidget(self.base_url_edit, 3)
-        row0.addWidget(QLabel("API Key"))
-        row0.addWidget(self.api_key_edit, 2)
+        row0.addWidget(QLabel("主模型后端"))
+        row0.addWidget(self.llm_backend_combo)
         row0.addWidget(QLabel("模型"))
         row0.addWidget(self.model_combo, 2)
         row0.addWidget(self.fetch_btn)
+        row0.addWidget(QLabel("本地路径"))
+        row0.addWidget(self.llm_model_path_edit, 3)
+        row0.addWidget(self.llm_model_path_btn)
         lay.addLayout(row0)
+
+        # Row 0b: OpenAI-compatible 网络参数（本地后端下自动禁用）。
+        row0b = QHBoxLayout()
+        row0b.setSpacing(8)
+        row0b.addWidget(QLabel("Base URL"))
+        row0b.addWidget(self.base_url_edit, 3)
+        row0b.addWidget(QLabel("API Key"))
+        row0b.addWidget(self.api_key_edit, 2)
+        lay.addLayout(row0b)
 
         # Row 1: 上下文长度 | 温度 | top_p | min_p | top_k | 重复惩罚 | 超时(秒) | 应用配置
         row1 = QHBoxLayout()
@@ -782,6 +895,47 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.stop_sync_btn)
         lay.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        row3.addWidget(QLabel("Embedding"))
+        row3.addWidget(self.embedding_backend_combo)
+        row3.addWidget(QLabel("模型/目录名"))
+        row3.addWidget(self.embedding_model_edit, 2)
+        row3.addWidget(QLabel("本地路径"))
+        row3.addWidget(self.embedding_model_path_edit, 3)
+        row3.addWidget(self.embedding_model_path_btn)
+        lay.addLayout(row3)
+
+        row4 = QHBoxLayout()
+        row4.setSpacing(8)
+        row4.addWidget(QLabel("Reranker"))
+        row4.addWidget(self.reranker_backend_combo)
+        row4.addWidget(QLabel("模型/目录名"))
+        row4.addWidget(self.reranker_model_edit, 2)
+        row4.addWidget(QLabel("本地路径"))
+        row4.addWidget(self.reranker_model_path_edit, 3)
+        row4.addWidget(self.reranker_model_path_btn)
+        row4.addWidget(self.reranker_enabled_check)
+        lay.addLayout(row4)
+
+        # Row 5: 本地后端测速对比。结果写入 ~/.base-agent/model_benchmark.json，
+        # 作为后续在 fastembed / 本地后端之间切换的依据。
+        row5 = QHBoxLayout()
+        row5.setSpacing(8)
+        self.benchmark_btn = QPushButton("测速对比")
+        self.benchmark_btn.setToolTip(
+            "对比「本地直载后端」与「fastembed CPU 量化版」的吞吐与一致性\n"
+            "Embedding: models/nomic-embed-text-v1.5-mlx vs nomic-ai/nomic-embed-text-v1.5-Q\n"
+            "Reranker: models/bge-reranker-v2-m3-ONNX vs BAAI/bge-reranker-v2-m3-int8\n"
+            "结果保存到 ~/.base-agent/model_benchmark.json"
+        )
+        self.benchmark_label = QLabel("")
+        self.benchmark_label.setStyleSheet("color:#6b7280;")
+        row5.addWidget(QLabel("本地后端"))
+        row5.addWidget(self.benchmark_btn)
+        row5.addWidget(self.benchmark_label, 1)
+        lay.addLayout(row5)
+
         return box
 
     def _build_body_panel(self) -> QWidget:
@@ -797,6 +951,17 @@ class MainWindow(QMainWindow):
         chat_header = QHBoxLayout()
         chat_header.setSpacing(8)
         chat_header.addWidget(QLabel("对话"))
+        self.attach_image_btn = QPushButton("附加图片…")
+        self.attach_image_btn.setToolTip("为下一条消息附加一张本地图片（本地 VLM 后端）")
+        self.attached_image_label = QLabel("")
+        self.attached_image_label.setStyleSheet("color:#6b7280;")
+        chat_header.addWidget(self.attach_image_btn)
+        chat_header.addWidget(self.attached_image_label)
+        self.attach_clear_btn = QPushButton("×")
+        self.attach_clear_btn.setFixedWidth(28)
+        self.attach_clear_btn.setToolTip("取消附加图片")
+        self.attach_clear_btn.setVisible(False)
+        chat_header.addWidget(self.attach_clear_btn)
         chat_header.addStretch(1)
         chat_header.addWidget(self.clear_btn)
         chat_header.addWidget(self.stop_btn)
@@ -888,6 +1053,16 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self._on_apply_config)
         self.workspace_btn.clicked.connect(self._on_pick_workspace)
         self.knowledge_base_btn.clicked.connect(self._on_pick_knowledge_base)
+        self.llm_model_path_btn.clicked.connect(self._on_pick_llm_model)
+        self.embedding_model_path_btn.clicked.connect(self._on_pick_embedding_model)
+        self.reranker_model_path_btn.clicked.connect(self._on_pick_reranker_model)
+        self.benchmark_btn.clicked.connect(self._on_run_benchmark)
+        self.attach_image_btn.clicked.connect(self._on_pick_chat_image)
+        self.attach_clear_btn.clicked.connect(self._on_clear_attached_image)
+        self.llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
+        self.reranker_backend_combo.currentTextChanged.connect(self._update_model_controls)
+        self.reranker_backend_combo.currentTextChanged.connect(self._on_reranker_backend_changed)
+        self.model_combo.activated.connect(self._on_model_combo_activated)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
         self.stop_sync_btn.clicked.connect(self._on_stop_sync)
         self.clear_btn.clicked.connect(self._on_clear_chat)
@@ -917,6 +1092,15 @@ class MainWindow(QMainWindow):
     def _apply_config_to_widgets(self) -> None:
         self.base_url_edit.setText(self.config.base_url)
         self.api_key_edit.setText(self.config.api_key)
+        self.llm_backend_combo.setCurrentText(self.config.llm_backend)
+        self.llm_model_path_edit.setText(self.config.llm_model_path)
+        self.embedding_backend_combo.setCurrentText(self.config.rag_embedding_backend)
+        self.embedding_model_edit.setText(self.config.rag_embedding_model)
+        self.embedding_model_path_edit.setText(self.config.rag_embedding_model_path)
+        self.reranker_backend_combo.setCurrentText(self.config.rag_rerank_backend)
+        self.reranker_model_edit.setText(self.config.rag_rerank_model)
+        self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
+        self.reranker_enabled_check.setChecked(self.config.rag_rerank_enabled)
         if self.config.model:
             self.model_combo.setEditText(self.config.model)
         self.temp_edit.setText(str(self.config.temperature))
@@ -928,11 +1112,44 @@ class MainWindow(QMainWindow):
         self.timeout_edit.setText(str(self.config.request_timeout))
         self.workspace_edit.setText(self.config.workspace)
         self.knowledge_base_edit.setText(self.config.knowledge_base)
+        self._update_model_controls()
+        self._refresh_benchmark_label()
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
         self.config.api_key = self.api_key_edit.text().strip()
         self.config.model = self.model_combo.currentText().strip()
+        self.config.llm_backend = self.llm_backend_combo.currentText().strip() or "openai"
+        self.config.llm_model_path = (
+            self.llm_model_path_edit.text().strip() or self.config.llm_model_path
+        )
+        self.config.rag_embedding_backend = (
+            self.embedding_backend_combo.currentText().strip() or "fastembed"
+        )
+        self.config.rag_embedding_model = (
+            self.embedding_model_edit.text().strip() or self.config.rag_embedding_model
+        )
+        self.config.rag_embedding_model_path = (
+            self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
+        )
+        self.config.rag_rerank_backend = (
+            self.reranker_backend_combo.currentText().strip() or "fastembed"
+        )
+        self.config.rag_rerank_model = (
+            self.reranker_model_edit.text().strip() or self.config.rag_rerank_model
+        )
+        # MLX 交叉编码器是目录，ONNX 是文件，两者各存一份：切换后端时不必
+        # 重新粘贴路径（见 _reranker_path_for_backend）。
+        path_value = self.reranker_model_path_edit.text().strip()
+        if self.reranker_backend_combo.currentText().strip() == "mlx":
+            self.config.rag_rerank_mlx_model_path = (
+                path_value or self.config.rag_rerank_mlx_model_path
+            )
+        else:
+            self.config.rag_rerank_model_path = (
+                path_value or self.config.rag_rerank_model_path
+            )
+        self.config.rag_rerank_enabled = self.reranker_enabled_check.isChecked()
         try:
             # 范围钳制 [0, 2]：负数/超范围的值会被服务端直接拒绝，报错难懂。
             self.config.temperature = max(0.0, min(2.0, float(self.temp_edit.text().strip() or "0.7")))
@@ -1036,15 +1253,7 @@ class MainWindow(QMainWindow):
         self._agent = None
         new_llm = None
         try:
-            new_llm = LLMClient(
-                base_url=self.config.base_url, api_key=self.config.api_key,
-                model=self.config.model, timeout=self.config.request_timeout,
-                max_tokens=self.config.max_tokens,
-                top_p=self.config.top_p,
-                min_p=self.config.min_p,
-                top_k=self.config.top_k,
-                repetition_penalty=self.config.repetition_penalty,
-            )
+            new_llm = create_llm_backend(self.config)
             new_agent = Agent(llm=new_llm, config=self.config, callbacks=self._callbacks)
             new_agent.max_iterations = self.config.max_iterations
         except Exception as e:
@@ -1084,9 +1293,13 @@ class MainWindow(QMainWindow):
                 "知识库同步/依赖安装进行中，请先停止或等待其完成，再应用配置。",
             )
             return
+        self._gather_config_from_widgets()
         self.config.save(CONFIG_PATH)
         self._rebuild_agent()
-        self._append_log(f"[cfg] applied: {self.config.base_url} model={self.config.model}")
+        self._append_log(
+            f"[cfg] applied: backend={self.config.llm_backend} "
+            f"model={self.config.model} path={self.config.llm_model_path}"
+        )
         self.status_label.setText("配置已应用")
 
     def _on_pick_workspace(self) -> None:
@@ -1098,6 +1311,216 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择知识库目录", self.config.knowledge_base or self.config.workspace)
         if d:
             self.knowledge_base_edit.setText(d)
+
+    def _update_model_controls(self, *_args) -> None:
+        remote = self.llm_backend_combo.currentText() == "openai"
+        self.base_url_edit.setEnabled(remote)
+        self.api_key_edit.setEnabled(remote)
+        self.llm_model_path_edit.setEnabled(not remote)
+        self.llm_model_path_btn.setEnabled(not remote)
+        self.fetch_btn.setText("获取模型" if remote else "扫描本地")
+        multimodal = self.llm_backend_combo.currentText() in ("mlx_vlm", "onnx", "llama_cpp")
+        self.attach_image_btn.setEnabled(multimodal)
+        # 切到不支持视觉的后端时必须丢弃待发图片：否则 [image:...] 标记会以
+        # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
+        if not multimodal and self._pending_image_path:
+            self._set_attached_image("")
+        rerank_disabled = self.reranker_backend_combo.currentText() == "disabled"
+        self.reranker_enabled_check.setEnabled(not rerank_disabled)
+        if rerank_disabled:
+            self.reranker_enabled_check.setChecked(False)
+
+    @staticmethod
+    def _dialog_start(value: str) -> str:
+        candidate = os.path.expanduser(value or "")
+        if os.path.isfile(candidate):
+            return os.path.dirname(candidate)
+        if os.path.isdir(candidate):
+            return candidate
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "..", "models")
+
+    def _on_pick_llm_model(self) -> None:
+        backend = self.llm_backend_combo.currentText()
+        start = self._dialog_start(self.llm_model_path_edit.text())
+        if backend == "llama_cpp":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF 主模型", start, "GGUF (*.gguf);;所有文件 (*)")
+        elif backend == "onnx":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 ONNX 主模型", start, "ONNX (*.onnx);;所有文件 (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "选择本地主模型目录", start)
+        if path:
+            self.llm_model_path_edit.setText(path)
+
+    def _on_pick_embedding_model(self) -> None:
+        backend = self.embedding_backend_combo.currentText()
+        start = self._dialog_start(self.embedding_model_path_edit.text())
+        if backend == "llama_cpp":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 GGUF Embedding 模型", start, "GGUF (*.gguf);;所有文件 (*)")
+        elif backend == "onnx":
+            path, _ = QFileDialog.getOpenFileName(self, "选择 ONNX Embedding 模型", start, "ONNX (*.onnx);;所有文件 (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "选择 Embedding 模型目录", start)
+        if path:
+            self.embedding_model_path_edit.setText(path)
+
+    def _reranker_path_for_backend(self) -> str:
+        """ONNX 是文件、MLX 是目录，两者在 config 里各存一份。"""
+        backend = self.reranker_backend_combo.currentText().strip() or "fastembed"
+        if backend == "mlx":
+            return getattr(self.config, "rag_rerank_mlx_model_path", "")
+        return getattr(self.config, "rag_rerank_model_path", "")
+
+    def _on_reranker_backend_changed(self, *_args) -> None:
+        mlx = self.reranker_backend_combo.currentText().strip() == "mlx"
+        self.reranker_model_path_edit.setPlaceholderText(
+            "本地 MLX Reranker 目录" if mlx else "本地 Reranker .onnx 文件"
+        )
+        self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
+
+    def _on_pick_reranker_model(self) -> None:
+        start = self._dialog_start(self.reranker_model_path_edit.text())
+        if self.reranker_backend_combo.currentText().strip() == "mlx":
+            path = QFileDialog.getExistingDirectory(self, "选择 MLX Reranker 目录", start)
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 ONNX Reranker 模型", start, "ONNX (*.onnx);;所有文件 (*)"
+            )
+        if path:
+            self.reranker_model_path_edit.setText(path)
+
+    # ------------------------------------------------------------------
+    # attached image (local VLM backends)
+    # ------------------------------------------------------------------
+    def _on_pick_chat_image(self) -> None:
+        """Pick a local image to send with the next message.
+
+        本地 VLM 后端（mlx_vlm / onnx / llama_cpp）没有 OpenAI 那种 multipart
+        内容协议，这里用文本标记 ``[image:<path>]`` 把路径带进用户消息，由
+        ``MLXVLMBackend._media`` 等解析成真正的视觉输入。
+        """
+        start = self._dialog_start(self._pending_image_path)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择附加图片", start,
+            "图片 (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;所有文件 (*)",
+        )
+        if not path:
+            return
+        self._set_attached_image(path)
+        self._append_log(f"[chat] 已附加图片: {path}")
+
+    def _set_attached_image(self, path: str) -> None:
+        self._pending_image_path = path
+        self.attached_image_label.setText(os.path.basename(path) if path else "")
+        self.attach_clear_btn.setVisible(bool(path))
+
+    def _on_clear_attached_image(self) -> None:
+        self._set_attached_image("")
+
+    # ------------------------------------------------------------------
+    # local backend benchmark
+    # ------------------------------------------------------------------
+    def _refresh_benchmark_label(self) -> None:
+        """Show the last stored benchmark verdict next to the button."""
+        try:
+            from ..model_benchmark import recommend, result_for
+
+            embedding = result_for("embedding")
+            reranker = result_for("reranker")
+        except Exception as e:
+            self.benchmark_label.setText(f"测速记录读取失败: {e}")
+            return
+        if embedding is None and reranker is None:
+            self.benchmark_label.setText("尚无测速记录")
+            return
+        parts = []
+        if embedding is not None:
+            parts.append(recommend(embedding))
+        if reranker is not None:
+            parts.append(recommend(reranker))
+        self.benchmark_label.setText(" ｜ ".join(parts))
+
+    def _on_run_benchmark(self) -> None:
+        if self._is_worker_running(self._bench_worker):
+            return
+        # 测速会加载数 GB 级权重并占满 CPU：与 agent 推理或知识库同步并发跑，
+        # 两边都会互相拖慢，测出来的数字也没有参考价值。
+        if self._busy or self._is_worker_running(self._worker):
+            QMessageBox.warning(
+                self, "正在运行", "Agent 正在运行，请先点击「终止对话」停止当前任务，再测速。"
+            )
+            return
+        if (self._sync_busy or self._is_worker_running(self._sync_worker)
+                or self._is_worker_running(self._deps_worker)):
+            QMessageBox.warning(
+                self, "正在同步", "知识库同步/依赖安装进行中，请等待其完成，再测速。"
+            )
+            return
+        self.benchmark_btn.setEnabled(False)
+        self.status_label.setText("正在测速本地后端…")
+        self.progress.setRange(0, 0)
+        self._bench_worker = BenchmarkWorker(
+            kind="all",
+            rounds=3,
+            threads=max(1, int(getattr(self.config, "onnx_threads", 4))),
+            embedding_batch_size=max(1, int(getattr(self.config, "rag_embedding_batch_size", 8))),
+            rerank_batch_size=max(1, int(getattr(self.config, "rag_rerank_batch_size", 16))),
+            embedding_path=self.embedding_model_path_edit.text().strip(),
+            embedding_model=self.embedding_model_edit.text().strip(),
+            rerank_path=self.reranker_model_path_edit.text().strip(),
+            rerank_model=self.reranker_model_edit.text().strip(),
+        )
+        self._bench_worker.bench_progress.connect(self._on_benchmark_progress)
+        self._bench_worker.bench_finished.connect(self._on_benchmark_finished)
+        self._bench_worker.bench_failed.connect(self._on_benchmark_failed)
+        self._bench_worker.finished.connect(self._bench_worker.deleteLater)
+        self._bench_worker.start()
+
+    def _on_benchmark_progress(self, msg: str) -> None:
+        self._append_log(f"[bench] {msg}")
+        self.status_label.setText(msg)
+
+    def _on_benchmark_finished(self, results: list) -> None:
+        self._bench_worker = None
+        self.benchmark_btn.setEnabled(True)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        try:
+            from ..model_benchmark import recommend, summarize
+
+            lines = []
+            for item in results or []:
+                lines.append(summarize(item))
+                suggestion = recommend(item)
+                if suggestion:
+                    lines.append(f"  → {suggestion}")
+            text = "\n".join(lines) or "（无结果）"
+        except Exception as e:
+            text = f"结果渲染失败: {e}"
+        for line in (text.splitlines() or [text]):
+            self._append_log(f"[bench] {line}")
+        self._refresh_benchmark_label()
+        self.status_label.setText("测速完成（结果已保存）")
+        QMessageBox.information(self, "本地后端测速对比", text)
+
+    def _on_benchmark_failed(self, error: str) -> None:
+        self._bench_worker = None
+        self.benchmark_btn.setEnabled(True)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.status_label.setText("测速失败")
+        self._append_log(f"[bench] 测速失败: {error}")
+        QMessageBox.critical(
+            self, "测速失败",
+            f"本地后端测速失败：\n{error}\n\n"
+            "请确认已安装对应运行时（mlx / onnxruntime / fastembed）且模型路径存在。",
+        )
+
+    def _on_model_combo_activated(self, _index: int) -> None:
+        if self.llm_backend_combo.currentText() == "openai":
+            return
+        value = self.model_combo.currentText().strip()
+        if os.path.exists(os.path.expanduser(value)):
+            self.llm_model_path_edit.setText(value)
 
     @staticmethod
     def _is_worker_running(worker) -> bool:
@@ -1250,6 +1673,21 @@ class MainWindow(QMainWindow):
             rerank_model=self.config.rag_rerank_model,
             # PDF 主引擎（docling|marker，#134）。
             pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
+            model_options={
+                "embedding_backend": self.config.rag_embedding_backend,
+                "embedding_model_path": self.config.rag_embedding_model_path,
+                "embedding_threads": self.config.onnx_threads,
+                "embedding_batch_size": self.config.rag_embedding_batch_size,
+                "embedding_max_length": self.config.rag_embedding_max_length,
+                "chunk_size": self.config.rag_chunk_size,
+                "chunk_overlap": self.config.rag_chunk_overlap,
+                "rerank_backend": self.config.rag_rerank_backend,
+                "rerank_model_path": self.config.rag_rerank_model_path,
+                "rerank_threads": self.config.onnx_threads,
+                "rerank_batch_size": self.config.rag_rerank_batch_size,
+                "rerank_max_length": self.config.rag_rerank_max_length,
+                "rerank_enabled": self.config.rag_rerank_enabled,
+            },
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
         self._sync_worker.sync_failed.connect(self._on_sync_failed)
@@ -1426,6 +1864,19 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_fetch_models(self) -> None:
+        backend = self.llm_backend_combo.currentText().strip() or "openai"
+        if backend != "openai":
+            models = discover_local_models("models", backend)
+            configured = self.llm_model_path_edit.text().strip()
+            if configured and os.path.exists(os.path.expanduser(configured)) and configured not in models:
+                models.insert(0, configured)
+            self._on_models_fetched(models)
+            if models:
+                self.status_label.setText(f"扫描到 {len(models)} 个本地模型")
+            else:
+                self.status_label.setText("未扫描到匹配的本地模型")
+            return
+
         base_url = self.base_url_edit.text().strip()
         api_key = self.api_key_edit.text().strip()
         if not base_url:
@@ -1505,15 +1956,20 @@ class MainWindow(QMainWindow):
             )
             return
         text = self.send_editor.toPlainText().strip()
-        if not text:
+        # 只有图片没有文字时也允许发送：VLM 的常见问题就是「看图说话」。
+        if not text and not self._pending_image_path:
             return
         if self._agent is None:
             self._rebuild_agent()
         if self._agent is None:
             QMessageBox.warning(self, "未就绪", "Agent 未初始化，请先应用配置。")
             return
+        if self._pending_image_path:
+            marker = f"[image:{self._pending_image_path}]"
+            text = f"{text}\n{marker}" if text else marker
 
         self._append_user(text)
+        self._set_attached_image("")
         self.send_editor.clear()
         self._busy = True
         self._set_controls_busy(True)
@@ -2189,6 +2645,10 @@ class MainWindow(QMainWindow):
         if self._shutdown_worker(self._deps_worker, "deps",
                                  wait_ms=2000, term_wait_ms=1000):
             self._deps_worker = None
+        # --- BenchmarkWorker: loads model weights, give it a bit more time.
+        if self._shutdown_worker(self._bench_worker, "bench",
+                                 wait_ms=3000, term_wait_ms=1000):
+            self._bench_worker = None
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:
             try:

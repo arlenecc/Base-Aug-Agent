@@ -16,6 +16,17 @@ class AgentConfig:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    # 主模型既可使用 OpenAI-compatible 网络端点，也可在应用进程内直接加载。
+    # 本地后端均为懒加载，应用配置时不会在 UI 线程同步读入数 GB 权重。
+    llm_backend: str = "openai"  # openai | mlx_lm | mlx_vlm | onnx | llama_cpp
+    llm_model_path: str = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
+    llm_vision_projection_path: str = ""  # GGUF VLM 的 mmproj/clip 文件
+    llm_chat_format: str = ""
+    llm_vlm_handler: str = "mtmd"
+    local_model_threads: int = 4
+    local_model_batch_size: int = 512
+    local_gpu_layers: int = -1
+    onnx_threads: int = 4
     temperature: float = 0.7
     max_tokens: int = 32768
     top_p: float = 0.95
@@ -43,8 +54,24 @@ class AgentConfig:
     # RAG settings
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
-    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
-    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # fastembed ONNX reranker
+    # 默认走本地 MLX 直载（实测 Embedding 3.7x、Reranker 2.5x 于 fastembed CPU）。
+    # MLX 不可用时（非 Apple Silicon / 未安装 / 路径缺失）自动回退 fastembed，
+    # 不会出现「默认配置直接不可用」。
+    rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
+    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"  # MLX 回退用
+    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx"
+    # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
+    # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
+    rag_embedding_batch_size: int = 16
+    rag_embedding_max_length: int = 512
+    rag_rerank_backend: str = "mlx"  # mlx | fastembed | onnx | disabled
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
+    rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
+    # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，
+    # 这样在 UI 里切换后端不必重新粘贴路径。
+    rag_rerank_mlx_model_path: str = "models/bge-reranker-v2-m3-mlx-mxfp8"
+    rag_rerank_batch_size: int = 16
+    rag_rerank_max_length: int = 512
     rag_rerank_enabled: bool = True
     rag_auto_ingest: bool = True
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
@@ -65,20 +92,34 @@ class AgentConfig:
     # 数值字段的类型，用于把 config.json 里的字符串/浮点值强制转换回正确类型。
     # 手工编辑过的 config.json 常出现 "32768"（字符串）或 32768.0（浮点），
     # 直接喂给 dataclass 会让后续算术/比较在运行时炸掉。
-    _INT_FIELDS = ("max_tokens", "top_k", "max_iterations", "max_history",
-                   "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap")
+    _INT_FIELDS = (
+        "max_tokens", "top_k", "max_iterations", "max_history",
+        "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
+        "local_model_threads", "local_model_batch_size", "local_gpu_layers",
+        "onnx_threads", "rag_embedding_batch_size", "rag_embedding_max_length",
+        "rag_rerank_batch_size", "rag_rerank_max_length",
+    )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio")
-    _STR_FIELDS = ("base_url", "api_key", "model", "workspace", "knowledge_base",
-                   "rag_embedding_model", "rag_rerank_model", "browser_endpoint",
-                   "rag_pdf_engine")
+    _STR_FIELDS = (
+        "base_url", "api_key", "model", "workspace", "knowledge_base",
+        "llm_backend", "llm_model_path", "llm_vision_projection_path",
+        "llm_chat_format", "llm_vlm_handler",
+        "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
+        "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
+        "rag_rerank_mlx_model_path",
+        "browser_endpoint", "rag_pdf_engine",
+    )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
-    # knowledge_base 故意不在其中：它本来就可以为空（表示「用 workspace 下的
-    # 默认目录」）。
-    _NON_EMPTY_STR_FIELDS = ("base_url", "model", "workspace",
-                             "rag_embedding_model", "rag_rerank_model",
-                             "rag_pdf_engine")
+    # knowledge_base / API key / mmproj / chat format 可以为空。
+    _NON_EMPTY_STR_FIELDS = (
+        "base_url", "model", "workspace", "llm_backend", "llm_model_path",
+        "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
+        "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
+        "rag_rerank_mlx_model_path",
+        "rag_pdf_engine",
+    )
 
     @classmethod
     def _coerce(cls, name: str, value):
@@ -201,6 +242,21 @@ class AgentConfig:
         # so the shrink threshold follows the model's actual window.
         if self.max_context_tokens < 8192:
             self.max_context_tokens = self.max_tokens
+
+        if self.llm_backend not in ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp"):
+            self.llm_backend = "openai"
+        if self.rag_embedding_backend not in ("fastembed", "mlx", "onnx", "llama_cpp"):
+            self.rag_embedding_backend = "fastembed"
+        if self.rag_rerank_backend not in ("fastembed", "mlx", "onnx", "disabled"):
+            self.rag_rerank_backend = "fastembed"
+        self.local_model_threads = max(1, self.local_model_threads)
+        self.local_model_batch_size = max(1, self.local_model_batch_size)
+        self.onnx_threads = max(1, self.onnx_threads)
+        # 批大小夹在 [2, 64]：低于 2 吞吐腰斩，高于 64 无收益且内存无谓增长。
+        self.rag_embedding_batch_size = max(2, min(64, self.rag_embedding_batch_size))
+        self.rag_embedding_max_length = max(8, self.rag_embedding_max_length)
+        self.rag_rerank_batch_size = max(1, self.rag_rerank_batch_size)
+        self.rag_rerank_max_length = max(8, self.rag_rerank_max_length)
 
     def save(self, path: str) -> None:
         import json

@@ -201,7 +201,16 @@ class LongTermMemory:
     the ``graph`` attribute (a GraphMemoryStore).
     """
 
-    def __init__(self, path: str, embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"):
+    def __init__(
+        self,
+        path: str,
+        embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q",
+        embedding_backend: str = "fastembed",
+        embedding_model_path: str = "",
+        embedding_threads: int = 4,
+        embedding_batch_size: int = 8,
+        embedding_max_length: int = 512,
+    ):
         from .graph_memory import GraphMemoryStore
         # path is like .../long_memory.json; the graph file is the same
         # path but with .json → .graph.json so old flat-memory files are
@@ -210,7 +219,15 @@ class LongTermMemory:
         # /data.json/long_memory.json），replace 会把它们一起改掉，得到一个
         # 错误的目录路径。
         graph_path = path[:-5] + ".graph.json" if path.endswith(".json") else path + ".graph"
-        self._graph = GraphMemoryStore(path=graph_path, embedding_model=embedding_model)
+        self._graph = GraphMemoryStore(
+            path=graph_path,
+            embedding_model=embedding_model,
+            embedding_backend=embedding_backend,
+            embedding_model_path=embedding_model_path,
+            embedding_threads=embedding_threads,
+            embedding_batch_size=embedding_batch_size,
+            embedding_max_length=embedding_max_length,
+        )
         self._legacy_store = _JsonStore(path)
         # Migrate old flat facts into the graph on first use.
         self._migrate_legacy_facts()

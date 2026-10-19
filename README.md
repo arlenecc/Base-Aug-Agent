@@ -74,6 +74,9 @@ pip install -e ".[all]"
 | 核心 | `pip install -e .` | PyQt6, httpx, beautifulsoup4 |
 | RAG | `pip install -e ".[rag]"` | lancedb, fastembed, FlagEmbedding, python-docx, openpyxl, python-pptx, PyMuPDF, ebooklib, docling, chonkie, jieba |
 | OCR | `pip install -e ".[ocr]"` | rapidocr-onnxruntime（图片型 PDF 识别） |
+| 本地 MLX | `pip install -e ".[local-mlx]"` | mlx, mlx-lm, mlx-vlm, mlx-embeddings（仅 Apple Silicon） |
+| 本地 ONNX | `pip install -e ".[local-onnx]"` | onnxruntime, transformers |
+| 本地 GGUF | `pip install -e ".[local-gguf]"` | llama-cpp-python |
 | 测试 | `pip install -e ".[test]"` | pytest, pytest-qt（`qapp` fixture，UI 测试必需） |
 | 全部 | `pip install -e ".[all]"` | 以上所有 |
 
@@ -136,6 +139,68 @@ python main.py
 | `rag_outline` | 获取文档缩略版本（目录结构 + 章节标题） | ❌ |
 | `rag_status` | 查看知识库状态 | ❌ |
 | `rag_ingest` | 增量索引知识库 | ❌ |
+
+## 本地模型直载（免网络推理）
+
+除 OpenAI 兼容端点外，主模型、Embedding、Reranker 都可以直接在应用进程内加载本地权重，全程不发网络请求。三处选择都是**配置项**（`~/.base-agent/config.json`，界面顶部配置区可直接改）。
+
+### 可选运行时
+
+| 后端 | 配置项取值 | 依赖 extra | 适用模型格式 |
+|------|-----------|-----------|-------------|
+| MLX-LM | `llm_backend=mlx_lm` | `.[local-mlx]` | MLX 量化/半精度 LLM 目录（Apple Silicon） |
+| MLX-VLM | `llm_backend=mlx_vlm` | `.[local-mlx]` | MLX 多模态目录（图/音/视频） |
+| ONNX Runtime | `llm_backend=onnx`、Embedding/Reranker `onnx` | `.[local-onnx]` | 导出的 `.onnx` + 同目录 `tokenizer.json` |
+| MLX Reranker | `rag_rerank_backend=mlx` | `.[local-mlx]` | MLX 交叉编码器目录（XLM-RoBERTa 序列分类，支持 mxfp8/int8/int4 量化） |
+| llama.cpp | `llm_backend=llama_cpp`、Embedding `llama_cpp` | `.[local-gguf]` | `.gguf`（VLM 需额外配置 mmproj） |
+| fastembed | Embedding/Reranker 默认 | `.[rag]` | fastembed 目录名（CPU 量化 ONNX，首次需下载） |
+
+```bash
+pip install -e ".[local-mlx]"    # mlx / mlx-lm / mlx-vlm / mlx-embeddings
+pip install -e ".[local-onnx]"   # onnxruntime + transformers
+pip install -e ".[local-gguf]"   # llama-cpp-python
+```
+
+### 关键配置项
+
+| 配置键 | 默认 | 说明 |
+|--------|------|------|
+| `llm_backend` | `openai` | `openai` / `mlx_lm` / `mlx_vlm` / `onnx` / `llama_cpp` |
+| `llm_model_path` | `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx` | 本地主模型目录或 `.onnx`/`.gguf` 文件 |
+| `rag_embedding_backend` | `mlx` | `mlx` / `fastembed` / `onnx` / `llama_cpp` |
+| `rag_embedding_model_path` | `models/nomic-embed-text-v1.5-mlx` | 本地 Embedding 权重 |
+| `rag_rerank_backend` | `mlx` | `mlx` / `fastembed` / `onnx` / `disabled` |
+| `rag_rerank_model_path` | `models/bge-reranker-v2-m3-ONNX/model_quantized.onnx` | 本地 ONNX Reranker 文件 |
+| `rag_rerank_mlx_model_path` | `models/bge-reranker-v2-m3-mlx-mxfp8` | 本地 MLX Reranker 目录（与 ONNX 分开保存，切换后端不用重贴路径） |
+| `onnx_threads` / `local_model_threads` | `4` | CPU 推理线程数 |
+| `rag_embedding_batch_size` / `rag_rerank_batch_size` | `16` / `16` | 批大小；Embedding 夹在 `[2, 64]`（MLX 实测 2→88、8→152、16→178、32→205、64→205、128→190 条/s） |
+
+本地模型全部**懒加载**：应用配置时只读路径，权重在首次推理时才载入。Embedding 权重在 RAG / 知识图谱 / 技能检索之间按「后端 + 路径 + 线程 + 批大小」共享同一份进程级单例，不会重复占用内存。本地模型没有原生 tool calling，`<think>` 与 `<tool_call>` 由 `_TaggedOutputParser` 从纯文本解析成标准事件。
+
+### 测速对比
+
+界面「本地后端 → 测速对比」按钮会对比本地直载后端与 fastembed CPU 量化版，结果写入 `~/.base-agent/model_benchmark.json` 并在按钮旁给出切换建议；也可命令行跑：
+
+```bash
+python -m src.agent.model_benchmark --save     # 测速并保存
+python -m src.agent.model_benchmark --show     # 查看已保存结果与建议
+```
+
+本机（Apple Silicon，batch=8/16，3 轮）实测：
+
+| 环节 | 本地直载 | fastembed CPU | 结论 |
+|------|---------|---------------|------|
+| Embedding | MLX `nomic-embed-text-v1.5-mlx` 153–161 条/s | `nomic-ai/nomic-embed-text-v1.5-Q` 42–47 条/s | **3.4–3.7x**，向量余弦 0.962 → 建议切 `mlx` |
+| Reranker | MLX `bge-reranker-v2-m3-mlx-mxfp8` 34–39 条/s | `BAAI/bge-reranker-v2-m3-int8` 14–15 条/s | **2.2–2.7x**，分数相关 0.997 → 建议切 `mlx` |
+| Reranker | ONNX `bge-reranker-v2-m3-ONNX` 14.2 条/s | 同上 | 0.93–1.06x（持平），分数相关 1.000 → 免联网的等价方案 |
+
+切换判据是「速度 + 一致性」双门槛：只快但向量/分数不一致时会提示先回归检索质量，而不是直接建议切换。
+
+### 默认选择
+
+RAG 的 Embedding 与 Reranker **默认走本地 MLX**（`nomic-embed-text-v1.5-mlx`、`bge-reranker-v2-m3-mlx-mxfp8`），即上表的两组提速结论直接生效；主模型仍是 `openai` 网络端点，不是被强制本地化。
+
+MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：非 macOS / 非 arm64 / 未装 MLX / 模型路径缺失时，日志会写明原因并回退到 `fastembed` CPU 量化版，RAG 不会因默认配置而不可用。回退用的目录名保留在 `rag_embedding_model` 与 `rag_rerank_model` 里。
 
 ## 本地知识库 (RAG)
 
@@ -241,7 +306,7 @@ python main.py
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
 - **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
-- **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内按文本长度降序分桶后再拆子批，子批大小由自适应控制器实测吞吐动态调整（4-20，初始 8、步长 2：更快则继续上调、变慢回退；持续劣化自动降档避让，环境变快重新爬升），累计持 GIL 达到阈值才主动让出（不逐个 sleep），让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
+- **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内按文本长度降序分桶后再拆子批，子批大小由自适应控制器实测吞吐动态调整（2-64，初始 16、步长 2：更快则继续上调、变慢回退；持续劣化自动降档避让，环境变快重新爬升；超长文本另由形状预算钳制条数，RSS 软墙 8GB 兜底），累计持 GIL 达到阈值才主动让出（不逐个 sleep），让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
 - **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
@@ -694,6 +759,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 130 | OCR 回收周期 20 页是凭水位倒推的估计值（~35MB/页 × 20 ≈ 0.7GB），热重建成本当时按冷启动 ~6s 估，偏保守 | 周期过紧白白增加重建频率，或过松累积缓存 | 系统扫描 N=10..100 × 真实 200dpi 页：热重建仅 1-2s/次（冷启动 3-4s 只发生一次），峰值足迹各 N 持平 ~5.2GB（压缩器吸收缓存增长，peak_cmprs 随 N 线性涨），N 对 400 页书总耗时影响仅 1-3%；定 N=50：单代水位 ~1.8GB、重建摊销 ~0.5%，速度与内存的实测平衡点 |
 | 131 | 重排序三处与设计意图脱节：① 两个真实调用点都不传 rerank_model，实际吃 engine.py 旧默认 `BAAI/bge-reranker-base`（fp32 ~1.04GB 非量化），而非设计声明的 INT8 v2-m3（~570MB）；② `TextCrossEncoder` 未传 cache_dir，fastembed 默认下到系统临时目录（macOS 定期清理 → 重复下载，与 #121 同型）；③ 未显式传 providers，EP 选择依赖 fastembed 默认行为 | 加载的模型比预期大一倍且非量化；模型缓存被系统清理后重复下载 | engine.py 默认改为 `DEFAULT_RERANK_MODEL`（BAAI/bge-reranker-v2-m3-int8，与 deps.py 缓存判定、设计文档对齐）；TextCrossEncoder 显式传持久 cache_dir（~/.cache/fastembed）+ `providers=["CPUExecutionProvider"]`（与嵌入模型同款锁死）；目录映射核实：catalog 名 → onnx-community/bge-reranker-v2-m3-ONNX 的 onnx/model_int8.onnx；用已缓存小型 cross-encoder 实测验证 CPU 锁死生效 |
 | 132 | 重排延迟实测：v2-m3-int8（568M）在本机 CPU 逐对 ~0.55s/对是地板（批并行无收益——CPU EP 单序列已吃满多核；threads ±10% 噪声；截断 512 对 top3 常规场景无收益，已放弃）；agent LLM 自主传 top_k=5 → 40 条候选 ≈ 23s，交互不可接受 | LLM 自选大 top_k 放大重排延迟 | rag_search 工具 top_k 封顶 3（LLM 传 5 被钳到 3 → 24 条 ≈ 14s），schema 描述同步「上限 3」；进一步降耗的备选杠杆（候选池减半 multiplier 4→2、异步重排）留观察后决定 |
+| 135 | 子批区间 1-5 / 初始 2 是 fastembed(ONNX CPU) 时代的标定（「子批增大吞吐单调变差」）。MLX 直载后曲线反转：短切片 2→88、8→152、16→178、32→205、64→205、128→190 条/s；长切片（~1200 字符）与子批数无关（1-16 均 13.2 条/s）。原区间把吞吐锁在最优的 50-69% | 默认后端换成 MLX 后自适应器仍按旧曲线取小批，白白损失一半吞吐 | 区间改为 **2-64、初始 16、步长 2**（用户定参），RSS 软墙保留 8GB；`rag_embedding_batch_size` 默认 8→16 并夹 `[2,64]`；形状预算仍可把单批压到 1（内存硬约束优先于下限）；子批测试改为常量驱动（改档位不改测试）；实测 96 条语料 batch 8→16：173→211 条/s（+22%） |
 
 ## 部署
 

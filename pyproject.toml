@@ -49,6 +49,8 @@ rag = [
     # CoreML EP（Apple Silicon OCR/推理加速）需要官方 wheel 内置的
     # CoreMLExecutionProvider；旧版 wheel 没有，运行时 deps 检查也会强制此下限。
     "onnxruntime>=1.31",
+    # 直接 ONNX Embedding/Reranker 使用本地 tokenizer.json，禁止联网加载。
+    "transformers>=4.49",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)。
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
@@ -58,6 +60,17 @@ ocr = ["rapidocr>=3.10"]
 # rag_pdf_engine 配置切换。会连带拉 PyTorch（~2GB+）+ surya OCR 模型，
 # 故独立 extra，不进默认 rag 组；未安装时自动回退 docling。
 marker = ["marker-pdf>=2.0.0"]
+# 应用内直接加载本地模型。MLX 仅在 Apple Silicon macOS 可用；ONNX 与
+# llama.cpp 保持独立 extra，用户只需安装实际选择的运行时。
+local-mlx = [
+    "mlx>=0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.7.8; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers>=4.49",
+]
+local-onnx = ["numpy>=1.24.0", "onnxruntime>=1.31", "transformers>=4.49"]
+local-gguf = ["llama-cpp-python>=0.3.36"]
 # All optional features
 #all = ["base-agent[test,rag,ocr]"]
 

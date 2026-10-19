@@ -49,6 +49,14 @@ def _make_window(tmp_path, monkeypatch):
     return win
 
 
+def _flush_reason(win):
+    """思考区走 100ms 攒批写入（见 MainWindow._on_reasoning）。
+
+    UI 线程上的同步断言读不到缓冲区里的内容，必须先把攒批落地。
+    """
+    win._flush_reason_buffer()
+
+
 def test_send_streams_content_into_chat(qtbot, tmp_path, monkeypatch):
     win = _make_window(tmp_path, monkeypatch)
     qtbot.addWidget(win)
@@ -128,11 +136,13 @@ def test_reasoning_appends_even_after_cursor_drift(qtbot, tmp_path, monkeypatch)
     qtbot.addWidget(win)
 
     win._on_reasoning("abc")
+    _flush_reason(win)
     # simulate the user clicking at the start of the thinking view
     cursor = win.think_view.textCursor()
     cursor.movePosition(QTextCursor.MoveOperation.Start)
     win.think_view.setTextCursor(cursor)
     win._on_reasoning("def")
+    _flush_reason(win)
 
     assert win.think_view.toPlainText() == "abcdef"
 
@@ -237,6 +247,7 @@ def test_reasoning_with_carriage_returns_does_not_overlap(qtbot, tmp_path, monke
     qtbot.addWidget(win)
 
     win._on_reasoning("line1\rline2")
+    _flush_reason(win)
 
     assert win.think_view.toPlainText() == "line1\nline2"
 
@@ -246,6 +257,7 @@ def test_reasoning_empty_chunk_is_noop(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(win)
     win._on_reasoning("keep")
     win._on_reasoning("")  # empty / sanitizes to empty -> ignored
+    _flush_reason(win)
     assert win.think_view.toPlainText() == "keep"
     assert win._agent._history == []
 
@@ -282,6 +294,7 @@ def test_reasoning_scrolls_to_bottom_after_each_chunk(qtbot, tmp_path, monkeypat
     # Fill enough lines to make the view scrollable, then verify bottom is shown.
     for i in range(40):
         win._on_reasoning(f"line {i}\n")
+        _flush_reason(win)
         sb = win.think_view.verticalScrollBar()
         assert sb.value() == sb.maximum(), (
             f"think_view not at bottom after line {i}: "
@@ -296,6 +309,7 @@ def test_reasoning_scrolls_to_bottom_after_each_chunk(qtbot, tmp_path, monkeypat
 
     # A new chunk arrives -> must snap back to the bottom.
     win._on_reasoning("new tail line\n")
+    _flush_reason(win)
     sb = win.think_view.verticalScrollBar()
     assert sb.value() == sb.maximum()
 

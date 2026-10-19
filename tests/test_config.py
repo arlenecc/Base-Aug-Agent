@@ -255,3 +255,65 @@ def test_migrate_keeps_explicitly_small_budget(tmp_path):
     cfg = AgentConfig.load(str(p))
     assert cfg.max_tokens == 2048
     assert cfg.max_context_tokens == 2048
+
+
+def test_local_model_defaults_are_parallel_not_forced():
+    cfg = AgentConfig()
+    assert cfg.llm_backend == "openai"
+    assert cfg.llm_model_path.endswith("qwen3.5-4b-agentic-coder-v4-4bit-mlx")
+    # 主模型仍是网络端点（不被强制本地化），RAG 两个模型默认走本地 MLX。
+    assert cfg.rag_embedding_backend == "mlx"
+    assert cfg.rag_embedding_model_path.endswith("nomic-embed-text-v1.5-mlx")
+    assert cfg.rag_rerank_backend == "mlx"
+    assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+    # 回退用的 fastembed 目录名必须保留，否则 MLX 不可用时无路可退。
+    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
+    assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+
+
+def test_local_model_config_round_trip(tmp_path):
+    p = tmp_path / "c.json"
+    cfg = AgentConfig(
+        llm_backend="mlx_lm",
+        rag_embedding_backend="mlx",
+        rag_rerank_backend="mlx",
+        rag_rerank_mlx_model_path="models/bge-reranker-v2-m3-mlx-mxfp8",
+        onnx_threads=6,
+        rag_embedding_batch_size=3,
+        rag_rerank_batch_size=7,
+    )
+    cfg.save(str(p))
+    loaded = AgentConfig.load(str(p))
+    assert loaded.llm_backend == "mlx_lm"
+    assert loaded.rag_embedding_backend == "mlx"
+    assert loaded.rag_rerank_backend == "mlx"
+    assert loaded.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+    assert loaded.onnx_threads == 6
+    assert loaded.rag_embedding_batch_size == 3
+    assert loaded.rag_rerank_batch_size == 7
+
+
+def test_embedding_batch_size_default_and_clamp(tmp_path):
+    """默认 16（MLX 拐点），越界值夹回 [2, 64]。"""
+    assert AgentConfig().rag_embedding_batch_size == 16
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"rag_embedding_batch_size": 1000}))
+    assert AgentConfig.load(str(p)).rag_embedding_batch_size == 64
+    p.write_text(json.dumps({"rag_embedding_batch_size": 0}))
+    assert AgentConfig.load(str(p)).rag_embedding_batch_size == 2
+
+
+def test_invalid_local_backend_values_fall_back(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "llm_backend": "bad",
+        "rag_embedding_backend": "bad",
+        "rag_rerank_backend": "bad",
+        "onnx_threads": 0,
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.llm_backend == "openai"
+    assert cfg.rag_embedding_backend == "fastembed"
+    assert cfg.rag_rerank_backend == "fastembed"
+    assert cfg.onnx_threads == 1

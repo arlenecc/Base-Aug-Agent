@@ -98,8 +98,9 @@ class FastEmbedEmbeddingFunction:
     Use get_or_create_embedding_function() to get a shared singleton.
     """
 
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL):
+    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, threads: int = 4):
         self._model_name = model_name
+        self._threads = max(1, int(threads))
         self._model = None  # lazy-init
         # 懒加载的双检锁：InferenceSession.run() 的线程安全只覆盖推理，不覆盖
         # 这里的懒初始化——两个线程同时首次调用会各自加载一份 ~130MB 模型，
@@ -145,7 +146,7 @@ class FastEmbedEmbeddingFunction:
                         # （57 vs 63 tok/s），留一半核心给 OCR/解析 worker。
                         # 嵌入吞吐的主要杠杆是长度分桶（见 _embed_chunks），
                         # 线程数影响很小（#122）。
-                        threads=4,
+                        threads=self._threads,
                     )
             except Exception as e:
                 # 模型加载失败最常见的原因是首次使用时需要从 HuggingFace
@@ -171,14 +172,17 @@ class FastEmbedEmbeddingFunction:
             logger.info("  ✅ 嵌入模型加载完成: %s", self._model_name)
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
-    def __call__(self, input: List[str]) -> List[List[float]]:
+    def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         """Embed a list of document texts. Returns a list of embedding vectors."""
         if not input:
             return []
         self._ensure_model()
         # Add document prefix for nomic-embed-text-v1.5
         prefixed = [_DOC_PREFIX + t if not t.startswith(_DOC_PREFIX) else t for t in input]
-        embeddings = list(self._model.embed(prefixed))
+        if batch_size:
+            embeddings = list(self._model.embed(prefixed, batch_size=int(batch_size)))
+        else:
+            embeddings = list(self._model.embed(prefixed))
         return [e.tolist() for e in embeddings]
 
     def embed_query(self, text: str) -> List[float]:
@@ -188,13 +192,13 @@ class FastEmbedEmbeddingFunction:
         embeddings = list(self._model.embed([prefixed]))
         return embeddings[0].tolist()
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def embed_documents(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         """Embed a list of document texts (with document prefix).
 
         Batched: a single ONNX forward pass for the whole list, much faster
         than calling embed_query() per text.
         """
-        return self(texts)
+        return self(texts, batch_size=batch_size)
 
     def name(self) -> str:
         return f"fastembed:{self._model_name}"
@@ -204,7 +208,7 @@ class FastEmbedEmbeddingFunction:
 # Process-level embedding function singleton
 # ---------------------------------------------------------------------------
 
-_EF_SINGLETONS: Dict[str, "FastEmbedEmbeddingFunction"] = {}
+_EF_SINGLETONS: Dict[str, Any] = {}
 _EF_SINGLETONS_LOCK = threading.Lock()
 
 
@@ -228,22 +232,39 @@ def _store_op(func):
 
 def get_or_create_embedding_function(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
-) -> "FastEmbedEmbeddingFunction":
-    """Return a process-wide shared FastEmbedEmbeddingFunction.
-
-    The ONNX model (~137MB) is loaded once and shared across all callers
-    (RAG VectorStore, graph_memory GraphMemoryStore, etc.).  ONNX Runtime
-    InferenceSession.run() is thread-safe, so concurrent callers can share
-    a single model instance without locking on inference.
-
-    This avoids loading multiple copies of the same ~137MB model when both
-    RAG and graph_memory are active (which previously cost ~274MB).
-    """
+    *,
+    backend: str = "fastembed",
+    model_path: str = "",
+    threads: int = 4,
+    batch_size: int = 8,
+    max_length: int = 512,
+):
+    """Return a shared embedding adapter for the selected local backend."""
+    backend = (backend or "fastembed").lower()
+    key = "|".join((
+        backend,
+        model_name or "",
+        os.path.abspath(os.path.expanduser(model_path)) if model_path else "",
+        str(max(1, int(threads))),
+        str(max(1, int(batch_size))),
+        str(max(8, int(max_length))),
+    ))
     with _EF_SINGLETONS_LOCK:
-        ef = _EF_SINGLETONS.get(model_name)
+        ef = _EF_SINGLETONS.get(key)
         if ef is None:
-            ef = FastEmbedEmbeddingFunction(model_name=model_name)
-            _EF_SINGLETONS[model_name] = ef
+            if backend == "fastembed":
+                ef = FastEmbedEmbeddingFunction(model_name=model_name, threads=threads)
+            else:
+                from .model_backends import create_embedding_backend
+                ef = create_embedding_backend(
+                    backend,
+                    model_name,
+                    model_path,
+                    threads=threads,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                )
+            _EF_SINGLETONS[key] = ef
         return ef
 
 
@@ -251,17 +272,23 @@ def get_or_create_embedding_function(
 # 自适应嵌入子批大小控制器
 # ---------------------------------------------------------------------------
 
-# 子批大小探索范围与步长（#125，#126/#127/#128 生产验证后修订）：真实
-# 切片上的实测是「吞吐与内存都随子批增大单调变差」——激活工作集 ∝ 子批
-# ×批内最长序列，超出 CPU 缓存后被内存带宽卡死，「大批次摊薄开销」在此
-# 不成立。真实 200 切片实测：size2 = 2071 tok/s @ 1.28GB，size4 = 1864 @
-# 2.14GB，size12 = 1163 @ 4.99GB。1-5 覆盖「单条最省内存」到「短切片批
-# 效率」的合理区间，步长 1 让爬山在平坦段也能精细寻优；初始 2 起步即落
-# 在实测最优区（#128 用户规格）。
-_SUBBATCH_MIN = 1
-_SUBBATCH_MAX = 5
-_SUBBATCH_START = 2
-_SUBBATCH_STEP = 1
+# 子批大小探索范围与步长（#125 引入，#126-#129 生产验证修订，2026-10 MLX
+# 默认后端后按新实测重新标定）。
+#
+# 旧标定「吞吐随子批增大单调变差、size2 双优」（size2 = 2071 tok/s @
+# 1.28GB，size12 = 1163 @ 4.99GB）是 **fastembed/ONNX CPU** 时代的结论。
+# 换成 MLX 直载后曲线反转：短切片 2→16 吞吐从 88 涨到 178 条/s（+102%），
+# 16→32 再 +5~8%，32 以上基本持平、128 反而回落；长切片（~1200 字符）
+# 则与子批数无关（13.2 条/s 从 1 到 16 平坦）。因此：
+#   - 起步 16：直接落在 MLX 的拐点上，省掉从 2 一路爬 24 档的试探开销；
+#   - 上限 64：32-96 已无收益，64 是收益与安全的水位（未测更大批的内存）；
+#   - 下限 2：低于 4 吞吐掉到最优的 50-69%，但保留 2 作为极端内存压力下的
+#     避让位（形状预算还能进一步钳到 1，见 _shape_cap_size）。
+# 步长 2：范围扩大到 [2,64] 后步长 1 要爬 31 档才到顶，爬山期过长。
+_SUBBATCH_MIN = 2
+_SUBBATCH_MAX = 64
+_SUBBATCH_START = 16
+_SUBBATCH_STEP = 2
 # RSS 软墙（#129，用户定参 8GB）：内存偶尔冲高是正常的（OCR 缓存、压缩
 # 计费），只要求「超墙时降档避让、回墙下即停」——无闩锁。旧 5GB 闩锁版
 # 会在真实同步基线（6-10GB）下首个子批就触发且永不解除，是「降到 1 再
@@ -283,7 +310,12 @@ _SUBBATCH_SHAPE_BUDGET = 6_000_000  # 条 × 字符²
 
 
 def _shape_cap_size(size: int, max_len: int) -> int:
-    """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。"""
+    """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。
+
+    这是**内存硬约束**，可以压到 ``_SUBBATCH_MIN`` 以下（超长文本时到 1）：
+    调优器的下限管的是「状态机探索范围」，形状预算管的是「单批不能超过多少
+    激活」，二者语义不同——内存安全优先于下限。
+    """
     if max_len <= 0:
         return size
     budget = _SUBBATCH_SHAPE_BUDGET // (max_len * max_len)
@@ -309,30 +341,30 @@ _SUBBATCH_RE_CLIMB = 1.10
 
 
 class _SubBatchTuner:
-    """在 [1, 5] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
+    """在 [2, 64] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
 
     度量：不用原始 tok/s——长度分桶后各批序列长度天然不同，直接比
     tok/s 有系统性偏差。改用算力速率 ``ops/s = n × max_len² / dt``（以
     字符数近似 token 数，单调代理即可），对批大小与批内最长长度同时
     归一，跨窗口、跨尺寸可比。
 
-    状态机（#125 用户规格，#126/#127/#128 生产验证修订）：
-      climb   初始 2：基线窗口（2 子批）→ 试探 +1 → 更快（≥3%）则采纳并
-              继续上调，变慢则回退到上一个数字，进入 monitor。起步即落
-              在实测最优区，步长 1 在吞吐平坦段也能精细寻优；
-      monitor 持续盯速率：连续 2 窗口低于历史最优 75% → 降 1 避让（下限
-              1），速率恢复即停；速率回到历史最优 95% 且尺寸低于最优尺寸 →
-              尖峰已过去，回到最优尺寸重新爬升（#129，消除降档单向棘轮）；
-              实测速率比历史最优高 10% → 环境变快，重新爬升。
+    状态机（#125 用户规格，#126/#127/#128 生产验证修订，2026-10 重标定）：
+      climb   初始 16（MLX 拐点）：基线窗口（2 子批）→ 试探 +2 → 更快
+              （≥3%）则采纳并继续上调，变慢则回退到上一个数字，进入
+              monitor。起步即落在实测最优区，不必从下限一路爬上来；
+      monitor 持续盯速率：连续 2 窗口低于历史最优 75% → 降 1 档（步长 2）
+              避让（下限 2），速率恢复即停；速率回到历史最优 95% 且尺寸低于
+              最优尺寸 → 尖峰已过去，回到最优尺寸重新爬升（#129，消除降档
+              单向棘轮）；实测速率比历史最优高 10% → 环境变快，重新爬升。
 
     内存安全双保险（#126/#129）：
       ① 形状预算：_embed_chunks 组装每个子批时按 ``_shape_cap_size`` 钳制
          条数（激活 ∝ 条数 × 批内最长序列²），超长文本自动变小。绝对 RSS
          阈值在真实同步进程（基线 6-10GB）必然误触发，曾导致永久卡死。
-      ② RSS 软墙 8GB（无闩锁）：超墙每子批 force_down 降 1 档，回墙下即
-         停，恢复交给 monitor 恢复分支——旧 5GB 闩锁版是「降到 1 再也不
-         回去」的根因。调优器 report() 收到的是钳制后的实际条数，状态机
-         在可行域内正常爬山。
+      ② RSS 软墙 8GB（无闩锁，2026-10 用户定参保留 8GB）：超墙每子批
+         force_down 降 1 档（步长 2），回墙下即停，恢复交给 monitor 恢复
+         分支——旧 5GB 闩锁版是「降到下限再也不回去」的根因。调优器 report()
+         收到的是钳制后的实际条数，状态机在可行域内正常爬山。
 
     预热丢弃（#126 修订）：首个完整窗口包含模型加载 / ONNX 会话初始化
     （可达 10s+），会把爬升基线拉到虚低，让热身的试探窗口显得「暴涨」
@@ -531,10 +563,33 @@ class VectorStore:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         rerank_model: str = DEFAULT_RERANK_MODEL,
         embedding_function: Optional[Any] = None,
+        embedding_backend: str = "fastembed",
+        embedding_model_path: str = "",
+        embedding_threads: int = 4,
+        embedding_batch_size: int = 8,
+        embedding_max_length: int = 512,
+        rerank_backend: str = "fastembed",
+        rerank_model_path: str = "",
+        rerank_mlx_model_path: str = "",
+        rerank_threads: int = 4,
+        rerank_batch_size: int = 16,
+        rerank_max_length: int = 512,
+        rerank_enabled: bool = True,
     ):
         self._persist_dir = persist_dir
         self._embedding_model = embedding_model
+        self._embedding_backend = embedding_backend
+        self._embedding_model_path = embedding_model_path
+        self._embedding_threads = max(1, int(embedding_threads))
+        self._embedding_batch_size = max(1, int(embedding_batch_size))
+        self._embedding_max_length = max(8, int(embedding_max_length))
         self._rerank_model = rerank_model
+        self._rerank_backend = rerank_backend if rerank_enabled else "disabled"
+        self._rerank_model_path = rerank_model_path
+        self._rerank_mlx_model_path = rerank_mlx_model_path
+        self._rerank_threads = max(1, int(rerank_threads))
+        self._rerank_batch_size = max(1, int(rerank_batch_size))
+        self._rerank_max_length = max(8, int(rerank_max_length))
         self._custom_ef = embedding_function  # for testing injection
         self._db = None
         self._table = None
@@ -654,13 +709,18 @@ class VectorStore:
         logger.info("  连接 LanceDB: %s", self._persist_dir)
         self._db = lancedb.connect(self._persist_dir)
 
-        # Use injected embedding function (for testing) or create FastEmbed one
+        # Use injected embedding function (for testing) or the configured shared backend.
         if self._custom_ef is not None:
             self._ef = self._custom_ef
         else:
-            # Use the process-wide shared singleton to avoid loading
-            # multiple copies of the ~137MB ONNX model (RAG + graph_memory).
-            self._ef = get_or_create_embedding_function(self._embedding_model)
+            self._ef = get_or_create_embedding_function(
+                self._embedding_model,
+                backend=self._embedding_backend,
+                model_path=self._embedding_model_path,
+                threads=self._embedding_threads,
+                batch_size=self._embedding_batch_size,
+                max_length=self._embedding_max_length,
+            )
 
         # Open existing table or defer creation until first add
         if _TABLE_NAME in self._db.table_names():
@@ -1380,6 +1440,10 @@ class VectorStore:
         # 会直接 return（状态置 failed），避免状态机卡死或「复活」持有权重。
         if getattr(self, "_closed", False):
             return None
+        if self._rerank_backend == "disabled":
+            self._reranker = None
+            self._reranker_state = "failed"
+            return None
         state = getattr(self, "_reranker_state", "idle")
         if state == "done":
             return self._reranker
@@ -1399,41 +1463,32 @@ class VectorStore:
             if state in ("failed", "loading"):
                 return None
 
-            try:
-                from fastembed.rerank.cross_encoder import TextCrossEncoder
-            except ImportError:
-                try:
-                    # fastembed 0.6–0.8 在顶层导出 TextCrossEncoder，0.9 起移入子模块。
-                    from fastembed import TextCrossEncoder  # type: ignore[no-redef]
-                except ImportError:
-                    logger.warning(
-                        "  ⚠ fastembed 未安装或版本过旧, 重排序功能不可用. "
-                        "pip install 'fastembed>=0.6'"
-                    )
-                    self._reranker = None
-                    self._reranker_state = "failed"
-                    return None
+            from .model_backends import create_reranker_backend
 
-            logger.info("  🔧 正在加载 BGE Reranker 模型: %s (首次加载, ~570MB INT8)...", self._rerank_model)
+            logger.info(
+                "  🔧 正在加载 Reranker: backend=%s model=%s path=%s...",
+                self._rerank_backend,
+                self._rerank_model,
+                self._rerank_model_path or "(catalog)",
+            )
             import time as _time
             _time.sleep(0.01)  # 释放 GIL 让 UI 更新
 
             def _load():
                 try:
-                    # 显式锁死 CPU EP：不依赖 fastembed 默认行为（只自动选
-                    # CUDA、从不选 CoreML）。cross-encoder 输入是变长 (query,
-                    # doc) 序列，attention 动态 shape 在 CoreML 上频繁 fallback
-                    # 反而更慢；INT8 权重在 CPU EP 上有原生 int8 算子加速。
-                    # cache_dir 必须显式传持久目录：fastembed 默认用系统临时
-                    # 目录（/var/folders/.../T/fastembed_cache），macOS 会定期
-                    # 清理 → 每次都重新下载几百 MB（与 nomic 曾重下同型 bug）。
-                    reranker = TextCrossEncoder(
+                    reranker = create_reranker_backend(
+                        self._rerank_backend,
                         self._rerank_model,
-                        cache_dir=os.path.join(
-                            os.path.expanduser("~"), ".cache", "fastembed"
-                        ),
-                        providers=["CPUExecutionProvider"],
+                        self._rerank_model_path,
+                        threads=self._rerank_threads,
+                        max_length=self._rerank_max_length,
+                        batch_size=self._rerank_batch_size,
+                        mlx_model_path=self._rerank_mlx_model_path,
                     )
+                    if reranker is None:
+                        self._reranker = None
+                        self._reranker_state = "failed"
+                        return
                     if getattr(self, "_closed", False):
                         # close() 已经执行：不要再把数百 MB 模型写回实例
                         # （旧实现会让 close 之后的实例「复活」持有权重）。
@@ -1448,7 +1503,10 @@ class VectorStore:
                         return
                     self._reranker = reranker
                     self._reranker_state = "done"
-                    logger.info("  ✅ BGE Reranker 加载完成: %s", self._rerank_model)
+                    logger.info(
+                        "  ✅ Reranker 加载完成: backend=%s model=%s",
+                        self._rerank_backend, self._rerank_model,
+                    )
                 except Exception as e:
                     logger.warning("  ⚠ BGE Reranker 加载失败: %s", e)
                     self._reranker = None
@@ -1542,7 +1600,9 @@ class VectorStore:
             # 手动 sigmoid 归一化到 [0,1]，保持与旧 FlagReranker
             # compute_score(normalize=True) 相同的分数语义——下游
             # min_similarity 阈值过滤依赖这个 [0,1] 区间。
-            raw_scores = reranker.rerank(query, texts, batch_size=16)
+            raw_scores = reranker.rerank(
+                query, texts, batch_size=self._rerank_batch_size
+            )
             scores = [_logit_to_score(s) for s in raw_scores]
         except Exception as e:
             # 模型/输入异常（超长序列截断失败等）时回退到向量距离排序，
@@ -1801,8 +1861,12 @@ class VectorStore:
             # session 随析构释放，无需 CPU 迁移步骤。
             reranker = self._reranker
             try:
-                # fastembed 旧版实例带 .model 子对象；统一丢弃引用即可。
-                _ = getattr(reranker, "model", None)
+                close_fn = getattr(reranker, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                else:
+                    # fastembed 旧版实例带 .model 子对象；统一丢弃引用即可。
+                    _ = getattr(reranker, "model", None)
             except Exception:
                 pass
             self._reranker = None

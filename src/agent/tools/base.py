@@ -265,12 +265,21 @@ class ToolRegistry:
                 workspace=self.config.workspace,
                 knowledge_base=kb,
                 embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
-                # 不转发 config.rag_rerank_model 的话，engine 的本地默认值会
-                # 赢——曾因此实际加载 fp32 bge-reranker-base 而非配置声明的
-                # INT8 v2-m3（#131）。
+                embedding_backend=getattr(self.config, "rag_embedding_backend", "fastembed"),
+                embedding_model_path=getattr(self.config, "rag_embedding_model_path", ""),
+                embedding_threads=getattr(self.config, "onnx_threads", 4),
+                embedding_batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
+                embedding_max_length=getattr(self.config, "rag_embedding_max_length", 512),
+                chunk_size=getattr(self.config, "rag_chunk_size", 500),
+                chunk_overlap=getattr(self.config, "rag_chunk_overlap", 50),
                 rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8"),
-                # PDF 主引擎（docling|marker，#134）：同 #131 的教训，
-                # 必须显式转发配置，否则永远用 engine 本地默认 docling。
+                rerank_backend=getattr(self.config, "rag_rerank_backend", "fastembed"),
+                rerank_model_path=getattr(self.config, "rag_rerank_model_path", ""),
+                rerank_mlx_model_path=getattr(self.config, "rag_rerank_mlx_model_path", ""),
+                rerank_threads=getattr(self.config, "onnx_threads", 4),
+                rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
+                rerank_max_length=getattr(self.config, "rag_rerank_max_length", 512),
+                rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
                 pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
             )
             self._rag_engine = engine
@@ -330,8 +339,21 @@ class ToolRegistry:
             if retriever is not None:
                 return retriever
             db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
+            from ..rag.vector_store import get_or_create_embedding_function
+            embedding_function = get_or_create_embedding_function(
+                getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                backend=getattr(self.config, "rag_embedding_backend", "fastembed"),
+                model_path=getattr(self.config, "rag_embedding_model_path", ""),
+                threads=getattr(self.config, "onnx_threads", 4),
+                batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
+                max_length=getattr(self.config, "rag_embedding_max_length", 512),
+            )
             from ..skill_retriever import SkillRetriever
-            retriever = SkillRetriever(skills_dir=skills_dir, db_path=db_path)
+            retriever = SkillRetriever(
+                skills_dir=skills_dir,
+                db_path=db_path,
+                embedding_function=embedding_function,
+            )
             cache[skills_dir] = retriever
             setattr(self, "_skill_retriever", retriever)
             return retriever
