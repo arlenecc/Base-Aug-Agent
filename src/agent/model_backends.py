@@ -27,6 +27,11 @@ _GT = chr(62)
 FE_RE = _LT + "/function" + _GT
 PE_RE = _LT + "/parameter" + _GT
 FN_RE = _LT + "function" + _GT
+# 思考标签。qwen3.x 模板把 think 开标签放在 generation prompt 末尾，模型续写
+# 思考正文、自己补 think 闭标签——所以生成内容里只有闭标签（见
+# _prompt_opens_thinking / _TaggedOutputParser.begin_reasoning）。
+THO = _LT + "think" + _GT
+THE = _LT + "/think" + _GT
 
 LLM_BACKENDS = ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
 # 辅助模型（#140）只支持进程内直载：没有网络端点可配。
@@ -168,8 +173,40 @@ def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _prompt_opens_thinking(prompt: Any) -> bool:
+    """判断 chat template 的 generation prompt 是否以思考开标签收尾。
+
+    qwen3.x 系模板的 add_generation_prompt 输出 assistant 换行 +
+    think 开标签 + 换行，模型续写的就是思考正文、自己补 think 闭标签。
+    此时生成内容里没有 think 开标签，解析器必须由调用方预置 reasoning
+    模式，否则整段思考会被当成普通 content 漏进对话区。
+
+    只认末尾的开标签：历史消息里残留的 think 开标签不算。
+    """
+    text = prompt if isinstance(prompt, str) else ""
+    if not text:
+        return False
+    tail = text.rstrip()
+    return tail.endswith(THO)
+
+
 class _TaggedOutputParser:
-    """Turn local-model text tags into reasoning/content/tool StreamEvents."""
+    """Turn local-model text tags into reasoning/content/tool StreamEvents.
+
+    本地模型（MLX / ONNX / GGUF）没有 OpenAI 式的结构化 tool_calls 字段，
+    一切以文本标签形式出现在生成内容里。两个必须知道的坑：
+
+    1. **思考开标签在 prompt 里，不在生成内容里。** qwen3.x 系的模板以
+       assistant 换行 + think 开标签 + 换行 结尾，模型接着写的就是思考正文，
+       直到自己输出 think 闭标签——生成内容里**只有闭标签**。若按 content
+       模式傻等 think 开标签，永远等不到，整段思考会被当成普通回复塞进对话区
+       （「思考过程不显示」的直接原因）。所以 begin_reasoning() 让调用方
+       按 prompt 实际情况预置模式。
+    2. **工具调用 payload 有两种写法。** JSON（name/arguments）与
+       XML（function=name 包裹 parameter=k）。旧实现只会 json.loads，
+       XML 必然失败、tool_calls 恒为空——task_plan 永不被调用，任务计划面板
+       一直空着。现在两种都认。
+    """
 
     _OPENERS = (("<think>", "reasoning"), ("<tool_call>", "tool"))
     _CLOSERS = {"reasoning": "</think>", "tool": "</tool_call>"}
@@ -179,6 +216,16 @@ class _TaggedOutputParser:
         self._mode = "content"
         self._tool_buffer = ""
         self.tool_calls: List[Dict[str, Any]] = []
+
+    def begin_reasoning(self) -> None:
+        """告诉解析器：prompt 末尾已预置思考开标签，生成内容直接是思考正文。
+
+        qwen3.x 模板的 generation prompt 以 think 开标签收尾，模型续写思考、
+        自己补 think 闭标签。不调用本方法的话解析器停在 content 模式等一个
+        永远不会出现的开标签，整段思考就漏进对话区了。
+        """
+        if self._mode == "content" and not self._buffer.strip():
+            self._mode = "reasoning"
 
     @staticmethod
     def _xml_tool_calls(payload: str) -> List[Dict[str, Any]]:
@@ -374,6 +421,11 @@ class MLXLanguageBackend(_LazyLocalBackend):
         super().__init__(resolve_model_path(model_path), config)
         self._model_obj = None
         self._tokenizer = None
+        # 跨轮复用的 KV 缓存与它对应的 token 序列（见 chat_stream 的前缀复用）。
+        # 混合架构（线性层 ArraysCache）不可裁剪，所以只在「新 prompt 完整包含
+        # 旧序列」时复用，否则整体重建——最坏退化为无缓存，不会出错。
+        self._kv_cache = None
+        self._kv_ids: List[int] = []
 
     def _ensure_loaded(self) -> None:
         self._check_open()
@@ -387,12 +439,32 @@ class MLXLanguageBackend(_LazyLocalBackend):
             except ImportError as e:
                 raise LLMError("MLX-LM 未安装，请安装: pip install mlx-lm") from e
             logger.info("正在从本地加载 MLX-LM: %s", self.model_path)
+            # wired memory limit：mlx_lm CLI 默认会设，不设时 macOS 可能把
+            # GPU 工作集换页，吞吐明显下降（实测 decode 与 prefill 都受影响）。
+            # 失败不影响加载，只是少一层性能保障。
+            try:
+                from mlx_lm.utils import maybe_set_recommended_wired_limit
+
+                limit = maybe_set_recommended_wired_limit()
+                if limit:
+                    logger.info("MLX wired memory limit 已设置: %.1f GB", limit / 1024 ** 3)
+            except Exception as e:  # pragma: no cover - 性能优化，失败无所谓
+                logger.debug("设置 wired memory limit 失败（忽略）: %s", e)
             self._model_obj, self._tokenizer = load(
                 self.model_path,
                 lazy=False,
                 trust_remote_code=False,
             )
             logger.info("MLX-LM 加载完成: %s", self.model_path)
+
+    @staticmethod
+    def _common_prefix_len(a: List[int], b: List[int]) -> int:
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
 
     def _prompt(self, messages: List[Dict[str, Any]], tools) -> Any:
         # enable_thinking 不能缺省：qwen3.x 系模板里
@@ -444,16 +516,81 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     repetition_penalty=float(getattr(self.config, "repetition_penalty", 1.0)),
                 )
                 parser = _TaggedOutputParser()
+                # prompt 已预置思考开标签（qwen3.x 模板）→ 生成内容直接是
+                # 思考正文，只有闭标签。不预置模式的话思考整段漏进对话区。
+                if _prompt_opens_thinking(prompt):
+                    parser.begin_reasoning()
+
+                # ---- KV 前缀复用（对应 Ollama 的前缀缓存）----
+                # 每轮 prompt = 固定头部（system + 18 个工具 schema，实测约
+                # 2432 token）+ 历史 + 新问题。旧实现每轮把整个 prompt 重新
+                # prefill：M1 上约 160 tok/s，光头部就要 ~15-19s，用户感知就是
+                # 「本地模型特别慢」。Ollama 快很大程度上靠缓存这段不变的前缀。
+                #
+                # 约束：qwen3_5 是混合架构，线性层用 ArraysCache，
+                # trim_prompt_cache 不支持（can_trim 返回 False）。所以不裁剪，
+                # 只在「新 prompt 完整包含上一轮序列」时直接追加复用；否则整体
+                # 丢弃重建——最坏退化成无缓存，绝不会因缓存错位产生乱码。
+                #
+                # 注意：历史里的 assistant 内容是解析后的正文（think/tool 标签
+                # 已剥离），与模型原始输出不同，所以跨轮前缀通常对不齐——但只要
+                # 对上了就省掉整段头部 prefill。agent 侧可在取消/工具轮次后
+                # 主动 invalidate（见 invalidate_kv_cache）。
+                ids = None
+                encode = getattr(self._tokenizer, "encode", None)
+                if callable(encode):
+                    try:
+                        ids = encode(prompt)
+                        if not isinstance(ids, list):
+                            ids = list(ids)
+                    except Exception as e:  # pragma: no cover - 防御
+                        logger.debug("tokenizer.encode 失败，退化为无缓存: %s", e)
+                        ids = None
+                reuse = 0
+                cache = None
+                if ids is not None and self._kv_cache is not None and self._kv_ids:
+                    if self._common_prefix_len(ids, self._kv_ids) == len(self._kv_ids):
+                        cache, reuse = self._kv_cache, len(self._kv_ids)
+                    else:
+                        # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
+                        self._kv_cache = None
+                        self._kv_ids = []
+                if cache is None:
+                    try:
+                        from mlx_lm.models.cache import make_prompt_cache
+
+                        cache = make_prompt_cache(self._model_obj)
+                    except Exception as e:  # pragma: no cover - 老版本兜底
+                        logger.debug("make_prompt_cache 不可用，退化为无缓存: %s", e)
+                        cache = None
+                        reuse = 0
+                if reuse:
+                    logger.info(
+                        "MLX KV 前缀复用: 跳过 %d token 的 prefill（本 prompt %d token）",
+                        reuse, len(ids),
+                    )
+                gen_kwargs = {}
+                if cache is not None:
+                    gen_kwargs["prompt_cache"] = cache
+
                 prompt_tokens = 0
                 completion_tokens = 0
+                gen_ids: List[int] = []
                 for response in stream_generate(
                     self._model_obj,
                     self._tokenizer,
-                    prompt,
+                    ids[reuse:] if reuse else prompt,
                     max_tokens=int(getattr(self.config, "max_tokens", 32768)),
                     sampler=sampler,
                     logits_processors=logits_processors,
+                    **gen_kwargs,
                 ):
+                    _tok_id = getattr(response, "token", None)
+                    if _tok_id is not None:
+                        gen_ids.append(int(_tok_id))
+                    tok_id = getattr(response, "token", None)
+                    if tok_id is not None:
+                        gen_ids.append(int(tok_id))
                     prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
                     completion_tokens = int(
                         getattr(response, "generation_tokens", completion_tokens + 1)
@@ -462,6 +599,11 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     for event in parser.feed(getattr(response, "text", "")):
                         yield event
                 yield from parser.finish()
+                # 记录本轮完整序列，供下一轮前缀比对。被取消（生成中途 break）
+                # 时 gen_ids 不完整，序列对不上，下一轮自动重建，不会错位。
+                if cache is not None:
+                    self._kv_cache = cache
+                    self._kv_ids = ids + gen_ids
                 yield StreamEvent(
                     "done",
                     tool_calls=parser.tool_calls,
@@ -482,11 +624,22 @@ class MLXLanguageBackend(_LazyLocalBackend):
             self._closed = True
             self._model_obj = None
             self._tokenizer = None
+            self._kv_cache = None
+            self._kv_ids = []
             try:
                 import mlx.core as mx
                 mx.clear_cache()
             except Exception:
                 pass
+
+    def invalidate_kv_cache(self) -> None:
+        """丢弃跨轮 KV 缓存（历史被改写、用户取消、切换会话等场景调用）。
+
+        混合架构的 ArraysCache 不可裁剪，缓存只能整用或整弃；对不齐时
+        chat_stream 会自动重建，这里只是让调用方在已知历史变更时提前释放。
+        """
+        self._kv_cache = None
+        self._kv_ids = []
 
 
 class MLXVLMBackend(_LazyLocalBackend):
@@ -578,6 +731,10 @@ class MLXVLMBackend(_LazyLocalBackend):
                     top_k=int(getattr(self.config, "top_k", 0)),
                 )
                 parser = _TaggedOutputParser()
+                # prompt 已预置思考开标签（qwen3.x 模板）→ 生成内容直接是
+                # 思考正文，只有闭标签。不预置模式的话思考整段漏进对话区。
+                if _prompt_opens_thinking(prompt):
+                    parser.begin_reasoning()
                 prompt_tokens = 0
                 completion_tokens = 0
                 kwargs = {
@@ -812,6 +969,10 @@ class ONNXLanguageBackend(_LazyLocalBackend):
                 generated: List[int] = []
                 decoded = ""
                 parser = _TaggedOutputParser()
+                # prompt 已预置思考开标签（qwen3.x 模板）→ 生成内容直接是
+                # 思考正文，只有闭标签。不预置模式的话思考整段漏进对话区。
+                if _prompt_opens_thinking(prompt):
+                    parser.begin_reasoning()
                 eos = self._tokenizer.eos_token_id
                 eos_ids = set(eos if isinstance(eos, list) else [eos]) if eos is not None else set()
                 for _ in range(int(getattr(self.config, "max_tokens", 32768))):
