@@ -30,6 +30,11 @@ class AgentConfig:
     llm_vision_projection_path: str = ""  # GGUF VLM 的 mmproj/clip 文件
     llm_chat_format: str = ""
     llm_vlm_handler: str = "mtmd"
+    # 思考模式（本地模式主模型）。走 chat template 的 enable_thinking：
+    # True 时模板在 generation prompt 末尾预置 <think> 开标签，模型先输出
+    # 思考再作答（思考过程显示在「思考过程」面板）；False 时直接作答。
+    # 仅在模板支持该参数时生效，不支持的模板会自动退掉该 kwarg。
+    llm_enable_thinking: bool = True
     # 辅助模型（#140）：只支持本地直载，供上下文摘要等轻量子任务使用，
     # 避免为一次摘要把主模型的推理队列占住。默认 Qwen3.5-2B-MLX-4bit。
     aux_llm_backend: str = "mlx_lm"  # mlx_lm | mlx_vlm | onnx | llama_cpp
@@ -37,6 +42,10 @@ class AgentConfig:
     aux_llm_vision_projection_path: str = ""
     aux_llm_chat_format: str = ""
     aux_llm_vlm_handler: str = "mtmd"
+    # 辅助模型的思考模式。**默认关闭**：辅助模型只跑摘要/归纳这类轻量子任务，
+    # 要的是快与稳；开思考会多出一大段 reasoning 文本，显著拖慢摘要且对
+    # 归纳质量无实质帮助。主模型默认开（llm_enable_thinking=True）。
+    aux_llm_enable_thinking: bool = False
     # 辅助模型独立采样参数（不与主模型共用——主模型要的是生成质量，
     # 辅助模型要的是快与稳，温度/生成长度都不同）。
     aux_temperature: float = 0.5
@@ -153,7 +162,8 @@ class AgentConfig:
         "rag_rerank_mlx_model_path",
         "browser_endpoint", "rag_pdf_engine",
     )
-    _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest")
+    _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
+                    "llm_enable_thinking", "aux_llm_enable_thinking")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (

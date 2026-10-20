@@ -445,6 +445,20 @@ class MLXLanguageBackend(_LazyLocalBackend):
         # 旧序列」时复用，否则整体重建——最坏退化为无缓存，不会出错。
         self._kv_cache = None
         self._kv_ids: List[int] = []
+        # 创建该缓存的 **OS 线程**标识（threading.get_ident()）。
+        # **MLX 的 prompt cache 与其 stream 是线程局部的**：缓存（及 stream）
+        # 在 A 线程创建、却在 B 线程用于生成时，MLX 在 B 线程的 stream 表里
+        # 找不到那个 stream，直接抛
+        #   RuntimeError: There is no Stream(gpu, N) in current thread
+        # （实测抛出点：mlx_lm/generate.py 的 mx.eval([c.state for c in
+        # prompt_cache])）。表现为「第一条消息正常、第二条必崩」。
+        #
+        # 用 get_ident() 而不是「每条消息新建的 QThread」：UI 已改为**常驻单条
+        # agent 线程**（main_window._ensure_agent_worker），OS 线程跨消息稳定，
+        # 缓存可跨轮命中。get_ident() 在线程**终止后会被回收复用**，所以新建
+        # worker 时 UI 会主动 invalidate_kv_cache()（见 _ensure_agent_worker），
+        # 双保险堵住「旧线程已死、新线程拿到同一 ident」的极端情形。
+        self._kv_thread_ident = None
         # 上一轮的模型原始输出（含工具调用 XML）。agent 把它存进历史的
         # raw_content，本地后端据此重建忠实的历史序列以命中前缀复用。
         # HTTP 后端不提供该属性，agent 会跳过——历史格式对 HTTP 保持不变。
@@ -490,15 +504,24 @@ class MLXLanguageBackend(_LazyLocalBackend):
         return n
 
     def _prompt(self, messages: List[Dict[str, Any]], tools) -> Any:
-        # enable_thinking 不能缺省：qwen3.x 系模板里
+        # enable_thinking 由配置面板的「思考模式」开关控制
+        # （config.llm_enable_thinking；辅助模型经 _AuxConfigView 映射到
+        # aux_llm_enable_thinking）：
+        #   True  → 模板在 generation prompt 末尾预置 <think>，模型先输出思考
+        #           正文再作答（思考过程进「思考过程」面板）；
+        #   False → 不预置开标签，模型直接作答，省掉整段 reasoning，更快。
+        #
+        # 不能缺省：qwen3.x 系模板里
         #   {%- if enable_thinking is defined and enable_thinking is false %}
-        # 缺省时走 else 分支，照样输出 "<think>\n" 开头，思考过程正常。
-        # 但有些模板反过来（缺省 = 关闭思考），所以显式传 True 更稳；
+        # 缺省时走 else 分支，照样输出 "<think>\n" 开头——即「未设置」会被当成
+        # 开思考，开关就失效了。所以必须显式传值。
         # 老 tokenizer 不认识该参数时 TypeError 会被下面的兜底吃掉。
         kwargs: Dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": True,
+            "enable_thinking": bool(
+                getattr(self.config, "llm_enable_thinking", True)
+            ),
         }
         if tools:
             kwargs["tools"] = tools
@@ -575,6 +598,18 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         ids = None
                 reuse = 0
                 cache = None
+                # 线程亲和性检查（见 _kv_thread_ident 的注释）：缓存不是本线程
+                # 建的就整份作废，在本线程重建。跨线程复用会让 MLX 在**当前**
+                # 线程的 stream 表里找不到建缓存那个线程的 stream：
+                #   RuntimeError: There is no Stream(gpu, N) in current thread
+                # 每条消息都是新的 AgentWorker 线程，所以不检查就是「第二轮必崩」。
+                if (self._kv_cache is not None
+                        and self._kv_thread_ident != threading.get_ident()):
+                    logger.info(
+                        "MLX KV 缓存由另一线程创建（%s != %s），本轮作废重建",
+                        self._kv_thread_ident, threading.get_ident())
+                    self._kv_cache = None
+                    self._kv_ids = []
                 if ids is not None and self._kv_cache is not None and self._kv_ids:
                     # 两种命中形态，都要求「新 prompt 与缓存序列逐 token 一致」：
                     #   a) 缓存更长（常态）：缓存 = 上轮 prompt + 上轮生成，本轮
@@ -588,6 +623,15 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
                         self._kv_cache = None
                         self._kv_ids = []
+                if cache is not None and reuse >= len(ids):
+                    # 缓存已完整覆盖本轮 prompt → 没有可喂的新 token，
+                    # ids[reuse:] 为空，mlx_lm 直接报
+                    # "Either input_embeddings or prompt (or both) must be provided"。
+                    # 这种情况（重发同一条、历史改写后 prompt 变短）不复用，
+                    # 整轮重新 prefill——正确性优先，代价只是一次全量 prefill。
+                    logger.debug("MLX KV 缓存已覆盖全部 prompt（%d/%d），本轮不复用",
+                                 reuse, len(ids))
+                    cache, reuse = None, 0
                 if cache is None:
                     try:
                         from mlx_lm.models.cache import make_prompt_cache
@@ -639,6 +683,8 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 # 时 gen_ids 不完整，序列对不上，下一轮自动重建，不会错位。
                 if cache is not None:
                     self._kv_cache = cache
+                    # 记下建缓存的线程：下一轮只有同一线程才能复用（见上方检查）。
+                    self._kv_thread_ident = threading.get_ident()
                     if ids is not None:
                         self._kv_ids = ids + gen_ids
                     # ids 为 None（tokenizer 无 encode）→ 不记录缓存序列，
@@ -666,6 +712,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
             self._tokenizer = None
             self._kv_cache = None
             self._kv_ids = []
+            self._kv_thread_ident = None
             try:
                 import mlx.core as mx
                 mx.clear_cache()
@@ -680,6 +727,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
         """
         self._kv_cache = None
         self._kv_ids = []
+        self._kv_thread_ident = None
 
 
 class MLXVLMBackend(_LazyLocalBackend):
@@ -758,12 +806,27 @@ class MLXVLMBackend(_LazyLocalBackend):
                 }
                 if tools:
                     template_kwargs["tools"] = tools
-                prompt = apply_chat_template(
-                    self._processor,
-                    self._model_config,
-                    messages,
-                    **template_kwargs,
+                # 思考模式开关。mlx_vlm 的 apply_chat_template 是否接受
+                # enable_thinking 取决于具体模型的模板，不能假定——先带上试，
+                # 不认识（TypeError）就退掉重试，只牺牲这一个 kwarg。
+                template_kwargs["enable_thinking"] = bool(
+                    getattr(self.config, "llm_enable_thinking", True)
                 )
+                try:
+                    prompt = apply_chat_template(
+                        self._processor,
+                        self._model_config,
+                        messages,
+                        **template_kwargs,
+                    )
+                except TypeError:
+                    template_kwargs.pop("enable_thinking", None)
+                    prompt = apply_chat_template(
+                        self._processor,
+                        self._model_config,
+                        messages,
+                        **template_kwargs,
+                    )
                 sampler = make_sampler(
                     temp=max(0.0, float(temperature)),
                     top_p=float(getattr(self.config, "top_p", 0.95)),
@@ -887,14 +950,33 @@ class ONNXLanguageBackend(_LazyLocalBackend):
 
     def _prompt(self, messages, tools):
         owner = self._processor or self._tokenizer
-        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        # 思考模式开关（config.llm_enable_thinking，辅助模型经 _AuxConfigView
+        # 映射）。与 MLX 后端一致：显式传值，不缺省——缺省会被模板当成开思考。
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": bool(
+                getattr(self.config, "llm_enable_thinking", True)
+            ),
+        }
         if tools:
             kwargs["tools"] = tools
         messages = _template_messages(messages)
+        # 老 tokenizer 可能不认识 enable_thinking / tools：逐个退掉再试，
+        # 避免一次 TypeError 把两个参数一起丢掉。
         try:
             return owner.apply_chat_template(messages, **kwargs)
         except TypeError:
+            for extra in ("enable_thinking", "tools"):
+                if extra in kwargs:
+                    pruned = dict(kwargs)
+                    pruned.pop(extra)
+                    try:
+                        return owner.apply_chat_template(messages, **pruned)
+                    except TypeError:
+                        continue
             kwargs.pop("tools", None)
+            kwargs.pop("enable_thinking", None)
             return owner.apply_chat_template(messages, **kwargs)
 
     @staticmethod
@@ -1264,6 +1346,9 @@ class _AuxConfigView:
         "top_k": "aux_top_k",
         "repetition_penalty": "aux_repetition_penalty",
         "request_timeout": "aux_request_timeout",
+        # 思考模式：不登记的话辅助模型会经 __getattr__ 回落到主模型的
+        # llm_enable_thinking，UI 上辅助模型的开关就成了摆设。
+        "llm_enable_thinking": "aux_llm_enable_thinking",
         # GGUF VLM 的 mmproj / chat format / handler（见 LlamaCppBackend）。
         "llm_vision_projection_path": "aux_llm_vision_projection_path",
         "llm_chat_format": "aux_llm_chat_format",

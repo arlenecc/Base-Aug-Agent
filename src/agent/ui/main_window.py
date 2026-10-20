@@ -340,6 +340,14 @@ class BridgeCallbacks(AgentCallbacks):
 
 
 class AgentWorker(QThread):
+    """跑一轮对话的工作线程。
+
+    **实例由 MainWindow 常驻复用**（见 _ensure_agent_worker），不是每条消息
+    新建一个 —— MLX 的 KV 前缀缓存与其 stream 是线程局部的，换线程复用上一轮
+    的缓存会让 MLX 抛 "There is no Stream(gpu, N) in current thread"。
+    QThread 在 run() 返回后允许再次 start()（实测可重启）。
+    """
+
     def __init__(self, agent: Agent, callbacks: BridgeCallbacks):
         super().__init__()
         self._agent = agent
@@ -348,6 +356,14 @@ class AgentWorker(QThread):
 
     def set_input(self, text: str) -> None:
         self._user_text = text
+
+    def set_agent(self, agent: Agent) -> None:
+        """更新本轮要跑的 agent。
+
+        常驻复用后 agent 可能在两次发送之间被 _rebuild_agent 换掉（改配置、
+        换模型），必须换上新的，否则跑的还是旧 agent。
+        """
+        self._agent = agent
 
     def run(self) -> None:  # type: ignore[override]
         try:
@@ -771,6 +787,8 @@ class MainWindow(QMainWindow):
         self._llm: Optional[Any] = None
         self._agent: Optional[Agent] = None
         self._worker: Optional[AgentWorker] = None
+        # _on_finished 的幂等标志（常驻 worker 不再靠「_worker 置空」判重）。
+        self._finish_handled = False
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
@@ -1045,6 +1063,10 @@ class MainWindow(QMainWindow):
         ("repeat-penalty", "repeat_penalty_edit", 60, "1.0"),
         ("超时(秒)", "timeout_edit", 60, "120"),
     )
+    # 思考模式开关的属性基础名（实际属性 = prefix + 本名，主模型 "" / 辅助
+    # "aux_"）。它插在采样行「超时(秒)」之前，不是 _SAMPLING_SPECS 的成员
+    # ——后者全是 QLineEdit，开关是 QCheckBox，由 _add_sampling_row 单独插入。
+    _THINKING_CHECK_BASE = "enable_thinking_check"
 
     def _build_config_widgets(self, lay: QVBoxLayout) -> None:
         """构建配置区控件（现在住在独立配置窗口里）。
@@ -1271,6 +1293,8 @@ class MainWindow(QMainWindow):
             "top_k_edit": self.config.top_k,
             "repeat_penalty_edit": self.config.repetition_penalty,
             "timeout_edit": self.config.request_timeout,
+            # 思考模式：主模型默认开启（思考过程可见，利于复杂任务）。
+            "enable_thinking_check": getattr(self.config, "llm_enable_thinking", True),
         }
 
     def _aux_sampling_defaults(self) -> Dict[str, Any]:
@@ -1283,6 +1307,9 @@ class MainWindow(QMainWindow):
             "top_k_edit": getattr(cfg, "aux_top_k", 20),
             "repeat_penalty_edit": getattr(cfg, "aux_repetition_penalty", 1.0),
             "timeout_edit": getattr(cfg, "aux_request_timeout", 120.0),
+            # 思考模式：辅助模型默认**关闭**——它只跑摘要/归纳等轻量子任务，
+            # 要的是快与稳，开思考只会多出一大段 reasoning 拖慢速度。
+            "enable_thinking_check": getattr(cfg, "aux_llm_enable_thinking", False),
         }
 
     def _add_local_model_block(
@@ -1331,6 +1358,9 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         for label, base, width, fallback in self._SAMPLING_SPECS:
+            # 思考模式开关插在「超时(秒)」之前（需求：位于超时控制参数之前）。
+            if base == "timeout_edit":
+                self._add_thinking_check(row, prefix, defaults)
             edit = QLineEdit(str(defaults.get(base, fallback)))
             edit.setFixedWidth(width)
             setattr(self, prefix + base, edit)
@@ -1347,6 +1377,28 @@ class MainWindow(QMainWindow):
             setattr(self, attr, btn)
             row.addWidget(btn)
         lay.addLayout(row)
+
+    def _add_thinking_check(self, row: QHBoxLayout, prefix: str,
+                            defaults: Dict[str, Any]) -> None:
+        """在采样行里插入「思考模式」勾选框。
+
+        属性名 = ``prefix + "enable_thinking_check"``，于是主模型
+        （``enable_thinking_check``）与辅助模型（``aux_enable_thinking_check``）
+        共用同一套读写代码，不会出现两套逻辑各自漂移。
+
+        勾选 → 模板收到 ``enable_thinking=True``，generation prompt 末尾预置
+        ``<think>``，模型先思考再作答；不勾 → 传 False，直接作答。
+        """
+        check = QCheckBox("思考模式")
+        check.setToolTip(
+            "开启：模型先输出思考过程（显示在「思考过程」面板）再作答，适合复杂任务，\n"
+            "但多出一段 reasoning 文本，生成更慢。\n"
+            "关闭：直接作答，更快。\n"
+            "需要模型的 chat template 支持 enable_thinking；不支持时该参数会被自动忽略。"
+        )
+        check.setChecked(bool(defaults.get(self._THINKING_CHECK_BASE, True)))
+        setattr(self, prefix + self._THINKING_CHECK_BASE, check)
+        row.addWidget(check)
 
     # ------------------------------------------------------------------
     # wiring
@@ -1459,6 +1511,14 @@ class MainWindow(QMainWindow):
         }
         for base, value in values.items():
             getattr(self, prefix + base).setText(str(value))
+        # 思考模式是 QCheckBox 而非 QLineEdit：单独写回勾选状态。
+        # 缺省值与 dataclass 保持一致（主模型 True、辅助模型 False）。
+        _think_check = getattr(self, prefix + self._THINKING_CHECK_BASE, None)
+        if _think_check is not None:
+            _think_check.setChecked(
+                bool(getattr(cfg, prefix + "llm_enable_thinking",
+                             False if prefix else True))
+            )
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
@@ -1570,6 +1630,12 @@ class MainWindow(QMainWindow):
         setattr(self.config, prefix + "top_k", top_k)
         setattr(self.config, prefix + "repetition_penalty", repeat)
         setattr(self.config, prefix + "request_timeout", timeout)
+        # 思考模式：勾选框 → 布尔。prefix 拼出来的属性名正好对上配置字段
+        # （"" → llm_enable_thinking，"aux_" → aux_llm_enable_thinking）。
+        _think_check = getattr(self, prefix + self._THINKING_CHECK_BASE, None)
+        if _think_check is not None:
+            setattr(self.config, prefix + "llm_enable_thinking",
+                    _think_check.isChecked())
 
         if not prefix:
             # Keep max_context_tokens in sync with max_tokens: the shrink
@@ -2665,6 +2731,51 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # chat send / stop
     # ------------------------------------------------------------------
+    def _ensure_agent_worker(self) -> AgentWorker:
+        """取常驻的对话线程：首次创建，之后**复用同一条**。
+
+        为什么必须复用（MLX 的硬约束）：prompt cache（KV 前缀复用）与 stream
+        是**线程局部**的。旧实现每条消息 `AgentWorker(...)` 新建一个 QThread，
+        第二条消息就在新线程里复用上一轮的缓存，MLX 在当前线程的 stream 表里
+        找不到建缓存那个线程的 stream，直接抛
+            RuntimeError: There is no Stream(gpu, N) in current thread
+        表现为「第一条消息正常、第二条必崩」。
+
+        后端已有跨线程作废兜底（model_backends 的 _kv_thread_uid），但那等于
+        每轮都把缓存丢掉重建——多轮对话的提速收益就没了。让所有对话跑在同一条
+        常驻线程上，缓存跨轮也能命中，提速才真正生效。
+
+        QThread 在 run() 返回后允许再次 start()（已实测三轮连续重启）。
+        """
+        worker = self._worker
+        if worker is None:
+            # 只在首次（或 closeEvent 关掉之后）创建。
+            worker = AgentWorker(self._agent, self._callbacks)
+            self._worker = worker
+            # 换新线程 → 上一轮线程建的 KV 缓存必须作废：OS 线程终止后
+            # threading.get_ident() 会被回收复用，新线程可能拿到**同一个
+            # ident** 而被后端误判成同线程，复用已失效的缓存照样崩。这里
+            # 显式失效，与后端 _kv_thread_ident 检查构成双保险。
+            self._invalidate_llm_kv_caches()
+            return worker
+        # agent 可能已被 _rebuild_agent 换掉（改配置 / 换模型）：必须换上新的，
+        # 否则新一轮跑的还是旧 agent（旧模型、旧工具）。
+        worker.set_agent(self._agent)
+        return worker
+
+    def _invalidate_llm_kv_caches(self) -> None:
+        """失效主/辅助模型的跨轮 KV 缓存（换线程、切模型等场景）。
+
+        后端不一定实现该方法（HTTP 后端没有 KV 缓存），用 getattr 防御。
+        """
+        for backend in (getattr(self, "_llm", None), getattr(self, "_aux_llm", None)):
+            fn = getattr(backend, "invalidate_kv_cache", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as e:  # 绝不能让失效动作影响发送
+                    logger.debug("UI: invalidate_kv_cache 失败（忽略）: %s", e)
+
     def _on_send(self) -> None:
         if self._busy:
             return
@@ -2709,13 +2820,12 @@ class MainWindow(QMainWindow):
             self._reason_flush_timer.stop()
         self.speed_label.setText("0.0 tok/s")
         self._callbacks.reset()
-        self._worker = AgentWorker(self._agent, self._callbacks)
-        self._worker.set_input(text)
-        # Let Qt clean up the QThread asynchronously once run() returns, instead
-        # of calling QThread.wait() from a slot (which can deadlock a nested
-        # event loop). `_on_finished` is invoked via bridge.finished first.
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.start()
+        # 常驻线程：不再每条消息新建（见 _ensure_agent_worker）。
+        # 注意这里**不能**再连 finished → deleteLater：线程要留着复用。
+        self._finish_handled = False
+        worker = self._ensure_agent_worker()
+        worker.set_input(text)
+        worker.start()
 
     def _on_stop(self) -> None:
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
@@ -2978,17 +3088,21 @@ class MainWindow(QMainWindow):
                 self._append_log(f"[skill] saved '{name}'")
 
     def _on_finished(self) -> None:
-        # 幂等判据用 worker 引用而不是 _busy：agent.run() 有多条路径调用
-        # on_finished()，worker 的 finally 还会再发一次。若某条路径已经把
-        # _busy 置 False，后续调用会直接 return，跳过 worker.wait() 和引用
-        # 清理 —— QThread 可能在 OS 线程收尾时被 GC（Qt 直接 abort）。
         # 先把攒下的流式文本落地：否则最后一小段要等到 100ms 定时器才显示，
         # 而本轮已经结束了。
         self._flush_stream_buffer()
         worker = self._worker
         if worker is None and not self._busy:
             return
-        self._worker = None
+        # 幂等：agent.run() 有多条路径调用 on_finished()，worker 的 finally 还会
+        # 再发一次。旧实现靠「self._worker 已被置 None 且 _busy 已 False」判重；
+        # 改成常驻 worker 后 _worker 不再置空（要留给下一条消息复用），改用显式
+        # 标志，由 _on_send 在启动时复位。
+        if self._finish_handled:
+            return
+        self._finish_handled = True
+        # 这里**不能**置空 self._worker：它是常驻线程，下一条消息继续复用
+        # （见 _ensure_agent_worker）。
         self._busy = False
         self._streaming_assistant = False
         self._set_controls_busy(False)
@@ -3005,10 +3119,10 @@ class MainWindow(QMainWindow):
         # Python reference can GC the QThread while its OS thread is still
         # winding down, which Qt aborts as "destroyed while still running".
         if worker is not None and not self._join_worker(worker, msecs=300):
-            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。保留引用
-            # （_on_send 会据此拒绝新消息），并用定时器异步重试——旧实现在这
-            # 里阻塞等 2s，同步跑 ONNX 时主线程被 GIL 饿死，很容易命中。
-            self._worker = worker
+            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。用定时器
+            # 异步重试——旧实现在这里阻塞等 2s，同步跑 ONNX 时主线程被 GIL
+            # 饿死，很容易命中。常驻 worker 的引用一直保留在 self._worker
+            # （_on_send 会据此拒绝新消息），无需重新赋值。
             self._schedule_worker_join(worker)
         # Now that streaming is done and the worker thread has joined, it's
         # safe to show the skill-suggestion modal dialog without blocking
@@ -3084,8 +3198,9 @@ class MainWindow(QMainWindow):
         if worker is None:
             return
         if self._join_worker(worker, msecs=200):
-            if self._worker is worker:
-                self._worker = None
+            # 不再置空 self._worker：agent worker 是常驻线程，置空会让下一条
+            # 消息新建一条线程，跨轮 KV 前缀复用随之失效（见
+            # _ensure_agent_worker 的注释）。引用一直保留到 closeEvent 为止。
             return
         if attempt >= 20:  # 约 4s，交给 closeEvent 兜底
             logger.warning("UI: agent worker 未能及时退出，保留引用由 closeEvent 兜底")
