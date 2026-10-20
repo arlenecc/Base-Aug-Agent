@@ -120,10 +120,14 @@ def _get_converter():
     """Lazily build and cache the docling DocumentConverter singleton.
 
     管线降配（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
-    accelerator 强制 CPU + 限 4 线程。docling 2.x 在 macOS 上默认
-    device='auto' → MPS（torch Metal 后端），其缓存分配器只增不放——
-    实测同步图多的书时 RSS 可涨到 30GB+ 且不回落（#116 根因之一）。
-    CPU 模式下布局/表格模型对文本为主的文档足够快，且内存有界。
+    accelerator 强制 MPS + 限 4 线程。docling 2.x 在 macOS 上默认
+    device='auto' → MPS，其缓存分配器只增不放——旧实测同步图多的书时
+    RSS 可涨到 30GB+ 且不回落（#116 根因之一）。护栏方案（2026-10 二次
+    实验）：布局/表格模型跑 MPS，但每次 convert() 结束在 finally 里
+    torch.mps.empty_cache() 归还缓存。实测 60 页扫描书两次运行峰值都是
+    2.58GB 完全平坦，且比 CPU 版快 35%（106.5s vs 160.9s）；CPU 版不清
+    缓存反而 3.94→4.80GB 持续涨。附带收益：布局挪到 GPU 后，CPU 核让给
+    RapidOCR 与嵌入模型，消除同步期的 CPU 争抢（调优器「降档避让」）。
     """
     global _converter, _converter_unavailable
     if _converter is not None:
@@ -151,7 +155,7 @@ def _get_converter():
 
                 pdf_opts = PdfPipelineOptions()
                 pdf_opts.accelerator_options = AcceleratorOptions(
-                    num_threads=4, device=AcceleratorDevice.CPU
+                    num_threads=4, device=AcceleratorDevice.MPS
                 )
                 # 注意：这里**不要**动 pdf_opts.images_scale。
                 # images_scale 管的是版面/表格/图片描述模型用的**整页图**
@@ -180,11 +184,12 @@ def _get_converter():
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )
-                logger.info("docling DocumentConverter initialized (PDF 管线强制 CPU 加速, OCR=auto: ocrmac→rapidocr)")
+                logger.info("docling DocumentConverter initialized (PDF 管线强制 MPS 加速 + 每次转换后归还缓存, OCR=auto: ocrmac→rapidocr)")
             except Exception as e:
                 # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
-                # 降配入口就用默认构造——正确性不受影响，只是 macOS 上
-                # MPS 缓存可能再次推高内存。
+                # 降配入口就用默认构造——正确性不受影响，默认 device='auto'
+                # 在 macOS 上同样走 MPS，只是少了 num_threads 限线程；
+                # 缓存护栏在 extract_markdown 的 finally 里兜底生效。
                 logger.info("docling 管线降配不可用（%s），使用默认配置", e)
                 converter = DocumentConverter()
             _converter = converter
@@ -198,6 +203,45 @@ def _get_converter():
             logger.warning("failed to init docling converter: %s", e)
             _converter_unavailable = True
             return None
+
+
+def _flush_mps_cache() -> None:
+    """把 torch MPS 缓存分配器占着的统一内存归还系统。
+
+    docling 的 MPS 后端（torch Metal）缓存只增不放：单次 convert 后缓存
+    一直留着等复用，多本书累积可推到 30GB+（#116 的「逐次累积失控」）。
+    每次转换结束调 torch.mps.empty_cache() 归还——实测两次运行峰值完全
+    平坦（2.58GB），护栏把累积模式锁死。非 MPS 环境 / 版本差异下静默跳过。
+    """
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+# 单次 convert 的硬超时（秒）：torch/docling 的转换线程无法被安全杀死，
+# 超时后只能抓全线程栈定位卡点（卡在布局模型 / OCR / 表格识别一目了然），
+# 由同步层决定放弃该文件。1h 对 60 页扫描书是 30 倍余量，纯兜底。
+_CONVERT_TIMEOUT_S = 3600
+
+
+def _convert_watchdog(path) -> None:
+    """convert 硬超时兜底：dump 所有线程栈，便于事后定位卡死点。"""
+    try:
+        import faulthandler
+        import io
+
+        buf = io.StringIO()
+        faulthandler.dump_traceback(file=buf)
+        logger.error(
+            "docling convert 超过 %d 秒未返回（%s），抓取线程栈定位卡点：\n%s",
+            _CONVERT_TIMEOUT_S, getattr(path, "name", path), buf.getvalue(),
+        )
+    except Exception:
+        logger.error("docling convert 超过 %d 秒未返回（%s）", _CONVERT_TIMEOUT_S, path)
 
 
 def extract_markdown(filepath: str) -> Optional[str]:
@@ -224,6 +268,9 @@ def extract_markdown(filepath: str) -> Optional[str]:
     result = None
     doc = None
     markdown = None
+    watchdog = threading.Timer(_CONVERT_TIMEOUT_S, _convert_watchdog, args=(path,))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
         # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
@@ -241,12 +288,16 @@ def extract_markdown(filepath: str) -> Optional[str]:
         logger.warning("docling conversion failed for %s: %s", path.name, e)
         return None
     finally:
+        watchdog.cancel()
         # 及时释放大对象引用，避免整棵文档树在切片前一直常驻。
         # ConversionResult 持有整棵文档树 + 每页位图（数十~数百 MB）；
         # 旧实现只在成功路径 del，export_to_markdown() 抛异常时它活到函数
         # 返回才被回收，异常密集时是实打实的常驻。
         result = None
         doc = None
+        # 每次转换后归还 MPS 缓存（护栏，见 _flush_mps_cache 注释）。
+        # 放在 finally：成功与异常路径都清，防止异常密集时缓存照样累积。
+        _flush_mps_cache()
         # 周期性冲刷 docling 原生缓存（见 _maybe_recycle_converter 注释）。
         # 必须在 _converter_lock 之外：Lock 不可重入。
         try:
