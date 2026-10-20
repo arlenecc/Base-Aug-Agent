@@ -378,6 +378,16 @@ def _ocr_preprocess(pix):
     if pix.n != 1:  # 防御：非灰度渲染时按行内多通道扁平处理
         img = img.reshape(-1, pix.n).mean(axis=1).astype(np.uint8)
     img = img.reshape(pix.height, pix.width)
+    return _ocr_preprocess_array(img)
+
+
+def _ocr_preprocess_array(img):
+    """对**灰度 ndarray** 执行完整 OCR 预处理管线。
+
+    与 PDF 图片页共用同一套归一化：长边 Lanczos 缩放 → 归一化（暗色反色 +
+    对比度拉伸）→ 锐化 → 二值化。扫描版 epub 的图片 OCR（pandoc_parser）
+    复用本函数，保证两条通路的预处理完全一致。
+    """
     img = _ocr_downscale_long_edge(img)
     img = _ocr_normalize(img)
     if _OCR_SHARPEN:
@@ -713,14 +723,21 @@ def _extract_mobi(path: Path) -> str:
     """
     # Try calibre's ebook-convert first
     import subprocess
-    import shutil
 
-    if shutil.which("ebook-convert"):
+    # 不能用 shutil.which("ebook-convert")：macOS 上 calibre 装在
+    # /Applications/calibre.app/Contents/MacOS/ 里，**不在 PATH**，which 必然
+    # 返回 None —— 明明装了 calibre 却直接掉到下面的裸解析（正则扫二进制字节，
+    # 效果很差，>100MB 还直接报错返回空）。这里复用 pandoc_parser 的探测
+    # （which + 常见安装路径），与电子书主路径用同一个可执行文件。
+    from .pandoc_parser import find_ebook_convert
+
+    conv = find_ebook_convert()
+    if conv:
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             txt_path = tmp.name
         try:
             result = subprocess.run(
-                ["ebook-convert", str(path), txt_path],
+                [conv, str(path), txt_path],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode == 0 and os.path.exists(txt_path):

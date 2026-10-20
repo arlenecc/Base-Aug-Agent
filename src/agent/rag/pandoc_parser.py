@@ -135,6 +135,9 @@ def _run(cmd: List[str], timeout: int) -> Optional[str]:
 # 负责提供权威标题。convert_ebook 用完后再统一剥掉，不进缓存/digest。
 _EPUB_ANCHOR_SPAN_RE = re.compile(r'<span id="[^"]*"></span>\s*\n?')
 _EPUB_ANCHOR_FIND_RE = re.compile(r'<span id="([^"]+)"></span>')
+# 文档级锚点的判定：id 以内容文档扩展名结尾（titlepage.xhtml /
+# index_split_000.html）。带 "_filepos<数字>" 的是内部链接目标，不是文档边界。
+_EPUB_DOC_ANCHOR_RE = re.compile(r'\.(?:xhtml|html|htm)$', re.IGNORECASE)
 
 # pandoc 转出的空 HTML 注释残留。
 _HTML_COMMENT_RE = re.compile(r'<!--[\s\S]*?-->\s*\n?')
@@ -164,8 +167,9 @@ def convert_document(filepath: str) -> Optional[str]:
     md = _pandoc_to_markdown(filepath, fmt)
     if md and md.strip():
         # docx/html/LaTeX 源同样会透传 raw HTML（html 源尤其严重），与电子书
-        # 路径保持一致：文档转换无锚点，出口直接剥。
-        return strip_raw_html(md)
+        # 路径保持一致：文档转换无锚点，出口直接剥。图片与内部锚点链接同理
+        # 一并剥掉（html 源常带 <img> 与页内锚点）。
+        return strip_markdown_noise(strip_raw_html(md))
     return None
 
 
@@ -261,6 +265,60 @@ def _strip_html_line(line: str, code_spans: list) -> str:
     return re.sub(r'\x00(\d+)\x00', lambda m: code_spans[int(m.group(1))], protected)
 
 
+def _strip_outside_code(markdown: str, fn: "Callable[[str], str]") -> str:
+    """逐行应用 ``fn``，跳过围栏代码块与缩进代码块（其中的内容是字面量）。
+
+    代码里的 ``![](x.png)`` / ``<div>`` 是示例内容，不是噪音，不能剥。
+    """
+    out: List[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in markdown.split('\n'):
+        stripped = line.strip()
+        if not in_fence and _FENCE_OPEN_RE.match(line):
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            continue
+        if _INDENT_CODE_RE.match(line):
+            out.append(line)
+            continue
+        out.append(fn(line))
+    return '\n'.join(out)
+
+
+# pandoc 从 epub 转出的 markdown 图片：``![](images/xxx.jpg)``。
+# 图片本身不入库（多模态检索不在范围内），留着只占切片字数、污染嵌入。
+_MD_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
+# 内部锚点链接：``[序一](#index_split_003.html_filepos6604)``。
+# epub 的目录页与交叉引用会产出成百上千条这类链接，全部是导航噪音；
+# 剥掉链接语法但**保留链接文字**（目录条目名本身仍有语义）。
+_MD_INTERNAL_LINK_RE = re.compile(r'\[([^\]]*)\]\([^)]*#[^)]*\)')
+
+
+def strip_markdown_noise(markdown: str) -> str:
+    """剥掉 Markdown 图片语法与内部锚点链接（链接文字保留）。
+
+    ``strip_raw_html`` 只管 HTML 标签，管不到这两种 Markdown 原生语法；而
+    pandoc 输出的 markdown 在 engine 里被当作「规范 Markdown」直接入库
+    （跳过 clean_text），所以必须在这里显式剥。
+    """
+    if not markdown:
+        return markdown
+
+    def _fn(line: str) -> str:
+        line = _MD_IMAGE_RE.sub('', line)
+        return _MD_INTERNAL_LINK_RE.sub(r'\1', line)
+
+    return _strip_outside_code(markdown, _fn)
+
+
 def strip_raw_html(markdown: str) -> str:
     """剥掉 pandoc 输出里残留的 raw HTML 标签，保留标签内正文。
 
@@ -282,29 +340,10 @@ def strip_raw_html(markdown: str) -> str:
     """
     if not markdown:
         return markdown
-    out: List[str] = []
-    in_fence = False
-    fence_marker = ""
-    for line in markdown.split('\n'):
-        stripped = line.strip()
-        if not in_fence and _FENCE_OPEN_RE.match(line):
-            in_fence = True
-            fence_marker = stripped[:3]
-            out.append(line)
-            continue
-        if in_fence:
-            out.append(line)
-            if stripped.startswith(fence_marker):
-                in_fence = False
-                fence_marker = ""
-            continue
-        if _INDENT_CODE_RE.match(line):
-            # 缩进代码块行：逐字保留（pandoc 常把 <pre><code> 写成缩进代码，
-            # 里面的 vector<int> 等尖括号是代码内容）。
-            out.append(line)
-            continue
-        out.append(_strip_html_line(line, []))
-    return re.sub(r'[ \t]{2,}', ' ', '\n'.join(out))
+    # 围栏/缩进代码块的跳过逻辑统一由 _strip_outside_code 处理（图片与内部
+    # 链接的剥离共用同一套保护）。
+    stripped_md = _strip_outside_code(markdown, lambda line: _strip_html_line(line, []))
+    return re.sub(r'[ \t]{2,}', ' ', stripped_md)
 
 
 def split_chapters_by_anchors(
@@ -327,9 +366,17 @@ def split_chapters_by_anchors(
     if not toc_chapters or not markdown:
         return None
 
+    # 只保留**文档级**锚点。pandoc（3.12 实测）除了每个 spine 内容文档的
+    # 起点，还会为**每个内部链接目标**输出一个锚点，id 形如
+    #   index_split_008.html_filepos46532
+    # 即末段是 "_filepos<数字>" 而不是文档扩展名。实测某本 54 个内容文档的
+    # epub 共输出 982 个锚点，其中 928 个是这类链接/脚注目标。把它们一律当
+    # 成章节边界，会把正文在每个脚注处切碎——产生数百个几字符的碎片块，
+    # 检索时全是噪音，观感就是「只转了目录，没有内容」。
     anchors = [
         (m.start(), os.path.basename(m.group(1)).lower())
         for m in _EPUB_ANCHOR_FIND_RE.finditer(markdown)
+        if _EPUB_DOC_ANCHOR_RE.search(m.group(1))
     ]
     if len(anchors) < 2:
         return None
@@ -364,6 +411,177 @@ def split_chapters_by_anchors(
         chunks.append(seg)
 
     return chunks if chunks else None
+
+
+# ---------------------------------------------------------------------------
+# 扫描版 epub：图片 OCR
+# ---------------------------------------------------------------------------
+
+# 有些 epub 是「扫描图片版」：正文每页都是一张图，文字层只剩目录/页眉。实测某
+# 241.9MB 的统计教材：535 张图占 241.8MB（99.96%），文字层仅 5474 字符。这类
+# 书走 pandoc/docling 只能拿到目录，正文一个字都没有——必须对图片做 OCR。
+#
+# 判定：图片总字节 ≥ _EPUB_SCAN_MIN_IMAGE_BYTES 且「文字层字符 × 200 < 图片字节」
+# （图片在体积上压倒性占优）。纯文字书不会误判：正文几万字 × 200 远超其插图体积。
+_EPUB_SCAN_MIN_IMAGE_BYTES = 5 * 1024 * 1024
+_EPUB_SCAN_TEXT_WEIGHT = 200
+# pandoc 转出的正文少于这个字符数才考虑「可能是扫描版」（够长就不折腾）。
+_EPUB_SCAN_MD_MIN_CHARS = 20000
+# 太小的图是装饰（图标、分隔线、角标），不值得 OCR。
+_EPUB_OCR_MIN_IMAGE_BYTES = 20 * 1024
+
+_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _epub_scan_profile(filepath: str) -> Optional[Tuple[int, int, list]]:
+    """读取 epub 结构 → (图片总字节, 文字层字符数, 图片 item 列表)。
+
+    图片 item 按文件名排序：扫描版通常命名为 page001.jpg…page535.jpg，文件名
+    序即页序。读取失败返回 None（调用方按「非扫描版」处理，行为与改动前一致）。
+    """
+    try:
+        import ebooklib
+        from ebooklib import epub
+    except ImportError:
+        return None
+    try:
+        book = epub.read_epub(str(filepath))
+    except Exception as e:
+        logger.debug("读取 epub 结构失败 %s: %s", os.path.basename(filepath), e)
+        return None
+    try:
+        docs = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+        imgs = [i for i in book.get_items() if i.get_type() == ebooklib.ITEM_IMAGE]
+    except Exception as e:
+        logger.debug("遍历 epub 条目失败 %s: %s", os.path.basename(filepath), e)
+        return None
+
+    img_bytes = 0
+    for im in imgs:
+        try:
+            img_bytes += len(im.get_content() or b"")
+        except Exception:
+            continue
+    text_chars = 0
+    for d in docs:
+        try:
+            raw = (d.get_content() or b"").decode("utf-8", "replace")
+        except Exception:
+            continue
+        text_chars += len(_WS_RE.sub("", _TAG_RE.sub("", raw)))
+    imgs.sort(key=lambda i: getattr(i, "file_name", "") or "")
+    return img_bytes, text_chars, imgs
+
+
+def _is_scanned_epub(filepath: str) -> bool:
+    """是否为扫描图片版 epub（正文全是图，文字层只有目录/页眉）。"""
+    prof = _epub_scan_profile(filepath)
+    if prof is None:
+        return False
+    img_bytes, text_chars, _imgs = prof
+    return (img_bytes >= _EPUB_SCAN_MIN_IMAGE_BYTES
+            and text_chars * _EPUB_SCAN_TEXT_WEIGHT < img_bytes)
+
+
+def _ocr_image_array(img) -> str:
+    """对单张**已预处理**的灰度 ndarray 做识别。
+
+    **ocrmac（Apple Vision）优先**，不可用/失败时回退 RapidOCR —— 与 PDF 主
+    引擎（docling 的 OcrAutoOptions）的策略一致：Vision 是系统级加速，中文
+    识别的质量与速度都更好。
+    """
+    from PIL import Image
+
+    pil = Image.fromarray(img)
+    try:
+        from ocrmac import ocrmac
+
+        results = ocrmac.OCR(
+            pil,
+            framework="vision",
+            recognition_level="accurate",
+            language_preference=["zh-Hans", "en-US"],
+            detail=False,
+        ).recognize()
+        parts: List[str] = []
+        for item in results or []:
+            # detail=False → (text, confidence)；个别版本仍返回三元组。
+            text = item[0] if isinstance(item, (tuple, list)) else item
+            if text and str(text).strip():
+                parts.append(str(text).strip())
+        if parts:
+            return "\n".join(parts)
+        logger.debug("ocrmac 返回空结果，回退 rapidocr")
+    except Exception as e:
+        logger.debug("ocrmac 不可用/识别失败，回退 rapidocr: %s", e)
+
+    # 回退 RapidOCR：复用 parsers 的引擎单例与结果缓存（与 PDF 图片页同一实例）。
+    try:
+        from .parsers import _get_ocr_engine, _ocr_image_cached
+
+        engine = _get_ocr_engine()
+        if engine is None:
+            return ""
+        return _ocr_image_cached(engine, img, 0, "epub-page")
+    except Exception as e:
+        logger.debug("rapidocr 回退失败: %s", e)
+        return ""
+
+
+def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
+    """对扫描版 epub 的图片逐张 OCR，返回拼接正文（无可识别内容返回 None）。
+
+    预处理复用 ``parsers._ocr_preprocess_array``——与 PDF 图片页**完全一致**的
+    归一化：长边 Lanczos ≤1500px、灰度、USM 锐化、Otsu 二值化。
+
+    内存：逐张读取、识别后立即释放，不会把整本书的图片（可达数百 MB）常驻。
+    """
+    prof = _epub_scan_profile(filepath)
+    if prof is None:
+        return None
+    _img_bytes, _text_chars, imgs = prof
+    if not imgs:
+        return None
+
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from .parsers import _ocr_preprocess_array
+
+    parts: List[str] = []
+    done = 0
+    for idx, item in enumerate(imgs):
+        try:
+            raw = item.get_content() or b""
+        except Exception:
+            continue
+        if len(raw) < _EPUB_OCR_MIN_IMAGE_BYTES:
+            continue  # 装饰图，跳过
+        try:
+            pil = Image.open(io.BytesIO(raw))
+            pil.load()
+            gray = pil.convert("L")
+            del pil
+            arr = np.asarray(gray, dtype=np.uint8)
+            del gray
+            arr = _ocr_preprocess_array(arr)
+            text = _ocr_image_array(arr)
+            del arr
+            if text and text.strip():
+                parts.append(text.strip())
+                done += 1
+        except Exception as e:
+            logger.debug("epub 图片 OCR 失败 %s 第 %d 张: %s",
+                         os.path.basename(filepath), idx, e)
+            continue
+        if log and done and done % 20 == 0:
+            log("    ├─ 扫描版 OCR 进度: %d/%d 张", done, len(imgs))
+
+    if not parts:
+        return None
+    return "\n\n".join(parts)
 
 
 def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[List[str]]]]:
@@ -405,10 +623,28 @@ def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[
         md = _pandoc_to_markdown(src, "epub")
         if not md or not md.strip():
             return None
+        # 清洗后的正文（锚点 span 要留给 split_chapters_by_anchors，所以只对
+        # 副本做剥离）。
+        body_md = strip_markdown_noise(strip_raw_html(strip_anchor_spans(md)))
+        # 扫描图片版：正文全是图，pandoc 只能抽出目录/页眉那点文字 → 改用图片
+        # OCR 取正文；TOC 仍然保留（缩略版与目录信息是准的）。
+        #
+        # 判定必须用**清洗后**的正文量，不能拿原始 md：扫描版的原始 md 里塞满
+        # <img>/<svg> 标记（实测 82266 字符，剥完只剩 9986），拿原始值判断会
+        # 被误判成「内容很足」而跳过 OCR。
+        if (len(_WS_RE.sub("", body_md)) < _EPUB_SCAN_MD_MIN_CHARS
+                and _is_scanned_epub(src)):
+            logger.info("%s: 判定为扫描图片版 epub，改用图片 OCR 取正文",
+                        os.path.basename(filepath))
+            ocr_md = ocr_epub_images(src)
+            if ocr_md:
+                return ocr_md, toc, None
+            logger.warning("%s: 扫描版图片 OCR 未取到内容，回退 pandoc 结果",
+                           os.path.basename(filepath))
         chapter_texts = split_chapters_by_anchors(md, toc)
-        md = strip_raw_html(strip_anchor_spans(md))
+        md = body_md
         if chapter_texts:
-            chapter_texts = [strip_raw_html(t) for t in chapter_texts]
+            chapter_texts = [strip_markdown_noise(strip_raw_html(t)) for t in chapter_texts]
         return md, toc, chapter_texts
     finally:
         if tmp_epub:
