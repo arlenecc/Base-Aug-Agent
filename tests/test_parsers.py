@@ -17,8 +17,8 @@ _RAPIDOCR_IMPORT_NAMES = ("rapidocr", "rapidocr_onnxruntime")
 class _FakeRapidOCR:
     """Fake RapidOCR used for both candidate import names.
 
-    ``__init__`` 接受可选的 ``params``：Apple Silicon 上 _get_ocr_engine() 会
-    走 ``RapidOCR(params={"EngineConfig.onnxruntime.use_coreml": True})`` 分支。
+    ``__init__`` 仍接受可选的 ``params``（签名兼容）：_get_ocr_engine() 现在
+    一律不传参走默认 CPU EP，但旧签名保留以便将来再启用 EP。
     用**同一个类**注册到两个模块名，实例计数才与实际构造次数一致。
     """
     instances = 0

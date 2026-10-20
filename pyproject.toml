@@ -46,15 +46,15 @@ rag = [
     "ocrmac>=1.0.1",
     # BM25 hybrid retrieval: 原生 FTS (simple tokenizer) + jieba CJK 预分词
     "jieba>=0.42",
-    # CoreML EP（Apple Silicon OCR/推理加速）需要官方 wheel 内置的
-    # CoreMLExecutionProvider；旧版 wheel 没有，运行时 deps 检查也会强制此下限。
+    # onnxruntime 版本下限由 fastembed / rapidocr 的稳定性决定（不再为 CoreML
+    # EP 而强制：RapidOCR 已改回默认 CPU EP，见 parsers._get_ocr_engine）。
     "onnxruntime>=1.31",
     # 直接 ONNX Embedding/Reranker 使用本地 tokenizer.json，禁止联网加载。
     "transformers>=4.49",
 ]
 # PDF OCR (optional, heavy dependency ~500MB)。
 # rapidocr 3.x 起为统一包名（兼容层 rapidocr-onnxruntime 仅供旧环境回退，
-# 见 parsers._get_ocr_engine）；模型目录与 docling 共享，且支持 CoreML EP。
+# 见 parsers._get_ocr_engine）；模型目录与 docling 共享，一律走默认 CPU EP。
 ocr = ["rapidocr>=3.10"]
 # marker-pdf：与 docling 并行的 PDF→Markdown 引擎（#134），经
 # rag_pdf_engine 配置切换。会连带拉 PyTorch（~2GB+）+ surya OCR 模型，

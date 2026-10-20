@@ -478,9 +478,11 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                     required=False)
         )
 
-    # ---- onnxruntime 版本下限：CoreML EP 需要 >= 1.31 ----
-    # Apple Silicon 上的 OCR 推理加速（parsers._get_ocr_engine）依赖官方
-    # wheel 内置的 CoreMLExecutionProvider；旧版本会静默回退 CPU EP。
+    # ---- onnxruntime 版本下限：>= 1.31 ----
+    # pyproject 声明的下限，保证 fastembed / rapidocr 在官方 wheel 上的稳定
+    # 行为（旧版 wheel 缺算子/算子行为有差异，会静默降级或报错）。
+    # 注：此下限**不再**是为 CoreML EP 而设——RapidOCR 已改回默认 CPU EP
+    # （见 parsers._get_ocr_engine，实测 CoreML EP 反而更慢更耗资源）。
     # fastembed 会拉 onnxruntime，但可能拉到旧版——这里强制版本下限，
     # 缺失/过旧都进 missing_required，由 ensure_rag_deps 自动升级。
     if _is_importable("onnxruntime"):
@@ -491,7 +493,7 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                 report.missing_required.append(
                     DepSpec("onnxruntime", "onnxruntime>=1.31",
                             f"onnxruntime {_ort.__version__} 过旧"
-                            f"（CoreML EP 加速需要 >= 1.31）")
+                            f"（需要 >= 1.31）")
                 )
         except (ValueError, AttributeError):
             pass  # 版本号解析失败（如 dev 构建）时不误报

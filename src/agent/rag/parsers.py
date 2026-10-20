@@ -28,7 +28,7 @@ _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
 
-# OCR 引擎周期性重建页数。CoreML/ORT 的原生缓存按输入形状保留（实测真实
+# OCR 引擎周期性重建页数。ORT 的原生缓存按输入形状保留（实测真实
 # 扫描页 ~35MB/页，#119：400 页扫描书滞留 ~14GB，进程退出前不释放，最终
 # 被系统压缩到 17GB 直至 50GB 崩溃）。每 N 页强制重建引擎冲刷全部原生
 # 缓存：#130 系统扫描（N=10..100，单线程真实 200dpi 页）证实热重建仅
@@ -40,7 +40,7 @@ _OCR_RECYCLE_PAGES = 50
 
 # OCR 输入归一化：渲染 DPI 上限 + 长边像素上限（两道独立约束，缺一不可）。
 #   1. _OCR_DPI：渲染分辨率不超过 150 DPI。200+ DPI 扫描页渲染出的大位图会
-#      让 RapidOCR 的 CoreML/ORT 原生缓存按形状暴涨（见 _OCR_RECYCLE_PAGES
+#      让 RapidOCR 的 ORT 原生缓存按形状暴涨（见 _OCR_RECYCLE_PAGES
 #      注释），且对识别率提升边际递减；150 DPI 已足以覆盖常规印刷/扫描文字。
 #   2. _OCR_MAX_LONG_EDGE：长边不超过 1500px。A4 页在 150 DPI 下长边约 1754px，
 #      超出部分对识别无增益，却成倍推高 OCR 计算量与原生缓存占用，等比
@@ -289,7 +289,7 @@ def _ocr_downscale_long_edge(img):
     """长边超过 _OCR_MAX_LONG_EDGE(1500px) 时等比缩放回 1500px。
 
     A4 页在 150 DPI 下长边约 1754px，超出部分对识别无增益，却成倍推高
-    OCR 计算量与 CoreML/ORT 原生缓存占用。用 LANCZOS 高质量下采样，
+    OCR 计算量与 ORT 原生缓存占用。用 LANCZOS 高质量下采样，
     仅在确实超限时触发（绝大多数页面长边 < 1500px，零开销直通）。
     """
     import numpy as np
@@ -512,7 +512,7 @@ def _extract_pdf(path: Path) -> str:
                 # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
 
-            # 周期性重建引擎：冲刷 CoreML/ORT 按形状保留的原生缓存（见
+            # 周期性重建引擎：冲刷 ORT 按形状保留的原生缓存（见
             # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
             # 下一页都会重新取用/重建——旧引擎随各 worker 页末的引用释放
             # 而销毁，原生缓存真正被冲刷。
@@ -584,15 +584,6 @@ def _extract_pdf(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def _is_apple_silicon() -> bool:
-    """当前是否为 Apple Silicon（M 系列）Mac。
-
-    arm64 macOS 即 Apple Silicon；Intel Mac 返回 False，继续用 CPU EP。
-    """
-    import platform
-    return platform.system() == "Darwin" and platform.machine() == "arm64"
-
-
 def _get_ocr_engine():
     """Lazy-load RapidOCR engine as a global singleton.
 
@@ -601,11 +592,13 @@ def _get_ocr_engine():
     _OCR_SEMAPHORE serializes actual OCR calls so the shared engine is only
     invoked by one thread at a time.
 
-    引擎选择：优先 rapidocr 3.x（支持 CoreML EP、模型目录与 docling 共享、
-    懒加载省内存），未安装再回退旧版 rapidocr-onnxruntime 1.x（CPU EP）。
-    Apple Silicon（M 系列）上 3.x 启用 onnxruntime 的 CoreML EP（ANE+GPU
-    推理，实测比 CPU EP 快约 1.5 倍且输出一致）；CoreML 初始化失败自动
-    回退 CPU EP。
+    引擎选择：优先 rapidocr 3.x（模型目录与 docling 共享、懒加载省内存），
+    未安装再回退旧版 rapidocr-onnxruntime 1.x。
+
+    **一律使用默认 CPU EP**，不再启用 CoreML EP：实测 Apple Silicon 上
+    CoreML EP 反而比纯 CPU 更慢、且额外占用 ANE/GPU 与内存（与同进程里跑
+    MLX/Metal 的推理相互抢资源）。RapidOCR 现在只作为 ocrmac(Apple Vision)
+    **不可用时的兜底**，走稳不求快，CPU EP 足够。
     """
     global _OCR_ENGINE
     if _OCR_ENGINE is not None:
@@ -614,23 +607,12 @@ def _get_ocr_engine():
         if _OCR_ENGINE is not None:
             return _OCR_ENGINE
         try:
-            params = None
             try:
                 from rapidocr import RapidOCR  # 3.x
-                if _is_apple_silicon():
-                    params = {"EngineConfig.onnxruntime.use_coreml": True}
             except ImportError:
                 from rapidocr_onnxruntime import RapidOCR  # 1.x 回退
-            if params:
-                try:
-                    _OCR_ENGINE = RapidOCR(params=params)
-                except Exception as e:
-                    logger.info(
-                        "RapidOCR CoreML EP init failed (%s); using CPU EP",
-                        type(e).__name__)
-                    _OCR_ENGINE = RapidOCR()
-            else:
-                _OCR_ENGINE = RapidOCR()
+            # 不传 params → onnxruntime 默认 CPU EP。
+            _OCR_ENGINE = RapidOCR()
             # 预热一次（空图）：提前加载模型并探测实际生效的 EP。
             # 模型本来马上就会被用到，预热同时消除首页 OCR 的加载延迟。
             try:
