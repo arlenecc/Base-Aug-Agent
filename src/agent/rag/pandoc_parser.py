@@ -431,13 +431,19 @@ _EPUB_SCAN_MD_MIN_CHARS = 20000
 _EPUB_OCR_MIN_IMAGE_BYTES = 20 * 1024
 
 _TAG_RE = re.compile(r'<[^>]+>')
+# 正文里的图片引用（XHTML 的 <img src> 与内嵌 SVG 的 <image xlink:href>）。
+_EPUB_IMG_SRC_RE = re.compile(
+    r'<img[^>]*?\bsrc\s*=\s*["\']([^"\']+)["\']'
+    r'|<image[^>]*?\bxlink:href\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE)
 
 
 def _epub_scan_profile(filepath: str) -> Optional[Tuple[int, int, list]]:
     """读取 epub 结构 → (图片总字节, 文字层字符数, 图片 item 列表)。
 
-    图片 item 按文件名排序：扫描版通常命名为 page001.jpg…page535.jpg，文件名
-    序即页序。读取失败返回 None（调用方按「非扫描版」处理，行为与改动前一致）。
+    图片 item 按**阅读顺序**排列（见
+    :func:`_epub_images_in_reading_order`）——扫描版的文件名顺序经常不等于页
+    序。读取失败返回 None（调用方按「非扫描版」处理，行为与改动前一致）。
     """
     try:
         import ebooklib
@@ -469,8 +475,73 @@ def _epub_scan_profile(filepath: str) -> Optional[Tuple[int, int, list]]:
         except Exception:
             continue
         text_chars += len(_WS_RE.sub("", _TAG_RE.sub("", raw)))
-    imgs.sort(key=lambda i: getattr(i, "file_name", "") or "")
+    imgs = _epub_images_in_reading_order(book, docs, imgs)
     return img_bytes, text_chars, imgs
+
+
+def _epub_images_in_reading_order(book, docs, imgs):
+    """按**阅读顺序**重排图片：spine 文档里 ``<img>`` 的出现次序。
+
+    manifest（``Image00000.jpg``…）的文件名顺序**不等于页序**——实测某本
+    534 页的书 ``Image00000`` 对应的是第 470 页。若按 manifest 顺序 OCR，
+    拼接出的正文前后颠倒，切片语义全乱，检索质量急剧下降。
+
+    未在正文里被引用的图片（封面、纯装饰图）按文件名接在末尾，保证不丢页。
+    """
+    import posixpath
+
+    def _href(item):
+        return getattr(item, "file_name", "") or ""
+
+    def _base(href):
+        return posixpath.basename((href or "").split("#")[0])
+
+    by_href = {}
+    by_base = {}
+    for im in imgs:
+        href = _href(im)
+        by_href.setdefault(href, im)
+        by_href.setdefault(href.lstrip("./"), im)
+        by_href.setdefault(_base(href), im)
+        by_base.setdefault(_base(href), im)
+
+    ordered_docs: List = []
+    try:
+        for entry in book.spine or []:
+            idref = entry[0] if isinstance(entry, (tuple, list)) else entry
+            item = book.get_item_with_id(idref)
+            if item is not None:
+                ordered_docs.append(item)
+    except Exception as e:
+        logger.debug("解析 epub spine 失败，回退文档顺序: %s", e)
+    if not ordered_docs:
+        ordered_docs = list(docs)
+
+    result: List = []
+    used = set()
+    for d in ordered_docs:
+        try:
+            raw = (d.get_content() or b"").decode("utf-8", "replace")
+        except Exception:
+            continue
+        base_dir = posixpath.dirname(_href(d))
+        for groups in _EPUB_IMG_SRC_RE.findall(raw):
+            # 两个捕获组（img src / svg image xlink:href），取命中的那个。
+            src = next((g for g in groups if g), "")
+            src = src.split("#")[0].strip()
+            if not src:
+                continue
+            cand = (by_href.get(src)
+                    or by_href.get(posixpath.normpath(posixpath.join(base_dir, src)))
+                    or by_base.get(_base(src)))
+            if cand is not None and id(cand) not in used:
+                used.add(id(cand))
+                result.append(cand)
+
+    for im in sorted(imgs, key=_href):
+        if id(im) not in used:
+            result.append(im)
+    return result
 
 
 def _is_scanned_epub(filepath: str) -> bool:
