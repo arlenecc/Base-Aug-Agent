@@ -25,9 +25,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Formats docling can handle natively.  Text/markdown/csv/html are handled by
-# the lightweight parsers (docling is overkill and slower for them).
-_DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".epub"}
+# Formats docling handles.  Text/markdown/csv/html 由轻量解析器处理；
+# .epub 由专门的 ebook 路径（pandoc convert_ebook → ebook_parser）处理，不在此列
+# —— 一旦进 docling，DocumentConverter 会加载布局模型 + TableFormer（+3.7GB / 2s），
+# 对 epub 纯属浪费，故显式排除。若某天需要 docling 处理 epub，这里再加回。
+_DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"}
 
 # Converter singleton: docling models are heavy, so share one instance across
 # all workers (access is guarded by a lock — DocumentConverter is not
@@ -85,15 +87,21 @@ def _maybe_recycle_converter() -> None:
 
 
 def is_docling_available() -> bool:
-    """Return True if docling can be imported."""
+    """Return True if docling is installed (importable).
+
+    用 ``importlib.util.find_spec`` 做**轻量探测**：只检查包是否可导入，绝不真正
+    import docling——否则仅仅探测可用性就会把 torch 全家桶（docling 的依赖）加载
+    进内存。torch 应只在真正需要转换的 PDF 走到 ``_get_converter()`` 时才加载。
+    路由对每个文件都会调用本函数，轻量探测可避免对 .txt/.md 等根本用不到 docling
+    的文件也顺带拉起 torch；pandoc 不可用时本该走 ebook 路径的 .epub 同理。
+    """
     global _converter_unavailable
     if _converter_unavailable:
         return False
     try:
-        import docling  # noqa: F401
-        return True
-    except ImportError:
-        _converter_unavailable = True
+        import importlib.util
+        return importlib.util.find_spec("docling") is not None
+    except Exception:
         return False
 
 

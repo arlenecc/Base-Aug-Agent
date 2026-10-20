@@ -28,15 +28,19 @@ _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
 
-# OCR 引擎周期性重建页数。ORT 的原生缓存按输入形状保留（实测真实
-# 扫描页 ~35MB/页，#119：400 页扫描书滞留 ~14GB，进程退出前不释放，最终
-# 被系统压缩到 17GB 直至 50GB 崩溃）。每 N 页强制重建引擎冲刷全部原生
-# 缓存：#130 系统扫描（N=10..100，单线程真实 200dpi 页）证实热重建仅
-# 1-2s/次、峰值足迹在各 N 下持平 ~5.2GB（压缩器吸收缓存增长），N 对速度
-# 影响仅 1-3%/400 页书。取 50：单代水位 ~1.8GB（#123 后单代存活，4 worker
-# 聚合约同量级），重建开销摊薄到 ~0.5%。合成小图触发不了该积累，只有真实
-# 200dpi 大页 + 密集文字框才会——不要因为「合成实验没复现」而移除。
+# OCR 引擎周期性重建页数——**仅当使用 CoreML EP 时启用**（见
+# _OCR_RECYCLE_ENABLED）。CoreML 原生缓存按输入形状保留（#119：400 页扫描书
+# 滞留 ~14GB），故每 N 页强制重建引擎冲刷缓存。但 RapidOCR 现已统一走 CPU EP
+# （CoreML 实测慢 2 倍且抢 GPU/内存，见 _get_ocr_engine），CPU EP 下 ORT arena
+# 增量实测 0.00GB，原生缓存问题不复存在；此时周期重建纯属代价：每次新建
+# ~0.5-1GB 引擎，且 ORT 的 C++ 会话堆 GC 无法及时回收（见 release_ocr_engine
+# 注释），4 worker 并发交叉重建会让新旧两代共存把 RSS 顶上 6GB+。因此默认关闭，
+# 仅 CoreML EP 重新启用时才打开。取 50：CoreML 路径下重建开销摊薄到 ~0.5%。
 _OCR_RECYCLE_PAGES = 50
+# 周期重建开关：引擎构建时按实际生效 EP 设置——含 CoreMLExecutionProvider 才
+# 为 True。CPU EP（当前默认）为 False，热循环里不做任何重建。保留它是为了 CoreML
+# 重新启用时仍能冲刷原生缓存，不必改结构。
+_OCR_RECYCLE_ENABLED = False
 
 # OCR 输入归一化：渲染 DPI 上限 + 长边像素上限（两道独立约束，缺一不可）。
 #   1. _OCR_DPI：渲染分辨率不超过 150 DPI。200+ DPI 扫描页渲染出的大位图会
@@ -512,13 +516,15 @@ def _extract_pdf(path: Path) -> str:
                 # OCR 返回空结果（可能是图片质量太差或引擎异常）
                 ocr_skipped_count += 1
 
-            # 周期性重建引擎：冲刷 ORT 按形状保留的原生缓存（见
-            # _OCR_RECYCLE_PAGES 注释）。全局置 None 后，所有 worker 的
-            # 下一页都会重新取用/重建——旧引擎随各 worker 页末的引用释放
-            # 而销毁，原生缓存真正被冲刷。
-            if (ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0:
+            # 周期性重建引擎：仅 CoreML EP 下启用（_OCR_RECYCLE_ENABLED），
+            # 用于冲刷 CoreML 按形状保留的原生缓存。CPU EP（当前默认）下原生
+            # 缓存不积累（实测 arena 增量 0.00GB），重建纯属代价——4 worker 并发
+            # 交叉重建会让新旧引擎 C++ 堆叠加把 RSS 顶上 6GB+，故跳过。引擎仍由
+            # RAGEngine.close() 在同步结束时统一释放（见 release_ocr_engine）。
+            if _OCR_RECYCLE_ENABLED and \
+                    (ocr_page_count + ocr_skipped_count) % _OCR_RECYCLE_PAGES == 0:
                 release_ocr_engine()
-                logger.info("PDF '%s': OCR 引擎已周期重建（每 %d 页，冲刷原生缓存）",
+                logger.info("PDF '%s': OCR 引擎已周期重建（每 %d 页，CoreML 冲刷原生缓存）",
                             path.name, _OCR_RECYCLE_PAGES)
     finally:
         # 必须放在 finally：中途抛异常（加密 PDF、损坏文件、OCR 崩溃）时
@@ -623,6 +629,12 @@ def _get_ocr_engine():
                 inner = getattr(inner, "session", inner)
                 logger.info("RapidOCR engine loaded, EP: %s",
                             inner.get_providers())
+                # 周期重建仅对 CoreML EP 有意义（CPU EP 原生缓存不积累，见
+                # _OCR_RECYCLE_PAGES 注释）。按实际生效 EP 打开开关。
+                global _OCR_RECYCLE_ENABLED
+                _OCR_RECYCLE_ENABLED = any(
+                    "CoreML" in str(p) for p in inner.get_providers()
+                )
             except Exception:
                 logger.info("RapidOCR engine loaded (global singleton)")
             return _OCR_ENGINE
@@ -637,22 +649,13 @@ def _get_ocr_engine():
             return None
 
 
-class _OcrmacUnavailable(Exception):
-    """ocrmac 不可用（未安装 / 运行期异常）→ 调用方据此回退 RapidOCR。
-
-    注意：与「ocrmac 跑通了但这一页没识别到文字」**区分开**——后者是正常
-    情况（整页版画、插图、纯空白），不应触发 RapidOCR 的 500MB 引擎加载。
-    """
-
-
 def _ocrmac_recognize(img) -> str:
     """用 ocrmac（Apple Vision）识别**已预处理**的灰度 ndarray。
 
-    返回空串表示「跑通了但本页没识别到文字」（插图/空白页属于此类，直接
-    跳过，不回退）。ocrmac 未安装或运行期异常则抛 :class:`_OcrmacUnavailable`，
-    由 :func:`ocr_recognize_array` 回退 RapidOCR —— 与 docling 的
-    ``AutoOcrModel`` 同策略：Vision 是系统级加速，中文识别的质量与速度都
-    优于 RapidOCR。
+    返回空串表示「本页没识别到文字」**或**「ocrmac 不可用/异常」——这两种
+    情况都交给 :func:`ocr_recognize_array` 用 RapidOCR 补充**这一页**。
+    返回空 ≠ 全局回退：后续页仍优先走 ocrmac（繁体竖排、线装版画等个别页
+    ocrmac 读不出时，用 rapidocr 补这几页即可，不必整本切到 rapidocr）。
     """
     from PIL import Image
 
@@ -660,6 +663,11 @@ def _ocrmac_recognize(img) -> str:
     try:
         from ocrmac import ocrmac
 
+        # 注意：ocrmac 底层经 pyobjc 调 VNRecognizeTextRequest，每次识别产生的
+        # Objective-C 对象（NSImage/VNImageRequestHandler 等）靠 autorelease
+        # pool 回收。worker 子线程无主线程式隐式排空，故 autorelease pool 的
+        # 包裹由 _install_ocrmac_autorelease_patch()（模块加载时全局 monkeypatch
+        # ocrmac.OCR）统一处理，这里无需重复包。
         results = ocrmac.OCR(
             pil,
             framework="vision",
@@ -668,7 +676,8 @@ def _ocrmac_recognize(img) -> str:
             detail=False,
         ).recognize()
     except Exception as e:
-        raise _OcrmacUnavailable(e)
+        logger.debug("ocrmac 不可用/识别失败，本页改由 rapidocr 补充: %s", e)
+        return ""
 
     parts: List[str] = []
     for item in results or []:
@@ -686,21 +695,21 @@ def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
     与扫描版 epub 页（``pandoc_parser.ocr_epub_images``）都走这里，保证两条
     通路的预处理（:func:`_ocr_preprocess_array`）与引擎选择策略完全一致。
 
-    回退触发条件严格限于「ocrmac 不可用」——即 ocrmac 未安装或运行期异常
-    （:class:`_OcrmacUnavailable`）。ocrmac 跑通但本页无文字（插图/空白页）
-    直接返回空，绝不为了这几页拉起 RapidOCR 的 500MB 引擎。这也符合「优先
-    ocrmac，不可用再走 rapidocr」的语义：页上没字 ≠ ocrmac 不可用。
+    **按页回退（非全局）**：本页先走 ocrmac(Apple Vision)；若 ocrmac 未装/
+    运行期异常/本页没识别到文字，则该页改用 RapidOCR 补充。下一页依旧优先
+    ocrmac，不会因某一页失败就整体切到 RapidOCR（繁体竖排、线装版画等个别
+    页 ocrmac 读不出的场景，用 rapidocr 补这几页即可）。RapidOCR 单例按需
+    懒加载，仅在真正有页回退时才构造、之后复用。
 
     ``page_num`` / ``filename`` 仅用于 RapidOCR 失败时的日志定位。
     """
-    try:
-        return _ocrmac_recognize(img)
-    except _OcrmacUnavailable as e:
-        logger.debug("ocrmac 不可用，回退 rapidocr: %s", e)
-        ocr_engine = _get_ocr_engine()
-        if ocr_engine is None:
-            return ""
-        return _ocr_image_cached(ocr_engine, img, page_num, filename)
+    text = _ocrmac_recognize(img)
+    if text:
+        return text
+    ocr_engine = _get_ocr_engine()
+    if ocr_engine is None:
+        return ""
+    return _ocr_image_cached(ocr_engine, img, page_num, filename)
 
 
 def _ocr_backend_available() -> bool:
@@ -968,3 +977,48 @@ def iter_directory(
             logger.warning("Failed to extract '%s': %s", filepath.name, e)
             if errors is not None:
                 errors.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Apple Vision（ocrmac）autorelease-pool 补丁（#fix: 扫描书同步期内存泄漏）
+# ---------------------------------------------------------------------------
+# ocrmac 底层用 pyobjc 调 VNRecognizeTextRequest 做 OCR。每次识别产生的
+# NSImage / VNImageRequestHandler / 内部图像缓冲等 Objective-C 对象进入线程的
+# autorelease pool；而 ingest 的 OCR 跑在 worker 子线程里、没有主线程那种隐式
+# 排空，几百页扫描书累积下来就是数 GB 泄漏（表现为同步期内存周期性冲到 14GB+）。
+#
+# 这里在模块加载时把 ocrmac.OCR 整体（构造 + recognize 都在池内）包进
+# autorelease pool：每页识别完立刻排空，OC 对象不跨页堆积。这是全局 monkeypatch
+# —— 本模块 _ocrmac_recognize 走它，docling 内部的 ocrmac 调用（docling 在同步
+# 期构造 OCR 模型时取 ocrmac.OCR，此时补丁已生效）也一并被覆盖。
+def _install_ocrmac_autorelease_patch() -> None:
+    try:
+        import objc  # noqa: F401
+        # OCR 类在子模块 ocrmac.ocrmac 里（用法是 from ocrmac import ocrmac;
+        # ocrmac.OCR(...)），顶层包并没有 OCR 属性。docling 与本模块都从这个
+        # 子模块取 OCR，所以补丁打在 ocrmac.ocrmac.OCR 上，对所有调用方生效。
+        from ocrmac import ocrmac as _ocrmac_mod
+    except Exception:
+        return
+    _orig = getattr(_ocrmac_mod, "OCR", None)
+    if _orig is None or getattr(_orig, "_autorelease_patched", False):
+        return
+
+    def _pooled_OCR(*args, **kwargs):
+        # 构造与识别都在同一个 autorelease pool 内，识别完立刻排空。
+        with objc.autorelease_pool():
+            inst = _orig(*args, **kwargs)
+            _orig_recognize = inst.recognize
+
+            def _pooled_recognize(*rargs, **rkwargs):
+                with objc.autorelease_pool():
+                    return _orig_recognize(*rargs, **rkwargs)
+
+            inst.recognize = _pooled_recognize
+            return inst
+
+    _pooled_OCR._autorelease_patched = True
+    _ocrmac_mod.OCR = _pooled_OCR
+
+
+_install_ocrmac_autorelease_patch()

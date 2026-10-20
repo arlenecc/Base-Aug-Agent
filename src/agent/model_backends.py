@@ -714,7 +714,11 @@ class MLXLanguageBackend(_LazyLocalBackend):
             self._kv_ids = []
             self._kv_thread_ident = None
             try:
+                import gc
                 import mlx.core as mx
+                # 先 gc 断开权重引用，再 clear_cache 让 MLX 分配器把显存归还系统，
+                # 否则 _model_obj 置空后底层 MLX 缓存池仍会占着 GPU 统一内存。
+                gc.collect()
                 mx.clear_cache()
             except Exception:
                 pass

@@ -1688,6 +1688,12 @@ class MainWindow(QMainWindow):
         # 构造失败时必须清空引用：旧 agent 已在上面被异步关闭，继续持有它会让
         # _on_send 用一套已关闭的 MCP 客户端发起新一轮对话，报出与真实原因无关
         # 的二次错误。
+        # 重建前先捕获旧 agent 的后端：重建后若换成不同对象且已加载，必须 close()
+        # 掉，否则旧后端的 MLX 权重永远留在 GPU 统一内存（未调 mx.clear_cache()，
+        # GC 也不会释放显存）。对话加载路径会留 self._llm=None，此时旧 agent.llm
+        # 仍是已加载后端，最容易被孤儿化——这里兜底关闭。
+        _old_llm = getattr(self._agent, "llm", None) if self._agent is not None else None
+        _old_aux = getattr(self._agent, "aux_llm", None) if self._agent is not None else None
         self._agent = None
         new_llm = None
         new_aux = None
@@ -1722,6 +1728,15 @@ class MainWindow(QMainWindow):
             return
         self._llm = new_llm
         self._agent = new_agent
+        # 兜底关闭被换下的旧后端（已加载且与新后端不是同一对象才关，避免双关）。
+        for _old in (_old_llm, _old_aux):
+            if _old is not None and _old is not new_llm and _old is not new_aux \
+                    and getattr(_old, "_model_obj", None) is not None \
+                    and not getattr(_old, "_closed", False):
+                try:
+                    _old.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # config actions
@@ -1871,7 +1886,11 @@ class MainWindow(QMainWindow):
                 unload_btn.setStyleSheet("")
                 continue
             # 主模型在接口模式下没有本地模型可载；辅助模型永远可以操作。
-            usable = (local_mode or role == "aux") and not self._model_busy.get(role, False)
+            # 同步期间禁用「加载」：同步不需要 LLM，且要避免模型在同步中途被
+            # 加载进 GPU 把内存推高（与「同步前自动卸载」配合，保证同步期模型
+            # 彻底不在 GPU）。卸载按钮保留可用——中途卸载正是我们想要的。
+            usable = (local_mode or role == "aux") and not self._model_busy.get(
+                role, False) and not self._sync_busy
             load_btn.setEnabled(usable)
             unload_btn.setEnabled(usable)
             load_btn.setText("重新加载" if loaded else "加载模型")
@@ -2163,24 +2182,27 @@ class MainWindow(QMainWindow):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _on_unload_model(self, role: str) -> None:
-        """卸载已加载的模型，释放内存。"""
-        if self._model_busy.get(role, False):
-            QMessageBox.information(self, "请稍候", "正在处理另一个模型操作。")
-            return
-        if self._busy or self._is_worker_running(self._worker):
-            QMessageBox.warning(
-                self, "正在运行",
-                "Agent 正在运行，请先点击「终止对话」停止当前任务，再卸载模型。",
-            )
-            return
-        llm = self._loaded_model(role)
+    def _unload_role(self, role: str) -> bool:
+        """真正卸载某角色的 LLM 后端：close() 释放权重 + 换回惰性后端。
+
+        返回 True 表示确有模型被卸载；未加载则返回 False。被「卸载」按钮与
+        「同步前自动卸载」共用，避免卸载逻辑被重复粘贴。
+
+        **必须查 agent 侧后端，不能只查 UI 缓存 self._llm**：用户若仅通过「对话」
+        触发模型懒加载（chat_stream → _ensure_loaded），权重装在 self._agent.llm
+        上，而 self._llm 仍是 None（只有「加载」按钮回调 _on_model_loaded 会写
+        self._llm）。若只查 self._llm，同步起点卸载会误判「未加载」而漏掉真正
+        装着 ~11GB 权重的 agent.llm，导致同步期 GPU 仍被模型占满。
+        """
         label = "主模型" if role == "main" else "辅助模型"
-        if llm is None:
-            QMessageBox.information(self, "未加载", f"{label}尚未加载。")
-            return
-        # agent 正持有这个对象：直接 close() 会让下一轮对话撞上「后端已关闭」。
-        # 必须先把它从 agent 上摘下来、换一个全新的懒加载对象，再关旧的。
+        # 优先取 agent 上真正持有权重的后端；UI 缓存仅作兜底。
+        llm = None
+        if self._agent is not None:
+            llm = getattr(self._agent, "llm" if role == "main" else "aux_llm", None)
+        if llm is None or getattr(llm, "_closed", False):
+            llm = self._loaded_model(role)
+        if llm is None or getattr(llm, "_closed", False):
+            return False
         try:
             llm.close()
         except Exception as e:  # pragma: no cover - 防御
@@ -2197,7 +2219,25 @@ class MainWindow(QMainWindow):
                 self._agent.aux_llm = self._ensure_aux_llm()
         self._refresh_model_buttons()
         self._append_log(f"[model] {label} 已卸载")
-        self.status_label.setText(f"{label}已卸载")
+        logger.info("UI: %s 已卸载", label)
+        return True
+
+    def _on_unload_model(self, role: str) -> None:
+        """「卸载」按钮：卸载已加载的模型，释放内存。"""
+        if self._model_busy.get(role, False):
+            QMessageBox.information(self, "请稍候", "正在处理另一个模型操作。")
+            return
+        if self._busy or self._is_worker_running(self._worker):
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再卸载模型。",
+            )
+            return
+        label = "主模型" if role == "main" else "辅助模型"
+        if self._unload_role(role):
+            self.status_label.setText(f"{label}已卸载")
+        else:
+            QMessageBox.information(self, "未加载", f"{label}尚未加载。")
 
     def _on_model_loaded(self, payload: dict) -> None:
         """后台加载完成：换上热后端，并让正在用的 agent 指向它。"""
@@ -2354,6 +2394,8 @@ class MainWindow(QMainWindow):
         self._sync_busy = True
         self.sync_knowledge_btn.setEnabled(False)
         self.sync_knowledge_btn.setText("检查依赖…")
+        # 同步期间禁用模型「加载」按钮，避免主/辅助 LLM 在同步中途被装入 GPU。
+        self._refresh_model_buttons()
         # Enable stop-sync during the deps-check phase too so the user can
         # abort the whole pipeline before sync even starts.
         self.stop_sync_btn.setEnabled(True)
@@ -2386,6 +2428,8 @@ class MainWindow(QMainWindow):
         self.sync_knowledge_btn.setEnabled(not self._busy)
         self.sync_knowledge_btn.setText("同步知识")
         self.stop_sync_btn.setEnabled(False)
+        # 同步结束：恢复模型「加载」按钮（同步期间被禁用，避免中途加载 LLM）。
+        self._refresh_model_buttons()
 
     def _on_deps_progress(self, msg: str) -> None:
         self.status_label.setText(msg)
@@ -2450,6 +2494,49 @@ class MainWindow(QMainWindow):
         # stop_sync_btn stays enabled (it was enabled in _on_sync_knowledge)
         # so the user can cancel mid-sync.
         self._append_log("[rag] 依赖检查完成，启动同步引擎...")
+        # 同步期间无法对话，先把主/辅助 LLM 彻底卸载：二者都是 MLX 模型，
+        # 权重常驻 GPU 统一内存（约 11GB 的 IOAccelerator），与同步进程叠加
+        # 会把内存推到 13GB+。Embedding 模型同步必需（vectorize 要用）则保留。
+        # 卸载后 agent 换回惰性后端，下次对话时自动重载，无需在此恢复。
+        _unloaded = []
+        for _role in ("main", "aux"):
+            if self._unload_role(_role):
+                _unloaded.append("主" if _role == "main" else "辅助")
+        if _unloaded:
+            self._append_log(f"[rag] 同步前已卸载{'/'.join(_unloaded)}对话模型，释放 GPU 显存")
+            self.status_label.setText("已卸载对话模型，正在同步知识库…")
+        # 稳健兜底：gc 扫描所有「已加载」的 LLM 后端实例并强制 close()。
+        # 定向卸载（self._agent.llm / self._llm）查不到的孤儿后端——典型是
+        # _rebuild_agent 把旧后端换下、或某个仍存活的 AgentWorker 线程持有——会
+        # 一直占着 GPU 统一内存（同步期 +11GB）。只能靠 gc 扫描命中并关掉。
+        # 只扫 LLM 后端类，绝不碰同步必需的 embedding 模型。
+        try:
+            import gc as _gc
+            from agent.model_backends import (
+                MLXLanguageBackend, MLXVLMBackend, ONNXLanguageBackend, LlamaCppBackend)
+            _closed_extra = 0
+            for _o in _gc.get_objects():
+                if isinstance(_o, (MLXLanguageBackend, MLXVLMBackend,
+                                   ONNXLanguageBackend, LlamaCppBackend)):
+                    if getattr(_o, "_model_obj", None) is not None and not getattr(_o, "_closed", False):
+                        try:
+                            _o.close()
+                            _closed_extra += 1
+                        except Exception as _e:
+                            logger.debug("同步前 gc 清理 LLM 后端异常: %s", _e)
+            # 重置 UI/agent 侧 LLM 引用为全新惰性后端（下次对话自动重载）
+            self._llm = None
+            self._aux_llm = None
+            self._llm_signature = None
+            self._aux_llm_signature = None
+            if self._agent is not None:
+                self._agent.llm = self._ensure_main_llm()
+                self._agent.aux_llm = self._ensure_aux_llm()
+            self._refresh_model_buttons()
+            if _closed_extra:
+                logger.info("UI: 同步前 gc 清理 %d 个游离 LLM 后端，释放 GPU 显存", _closed_extra)
+        except Exception as _e:
+            logger.debug("同步前 gc 清理 LLM 后端失败(忽略): %s", _e)
         # 同步期间临时禁用 QSignalLogHandler 的 RAG 日志过滤，
         # 避免 QSignalLogHandler 和 _poll_sync_logs 同时操作 log_view
         # 导致的并发崩溃。RAG 日志在同步期间完全由 _log_buffer + QTimer 处理。

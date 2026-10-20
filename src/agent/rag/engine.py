@@ -28,6 +28,60 @@ from .vector_store import DEFAULT_RERANK_MODEL, VectorStore
 logger = logging.getLogger(__name__)
 
 
+# ---- 内存采样（默认关闭；设置 RAG_MEM_LOG 指向文件时开启）----
+# 仅用于排查同步期内存峰值：后台线程每 1s 记录当前 RSS 与进程峰值，各相位
+# 通过 _mem_mark 打点，便于把内存曲线对应到解析/切片/向量化阶段。正常运行为
+# 空操作（_MEM_LOG_PATH 为空时所有函数直接返回），零开销。
+_MEM_LOG_PATH = os.environ.get("RAG_MEM_LOG") or ""
+_mem_proc = None
+_mem_stop: Optional[threading.Event] = None
+_mem_peak = 0
+
+
+def _mem_rss() -> int:
+    global _mem_proc
+    if _mem_proc is None:
+        try:
+            import psutil
+            _mem_proc = psutil.Process(os.getpid())
+        except Exception:
+            return 0
+    try:
+        return _mem_proc.memory_info().rss
+    except Exception:
+        return 0
+
+
+def _mem_mark(msg: str) -> None:
+    if not _MEM_LOG_PATH:
+        return
+    try:
+        rss = _mem_rss()
+        global _mem_peak
+        _mem_peak = max(_mem_peak, rss)
+        ts = time.strftime("%H:%M:%S")
+        with open(_MEM_LOG_PATH, "a") as f:
+            f.write(f"{ts} MARK {msg} rss={rss / 1e6:.1f}MB peak={_mem_peak / 1e6:.1f}MB\n")
+    except Exception:
+        pass
+
+
+def _mem_sampler(interval: float = 1.0) -> None:
+    global _mem_peak
+    try:
+        with open(_MEM_LOG_PATH, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} START pid={os.getpid()}\n")
+            while not _mem_stop.is_set():
+                rss = _mem_rss()
+                _mem_peak = max(_mem_peak, rss)
+                f.write(f"{time.strftime('%H:%M:%S')} rss={rss / 1e6:.1f}MB "
+                        f"peak={_mem_peak / 1e6:.1f}MB\n")
+                _mem_stop.wait(interval)
+            f.write(f"{time.strftime('%H:%M:%S')} STOP peak={_mem_peak / 1e6:.1f}MB\n")
+    except Exception:
+        pass
+
+
 def _is_stale_digest(old_digest: str) -> bool:
     """判断 documents 表中已存的 digest 是否为旧格式、需要重刷。
 
@@ -568,6 +622,16 @@ class RAGEngine:
             return {"error": f"Knowledge base directory not found: {self._knowledge_base}"}
 
         t_start = time.monotonic()
+
+        # 内存采样（排查同步期峰值，默认关闭；设置 RAG_MEM_LOG 时开启）。
+        mem_thread = None
+        if _MEM_LOG_PATH:
+            global _mem_stop, _mem_peak
+            _mem_stop = threading.Event()
+            _mem_peak = 0
+            mem_thread = threading.Thread(target=_mem_sampler, daemon=True)
+            mem_thread.start()
+
         os.makedirs(self._rag_dir, exist_ok=True)
         os.makedirs(self._markdown_dir, exist_ok=True)
 
@@ -617,9 +681,15 @@ class RAGEngine:
                 _save_manifest(self._rag_dir, new_manifest, removed=removed)
             except OSError as e:
                 logger.warning("RAG: failed to save manifest: %s", e)
+            if mem_thread is not None and _mem_stop is not None:
+                _mem_stop.set()
+                mem_thread.join(timeout=2.0)
             return stats
         if self._is_cancelled():
             stats["cancelled"] = True
+            if mem_thread is not None and _mem_stop is not None:
+                _mem_stop.set()
+                mem_thread.join(timeout=2.0)
             return stats
 
         # Step 2: load manifest and partition
@@ -782,6 +852,7 @@ class RAGEngine:
                                  fname, len(text), t_extract,
                                  f" [{self._pdf_engine}]" if is_markdown else "")
                             _flush_logs(f"解析完成: {fname}")
+                            _mem_mark(f"解析完成 {fname} chars={len(text)}")
                         except Exception as e:
                             msg = f"{os.path.basename(filepath)}: {e}"
                             logger.warning("    └─ ❌ 解析失败: %s (耗时 %.2fs): %s", fname, time.monotonic() - t0, e)
@@ -949,6 +1020,7 @@ class RAGEngine:
                                 t_chunk_end - t_chunk,
                             )
                             _flush_logs(f"切片完成: {fname} ({len(doc_chunks)}片)")
+                            _mem_mark(f"切片完成 {fname} chunks={len(doc_chunks)}")
                             del cleaned
                         except Exception as e:
                             # clean/chunk 阶段异常：记录并跳过该文件，不中断整个同步。
@@ -1089,6 +1161,7 @@ class RAGEngine:
                             logger.warning("RAG: progress_callback error: %s", e)
 
             def _on_batch(batch_added: int, total_added: int) -> None:
+                _mem_mark(f"向量化批次 +{batch_added} (累计 {total_added})")
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:
                     try:
@@ -1228,6 +1301,9 @@ class RAGEngine:
                 stats["files_skipped"], stats["chunks"],
             )
             _log("══════════════════════════════════════════")
+            if mem_thread is not None and _mem_stop is not None:
+                _mem_stop.set()
+                mem_thread.join(timeout=2.0)
             return stats
 
         t_total = time.monotonic() - t_start
@@ -1247,6 +1323,9 @@ class RAGEngine:
             if len(stats["errors"]) > 10:
                 _log("     ... (还有 %d 个错误)", len(stats["errors"]) - 10)
         _log("══════════════════════════════════════════")
+        if mem_thread is not None and _mem_stop is not None:
+            _mem_stop.set()
+            mem_thread.join(timeout=2.0)
         return stats
 
     def _cleanup_deleted_files(

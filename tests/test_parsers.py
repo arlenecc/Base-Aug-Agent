@@ -122,24 +122,34 @@ def test_ocr_recognize_prefers_ocrmac_and_skips_rapidocr(monkeypatch):
 
 
 def test_ocr_recognize_falls_back_to_rapidocr(monkeypatch):
-    """ocrmac **不可用**（抛 _OcrmacUnavailable）时回退 RapidOCR。"""
-    _reset_ocr_state()
-    fake = _install_fake_rapidocr(monkeypatch)
-    monkeypatch.setattr(parsers, "_ocrmac_recognize",
-                        lambda img: (_ for _ in ()).throw(parsers._OcrmacUnavailable("no")))
-
-    parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
-    assert fake.instances == 1  # 确实回退了
-
-
-def test_ocr_recognize_empty_result_does_not_load_rapidocr(monkeypatch):
-    """ocrmac 跑通但本页无文字（插图/空白）→ 直接返回空，不加载 RapidOCR。"""
+    """ocrmac 本页识别不到（返回空/异常）时按页回退 RapidOCR。"""
     _reset_ocr_state()
     fake = _install_fake_rapidocr(monkeypatch)
     monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "")
 
-    assert parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf") == ""
-    assert fake.instances == 0  # RapidOCR 单例未被构造
+    parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
+    assert fake.instances == 1  # 仅这一页回退，拉起 RapidOCR
+
+
+def test_ocr_recognize_fallback_is_per_page_not_global(monkeypatch):
+    """按页回退：ocrmac 命中时不加载 rapidocr，下一页空了再独立回退。"""
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+    seq = {"n": 0}
+
+    def _mock(img):
+        seq["n"] += 1
+        # 第 1、3 页 ocrmac 命中，第 2 页识别不到
+        return "" if seq["n"] == 2 else f"第{seq['n']}页文字"
+
+    monkeypatch.setattr(parsers, "_ocrmac_recognize", _mock)
+
+    r1 = parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
+    r2 = parsers.ocr_recognize_array(_blank_page(), 2, "x.pdf")
+    r3 = parsers.ocr_recognize_array(_blank_page(), 3, "x.pdf")
+
+    assert r1 == "第1页文字" and r2 == "" and r3 == "第3页文字"
+    assert fake.instances == 1  # 只有第 2 页触发回退，引擎只构造一次
 
 
 def test_ocr_backend_available_prefers_ocrmac(monkeypatch):

@@ -25,6 +25,38 @@ EMBEDDING_BACKENDS = ("fastembed", "mlx", "onnx", "llama_cpp")
 # 间接产生（见 VectorStore.__init__），create_reranker_backend 仍容错处理。
 RERANKER_BACKENDS = ("fastembed", "mlx", "onnx")
 
+# MLX Metal buffer cache 上限（#fix: 同步期 phys_footprint 冲到 18-19GB）。
+# MLX 默认 memory_limit = recommendedMaxWorkingSetSize（实测 16GB 机器 =
+# 15.2GB，即 95% RAM），MetalAllocator 的 buffer cache 会一路涨到这个上限
+# 才被迫 release_cached_buffers——嵌入/重排批间释放的中间缓冲全部滞留在
+# cache 里，而 phys_footprint 把统一内存的 GPU 分配也计入，于是被推到接近
+# 物理内存。这不是泄漏，是默认上限太高：cache_limit 压到 1GB（超出立即归还
+# 系统，批间复用仍够用），memory_limit 仅在默认过高时压到 8GB 作兜底；
+# 模型权重/激活的实际占用不受影响。
+_MLX_MEM_CAP_DONE = False
+
+
+def _cap_mlx_memory_limits() -> None:
+    """限制 MLX Metal buffer cache，避免同步期统一内存被 cache 吃满。"""
+    global _MLX_MEM_CAP_DONE
+    if _MLX_MEM_CAP_DONE:
+        return
+    try:
+        import mlx.core as mx
+        before_mem = int(mx.get_memory_limit())
+        _GB = 1024 ** 3
+        mx.set_cache_limit(1 * _GB)
+        if before_mem > 8 * _GB:
+            mx.set_memory_limit(8 * _GB)
+        _MLX_MEM_CAP_DONE = True
+        logger.info(
+            "MLX 内存上限已设: cache_limit=1GB, memory_limit %.2fGB→%.2fGB "
+            "(默认约 95%% RAM，会把 buffer cache 一路涨到系统上限)",
+            before_mem / _GB, mx.get_memory_limit() / _GB,
+        )
+    except Exception as e:
+        logger.warning("设置 MLX 内存上限失败(忽略): %s", e)
+
 _DEFAULT_DOC_PREFIX = "search_document: "
 _DEFAULT_QUERY_PREFIX = "search_query: "
 
@@ -164,6 +196,7 @@ class MLXEmbeddingFunction:
         with self._load_lock:
             if self._model is not None:
                 return
+            _cap_mlx_memory_limits()
             config_path = Path(self._model_path) / "config.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
             self._model_type = str(config.get("model_type", ""))
@@ -775,6 +808,7 @@ class MLXReranker:
         with self._lock:
             if self._model is not None:
                 return
+            _cap_mlx_memory_limits()
             import json as _json
 
             import mlx.core as mx
