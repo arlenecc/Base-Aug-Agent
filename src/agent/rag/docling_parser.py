@@ -53,6 +53,36 @@ def release_converter() -> None:
         _converter = None
 
 
+# 转换篇数计数器 + 周期冲刷间隔。
+#
+# 为什么需要：docling 用 OcrAutoOptions **自己实例化**一份 OCR/ORT session，
+# parsers.py 的 _OCR_RECYCLE_PAGES 周期重建只作用于 parsers._OCR_ENGINE 那个
+# 模块级单例，管不到 docling 内部这份。整库同步几百页扫描件时，那份原生缓存
+# 按输入形状在**同步过程中**单调增长，直到 engine.close() 才释放——中途就会被
+# 系统杀掉（docling 是默认 pdf_engine，这是主路径）。按转换篇数主动置空单例，
+# 下一份文档惰性重建，把峰值限制在一代内。
+_DOCLING_RECYCLE_DOCS = 50
+_convert_count = 0
+_convert_count_lock = threading.Lock()
+
+
+def _maybe_recycle_converter() -> None:
+    """每 _DOCLING_RECYCLE_DOCS 篇冲刷一次 docling 原生缓存。
+
+    必须在 **_converter_lock 之外**调用：threading.Lock 不可重入，在持有锁的
+    转换流程里直接调 release_converter() 会死锁。
+    """
+    global _convert_count
+    with _convert_count_lock:
+        _convert_count += 1
+        n = _convert_count
+    if n % _DOCLING_RECYCLE_DOCS:
+        return
+    release_converter()
+    logger.info("docling 转换器已周期重建（每 %d 篇，冲刷 OCR/ORT 原生缓存）",
+                _DOCLING_RECYCLE_DOCS)
+
+
 def is_docling_available() -> bool:
     """Return True if docling can be imported."""
     global _converter_unavailable
@@ -68,6 +98,13 @@ def is_docling_available() -> bool:
 
 def is_supported(ext: str) -> bool:
     return ext.lower() in _DOCLING_EXTENSIONS
+
+
+# OCR 渲染分辨率上限（DPI）。docling 的 OcrOptions.scale 语义是「72 DPI ×
+# scale」，默认 3.0 = 216 DPI；这里锁到 150 DPI，与 parsers.py 的 _OCR_DPI
+# 保持一致，避免高分辨率扫描页把 OCR 原生缓存撑爆。
+# 换算：scale = _DOCLING_OCR_DPI / 72.0 ≈ 2.083
+_DOCLING_OCR_DPI = 150
 
 
 def _get_converter():
@@ -107,6 +144,12 @@ def _get_converter():
                 pdf_opts.accelerator_options = AcceleratorOptions(
                     num_threads=4, device=AcceleratorDevice.CPU
                 )
+                # 注意：这里**不要**动 pdf_opts.images_scale。
+                # images_scale 管的是版面/表格/图片描述模型用的**整页图**
+                # （page.image），与 OCR 渲染是两条独立通路；本机实测其默认
+                # 值是 1.0（72 DPI），把它设成 150/72 只会**抬高**整页图
+                # 分辨率、增加内存，与你想要的「限制」正好相反。
+                # OCR 的渲染倍率由下面的 OcrAutoOptions.scale 控制。
                 # OCR 引擎用 auto 探测（2026-10 实验切换）：
                 #   1. ocrmac（Apple Vision，系统级加速）优先；
                 #   2. 未安装 ocrmac / 请求语言不被 Vision 支持时自动回退
@@ -115,7 +158,16 @@ def _get_converter():
                 # lang 必须显式含 zh-Hans：OcrMacOptions 的字段默认值只有
                 # 西语系（en/es/fr/de），中文书会被 Vision 拒识；而 rapidocr
                 # 收到多语言时取第一个（zh-Hans → ch），回退路径不受影响。
-                pdf_opts.ocr_options = OcrAutoOptions(lang=["zh-Hans", "en-US"])
+                # scale 才是 OCR 的渲染倍率：页面按「72 DPI × scale」渲染，
+                # docling 默认 3.0 → **216 DPI**（远超 150 上限）。这里锁到
+                # 150/72 ≈ 2.083 → 150 DPI，与 parsers.py 的 _OCR_DPI 对齐。
+                # 且 docling 是对每个 OCR 区域**裁剪后**单独渲染
+                # （get_page_image(scale=..., cropbox=ocr_rect)），降 scale
+                # 直接减少送进 ocrmac/rapidocr 的像素量。
+                pdf_opts.ocr_options = OcrAutoOptions(
+                    lang=["zh-Hans", "en-US"],
+                    scale=_DOCLING_OCR_DPI / 72.0,
+                )
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )
@@ -158,6 +210,11 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if converter is None:
         return None
 
+    # 预置为 None：finally 里无条件解引用，异常发生在赋值之前也不会
+    # UnboundLocalError（旧实现把释放只放在成功路径）。
+    result = None
+    doc = None
+    markdown = None
     try:
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
         # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
@@ -166,8 +223,6 @@ def extract_markdown(filepath: str) -> Optional[str]:
             result = converter.convert(str(path))
             doc = result.document
             markdown = doc.export_to_markdown()
-        # 及时释放大对象引用，避免整棵文档树在切片前一直常驻。
-        del result, doc
         if not markdown or not markdown.strip():
             logger.warning("docling extracted empty markdown from %s", path.name)
             return None
@@ -176,3 +231,16 @@ def extract_markdown(filepath: str) -> Optional[str]:
         # Never let a docling failure abort ingestion — caller falls back.
         logger.warning("docling conversion failed for %s: %s", path.name, e)
         return None
+    finally:
+        # 及时释放大对象引用，避免整棵文档树在切片前一直常驻。
+        # ConversionResult 持有整棵文档树 + 每页位图（数十~数百 MB）；
+        # 旧实现只在成功路径 del，export_to_markdown() 抛异常时它活到函数
+        # 返回才被回收，异常密集时是实打实的常驻。
+        result = None
+        doc = None
+        # 周期性冲刷 docling 原生缓存（见 _maybe_recycle_converter 注释）。
+        # 必须在 _converter_lock 之外：Lock 不可重入。
+        try:
+            _maybe_recycle_converter()
+        except Exception as e:  # 绝不能让回收逻辑影响解析结果
+            logger.debug("docling 周期回收失败（忽略）: %s", e)

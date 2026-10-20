@@ -38,6 +38,30 @@ _OCR_ENGINE_LOCK = threading.Lock()
 # 200dpi 大页 + 密集文字框才会——不要因为「合成实验没复现」而移除。
 _OCR_RECYCLE_PAGES = 50
 
+# OCR 输入归一化：渲染 DPI 上限 + 长边像素上限（两道独立约束，缺一不可）。
+#   1. _OCR_DPI：渲染分辨率不超过 150 DPI。200+ DPI 扫描页渲染出的大位图会
+#      让 RapidOCR 的 CoreML/ORT 原生缓存按形状暴涨（见 _OCR_RECYCLE_PAGES
+#      注释），且对识别率提升边际递减；150 DPI 已足以覆盖常规印刷/扫描文字。
+#   2. _OCR_MAX_LONG_EDGE：长边不超过 1500px。A4 页在 150 DPI 下长边约 1754px，
+#      超出部分对识别无增益，却成倍推高 OCR 计算量与原生缓存占用，等比
+#      缩放回 1500px 即可（见 _ocr_downscale_long_edge）。
+_OCR_DPI = 150
+_OCR_MAX_LONG_EDGE = 1500
+
+# 锐化 / 二值化开关（默认全开）。放在这里是为了留退路：二值化会丢掉反锯齿
+# 灰边，个别印刷质量差的扫描件若识别率反而下降，把 _OCR_BINARIZE 置 False
+# 即可退回灰度管线，不必改代码结构。
+_OCR_SHARPEN = True
+_OCR_BINARIZE = True
+
+# MuPDF store 的页级收缩间隔。store 缓存解码后的嵌入图（每张满页扫描图解码
+# 后 ~10MB+），旧实现只在**全书结束**时收缩一次（_extract_pdf 的 finally），
+# 数百页扫描书在单文件内的峰值就冲到 GB 级，再 ×并发 worker 数——「同步跑
+# 一会就崩」的来源之一。每 N 页冲刷一次把峰值压在 ~N×10MB。
+# store_shrink(percent) 的语义是「释放百分之多少」（fitz.TOOLS.store_shrink
+# 的 docstring: "Free 'percent' of current store size"），100 = 全部释放。
+_STORE_SHRINK_PAGES = 25
+
 # ---------------------------------------------------------------------------
 # Format → extension mapping
 # ---------------------------------------------------------------------------
@@ -261,8 +285,89 @@ def _ocr_normalize(img):
     return img
 
 
+def _ocr_downscale_long_edge(img):
+    """长边超过 _OCR_MAX_LONG_EDGE(1500px) 时等比缩放回 1500px。
+
+    A4 页在 150 DPI 下长边约 1754px，超出部分对识别无增益，却成倍推高
+    OCR 计算量与 CoreML/ORT 原生缓存占用。用 LANCZOS 高质量下采样，
+    仅在确实超限时触发（绝大多数页面长边 < 1500px，零开销直通）。
+    """
+    import numpy as np
+    from PIL import Image
+
+    h, w = img.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= _OCR_MAX_LONG_EDGE:
+        return img
+    scale = _OCR_MAX_LONG_EDGE / float(long_edge)
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    return np.asarray(
+        Image.fromarray(img).resize((new_w, new_h), Image.LANCZOS),
+        dtype=np.uint8,
+    )
+
+
+def _ocr_sharpen(img):
+    """锐化：轻度 USM（Unsharp Mask），让文字边缘更利落。
+
+    参数刻意保守（radius=1 / percent=60 / threshold=3）：锐化过猛会把 JPEG 与
+    扫描噪点放大成伪笔画，反而拉低识别率——与 _ocr_normalize 里「极差过小就
+    不做对比度拉伸」是同一条原则。threshold=3 让纯色背景等平滑区域不参与
+    锐化，只作用于真正的边缘。
+    """
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    return np.asarray(
+        Image.fromarray(img).filter(
+            ImageFilter.UnsharpMask(radius=1, percent=60, threshold=3)
+        ),
+        dtype=np.uint8,
+    )
+
+
+def _ocr_binarize(img):
+    """二值化：按**当前图像**的灰度直方图用 Otsu 自动定阈值。
+
+    为什么不用固定阈值：不同扫描件的黑白场差异极大，固定阈值会把浅色页整页
+    判成背景（全白、一个字都没有），深色页整页判成前景（全黑）。Otsu 最大化
+    类间方差自动取直方图谷底，对归一化后的文档页稳定。
+
+    为什么此时二值化是安全的：_ocr_normalize 已做过 p2-p98 对比度拉伸，前景与
+    背景双峰已经分开，阈值落在谷底。这一步的收益是去掉压缩噪点与反锯齿灰边，
+    让 det 模型的文本框更紧。
+
+    退化保护：阈值极端（≤8 或 ≥247，整页几乎全黑/全白）说明直方图没有有效
+    双峰，二值化只会把整页抹平——此时保留灰度原样返回。
+    """
+    import numpy as np
+
+    hist = np.bincount(img.ravel(), minlength=256).astype(np.float64)
+    total = hist.sum()
+    if total <= 0:
+        return img
+    omega = np.cumsum(hist) / total
+    levels = np.arange(256, dtype=np.float64)
+    mu = np.cumsum(hist * levels) / total
+    mu_t = mu[-1]
+    denom = omega * (1.0 - omega)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sigma_b = (mu_t * omega - mu) ** 2 / denom
+    sigma_b[~np.isfinite(sigma_b)] = -1.0
+    thr = int(np.argmax(sigma_b))
+    if thr <= 8 or thr >= 247:
+        return img
+    return np.where(img > thr, np.uint8(255), np.uint8(0))
+
+
 def _ocr_preprocess(pix):
-    """OCR 输入预处理：解码 pixmap → _ocr_normalize 归一化。
+    """OCR 输入预处理。管线顺序即代码顺序：
+
+        灰度解码 → 长边 Lanczos 缩放到 ≤1500px → 归一化（暗色反色 + 对比度
+        拉伸）→ 锐化 → 二值化
+
+    DPI 与灰度在**渲染侧**保证（_extract_pdf 用 _OCR_DPI=150 +
+    colorspace=fitz.csGRAY 渲染），这里只做像素级处理。
 
     返回 ndarray（不编码 PNG）：RapidOCR 接受 ndarray 输入，省掉 PNG
     编码 + 引擎内部解码两步开销。
@@ -273,7 +378,13 @@ def _ocr_preprocess(pix):
     if pix.n != 1:  # 防御：非灰度渲染时按行内多通道扁平处理
         img = img.reshape(-1, pix.n).mean(axis=1).astype(np.uint8)
     img = img.reshape(pix.height, pix.width)
-    return _ocr_normalize(img)
+    img = _ocr_downscale_long_edge(img)
+    img = _ocr_normalize(img)
+    if _OCR_SHARPEN:
+        img = _ocr_sharpen(img)
+    if _OCR_BINARIZE:
+        img = _ocr_binarize(img)
+    return img
 
 
 def _extract_pdf(path: Path) -> str:
@@ -318,6 +429,14 @@ def _extract_pdf(path: Path) -> str:
         blank_page_count = 0
 
         for page_num in range(total_pages):
+            # 页级 store 收缩：解码缓存随页数累积，不能等全书结束才冲刷
+            # （见 _STORE_SHRINK_PAGES 注释）。放在循环开头而非末尾：循环体
+            # 内有多处 continue，放在末尾会被跳过。
+            if page_num and page_num % _STORE_SHRINK_PAGES == 0:
+                try:
+                    fitz.TOOLS.store_shrink(100)
+                except Exception:
+                    pass
             page = doc[page_num]
             text = page.get_text("text").strip()
 
@@ -355,7 +474,9 @@ def _extract_pdf(path: Path) -> str:
                     continue
                 # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
                 # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
-                pix = page.get_pixmap(dpi=200, colorspace=fitz.csGRAY)
+                # DPI 上限 _OCR_DPI(150)；若原页在 150 DPI 下长边仍 > 1500px，
+                # _ocr_downscale_long_edge 会等比缩回到 1500px。
+                pix = page.get_pixmap(dpi=_OCR_DPI, colorspace=fitz.csGRAY)
                 try:
                     if _pixmap_is_blank(pix):
                         # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
@@ -365,7 +486,7 @@ def _extract_pdf(path: Path) -> str:
                         continue
                     img = _ocr_preprocess(pix)
                 finally:
-                    # Pixmap 持有整页 200dpi 位图（数 MB），显式释放避免
+                    # Pixmap 持有整页位图（数 MB），显式释放避免
                     # 多页循环时峰值内存持续累积。
                     pix = None
 
