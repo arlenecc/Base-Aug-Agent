@@ -189,9 +189,17 @@ class LLMClient:
         temperature: float = 0.7,
     ) -> Iterator[StreamEvent]:
         url = f"{self.base_url}/chat/completions"
+        # raw_content 是本地 MLX 后端专用的历史镜像（见 Agent._run 的「双视图」
+        # 设计）：只有本地后端读它重建忠实的 KV 前缀序列。HTTP 服务端不认识这
+        # 个字段——宽容的会忽略，严格的会以 400 拒绝。发出去之前剥掉。
+        api_messages = [
+            {k: v for k, v in m.items() if k != "raw_content"}
+            if isinstance(m, dict) else m
+            for m in (messages or [])
+        ]
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": api_messages,
             "temperature": temperature,
             "max_tokens": self.max_tokens,
             "top_p": self.top_p,

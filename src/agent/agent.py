@@ -241,6 +241,22 @@ class Agent:
         self._closed = False
 
     # ------------------------------------------------------------------
+    def _invalidate_local_kv_cache(self) -> None:
+        """让本地后端丢弃跨轮 KV 缓存（历史被改写/清空时调用）。
+
+        本地后端（MLX）只在「新 prompt 完整包含上一轮序列」时复用 KV 缓存。
+        历史一旦被改写（上下文收缩、reset、编辑历史），前缀必然对不齐——
+        后端自己也会检测到并重建，这里主动通知更直接，也省一次无效比对。
+        对没有该方法的后端（HTTP 客户端）是 no-op。
+        """
+        invalidate = getattr(self.llm, "invalidate_kv_cache", None)
+        if callable(invalidate):
+            try:
+                invalidate()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # ------------------------------------------------------------------
     def reset(self) -> None:
         self._history = []
         self._total_tokens = 0
@@ -255,6 +271,8 @@ class Agent:
             clear_plan(self.config.workspace)
         except Exception:  # pragma: no cover - defensive
             pass
+        # 历史清空 → KV 前缀必然对不齐，主动失效本地缓存。
+        self._invalidate_local_kv_cache()
 
     def close(self) -> None:
         """Release the dedicated fact-extraction LLM client's connection pool.
@@ -484,6 +502,9 @@ class Agent:
             ),
         }
         self._history = [summary_msg] + list(recent_messages)
+        # 历史被整体改写，本地后端的 KV 前缀必然对不齐。虽然后端会自己检测到
+        # 并重建，这里主动失效更直接（也顺便释放显存里的缓存）。
+        self._invalidate_local_kv_cache()
         # Recompute incremental counter after shrink (cheaper than full O(n) scan
         # on every turn, and only runs when context actually shrinks).
         self._log(
@@ -957,6 +978,10 @@ class Agent:
                     if self._safe_is_cancelled():
                         self._log("[agent] 取消：中断流式读取")
                         cancelled_mid_stream = True
+                        # 生成被用户掐断：后端记录的是不完整的 token 序列，
+                        # 下一轮前缀必然对不齐（而且我们也不会把这次残输出
+                        # 存进历史）。主动失效，省一次无效比对。
+                        self._invalidate_local_kv_cache()
                         break
                     if ev.type == "content":
                         content_buf.append(ev.content)
@@ -1133,6 +1158,20 @@ class Agent:
                 # omitting it triggers HTTP 400 on some servers. Use None (null)
                 # rather than "" so the model sees "no text reply", not "empty reply".
                 assistant_msg["content"] = None
+            # 原始输出镜像（仅本地 MLX 后端提供，含工具调用 XML）。
+            #
+            # 为什么需要：本地后端的 KV 前缀复用要求历史渲染与上一轮生成序列
+            # 逐 token 一致。但结构化历史是「解析后」的——think 标签被剥掉、
+            # 工具调用被转成 JSON，重新渲染必然和模型当初生成的不一样，前缀
+            # 对不齐，每轮仍要重算整段工具 schema 的 prefill（M1 上 ~15s）。
+            # 存一份原文给本地后端重建忠实序列用。
+            #
+            # 这是「双视图」：content 保持解析后的形状供 HTTP 后端、记忆抽取、
+            # 上下文收缩与 UI 使用；raw_content 只有本地后端的 _template_messages
+            # 会读。HTTP 后端拿不到该属性，历史格式对它完全不变。
+            raw_output = getattr(self.llm, "last_raw_output", "")
+            if raw_output:
+                assistant_msg["raw_content"] = raw_output
             if tool_calls:
                 # Ensure every tool_call has a non-empty id. Some local models
                 # omit it; without an id the tool result cannot be correlated

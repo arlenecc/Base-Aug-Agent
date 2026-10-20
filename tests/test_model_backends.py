@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import pytest
 
@@ -12,14 +13,17 @@ from agent.model_backends import (
     MLXLanguageBackend,
     _TaggedOutputParser,
     _coerce_param,
+    _prompt_opens_thinking,
     _template_messages,
     create_llm_backend,
     discover_local_models,
     resolve_model_path,
 )
 
-# XML 工具调用标签：用字符拼接构造，源码里不出现完整标签。
+# XML / 思考标签：用字符拼接构造，源码里不出现完整标签。
 _LT, _GT = chr(60), chr(62)
+_THO = _LT + "think" + _GT
+_THE = _LT + "/think" + _GT
 _TC = _LT + "tool_call" + _GT
 _TCE = _LT + "/tool_call" + _GT
 _FN = _LT + "function="
@@ -216,6 +220,81 @@ def test_template_messages_keeps_malformed_arguments_untouched():
     ]
     normalized = _template_messages(history)
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == "{不是合法 JSON"
+
+
+def test_prompt_opens_thinking_detects_qwen3_generation_prompt():
+    """qwen3.x 模板的 generation prompt 以思考开标签收尾（见模型自带
+    chat_template.jinja 的 add_generation_prompt 分支）。"""
+    assert _prompt_opens_thinking("assistant\n" + _THO + "\n")
+    assert _prompt_opens_thinking("assistant\n" + _THO)
+    # 历史里残留的开标签不算，只认末尾
+    assert not _prompt_opens_thinking("user\nhi\nassistant\n" + _THO + "\n答案\nassistant\n")
+    assert not _prompt_opens_thinking("assistant\n")
+    assert not _prompt_opens_thinking("")
+    assert not _prompt_opens_thinking(None)
+
+
+def test_tagged_parser_reasoning_when_prompt_preopened_think():
+    """核心回归：prompt 预置思考开标签时，生成内容里只有闭标签。
+
+    qwen3.5-agentic-coder 的真实输出就是这样（开标签在 prompt 里）。旧实现按
+    content 模式傻等一个永远不会出现的 think 开标签，整段思考被当成普通回复
+    塞进对话区——「思考过程不显示」的直接原因。
+    """
+    raw = (
+        "用户想要制定计划，先扫描目录。\n\n"
+        "让我规划步骤：\n1. 扫描\n2. 输出清单\n\n"
+        "先创建任务计划。" + _THE + "\n\n"
+        + _xml_tool_call("task_plan", op="create", goal="扫描并输出清单")
+    )
+    parser = _TaggedOutputParser()
+    parser.begin_reasoning()
+    events = _feed(parser, raw, step=9)
+
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert "用户想要制定计划" in reasoning
+    assert "让我规划步骤" in reasoning
+    assert _THE not in reasoning
+    # 思考段结束后紧跟的工具调用仍要解析出来
+    assert len(parser.tool_calls) == 1
+    assert json.loads(parser.tool_calls[0]["function"]["arguments"]) == {
+        "op": "create",
+        "goal": "扫描并输出清单",
+    }
+
+
+def test_tagged_parser_begin_reasoning_is_noop_after_content_started():
+    """已经开始产出 content 后再调用 begin_reasoning 不应改写模式。"""
+    parser = _TaggedOutputParser()
+    # 喂足够长的文本：feed 会按 opener 长度预留尾部，太短不产出 content。
+    events = list(parser.feed("已经说了半句话，足够长了。"))
+    assert events and events[0].type == "content"
+    parser.begin_reasoning()
+    assert parser._mode == "content"
+
+
+def test_tagged_parser_reasoning_without_preopen_still_works():
+    """回归：prompt 未预置思考标签时，生成内容自带 think 开标签照样分流。"""
+    parser = _TaggedOutputParser()
+    assert not _prompt_opens_thinking("assistant\n")
+    events = _feed(parser, _THO + "思考内容" + _THE + "答复", step=4)
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert reasoning == "思考内容"
+    assert content == "答复"
+
+
+def test_tagged_parser_preopened_reasoning_survives_truncation():
+    """预置思考模式但模型被截断（没有闭标签）时，残段归思考而非对话区。"""
+    parser = _TaggedOutputParser()
+    parser.begin_reasoning()
+    events = list(parser.feed("思考到一半被截断"))
+    events.extend(parser.finish())
+    reasoning = "".join(e.content for e in events if e.type == "reasoning")
+    content = "".join(e.content for e in events if e.type == "content")
+    assert reasoning == "思考到一半被截断"
+    assert content == ""
 
 
 def test_resolve_model_path_accepts_project_relative_directory():
@@ -450,6 +529,180 @@ def test_reranker_max_length_follows_model_position_embeddings(tmp_path):
     broken.mkdir()
     (broken / "config.json").write_text("{ not json")
     assert _model_max_length(broken) == 512
+
+
+# ---------------------------------------------------------------------------
+# KV 前缀复用（对应 Ollama 的前缀缓存）。
+#
+# 每轮 prompt = 固定头部（system + 18 个工具 schema，实测约 2432 token）+ 历史
+# + 新问题。旧实现每轮把整个 prompt 重新 prefill，M1 上约 160 tok/s，光头部就
+# ~15s，用户感知「本地模型特别慢 / 每次都像重新加载」。Ollama 快很大程度上靠
+# 缓存这段不变的前缀。复用的前提是：历史渲染与上一轮生成序列逐 token 一致——
+# 由 agent 的「双视图历史」（content 解析后 + raw_content 原始）保证，详见
+# _template_messages 与 agent._run。
+# ---------------------------------------------------------------------------
+
+def _install_mock_mlx(monkeypatch, replies, with_encode=True):
+    """安装一个最小 mlx_lm 替身，依次吐出 replies（文本, 编码后的 token 列表）。
+
+    gen_ids 必须是文本的编码，这样缓存序列（prompt 编码 + 生成编码）才能与第二
+    轮 prompt 里对应的位置逐 token 对齐——这正是真实 tokenizer 天然满足、而缓存
+    复用成立的前提。
+    """
+
+    class _FakeTok:
+        def apply_chat_template(self, messages, **kw):
+            # 极简渲染：assistant 用 raw_content 重建，与真实模板一致的关键属性
+            # （前缀对齐）由 _template_messages 负责，这里只保证可编码、可反推。
+            parts = []
+            for m in messages:
+                parts.append("<|im_start|>" + m["role"])
+                if m["role"] == "assistant" and m.get("raw_content"):
+                    parts.append("\n" + _THO + "\n" + m["raw_content"])
+                else:
+                    parts.append("\n" + (m.get("content") or ""))
+            parts.append("<|im_start|>assistant")
+            return "\n".join(parts)
+
+        def encode(self, text, **kw):
+            return [ord(c) for c in text]
+
+        def decode(self, ids):
+            return "".join(chr(i) for i in ids)
+
+    tok_instance = _FakeTok()
+    if not with_encode:
+        tok_instance.encode = None
+
+    class _Cache:
+        def __init__(self):
+            self.fed = 0
+
+    seen = {"n": 0}
+
+    def _stream_generate(model, tok, prompt, **kw):
+        idx = seen["n"]
+        seen["n"] += 1
+        text, ids = replies[idx]
+        enc = getattr(tok, "encode", None)
+        if enc is not None and isinstance(prompt, str):
+            n_in = len(enc(prompt))
+        elif isinstance(prompt, str):
+            n_in = len(prompt)  # 无 encode：退化为字符数，仅用于记录
+        else:
+            n_in = len(list(prompt))
+        # 记录本次实际喂进去的 token 数（= 增量 prefill 量）。
+        _stream_generate.calls.append(
+            {"n_input_tokens": n_in, "used_cache": "prompt_cache" in kw}
+        )
+        for i, t in enumerate(ids):
+            yield type("R", (), {"text": text[i:i + 1], "token": t,
+                                 "prompt_tokens": n_in,
+                                 "generation_tokens": i + 1})()
+
+    _stream_generate.calls = []
+
+    mlx = type(sys)("mlx_lm")
+    mlx.load = lambda *a, **k: (object(), tok_instance)
+    mlx.stream_generate = _stream_generate
+
+    su = type(sys)("mlx_lm.sample_utils")
+    su.make_sampler = lambda **k: None
+    su.make_logits_processors = lambda **k: []
+
+    cache_mod = type(sys)("mlx_lm.models.cache")
+    cache_mod.make_prompt_cache = lambda model, **kw: [_Cache() for _ in range(4)]
+
+    models_pkg = type(sys)("mlx_lm.models")
+    models_pkg.cache = cache_mod
+
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx)
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", su)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", cache_mod)
+    return tok_instance, _stream_generate
+
+
+def test_mlx_kv_prefix_reuse_skips_cached_prefill(monkeypatch, tmp_path):
+    """多轮对话中，第二轮应跳过上一轮前缀的 prefill。
+
+    用 mock mlx_lm 验证了整条链路：agent 把原始输出存进 raw_content →
+    _template_messages 据此重建忠实序列 → 后端比对 token 前缀命中缓存、只喂增量。
+    """
+    tok, stream = _install_mock_mlx(
+        monkeypatch,
+        [
+            ("第一轮回复" + _xml_tool_call("task_plan", op="create"),
+             [ord(c) for c in "第一轮回复" + _xml_tool_call("task_plan", op="create")]),
+            ("第二轮回复", [ord(c) for c in "第二轮回复"]),
+        ],
+    )
+
+    cfg = AgentConfig(workspace=os.getcwd(), llm_backend="mlx_lm",
+                     llm_model_path=str(tmp_path))
+    backend = create_llm_backend(cfg)
+    try:
+        # 第一轮
+        list(backend.chat_stream(
+            [{"role": "user", "content": "开始"}], tools=None, temperature=0.0))
+        first_n = stream.calls[0]["n_input_tokens"]
+        raw = backend.last_raw_output
+
+        # 第二轮：历史里带 raw_content（agent 的真实行为）
+        history = [
+            {"role": "user", "content": "开始"},
+            {"role": "assistant", "content": "第一轮回复", "raw_content": raw},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": "继续"},
+        ]
+        prior_cache = len(backend._kv_ids)
+        list(backend.chat_stream(history, tools=None, temperature=0.0))
+    finally:
+        backend.close()
+
+    second = stream.calls[1]
+    second_prompt_len = second["n_input_tokens"] + prior_cache
+    assert second["used_cache"], "第二轮必须命中 KV 缓存"
+    # 必须跳过上一轮前缀，只 prefill 增量。
+    assert second["n_input_tokens"] == second_prompt_len - prior_cache, (
+        "第二轮应只 prefill 增量，而非全量 %d" % second_prompt_len
+    )
+    assert second["n_input_tokens"] > 0, "仍有待 prefill 的增量"
+    assert prior_cache > 0, "上一轮缓存非空"
+
+
+def test_mlx_kv_cache_invalidated_on_reset(monkeypatch, tmp_path):
+    """reset / 历史被改写后，缓存应被清掉，避免前缀错位。"""
+    tok, stream = _install_mock_mlx(
+        monkeypatch,
+        [("回复一", [ord(c) for c in "回复一"]), ("回复二", [ord(c) for c in "回复二"])],
+    )
+    cfg = AgentConfig(workspace=os.getcwd(), llm_backend="mlx_lm",
+                     llm_model_path=str(tmp_path))
+    backend = create_llm_backend(cfg)
+    try:
+        list(backend.chat_stream([{"role": "user", "content": "a"}], tools=None))
+        assert len(backend._kv_ids) > 0
+        backend.invalidate_kv_cache()
+        assert backend._kv_cache is None
+        assert backend._kv_ids == []
+    finally:
+        backend.close()
+
+
+def test_mlx_kv_reuse_silent_when_tokenizer_has_no_encode(monkeypatch, tmp_path):
+    """tokenizer 没有 encode（极端情况）时，退化为无缓存，不报错。"""
+    tok, stream = _install_mock_mlx(
+        monkeypatch, [("回复", [ord(c) for c in "回复"])], with_encode=False)
+    cfg = AgentConfig(workspace=os.getcwd(), llm_backend="mlx_lm",
+                     llm_model_path=str(tmp_path))
+    backend = create_llm_backend(cfg)
+    try:
+        list(backend.chat_stream([{"role": "user", "content": "a"}], tools=None))
+        # 无 encode → 不记录缓存，下一轮不会尝试复用
+        assert backend._kv_ids == []
+    finally:
+        backend.close()
 
 
 def test_reranker_batch_shrinks_with_sequence_length():

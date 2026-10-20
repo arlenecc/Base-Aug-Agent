@@ -136,13 +136,24 @@ def _coerce_param(raw: str) -> Any:
 
 
 def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """把 agent 历史消息适配成 chat template 友好的形状。
+    """把 agent 历史消息适配成 chat template 友好的形状。两件事：
 
-    agent 内部（以及 OpenAI 兼容 API）里 ``tool_calls[*].function.arguments``
-    是 **JSON 字符串**。但 qwen3.5-agentic-coder 的模板渲染历史时判的是
-    ``tool_call.arguments is mapping`` ——字符串会让整个参数段被静默丢掉，
-    模型下一轮看到的就是「调了 task_plan 但没有任何参数」，任务计划自然建不
-    出来。这里在送模板前把 arguments 还原成 dict。
+    1. **tool_calls 的 arguments 还原成 dict。** agent 内部（以及 OpenAI 兼容
+       API）里它是 JSON 字符串，而 qwen3.5-agentic-coder 的模板按
+       ``tool_call.arguments is mapping`` 渲染——字符串会让整个参数段被静默
+       丢掉，模型下一轮看到的就是「调了 task_plan 但没有任何参数」。
+    2. **有 raw_content 时用它重建忠实序列（KV 前缀复用的关键）。**
+       本地后端会把模型原始输出（含工具调用 XML）记在 ``raw_content`` 上；
+       直接渲染它，模板输出就与上一轮生成序列**逐 token 一致**，下一轮
+       prefill 才能命中缓存。做法（已用真实 tokenizer 验证 2600/2600 对齐）：
+         - ``content`` = 思考开标签 + 换行 + raw_content；
+         - ``reasoning_content`` = ""（**字符串**）。
+       后者是模板的暗门：它是字符串时模板跳过「按 think 闭标签自动拆分」，
+       否则标签会被剥掉、序列就对不上了。
+       raw 文本里已含工具调用的 XML，所以同时要**丢掉结构化的 tool_calls**，
+       否则模板会再渲染一遍，变成重复内容。
+
+    只有本地后端会设置 raw_content；HTTP 后端的历史原样透传，行为不变。
     """
     out: List[Dict[str, Any]] = []
     for msg in messages or []:
@@ -150,6 +161,14 @@ def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             out.append(msg)
             continue
         copied = dict(msg)
+        raw = copied.get("raw_content")
+        if raw and copied.get("role") == "assistant":
+            copied["content"] = THO + "\n" + raw
+            copied["reasoning_content"] = ""
+            # raw 里已含工具调用 XML，结构化字段再渲染一遍会重复。
+            copied.pop("tool_calls", None)
+            out.append(copied)
+            continue
         calls = copied.get("tool_calls")
         if calls:
             normalized = []
@@ -160,10 +179,10 @@ def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 fn = tc.get("function")
                 if isinstance(fn, dict):
                     fn = dict(fn)
-                    raw = fn.get("arguments")
-                    if isinstance(raw, str) and raw.strip():
+                    raw_args = fn.get("arguments")
+                    if isinstance(raw_args, str) and raw_args.strip():
                         try:
-                            fn["arguments"] = json.loads(raw)
+                            fn["arguments"] = json.loads(raw_args)
                         except (json.JSONDecodeError, ValueError):
                             pass  # 保持原样，让模板/服务端自己处理
                     tc = {**tc, "function": fn}
@@ -426,6 +445,10 @@ class MLXLanguageBackend(_LazyLocalBackend):
         # 旧序列」时复用，否则整体重建——最坏退化为无缓存，不会出错。
         self._kv_cache = None
         self._kv_ids: List[int] = []
+        # 上一轮的模型原始输出（含工具调用 XML）。agent 把它存进历史的
+        # raw_content，本地后端据此重建忠实的历史序列以命中前缀复用。
+        # HTTP 后端不提供该属性，agent 会跳过——历史格式对 HTTP 保持不变。
+        self.last_raw_output = ""
 
     def _ensure_loaded(self) -> None:
         self._check_open()
@@ -506,6 +529,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
                 prompt = self._prompt(messages, tools)
+                self.last_raw_output = ""
                 sampler = make_sampler(
                     temp=max(0.0, float(temperature)),
                     top_p=float(getattr(self.config, "top_p", 0.95)),
@@ -524,18 +548,21 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 # ---- KV 前缀复用（对应 Ollama 的前缀缓存）----
                 # 每轮 prompt = 固定头部（system + 18 个工具 schema，实测约
                 # 2432 token）+ 历史 + 新问题。旧实现每轮把整个 prompt 重新
-                # prefill：M1 上约 160 tok/s，光头部就要 ~15-19s，用户感知就是
-                # 「本地模型特别慢」。Ollama 快很大程度上靠缓存这段不变的前缀。
+                # prefill：M1 上约 160 tok/s，光头部就要 ~15s，用户感知就是
+                # 「本地模型特别慢」/「每次都像重新加载」。Ollama 快很大程度上
+                # 靠缓存这段不变的前缀。
                 #
                 # 约束：qwen3_5 是混合架构，线性层用 ArraysCache，
                 # trim_prompt_cache 不支持（can_trim 返回 False）。所以不裁剪，
-                # 只在「新 prompt 完整包含上一轮序列」时直接追加复用；否则整体
-                # 丢弃重建——最坏退化成无缓存，绝不会因缓存错位产生乱码。
+                # 只按「公共前缀」复用；对不齐就整体丢弃重建——最坏退化成无缓存，
+                # 绝不会因缓存错位产生乱码。
                 #
-                # 注意：历史里的 assistant 内容是解析后的正文（think/tool 标签
-                # 已剥离），与模型原始输出不同，所以跨轮前缀通常对不齐——但只要
-                # 对上了就省掉整段头部 prefill。agent 侧可在取消/工具轮次后
-                # 主动 invalidate（见 invalidate_kv_cache）。
+                # 要让前缀对得上，历史必须忠实于模型原始输出。agent 为此维护
+                # 「双视图」：content 存解析后正文（HTTP 后端/记忆抽取用），
+                # raw_content 存原始生成（含工具调用 XML，仅本地后端读）。
+                # _template_messages 据此重建序列——实测与上轮生成逐 token 一致
+                # （2600/2600）。历史被改写（上下文收缩、reset）时 agent 调
+                # invalidate_kv_cache 主动失效。
                 ids = None
                 encode = getattr(self._tokenizer, "encode", None)
                 if callable(encode):
@@ -549,8 +576,14 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 reuse = 0
                 cache = None
                 if ids is not None and self._kv_cache is not None and self._kv_ids:
-                    if self._common_prefix_len(ids, self._kv_ids) == len(self._kv_ids):
-                        cache, reuse = self._kv_cache, len(self._kv_ids)
+                    # 两种命中形态，都要求「新 prompt 与缓存序列逐 token 一致」：
+                    #   a) 缓存更长（常态）：缓存 = 上轮 prompt + 上轮生成，本轮
+                    #      prompt 是它的前缀 → 只需喂本轮新增的尾部；
+                    #   b) 新 prompt 更长：恰好完全包含缓存（重试/追加场景）。
+                    # 两种情况都取公共前缀长度，未命中的部分交给 prefill。
+                    common = self._common_prefix_len(ids, self._kv_ids)
+                    if common == len(ids) or common == len(self._kv_ids):
+                        cache, reuse = self._kv_cache, common
                     else:
                         # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
                         self._kv_cache = None
@@ -576,6 +609,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 prompt_tokens = 0
                 completion_tokens = 0
                 gen_ids: List[int] = []
+                raw_text = ""
                 for response in stream_generate(
                     self._model_obj,
                     self._tokenizer,
@@ -585,12 +619,14 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     logits_processors=logits_processors,
                     **gen_kwargs,
                 ):
-                    _tok_id = getattr(response, "token", None)
-                    if _tok_id is not None:
-                        gen_ids.append(int(_tok_id))
                     tok_id = getattr(response, "token", None)
                     if tok_id is not None:
                         gen_ids.append(int(tok_id))
+                    # 原始生成文本（含工具调用 XML）——agent 无法从事件重建：
+                    # tool_call 段被 _TaggedOutputParser 吃掉转成结构化调用，
+                    # 文本不进 content/reasoning 事件。这里逐片攒下，交给
+                    # agent 存进历史的 raw_content，供下一轮前缀复用。
+                    raw_text += getattr(response, "text", "") or ""
                     prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
                     completion_tokens = int(
                         getattr(response, "generation_tokens", completion_tokens + 1)
@@ -603,7 +639,11 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 # 时 gen_ids 不完整，序列对不上，下一轮自动重建，不会错位。
                 if cache is not None:
                     self._kv_cache = cache
-                    self._kv_ids = ids + gen_ids
+                    if ids is not None:
+                        self._kv_ids = ids + gen_ids
+                    # ids 为 None（tokenizer 无 encode）→ 不记录缓存序列，
+                    # 下一轮退化为无缓存字符串路径。
+                self.last_raw_output = raw_text
                 yield StreamEvent(
                     "done",
                     tool_calls=parser.tool_calls,
