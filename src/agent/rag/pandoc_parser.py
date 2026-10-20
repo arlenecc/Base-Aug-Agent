@@ -163,7 +163,9 @@ def convert_document(filepath: str) -> Optional[str]:
         return None
     md = _pandoc_to_markdown(filepath, fmt)
     if md and md.strip():
-        return md
+        # docx/html/LaTeX 源同样会透传 raw HTML（html 源尤其严重），与电子书
+        # 路径保持一致：文档转换无锚点，出口直接剥。
+        return strip_raw_html(md)
     return None
 
 
@@ -226,6 +228,83 @@ def strip_anchor_spans(markdown: str) -> str:
     if not markdown:
         return markdown
     return _EPUB_ANCHOR_SPAN_RE.sub('', markdown)
+
+
+# 残留 HTML 标签：以 </ 开头的闭合标签，或 <字母 开头的开/自闭合标签。
+# 要求标签首字符是字母——避开散文里的比较运算（"if a < b and c > d" 中
+# "< b and c >" 不是标签）；pandoc 的 markdown writer 本身会把正文里的
+# 字面 "<" 转义成 "\<"，所以能匹配到的都是源文档透传的真 HTML。
+_HTML_TAG_RE = re.compile(r'</?[a-zA-Z][^>]*>')
+# script/style 整块删除（含内容）——标签剥除只会留下正文，CSS/JS 文本
+# 反而会变成噪音入库。
+_HTML_BLOCK_RE = re.compile(
+    r'<(script|style|head)[^>]*>[\s\S]*?</\1\s*>', re.IGNORECASE
+)
+_FENCE_OPEN_RE = re.compile(r'^\s{0,3}(```|~~~)')
+# 缩进代码块（4 空格 / tab 起）——markdown 字面代码，< > 是内容不是标签。
+_INDENT_CODE_RE = re.compile(r'^(?:\t| {4,})\S')
+# pandoc 会把正文里的字面反引号/尖括号转义成 \` \< \>（行内代码 span 整体被
+# 转义时，`` `[^`]+` `` 的掩码匹配不上），这些转义序列必须先掩掉。
+_ESCAPED_RE = re.compile(r'\\[`<>]')
+
+
+def _strip_html_line(line: str, code_spans: list) -> str:
+    """单行剥标签：先掩掉行内代码 span 与转义序列（里面的 < > 不能动）。"""
+    def _mask(m: "re.Match") -> str:
+        code_spans.append(m.group(0))
+        return '\x00%d\x00' % (len(code_spans) - 1)
+
+    protected = re.sub(r'`[^`]+`', _mask, line)
+    protected = _ESCAPED_RE.sub(_mask, protected)
+    protected = _HTML_BLOCK_RE.sub(' ', protected)
+    protected = _HTML_TAG_RE.sub(' ', protected)
+    return re.sub(r'\x00(\d+)\x00', lambda m: code_spans[int(m.group(1))], protected)
+
+
+def strip_raw_html(markdown: str) -> str:
+    """剥掉 pandoc 输出里残留的 raw HTML 标签，保留标签内正文。
+
+    背景：pandoc 转成 GFM 时 ``raw_html`` 扩展默认开启，epub/docx/html 源里
+    的 ``<div>``/``<span class=...>``/``<a id=...>`` 等会原样透传进 markdown。
+    而 engine 对 pandoc 路径直接把文本当「规范 Markdown」用（跳过 clean_text
+    的 HTML 剥离），这些标签就大量进入切片与缓存。
+
+    不能改用 ``-t gfm-raw_html`` 一刀切：epub 锚点 span 本身就是 raw HTML，
+    split_chapters_by_anchors 依赖它按内容文档边界精确切章。所以只在锚点
+    切分完成后调用本函数。
+
+    保护措施：
+      - 围栏代码块（``` / ~~~）内部逐字保留——代码里的 ``vector<int>`` 等
+        不是标签；
+      - 行内代码 span（`` `...` ``）先掩后剥——`` `<div>` `` 的尖括号是内容；
+      - script/style/head 整块连内容一起删（标签剥除只会留下 CSS/JS 噪音）；
+      - 标签必须以字母开头，避免误伤散文里的比较运算。
+    """
+    if not markdown:
+        return markdown
+    out: List[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in markdown.split('\n'):
+        stripped = line.strip()
+        if not in_fence and _FENCE_OPEN_RE.match(line):
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            continue
+        if _INDENT_CODE_RE.match(line):
+            # 缩进代码块行：逐字保留（pandoc 常把 <pre><code> 写成缩进代码，
+            # 里面的 vector<int> 等尖括号是代码内容）。
+            out.append(line)
+            continue
+        out.append(_strip_html_line(line, []))
+    return re.sub(r'[ \t]{2,}', ' ', '\n'.join(out))
 
 
 def split_chapters_by_anchors(
@@ -327,7 +406,9 @@ def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[
         if not md or not md.strip():
             return None
         chapter_texts = split_chapters_by_anchors(md, toc)
-        md = strip_anchor_spans(md)
+        md = strip_raw_html(strip_anchor_spans(md))
+        if chapter_texts:
+            chapter_texts = [strip_raw_html(t) for t in chapter_texts]
         return md, toc, chapter_texts
     finally:
         if tmp_epub:
