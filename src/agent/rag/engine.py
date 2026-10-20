@@ -445,6 +445,40 @@ class RAGEngine:
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出
+        # ingest() 启动的 worker 线程注册表。close() 必须等它们全部退出——
+        # 否则 OCR 引擎 / ONNX session / LanceDB 连接会在 worker 手里被释放，
+        # 原生层 use-after-free 直接段错误（整进程崩，无 Python traceback）。
+        self._ingest_threads: List[threading.Thread] = []
+        self._ingest_threads_lock = threading.Lock()
+
+    def _register_ingest_threads(self, threads: List[threading.Thread]) -> None:
+        with self._ingest_threads_lock:
+            self._ingest_threads = list(threads)
+
+    def _wait_ingest_threads(self, timeout: float = 600.0) -> bool:
+        """等待 ingest worker 全部退出。返回 True 表示已全部结束。
+
+        兜底超时后返回 False——调用方（close）此时不能安全释放原生资源，
+        必须记录而不是静默继续。
+        """
+        with self._ingest_threads_lock:
+            threads = list(self._ingest_threads)
+        if not threads:
+            return True
+        deadline = time.monotonic() + timeout
+        for i, t in enumerate(threads):
+            while t.is_alive() and time.monotonic() < deadline:
+                t.join(timeout=30.0)
+            if t.is_alive():
+                logger.error(
+                    "RAG: ingest worker %d/%d 未在 %.0fs 内退出，"
+                    "原生资源不能安全释放",
+                    i + 1, len(threads), timeout,
+                )
+                return False
+        with self._ingest_threads_lock:
+            self._ingest_threads = []
+        return True
 
     # ------------------------------------------------------------------
     # properties
@@ -966,6 +1000,8 @@ class RAGEngine:
                 t = threading.Thread(target=_worker, args=(shard,), daemon=True)
                 t.start()
                 threads.append(t)
+            # 注册到引擎：close() 据此等待这些线程退出（见 _wait_ingest_threads）
+            self._register_ingest_threads(threads)
 
             _flush_logs(f"启动 {len(threads)} 个 Worker ({len(files_to_process)} 个文件)")
 
@@ -1088,12 +1124,40 @@ class RAGEngine:
             else:
                 new_manifest.update(pending_manifest)
 
-            # 等待所有 worker 线程结束
+            # 等待所有 worker 线程结束。
+            #
+            # **必须等到真正退出，不能只 join(timeout=5) 就放过。** worker 的
+            # 取消检查只在「文件之间」，单文件内部（OCR 页循环、docling 转换）
+            # 完全不检查——一个扫描大 PDF 能跑几十秒，远超 5s。旧实现超时后
+            # 只打一条 warning 就返回，ingest() 随即结束，
+            # SyncKnowledgeWorker 的 finally 会调 engine.close()：释放 OCR
+            # 引擎 / ONNX session / LanceDB 连接。此时 worker 仍在用这些对象，
+            # 原生层就是 use-after-free → **整进程段错误**（用户看到「同步一会
+            # 就崩溃」，且没有任何 Python traceback）。
+            #
+            # 所以这里循环等到线程全部退出，只用一个兜底上限防止永久挂死：
+            # 单个文件的处理时长没有硬上限（巨型扫描件可能数分钟），兜底取
+            # 足够宽裕的值；超时后仍旧返回（不能让 UI 永久卡在「同步中」），
+            # 但会记 error 让用户知道本次结果可能不完整。
             _log("  等待所有 Worker 线程结束...")
+            _WORKER_JOIN_TIMEOUT = 30.0        # 单轮 join 超时（循环重试）
+            _WORKER_JOIN_DEADLINE = 600.0      # 总兜底上限 10 分钟
+            _join_deadline = time.monotonic() + _WORKER_JOIN_DEADLINE
             for i, t in enumerate(threads):
-                t.join(timeout=5.0)
+                while t.is_alive() and time.monotonic() < _join_deadline:
+                    t.join(timeout=_WORKER_JOIN_TIMEOUT)
                 if t.is_alive():
-                    logger.warning("  Worker 线程 %d 未在 5s 内结束", i + 1)
+                    # 兜底超时：不阻塞 UI 退出，但明确记录——close() 将与仍在
+                    # 运行的 worker 竞态，本次同步结果不可信。
+                    logger.error(
+                        "  Worker 线程 %d 未在 %.0fs 兜底上限内结束，将继续关闭"
+                        "（该线程仍在运行，本次同步结果可能不完整）",
+                        i + 1, _WORKER_JOIN_DEADLINE,
+                    )
+                    stats["errors"].append(
+                        f"worker thread {i + 1} did not stop within "
+                        f"{_WORKER_JOIN_DEADLINE:.0f}s; sync results may be incomplete"
+                    )
             _log("  所有 Worker 线程已结束")
         else:
             # All files skipped — no new chunks written. Report current store count.
@@ -1528,7 +1592,17 @@ class RAGEngine:
         the next operation. Call this when the RAGEngine is no longer needed
         (e.g. after SyncKnowledgeWorker finishes) to avoid leaking ~600MB of
         C++ heap memory per instance.
+
+        **先等 ingest worker 全部退出再释放。** 释放 OCR 引擎 / ONNX session /
+        LanceDB 连接时，若还有 worker 在用它们，原生层就是 use-after-free →
+        整进程段错误（同步「一会就崩溃」、且没有 Python traceback 的根因）。
+        正常情况下 ingest() 返回前已等过一轮，这里只是兜底。
         """
+        if not self._wait_ingest_threads():
+            logger.error(
+                "RAG: close() 时仍有 ingest worker 在运行，原生资源释放可能与"
+                "其竞态（段错误风险）"
+            )
         if self._store is not None:
             with self._store_lock:
                 if self._store is not None:
