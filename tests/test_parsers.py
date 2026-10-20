@@ -122,13 +122,24 @@ def test_ocr_recognize_prefers_ocrmac_and_skips_rapidocr(monkeypatch):
 
 
 def test_ocr_recognize_falls_back_to_rapidocr(monkeypatch):
-    """ocrmac 返回空（未安装/没识别到）时回退 RapidOCR。"""
+    """ocrmac **不可用**（抛 _OcrmacUnavailable）时回退 RapidOCR。"""
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+    monkeypatch.setattr(parsers, "_ocrmac_recognize",
+                        lambda img: (_ for _ in ()).throw(parsers._OcrmacUnavailable("no")))
+
+    parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
+    assert fake.instances == 1  # 确实回退了
+
+
+def test_ocr_recognize_empty_result_does_not_load_rapidocr(monkeypatch):
+    """ocrmac 跑通但本页无文字（插图/空白）→ 直接返回空，不加载 RapidOCR。"""
     _reset_ocr_state()
     fake = _install_fake_rapidocr(monkeypatch)
     monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "")
 
-    parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
-    assert fake.instances == 1  # 确实回退了
+    assert parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf") == ""
+    assert fake.instances == 0  # RapidOCR 单例未被构造
 
 
 def test_ocr_backend_available_prefers_ocrmac(monkeypatch):
@@ -159,3 +170,19 @@ def test_ocr_backend_available_falls_back_to_rapidocr(monkeypatch):
 
     assert parsers._ocr_backend_available() is True
     assert fake.instances == 1
+
+
+def test_is_scanned_epub_real_scan(monkeypatch):
+    """图多且文字层极少（真扫描版）判定为扫描版。"""
+    from agent.rag import pandoc_parser
+    monkeypatch.setattr(pandoc_parser, "_epub_scan_profile",
+                        lambda p: (250 * 1024 * 1024, 5474, []))
+    assert pandoc_parser._is_scanned_epub("x.epub") is True
+
+
+def test_is_scanned_epub_illustrated_book_not_scanned(monkeypatch):
+    """图多但文字层充足（漫画/绘本等图文书）不算扫描版，走 pandoc/docling。"""
+    from agent.rag import pandoc_parser
+    monkeypatch.setattr(pandoc_parser, "_epub_scan_profile",
+                        lambda p: (415 * 1024 * 1024, 483_230, []))
+    assert pandoc_parser._is_scanned_epub("x.epub") is False

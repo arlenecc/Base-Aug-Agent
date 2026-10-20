@@ -655,12 +655,22 @@ def _get_ocr_engine():
             return None
 
 
+class _OcrmacUnavailable(Exception):
+    """ocrmac 不可用（未安装 / 运行期异常）→ 调用方据此回退 RapidOCR。
+
+    注意：与「ocrmac 跑通了但这一页没识别到文字」**区分开**——后者是正常
+    情况（整页版画、插图、纯空白），不应触发 RapidOCR 的 500MB 引擎加载。
+    """
+
+
 def _ocrmac_recognize(img) -> str:
     """用 ocrmac（Apple Vision）识别**已预处理**的灰度 ndarray。
 
-    返回空串表示「不可用」或「没识别到内容」，调用方据此回退 RapidOCR ——
-    与 docling 的 ``AutoOcrModel`` 同策略：Vision 是系统级加速，中文识别的
-    质量与速度都优于 RapidOCR。
+    返回空串表示「跑通了但本页没识别到文字」（插图/空白页属于此类，直接
+    跳过，不回退）。ocrmac 未安装或运行期异常则抛 :class:`_OcrmacUnavailable`，
+    由 :func:`ocr_recognize_array` 回退 RapidOCR —— 与 docling 的
+    ``AutoOcrModel`` 同策略：Vision 是系统级加速，中文识别的质量与速度都
+    优于 RapidOCR。
     """
     from PIL import Image
 
@@ -676,8 +686,7 @@ def _ocrmac_recognize(img) -> str:
             detail=False,
         ).recognize()
     except Exception as e:
-        logger.debug("ocrmac 不可用/识别失败，回退 rapidocr: %s", e)
-        return ""
+        raise _OcrmacUnavailable(e)
 
     parts: List[str] = []
     for item in results or []:
@@ -685,8 +694,6 @@ def _ocrmac_recognize(img) -> str:
         text = item[0] if isinstance(item, (tuple, list)) else item
         if text and str(text).strip():
             parts.append(str(text).strip())
-    if not parts:
-        logger.debug("ocrmac 返回空结果，回退 rapidocr")
     return "\n".join(parts)
 
 
@@ -697,15 +704,21 @@ def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
     与扫描版 epub 页（``pandoc_parser.ocr_epub_images``）都走这里，保证两条
     通路的预处理（:func:`_ocr_preprocess_array`）与引擎选择策略完全一致。
 
+    回退触发条件严格限于「ocrmac 不可用」——即 ocrmac 未安装或运行期异常
+    （:class:`_OcrmacUnavailable`）。ocrmac 跑通但本页无文字（插图/空白页）
+    直接返回空，绝不为了这几页拉起 RapidOCR 的 500MB 引擎。这也符合「优先
+    ocrmac，不可用再走 rapidocr」的语义：页上没字 ≠ ocrmac 不可用。
+
     ``page_num`` / ``filename`` 仅用于 RapidOCR 失败时的日志定位。
     """
-    text = _ocrmac_recognize(img)
-    if text:
-        return text
-    ocr_engine = _get_ocr_engine()
-    if ocr_engine is None:
-        return ""
-    return _ocr_image_cached(ocr_engine, img, page_num, filename)
+    try:
+        return _ocrmac_recognize(img)
+    except _OcrmacUnavailable as e:
+        logger.debug("ocrmac 不可用，回退 rapidocr: %s", e)
+        ocr_engine = _get_ocr_engine()
+        if ocr_engine is None:
+            return ""
+        return _ocr_image_cached(ocr_engine, img, page_num, filename)
 
 
 def _ocr_backend_available() -> bool:

@@ -425,6 +425,11 @@ def split_chapters_by_anchors(
 # （图片在体积上压倒性占优）。纯文字书不会误判：正文几万字 × 200 远超其插图体积。
 _EPUB_SCAN_MIN_IMAGE_BYTES = 5 * 1024 * 1024
 _EPUB_SCAN_TEXT_WEIGHT = 200
+# 文字层**硬下限**：超过这个字符数就一律不算扫描版。图文并茂的书
+# （漫画/绘本，正文字符数十万）图也很多，会被「图片字节压过文字×200」误判，
+# 但它们有可读文字层，pandoc/docling 直接抽即可，不应去 OCR 几千张图。
+# 真正的扫描版文字层只有目录/页眉（实测统计教材 5474 字符）。
+_EPUB_SCAN_TEXT_FLOOR = 20000
 # pandoc 转出的正文少于这个字符数才考虑「可能是扫描版」（够长就不折腾）。
 _EPUB_SCAN_MD_MIN_CHARS = 20000
 # 太小的图是装饰（图标、分隔线、角标），不值得 OCR。
@@ -545,13 +550,21 @@ def _epub_images_in_reading_order(book, docs, imgs):
 
 
 def _is_scanned_epub(filepath: str) -> bool:
-    """是否为扫描图片版 epub（正文全是图，文字层只有目录/页眉）。"""
+    """是否为扫描图片版 epub（正文全是图，文字层只有目录/页眉）。
+
+    双条件，缺一不可：
+    1. 图片字节占压倒性多数（图字节 ≥ 阈值 且 文字层×200 < 图片字节）；
+    2. 文字层本身极少（< ``_EPUB_SCAN_TEXT_FLOOR``）—— 这是防误判的关键：
+       图文并茂的漫画/绘本正文字符数十万，会被条件 1 误伤，但它们有可读
+       文字层，走 pandoc/docling 直接抽正文即可，不该去 OCR 几千张图。
+    """
     prof = _epub_scan_profile(filepath)
     if prof is None:
         return False
     img_bytes, text_chars, _imgs = prof
     return (img_bytes >= _EPUB_SCAN_MIN_IMAGE_BYTES
-            and text_chars * _EPUB_SCAN_TEXT_WEIGHT < img_bytes)
+            and text_chars * _EPUB_SCAN_TEXT_WEIGHT < img_bytes
+            and text_chars < _EPUB_SCAN_TEXT_FLOOR)
 
 
 def _ocr_image_array(img) -> str:
