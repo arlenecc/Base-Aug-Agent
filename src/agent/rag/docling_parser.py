@@ -13,7 +13,8 @@ Design:
   * PDF 全量走 docling（2026-10 实验：撤掉「扫描件/图片重 → PyMuPDF 快速路径」
     拦截，改用 Apple Vision OCR 试试图片类 PDF 的速度）。OCR 引擎用 auto 探测：
     ocrmac 优先，未安装或请求语言不被 Vision 支持时自动回退 rapidocr。docling
-    不可用/转换失败仍回退 parsers.py 的 PyMuPDF+RapidOCR 兜底路径。
+    不可用/转换失败仍回退 parsers.py 的 PyMuPDF 兜底路径（同样 ocrmac 优先、
+    回退 rapidocr，见 parsers.ocr_recognize_array）。
 """
 from __future__ import annotations
 

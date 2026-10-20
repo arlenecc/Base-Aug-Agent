@@ -405,9 +405,11 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
         has_images = _pdf_has_image_pages(kb_path)
         report.has_image_pdf = has_images
         # Check if OCR is installed
-        # 新版 rapidocr (3.x) 与旧版 rapidocr-onnxruntime (1.x) 任一可用即可，
-        # 引擎选择见 parsers._get_ocr_engine。
-        report.ocr_installed = (_is_importable("rapidocr")
+        # 任一后端可用即可：ocrmac（Apple Vision，首选）或新版 rapidocr 3.x /
+        # 旧版 rapidocr-onnxruntime 1.x（回退）。引擎选择见
+        # parsers.ocr_recognize_array。
+        report.ocr_installed = (_is_importable("ocrmac")
+                                or _is_importable("rapidocr")
                                 or _is_importable("rapidocr_onnxruntime"))
         if has_images and not report.ocr_installed:
             # Move OCR from optional to required.
@@ -430,8 +432,8 @@ def check_dependencies(kb_path: str, include_core: bool = True) -> DependencyRep
                         "统一文档解析引擎 docling（可选，未安装时回退按格式解析）",
                         required=False)
             )
-        # docling OCR 首选引擎（Apple Vision）。仅当 docling 可用且知识库含
-        # PDF 时要求（docling 缺失时走 PyMuPDF+RapidOCR 兜底，用不到 ocrmac）。
+        # 首选 OCR 引擎（Apple Vision）。docling 与 PyMuPDF 兜底两条通路都
+        # 走 ocrmac 优先（见 parsers.ocr_recognize_array），rapidocr 只是回退。
         # 必须进 missing_required 而非 missing_optional：auto 探测下缺失 ocrmac
         # 会**静默**回退 rapidocr（逐框前向比 Vision 整页识别慢一个量级），
         # required 让 ensure_dependencies 自动安装、装失败则阻断同步并给出

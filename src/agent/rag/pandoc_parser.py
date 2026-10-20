@@ -557,46 +557,13 @@ def _is_scanned_epub(filepath: str) -> bool:
 def _ocr_image_array(img) -> str:
     """对单张**已预处理**的灰度 ndarray 做识别。
 
-    **ocrmac（Apple Vision）优先**，不可用/失败时回退 RapidOCR —— 与 PDF 主
-    引擎（docling 的 OcrAutoOptions）的策略一致：Vision 是系统级加速，中文
-    识别的质量与速度都更好。
+    直接委托 :func:`agent.rag.parsers.ocr_recognize_array`——ocrmac(Apple
+    Vision) 优先、回退 RapidOCR。与 PyMuPDF 兜底 PDF 页共用同一入口，避免
+    两条通路的引擎选择策略漂移。
     """
-    from PIL import Image
+    from .parsers import ocr_recognize_array
 
-    pil = Image.fromarray(img)
-    try:
-        from ocrmac import ocrmac
-
-        results = ocrmac.OCR(
-            pil,
-            framework="vision",
-            recognition_level="accurate",
-            language_preference=["zh-Hans", "en-US"],
-            detail=False,
-        ).recognize()
-        parts: List[str] = []
-        for item in results or []:
-            # detail=False → (text, confidence)；个别版本仍返回三元组。
-            text = item[0] if isinstance(item, (tuple, list)) else item
-            if text and str(text).strip():
-                parts.append(str(text).strip())
-        if parts:
-            return "\n".join(parts)
-        logger.debug("ocrmac 返回空结果，回退 rapidocr")
-    except Exception as e:
-        logger.debug("ocrmac 不可用/识别失败，回退 rapidocr: %s", e)
-
-    # 回退 RapidOCR：复用 parsers 的引擎单例与结果缓存（与 PDF 图片页同一实例）。
-    try:
-        from .parsers import _get_ocr_engine, _ocr_image_cached
-
-        engine = _get_ocr_engine()
-        if engine is None:
-            return ""
-        return _ocr_image_cached(engine, img, 0, "epub-page")
-    except Exception as e:
-        logger.debug("rapidocr 回退失败: %s", e)
-        return ""
+    return ocr_recognize_array(img, 0, "epub-page")
 
 
 def ocr_epub_images(filepath: str, log=None) -> Optional[str]:

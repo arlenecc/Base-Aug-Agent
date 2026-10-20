@@ -103,3 +103,59 @@ def test_get_ocr_engine_returns_none_when_missing(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _fake_import)
     assert parsers._get_ocr_engine() is None
     assert parsers._OCR_ENGINE is None
+
+
+def _blank_page():
+    import numpy as np
+    return np.zeros((8, 8), dtype=np.uint8)
+
+
+def test_ocr_recognize_prefers_ocrmac_and_skips_rapidocr(monkeypatch):
+    """ocrmac(Apple Vision) 命中时**不加载** RapidOCR 单例（省 ~500MB）。"""
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+    monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "视觉识别结果")
+
+    out = parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
+    assert out == "视觉识别结果"
+    assert fake.instances == 0  # RapidOCR 压根没被构造
+
+
+def test_ocr_recognize_falls_back_to_rapidocr(monkeypatch):
+    """ocrmac 返回空（未安装/没识别到）时回退 RapidOCR。"""
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+    monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "")
+
+    parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
+    assert fake.instances == 1  # 确实回退了
+
+
+def test_ocr_backend_available_prefers_ocrmac(monkeypatch):
+    """ocrmac 可用即视为有后端，不必加载 RapidOCR。"""
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+    mod = types.ModuleType("ocrmac")
+    monkeypatch.setitem(sys.modules, "ocrmac", mod)
+
+    assert parsers._ocr_backend_available() is True
+    assert fake.instances == 0
+
+
+def test_ocr_backend_available_falls_back_to_rapidocr(monkeypatch):
+    """ocrmac 缺失时以 RapidOCR 是否可用来判定。"""
+    monkeypatch.delitem(sys.modules, "ocrmac", raising=False)
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "ocrmac":
+            raise ImportError("no ocrmac")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    _reset_ocr_state()
+    fake = _install_fake_rapidocr(monkeypatch)
+
+    assert parsers._ocr_backend_available() is True
+    assert fake.instances == 1

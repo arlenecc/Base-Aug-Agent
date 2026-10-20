@@ -402,10 +402,12 @@ def _extract_pdf(path: Path) -> str:
 
     Strategy:
     1. Text-based pages: extract text directly via PyMuPDF get_text("text").
-    2. Image-based pages (no text layer, has embedded images): OCR via RapidOCR.
+    2. Image-based pages (no text layer, has embedded images): OCR —— 走
+       :func:`ocr_recognize_array`，ocrmac(Apple Vision) 优先、不可用时
+       回退 RapidOCR，与主引擎 docling 的 OcrAutoOptions 同策略。
     3. Mixed PDFs: text pages extracted directly, image pages OCR'd.
 
-    If RapidOCR is not installed and the PDF contains image-based pages,
+    If no OCR backend is available and the PDF contains image-based pages,
     a warning is logged and the image pages are skipped — but the text
     pages are still extracted.
     """
@@ -425,11 +427,9 @@ def _extract_pdf(path: Path) -> str:
 
         total_pages = len(doc)
         parts: List[str] = []
-        ocr_unavailable = False  # OCR 引擎加载失败标记，避免每页重复尝试
-        # 汇总日志用：记录「本本书 OCR 是否可用」。循环内每页重新绑定
-        # （页末即释放，不跨页持有旧引擎——见 _OCR_RECYCLE_PAGES 注释），
-        # 纯文本书不进 OCR 分支时保持 None。
-        ocr_engine = None
+        # ocrmac / RapidOCR 都不可用标记：触发后整份文件的剩余图页都不再
+        # 渲染，避免逐页白做。纯文本书不进 OCR 分支时为 False。
+        ocr_unavailable = False
 
         # 统计各类型页面数量，用于最终日志
         text_page_count = 0
@@ -471,17 +471,20 @@ def _extract_pdf(path: Path) -> str:
                 continue
 
             with _OCR_SEMAPHORE:
-                # 每页从进程级单例取引擎，页末即释放局部引用（#123）。
+                # 后端探测放在渲染之前：ocrmac 与 RapidOCR 都没有时整份文件
+                # 的图页都识别不了，早退可以省掉全部渲染开销。
+                if not _ocr_backend_available():
+                    ocr_unavailable = True
+                    ocr_skipped_count += 1
+                    continue
+                # 引擎单例在 ocr_recognize_array 内部按需取用（走 ocrmac 时
+                # 根本不会加载 RapidOCR，省掉 ~500MB）。每页从进程级单例取
+                # 引擎，页末即释放局部引用（#123）。
                 # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
                 # （release + 全局置 None）只影响触发回收的 worker，其它
                 # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
                 # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
                 # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
-                ocr_engine = _get_ocr_engine()
-                if ocr_engine is None:
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
-                    continue
                 # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
                 # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
                 # DPI 上限 _OCR_DPI(150)；若原页在 150 DPI 下长边仍 > 1500px，
@@ -500,7 +503,7 @@ def _extract_pdf(path: Path) -> str:
                     # 多页循环时峰值内存持续累积。
                     pix = None
 
-                ocr_text = _ocr_image_cached(ocr_engine, img, page_num + 1, path.name)
+                ocr_text = ocr_recognize_array(img, page_num + 1, path.name)
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -541,11 +544,11 @@ def _extract_pdf(path: Path) -> str:
         detail_parts.append(f"blank={blank_page_count}")
 
     # ---- 全图片版 PDF 且 OCR 不可用 → 抛出明确错误 ----
-    if not parts and image_page_count > 0 and ocr_engine is None:
+    if not parts and image_page_count > 0 and ocr_unavailable:
         msg = (
             f"PDF '{path.name}' 是图片版（{total_pages} 页全部为扫描图片），"
-            f"但 RapidOCR 未安装，无法进行 OCR 识别。"
-            f"请安装: pip install rapidocr-onnxruntime"
+            f"但没有任何可用的 OCR 后端（ocrmac / rapidocr），无法进行识别。"
+            f"请安装: pip install ocrmac（或 pip install rapidocr-onnxruntime）"
         )
         logger.error(msg)
         raise RuntimeError(msg)
@@ -558,12 +561,13 @@ def _extract_pdf(path: Path) -> str:
         )
         return ""
 
-    if ocr_skipped_count > 0 and ocr_engine is None:
+    if ocr_skipped_count > 0 and ocr_unavailable:
         # 混合 PDF：部分图片页因 OCR 不可用被跳过
         logger.warning(
-            "PDF '%s': %d/%d pages are image-based but RapidOCR is not installed. "
+            "PDF '%s': %d/%d pages are image-based but no OCR backend "
+            "(ocrmac / rapidocr) is available. "
             "Image pages were SKIPPED — only text pages were extracted (%d chars). "
-            "Install with: pip install rapidocr-onnxruntime",
+            "Install with: pip install ocrmac",
             path.name, ocr_skipped_count, total_pages, sum(len(p) for p in parts),
         )
     elif image_page_count > 0:
@@ -649,6 +653,73 @@ def _get_ocr_engine():
         except Exception as e:
             logger.warning("Failed to init RapidOCR: %s", e)
             return None
+
+
+def _ocrmac_recognize(img) -> str:
+    """用 ocrmac（Apple Vision）识别**已预处理**的灰度 ndarray。
+
+    返回空串表示「不可用」或「没识别到内容」，调用方据此回退 RapidOCR ——
+    与 docling 的 ``AutoOcrModel`` 同策略：Vision 是系统级加速，中文识别的
+    质量与速度都优于 RapidOCR。
+    """
+    from PIL import Image
+
+    pil = Image.fromarray(img)
+    try:
+        from ocrmac import ocrmac
+
+        results = ocrmac.OCR(
+            pil,
+            framework="vision",
+            recognition_level="accurate",
+            language_preference=["zh-Hans", "en-US"],
+            detail=False,
+        ).recognize()
+    except Exception as e:
+        logger.debug("ocrmac 不可用/识别失败，回退 rapidocr: %s", e)
+        return ""
+
+    parts: List[str] = []
+    for item in results or []:
+        # detail=False → (text, confidence)；个别版本仍返回三元组。
+        text = item[0] if isinstance(item, (tuple, list)) else item
+        if text and str(text).strip():
+            parts.append(str(text).strip())
+    if not parts:
+        logger.debug("ocrmac 返回空结果，回退 rapidocr")
+    return "\n".join(parts)
+
+
+def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
+    """识别**已归一化**的灰度 ndarray：ocrmac(Apple Vision) 优先，回退 RapidOCR。
+
+    全项目唯一的「图 → 文字」入口：PyMuPDF 兜底 PDF 页（:func:`_extract_pdf`）
+    与扫描版 epub 页（``pandoc_parser.ocr_epub_images``）都走这里，保证两条
+    通路的预处理（:func:`_ocr_preprocess_array`）与引擎选择策略完全一致。
+
+    ``page_num`` / ``filename`` 仅用于 RapidOCR 失败时的日志定位。
+    """
+    text = _ocrmac_recognize(img)
+    if text:
+        return text
+    ocr_engine = _get_ocr_engine()
+    if ocr_engine is None:
+        return ""
+    return _ocr_image_cached(ocr_engine, img, page_num, filename)
+
+
+def _ocr_backend_available() -> bool:
+    """是否存在任一可用 OCR 后端（ocrmac 优先，其次 RapidOCR）。
+
+    用于「整份文件都不必渲染」的早退判断：两个后端都没有时，提前标记
+    ``ocr_unavailable``，省掉逐页渲染的 CPU 与内存。
+    """
+    try:
+        import ocrmac  # noqa: F401  # 存在即视为可用（识别期异常会回退）
+        return True
+    except Exception:
+        pass
+    return _get_ocr_engine() is not None
 
 
 def release_ocr_engine() -> None:
