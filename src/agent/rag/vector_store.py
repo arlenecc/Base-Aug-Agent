@@ -295,6 +295,20 @@ _SUBBATCH_STEP = 2
 # 也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
 # 已启动的应用生效，需要完全重启。
 _SUBBATCH_RSS_LIMIT = 8.0  # GB
+
+# MLX 后端缓存清理间隔（每 N 个嵌入子批一次）。
+#
+# 为什么必须显式清理：默认嵌入后端就是 mlx（config.py: rag_embedding_backend
+# = "mlx"），而 mx.clear_cache() 原本只存在于 MLXEmbeddingFunction.close()
+# 与 MLXReranker.close() 两处。而共享单例 EF 根本走不到 close()——
+# VectorStore.close() 里 `is_shared` 为真时整段跳过释放，只做 `self._ef = None`
+# （共享 EF 不能 close，否则会砸掉 graph_memory / 其它 VectorStore）。
+# 于是整轮同步（数千子批）mx.clear_cache() 一次都不执行：子批大小在 [2,64]
+# 间不断变化（_SubBatchTuner + _shape_cap_size），MLX 按形状缓存 buffer/graph，
+# 缓存在同步期间单调增长 → 系统内存压力 → 「同步跑一会就崩」。
+# 每 N 个子批清一次即可把缓存压在一代内，清掉的只是不再引用的缓存数组，
+# 不影响仍在使用的模型权重。
+_MLX_CACHE_CLEAR_EVERY = 16
 # 恢复阈值（#129）：monitor 下速率回到历史最优 95% 且当前尺寸低于最优
 # 尺寸时，回到最优尺寸重新爬升——消除「降档单向棘轮」（降需连续 2 窗口
 # <75%，回却需 >110%，一次短暂内存尖峰会永久降档）。低于 100% 是安全
@@ -1199,6 +1213,17 @@ class VectorStore:
                     tuner.force_down()
             except Exception:
                 pass
+            # 周期性清理 MLX 缓存（见 _MLX_CACHE_CLEAR_EVERY 注释）：默认后端
+            # 就是 mlx，而共享单例 EF 走不到 close()，这里是唯一能冲刷 Metal
+            # buffer/graph 缓存的地方。
+            if (self._embedding_backend == "mlx"
+                    and sub_idx % _MLX_CACHE_CLEAR_EVERY == 0):
+                try:
+                    import mlx.core as mx
+
+                    mx.clear_cache()
+                except Exception:
+                    pass
             # 主动释放 GIL，让 Qt 事件循环有机会处理排队的日志/进度信号。
             # 这是关键：ONNX Runtime 在 embed() 期间持有 GIL，只有在 Python
             # 层主动 sleep 时才释放。
@@ -1866,6 +1891,16 @@ class VectorStore:
                                 session.release()
                             except Exception:
                                 pass
+                except Exception:
+                    pass
+                # 一并调用 EF 自己的 close()：MLX 后端在此执行 mx.clear_cache()，
+                # 单纯 self._ef = None 是不会触发的。私有（非共享）实例 close
+                # 是安全的——共享单例必须跳过，否则会砸掉 graph_memory /
+                # 其它 VectorStore 正在用的模型。
+                try:
+                    _ef_close = getattr(self._ef, "close", None)
+                    if callable(_ef_close):
+                        _ef_close()
                 except Exception:
                     pass
             self._ef = None

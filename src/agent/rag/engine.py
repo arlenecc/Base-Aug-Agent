@@ -452,8 +452,19 @@ class RAGEngine:
         self._ingest_threads_lock = threading.Lock()
 
     def _register_ingest_threads(self, threads: List[threading.Thread]) -> None:
+        """登记本轮 ingest 的 worker 线程，供 close() 等待。
+
+        用**追加**而非覆盖：agent 侧的 RAGEngine 是长生命周期单例（tools/base.py
+        的 _rag_engine），可被反复 ingest()。若上一轮有 worker 未能在超时内退出
+        （见 _wait_ingest_threads 的兜底分支），覆盖语义会丢失那批线程句柄，
+        close() 就只等新一批——仍在跑的旧 worker 与 release_ocr_engine() /
+        VectorStore.close() / release_converter() 并发，原生层 use-after-free
+        → 段错误。这正是 b292e10 想消除的族类，覆盖语义留了口子。
+        """
         with self._ingest_threads_lock:
-            self._ingest_threads = list(threads)
+            # 先剔除已结束的，避免列表随同步轮次无界增长。
+            self._ingest_threads = [t for t in self._ingest_threads if t.is_alive()]
+            self._ingest_threads.extend(threads)
 
     def _wait_ingest_threads(self, timeout: float = 600.0) -> bool:
         """等待 ingest worker 全部退出。返回 True 表示已全部结束。
@@ -633,7 +644,13 @@ class RAGEngine:
                 logger.warning("  ⚠ 文件签名失败（扫描后已消失？）: %s: %s",
                                os.path.basename(filepath), e)
                 with stats_lock:
-                    stats["errors"] += 1
+                    # stats["errors"] 是 list（见上方 stats 初始化），旧实现
+                    # 写成 `+= 1`：list += int 会抛 TypeError（'int' object is
+                    # not iterable），整个 ingest() 直接崩掉，已启动的 worker
+                    # 与未保存的 manifest 全部作废——恰好毁掉这段 try 想保护的
+                    # 东西。其余各处均用 .append，此处统一。
+                    stats["errors"].append(
+                        f"{os.path.basename(filepath)}: 文件签名失败（扫描后已消失）: {e}")
                 continue
             prev = manifest.get(filepath)
             if (not force
