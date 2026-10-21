@@ -31,29 +31,29 @@ logger = logging.getLogger(__name__)
 # 对 epub 纯属浪费，故显式排除。若某天需要 docling 处理 epub，这里再加回。
 _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"}
 
-# Converter singleton: docling models are heavy, so share one instance across
-# all workers (access is guarded by a lock — DocumentConverter is not
-# documented as thread-safe).
+# Converter singletons keyed by OCR scale: docling models are heavy, so share
+# instances across all workers (access is guarded by a lock — DocumentConverter
+# is not documented as thread-safe). 动态 scale 方案下最多并存 2 个实例
+# （默认档 / 高保档），由 _analyze_pdf_pages 的分类结果决定用哪把钥匙。
 #
 # 锁必须在模块导入时就创建好。旧实现在 _get_converter() 里「if _converter_lock
 # is None: _converter_lock = threading.Lock()」，这在并发首次调用时是典型的
 # check-then-act 竞态：两个线程各自新建一把锁，于是各自持自己的锁去创建
 # DocumentConverter —— 同时加载两份数百 MB 的模型。
-_converter = None
+_converters: dict = {}
 _converter_lock = threading.Lock()
 _converter_unavailable = False
 
 
 def release_converter() -> None:
-    """Drop the shared docling converter so its models can be freed.
+    """Drop the shared docling converter(s) so their models can be freed.
 
     Mirrors ``parsers.release_ocr_engine()``: ingestion runs in short bursts
-    (a sync job), after which the converter's models would otherwise stay
+    (a sync job), after which the converters' models would otherwise stay
     resident for the whole process lifetime.
     """
-    global _converter
     with _converter_lock:
-        _converter = None
+        _converters.clear()
 
 
 # 转换篇数计数器 + 周期冲刷间隔。
@@ -109,15 +109,34 @@ def is_supported(ext: str) -> bool:
     return ext.lower() in _DOCLING_EXTENSIONS
 
 
-# OCR 渲染分辨率上限（DPI）。docling 的 OcrOptions.scale 语义是「72 DPI ×
-# scale」，默认 3.0 = 216 DPI；这里锁到 150 DPI，与 parsers.py 的 _OCR_DPI
-# 保持一致，避免高分辨率扫描页把 OCR 原生缓存撑爆。
-# 换算：scale = _DOCLING_OCR_DPI / 72.0 ≈ 2.083
-_DOCLING_OCR_DPI = 150
+# OCR 渲染倍率档位（OcrOptions.scale 语义 = 「72 DPI × scale」）。
+# docling 的 scale 是**转换器级**参数，没有 per-page 接口，因此动态调整的
+# 做法是：先用 PyMuPDF 逐页分析分类，再按档位切连续页段，每段各建一个
+# 对应 scale 的转换器转换，最后按原页序拼接（见 _analyze_pdf_pages /
+# _extract_pdf_by_scale）。分类规则（2026-10 需求）：
+#   1. 纯文本文档（文本层达标）              → 默认档
+#   2. 扫描件但原始分辨率 < 150 DPI          → 默认档（升采样无意义）
+#   3. 其余扫描件：先全量扫描分类，检测到
+#      表格的页面                              → 高保档
+#   4. 其余页面                                → 默认档
+_OCR_SCALE_DEFAULT = 2.0   # 144 DPI
+_OCR_SCALE_TABLE = 2.5     # 180 DPI，表格页专用（边框/小字号对分辨率敏感）
+_SOURCE_DPI_CEILING = 150  # 原始扫描分辨率阈值
+_TEXT_LAYER_MIN_CHARS = 100  # 文本层字符数下限：达到即视为文本层页
+# 分类用的像素分析渲染 DPI。必须 >=150：扫描件通常按 300 DPI 栅格化，
+# 100 DPI 的 3:1 盒式降采样会把目录页的点线（leader dots）平均成连续
+# 灰带（(3×0+7×255)/10≈178 < 250 非白阈值），点线页被误判成表格；
+# 150 DPI 的 2:1 降采样保留 1.5px 点 + 3.5px 间隙的断续结构，点线不再
+# 成带。代价是分析渲染像素量 ×2.25（实测 3 页 1s，可忽略）。
+_CLASSIFY_DPI = 150
+# 印刷框线判别的灰度/厚度阈值（按 _CLASSIFY_DPI 标定，见 _rule_positions
+# 的二要素：非白 + 连续）。
+_NONWHITE_LEVEL = 250      # 非白：抓住被降采样成 ~246 浅灰的印刷框线
+_MAX_LINE_THICK = 5        # 框线带最大厚度（像素）：文字行/照片通带排除
 
 
-def _get_converter():
-    """Lazily build and cache the docling DocumentConverter singleton.
+def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
+    """Lazily build and cache the docling DocumentConverter for an OCR scale.
 
     管线降配（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
     accelerator 强制 MPS + 限 4 线程。docling 2.x 在 macOS 上默认
@@ -128,15 +147,22 @@ def _get_converter():
     2.58GB 完全平坦，且比 CPU 版快 35%（106.5s vs 160.9s）；CPU 版不清
     缓存反而 3.94→4.80GB 持续涨。附带收益：布局挪到 GPU 后，CPU 核让给
     RapidOCR 与嵌入模型，消除同步期的 CPU 争抢（调优器「降档避让」）。
+
+    ``scale`` 是该实例的 OCR 渲染倍率（72 DPI × scale），由调用方按页分类
+    结果选取：默认档 / 高保档，见 _OCR_SCALE_* 常量与 _analyze_pdf_pages。
+    同一 scale 的转换器全局共享一个实例（按 scale 键控）。
     """
-    global _converter, _converter_unavailable
-    if _converter is not None:
-        return _converter
+    global _converter_unavailable
+    key = round(float(scale), 3)
+    cached = _converters.get(key)
+    if cached is not None:
+        return cached
     if _converter_unavailable:
         return None
     with _converter_lock:
-        if _converter is not None:
-            return _converter
+        cached = _converters.get(key)
+        if cached is not None:
+            return cached
         try:
             from docling.document_converter import DocumentConverter
 
@@ -171,20 +197,19 @@ def _get_converter():
                 # lang 必须显式含 zh-Hans：OcrMacOptions 的字段默认值只有
                 # 西语系（en/es/fr/de），中文书会被 Vision 拒识；而 rapidocr
                 # 收到多语言时取第一个（zh-Hans → ch），回退路径不受影响。
-                # scale 才是 OCR 的渲染倍率：页面按「72 DPI × scale」渲染，
-                # docling 默认 3.0 → **216 DPI**（远超 150 上限）。这里锁到
-                # 150/72 ≈ 2.083 → 150 DPI，与 parsers.py 的 _OCR_DPI 对齐。
-                # 且 docling 是对每个 OCR 区域**裁剪后**单独渲染
-                # （get_page_image(scale=..., cropbox=ocr_rect)），降 scale
-                # 直接减少送进 ocrmac/rapidocr 的像素量。
+                # scale 是 OCR 的渲染倍率：页面按「72 DPI × scale」渲染
+                # （2.0 → 144 DPI，2.5 → 180 DPI，按页分类动态选取，见
+                # _analyze_pdf_pages）。docling 是对每个 OCR 区域**裁剪后**
+                # 单独渲染（get_page_image(scale=..., cropbox=ocr_rect)），
+                # 降 scale 直接减少送进 ocrmac/rapidocr 的像素量。
                 pdf_opts.ocr_options = OcrAutoOptions(
                     lang=["zh-Hans", "en-US"],
-                    scale=_DOCLING_OCR_DPI / 72.0,
+                    scale=key,
                 )
                 converter = DocumentConverter(
                     format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
                 )
-                logger.info("docling DocumentConverter initialized (PDF 管线强制 MPS 加速 + 每次转换后归还缓存, OCR=auto: ocrmac→rapidocr)")
+                logger.info("docling DocumentConverter initialized (PDF 管线 MPS 加速 + 转换后归还缓存 + OCR scale=%.2f, OCR=auto: ocrmac→rapidocr)", key)
             except Exception as e:
                 # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
                 # 降配入口就用默认构造——正确性不受影响，默认 device='auto'
@@ -192,8 +217,8 @@ def _get_converter():
                 # 缓存护栏在 extract_markdown 的 finally 里兜底生效。
                 logger.info("docling 管线降配不可用（%s），使用默认配置", e)
                 converter = DocumentConverter()
-            _converter = converter
-            logger.info("docling DocumentConverter initialized (global singleton)")
+            _converters[key] = converter
+            logger.info("docling DocumentConverter initialized (global singleton, scale=%.2f)", key)
             return converter
         except ImportError:
             logger.info("docling not installed; falling back to per-format parsers")
@@ -244,6 +269,321 @@ def _convert_watchdog(path) -> None:
         logger.error("docling convert 超过 %d 秒未返回（%s）", _CONVERT_TIMEOUT_S, path)
 
 
+# ---------------------------------------------------------------------------
+# PDF 逐页分析：OCR 渲染倍率（scale）动态分类
+# ---------------------------------------------------------------------------
+# docling 的 OcrAutoOptions.scale 是转换器级参数，没有 per-page 接口。要实现
+# 「表格页用 2.5、其余用 2.0」，只能在 convert 之前用 PyMuPDF 把每页分好类，
+# 再按档位切连续页段，每段各用一个对应 scale 的转换器转换，按原页序拼接
+# （见 _extract_pdf_by_scale）。本文件内的分析全部只读、线程安全。
+#
+# 分类规则（2026-10 需求）：
+#   1. 文本层达标（>= _TEXT_LAYER_MIN_CHARS）→ 默认档
+#   2. 扫描页原始分辨率 < _SOURCE_DPI_CEILING  → 默认档（升采样无意义）
+#   3. 其余扫描页：检测到表格（矢量框线或扫描框线）→ 高保档
+#   4. 其余                                  → 默认档
+class _PageProfile:
+    __slots__ = ("index", "has_text", "source_dpi", "has_table", "scale")
+
+    def __init__(self, index: int, has_text: bool,
+                 source_dpi: Optional[float], has_table: bool, scale: float):
+        self.index = index
+        self.has_text = has_text
+        self.source_dpi = source_dpi
+        self.has_table = has_table
+        self.scale = scale
+
+
+# 分析缓存：按 (路径, 大小, mtime) 键控，避免重复入库同一文件时重复分析。
+_analysis_cache: dict = {}
+_analysis_cache_lock = threading.Lock()
+_ANALYSIS_CACHE_MAX = 32
+
+
+def _dominant_image_dpi(page) -> Optional[float]:
+    """页面主图（面积最大）的原生 DPI；无图像返回 None。
+
+    扫描件的「原始分辨率」就是嵌入位图的分辨率：原生像素数 ÷ 显示尺寸
+    （英寸）。取面积最大的那张——页面里混一个小 logo 不应把整页误判成
+    低分辨率（旧实现用 min 就会被一枚 72 DPI 图标拖累）。
+    """
+    try:
+        infos = page.get_image_info()
+    except Exception:
+        return None
+    best = None
+    for info in infos or ():
+        bbox = info.get("bbox")
+        width = info.get("width")
+        if not bbox or not width:
+            continue
+        w_pt = float(bbox[2]) - float(bbox[0])
+        h_pt = float(bbox[3]) - float(bbox[1])
+        area = w_pt * h_pt
+        if area <= 0:
+            continue
+        dpi = float(width) / (w_pt / 72.0)
+        if best is None or area > best[0]:
+            best = (area, dpi)
+    return best[1] if best else None
+
+
+def _vector_table_lines(page) -> int:
+    """原生数字表格的长矢量线数量（数字 PDF 的表格是矢量线，不用渲染）。"""
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return 0
+    count = 0
+    w, h = float(page.rect.width), float(page.rect.height)
+    for d in drawings or ():
+        for item in d.get("items", ()):
+            if item and item[0] == "l":
+                p1, p2 = item[1], item[2]
+                if (abs(p1.x - p2.x) > w * 0.3
+                        or abs(p1.y - p2.y) > h * 0.3):
+                    count += 1
+    return count
+
+
+def _runs_of_true(mask):
+    """布尔序列的连续 True 段 [(start, end), ...]（end 不含）。"""
+    import numpy as np
+
+    if not len(mask):
+        return []
+    padded = np.concatenate(([0], mask.astype(np.int8), [0]))
+    edges = np.flatnonzero(np.diff(padded))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def _longest_run(line) -> int:
+    """一维布尔数组的最长连续 True 段长度。"""
+    import numpy as np
+
+    if not line.any():
+        return 0
+    idx = np.flatnonzero(np.diff(np.concatenate(([0], line.astype(np.int8), [0]))))
+    return int((idx[1::2] - idx[::2]).max())
+
+
+def _regular_spacing(positions, tol: float = 0.35) -> bool:
+    """是否构成「行框线式」等距结构：>=5 条线且 >=4 个间距一致。
+
+    抗两类误报：
+      * 装饰性横线（目录页的 Part 分隔线）：数量够但间距双峰杂乱，模态
+        间距最多重复 3 次——真实表格行框线是均匀重复的（实测 8 条线 7 个
+        一致间距），装饰线做不到；
+      * 表格下方无关分隔线：只数一致间距，不要求全部一致。
+    """
+    if len(positions) < 5:
+        return False
+    gaps = [b - a for a, b in zip(positions, positions[1:])]
+    med = sorted(gaps)[len(gaps) // 2]
+    if med <= 0:
+        return False
+    consistent = sum(1 for g in gaps if abs(g - med) <= tol * med)
+    return consistent >= 4
+
+
+def _rule_positions(arr, nonwhite, bands, axis: int, min_run: float) -> list:
+    """候选带中过滤出真正的「印刷框线」位置（带中线）。
+
+    判别维度是「是不是线」而不是「多暗」：
+      1. 非白(250) 占比达标 —— 扫描书的印刷框线常被降采样成 246 左右的
+         浅灰，按墨迹定的阈值（Otsu/128）会整条漏掉；
+      2. 最长连续非白段达标 —— 线是通的，文字行有词间/字间断裂。
+    加上调用方的「细带（<=5px）」预过滤，文字行（150 DPI 下 10pt 行高
+    ~14px）、照片通带（太厚）、目录点线（断续）全部排除。
+    注意**不按墨核深浅判**：黑色印刷框线本身就是墨核，按「无墨核」滤会
+    把黑框线表格整页漏掉（实测踩坑）。
+    """
+    positions = []
+    for s, e in bands:
+        mid = (s + e) // 2
+        if axis == 0:  # 水平带 → 检查该行的横向连续段
+            frac = _longest_run(nonwhite[mid, :]) / arr.shape[1]
+        else:          # 垂直带 → 检查该列的纵向连续段
+            frac = _longest_run(nonwhite[:, mid]) / arr.shape[0]
+        if frac >= min_run:
+            positions.append(mid)
+    return positions
+
+
+def _page_has_ruled_table(doc, index: int) -> bool:
+    """扫描页表格检测：先矢量线（数字表格），再像素投影（扫描表格）。
+
+    像素法判定「印刷框线」（阈值按 _CLASSIFY_DPI(150) 渲染标定）：
+    非白占比 >25%（水平）/ >8%（垂直）的细带（<=5 像素厚），且带中线
+    连续——细则见 _rule_positions。两种表格形态都认：
+      1. 网格型：>=2 条水平框线 + >=1 条垂直框线；
+      2. 横线型（中文书常见：只有水平框线无竖线）：>=5 条等距实线横框。
+
+    已知行为（有意接受）：少数书籍的目录页用通页宽分隔线做版式，像素层面
+    与表格行框线同构，会被判为表格页 → 该页用 2.5 渲染。代价有界（每本书
+    1-3 页、慢 ~25%），且对目录条目 OCR 质量有益，不值得为它加更多启发式。
+    """
+    import fitz  # noqa: F401  （doc 已由调用方打开）
+
+    page = doc[index]
+    # 1) 矢量线：>=4 条长直线即视为表格（原生数字 PDF）。
+    if _vector_table_lines(page) >= 4:
+        return True
+    # 2) 像素投影：只对无文本层的扫描页有意义。
+    import numpy as np
+
+    pix = page.get_pixmap(dpi=_CLASSIFY_DPI, colorspace=fitz.csGRAY)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width).astype(np.int16)
+    nonwhite = arr < _NONWHITE_LEVEL  # 250：抓住被降采样成浅灰的印刷框线
+    h_frac = nonwhite.mean(axis=1)
+    v_frac = nonwhite.mean(axis=0)
+    h_bands = [b for b in _runs_of_true(h_frac > 0.25) if b[1] - b[0] <= _MAX_LINE_THICK]
+    v_bands = [b for b in _runs_of_true(v_frac > 0.08) if b[1] - b[0] <= _MAX_LINE_THICK]
+    h_rules = _rule_positions(arr, nonwhite, h_bands, axis=0, min_run=0.25)
+    v_rules = _rule_positions(arr, nonwhite, v_bands, axis=1, min_run=0.08)
+    # 形态 1：网格型表格。
+    if len(h_rules) >= 2 and len(v_rules) >= 1:
+        return True
+    # 形态 2：横线型表格（>=5 条等距实线横框，无竖线也认；阈值见
+    # _regular_spacing——装饰性横线数量够但间距不 uniform）。
+    if _regular_spacing(h_rules):
+        return True
+    return False
+
+
+def _analyze_pdf_pages(path: Path) -> Optional[list]:
+    """逐页分类，返回 _PageProfile 列表；分析失败返回 None（调用方回退整篇）。
+
+    失败即回退：任何异常（加密 PDF、损坏、fitz 缺失）都返回 None，由
+    extract_markdown 走「整篇 + 默认档」的老路径，绝不让分析成为新故障点。
+    """
+    import os
+
+    try:
+        st = os.stat(str(path))
+        key = (str(path), st.st_size, st.st_mtime)
+    except Exception:
+        return None
+    with _analysis_cache_lock:
+        cached = _analysis_cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        import fitz
+
+        src = fitz.open(str(path))
+        try:
+            if src.is_encrypted and not src.authenticate(""):
+                return None
+            profiles = []
+            for i in range(len(src)):
+                page = src[i]
+                text_len = len(page.get_text().strip())
+                has_text = text_len >= _TEXT_LAYER_MIN_CHARS
+                dpi = _dominant_image_dpi(page)
+                has_table = False
+                if not has_text:
+                    # 规则 2：低分辨率扫描件不升采样；其余做表格检测。
+                    if dpi is None or dpi >= _SOURCE_DPI_CEILING:
+                        has_table = _page_has_ruled_table(src, i)
+                scale = _OCR_SCALE_TABLE if has_table else _OCR_SCALE_DEFAULT
+                profiles.append(_PageProfile(i, has_text, dpi, has_table, scale))
+        finally:
+            src.close()
+    except Exception as e:
+        logger.warning("PDF 逐页分析失败，回退整篇默认档转换（%s）: %s", path.name, e)
+        return None
+
+    if not profiles:
+        return None
+    with _analysis_cache_lock:
+        if len(_analysis_cache) >= _ANALYSIS_CACHE_MAX:
+            # 简单淘汰：清掉最早一批（同步任务按序处理，LRU 收益有限）。
+            for k in list(_analysis_cache.keys())[:_ANALYSIS_CACHE_MAX // 2]:
+                _analysis_cache.pop(k, None)
+        _analysis_cache[key] = profiles
+    n_table = sum(1 for p in profiles if p.has_table)
+    logger.info(
+        "PDF 逐页分析完成: %s（%d 页，文本层 %d 页，表格页 %d 个 → scale %.1f，"
+        "其余 %.1f）",
+        path.name, len(profiles),
+        sum(1 for p in profiles if p.has_text), n_table,
+        _OCR_SCALE_TABLE, _OCR_SCALE_DEFAULT,
+    )
+    return profiles
+
+
+def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
+    """按 scale 档位切连续页段，分段转换后按原页序拼接。
+
+    连续段（contiguous runs）而非逐页调用：同档位的相邻页合成一个子 PDF 一次
+    转换，绝大多数文档只有 1-2 个段，调用次数与整篇转换持平。
+
+    按档位**分组顺序处理、转完即释放该档转换器**：每档一个 DocumentConverter
+    = 一整套布局 + TableFormer 模型（两档并存白占 ~1.9GB 统一内存）。分组不
+    改变拼接顺序——各段 markdown 按段首页码重排，结果仍是原页序。
+    """
+    runs: list = []
+    for p in profiles:
+        if runs and runs[-1][0] == p.scale:
+            runs[-1][1].append(p.index)
+        else:
+            runs.append((p.scale, [p.index]))
+
+    parts: dict = {}  # 段首页码 -> markdown（按段首页码排序即原页序）
+    result = None
+    try:
+        import os
+        import fitz
+        import tempfile
+
+        src = fitz.open(str(path))
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="docling_seg_")
+            try:
+                for scale in sorted({s for s, _ in runs}, reverse=True):
+                    converter = _get_converter(scale)
+                    if converter is None:
+                        return None
+                    for s, idxs in [r for r in runs if r[0] == scale]:
+                        sub = fitz.open()
+                        sub.insert_pdf(src, from_page=idxs[0], to_page=idxs[-1])
+                        tmp = os.path.join(
+                            tmpdir, f"seg_{scale:.2f}_{idxs[0]}_{idxs[-1]}.pdf")
+                        sub.save(tmp)
+                        sub.close()
+                        result = None
+                        with _converter_lock:
+                            result = converter.convert(tmp)
+                            md = result.document.export_to_markdown()
+                        if md and md.strip():
+                            parts[idxs[0]] = md
+                        result = None
+                    # 该档全部转完，释放其转换器（只放这一把钥匙），把布局/
+                    # TableFormer 模型占的统一内存还给系统；下一本书用到同档
+                    # 位时惰性重建（~2s 模型加载 + ~10s 管线初始化）。
+                    with _converter_lock:
+                        _converters.pop(round(float(scale), 3), None)
+            finally:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        finally:
+            src.close()
+    except Exception as e:
+        logger.warning("PDF 分段转换失败（%s），回退整篇转换: %s", path.name, e)
+        return None
+
+    if not parts:
+        return None
+    if len(runs) > 1:
+        logger.info("PDF 分段转换完成: %s → %d 段（scale 分布 %s），转换器已按档释放",
+                    path.name, len(runs),
+                    "+".join(f"{s:.1f}×{len(ix)}" for s, ix in runs))
+    return "\n\n".join(parts[k] for k in sorted(parts))
+
+
 def extract_markdown(filepath: str) -> Optional[str]:
     """Convert a document to Markdown using docling.
 
@@ -259,10 +599,6 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if suffix not in _DOCLING_EXTENSIONS:
         return None
 
-    converter = _get_converter()
-    if converter is None:
-        return None
-
     # 预置为 None：finally 里无条件解引用，异常发生在赋值之前也不会
     # UnboundLocalError（旧实现把释放只放在成功路径）。
     result = None
@@ -272,6 +608,22 @@ def extract_markdown(filepath: str) -> Optional[str]:
     watchdog.daemon = True
     watchdog.start()
     try:
+        # PDF 走动态 scale：先逐页分析分类，再按档位切连续段分段转换、
+        # 按序拼接。分析或分段任一失败都回退下面的「整篇 + 默认档」老路径
+        # ——动态调整永远是优化，绝不让它成为新故障点。
+        if suffix == ".pdf":
+            profiles = _analyze_pdf_pages(path)
+            if profiles is not None:
+                markdown = _extract_pdf_by_scale(path, profiles)
+                if markdown and markdown.strip():
+                    return markdown
+                logger.warning("PDF 分段转换无输出，回退整篇转换: %s", path.name)
+            markdown = None
+
+        converter = _get_converter(_OCR_SCALE_DEFAULT)
+        if converter is None:
+            return None
+
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
         # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
         # 并发转换会互相踩踏（状态污染/崩溃）。这里用同一把锁串行化转换。

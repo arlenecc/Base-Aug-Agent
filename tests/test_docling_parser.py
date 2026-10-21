@@ -31,7 +31,9 @@ def test_is_supported_extensions():
     assert dp.is_supported(".docx")
     assert dp.is_supported(".xlsx")
     assert dp.is_supported(".pptx")
-    assert dp.is_supported(".epub")
+    # .epub 已改由 ebook 路径（pandoc convert_ebook → ebook_parser）处理，
+    # 不再进 docling（加载布局模型 + TableFormer 对 epub 纯属浪费）。
+    assert not dp.is_supported(".epub")
     assert not dp.is_supported(".txt")
     assert not dp.is_supported(".csv")
 
@@ -55,7 +57,7 @@ def test_extract_markdown_converts_via_docling(monkeypatch, tmp_path):
             return _FakeResult()
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConverter())
+    monkeypatch.setattr(dp, "_get_converter", lambda scale=dp._OCR_SCALE_DEFAULT: _FakeConverter())
 
     md = dp.extract_markdown(str(pdf))
     assert md == "# Title\n\nSome content."
@@ -69,7 +71,7 @@ def test_extract_markdown_converter_init_failure(monkeypatch, tmp_path):
     pdf.write_bytes(b"%PDF-1.4 dummy")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: None)
+    monkeypatch.setattr(dp, "_get_converter", lambda scale=dp._OCR_SCALE_DEFAULT: None)
 
     assert dp.extract_markdown(str(pdf)) is None
 
@@ -93,7 +95,7 @@ def test_extract_markdown_empty_output_returns_none(monkeypatch, tmp_path):
             return _FakeResult()
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _FakeConverter())
+    monkeypatch.setattr(dp, "_get_converter", lambda scale=dp._OCR_SCALE_DEFAULT: _FakeConverter())
 
     assert dp.extract_markdown(str(pdf)) is None
 
@@ -110,6 +112,6 @@ def test_extract_markdown_conversion_error_returns_none(monkeypatch, tmp_path):
             raise RuntimeError("corrupt page 3")
 
     monkeypatch.setattr(dp, "is_docling_available", lambda: True)
-    monkeypatch.setattr(dp, "_get_converter", lambda: _BrokenConverter())
+    monkeypatch.setattr(dp, "_get_converter", lambda scale=dp._OCR_SCALE_DEFAULT: _BrokenConverter())
 
     assert dp.extract_markdown(str(pdf)) is None
