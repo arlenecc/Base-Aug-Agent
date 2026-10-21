@@ -122,9 +122,18 @@ class AgentConfig:
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
     #   - "docling"：默认，版面理解 + ocrmac(Apple Vision) OCR
     #   - "marker"：marker-pdf 2.x（surya OCR，服务端进程架构）
+    #   - "ovis"：PyMuPDF + OvisOCR2 VLM（第三方案，同时是 PDF/图像的
+    #     轻量兜底，2026-10 起取代 PyMuPDF+RapidOCR 组合）
     # 主引擎不可用（未安装/导入失败）时自动回退到另一引擎；单文件转换
-    # 失败仍走 parsers.py 的轻量兜底，行为与 #133 之前一致。
+    # 失败仍走轻量兜底，行为与 #133 之前一致。
     rag_pdf_engine: str = "docling"
+    # OvisOCR2 模型配置（ovis 引擎 / PDF 兜底共用）：
+    #   - rag_ocr_backend：mlx | onnx | gguf（当前仅 mlx 有可用权重）
+    #   - rag_ocr_model：模型/目录名（展示与回退解析用）
+    #   - rag_ocr_model_path：本地模型目录（相对路径按应用根目录解析）
+    rag_ocr_backend: str = "mlx"
+    rag_ocr_model: str = "OvisOCR2-0.8B-MLX-4bit"
+    rag_ocr_model_path: str = "models/OvisOCR2-0.8B-MLX-4bit"
 
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
@@ -161,6 +170,7 @@ class AgentConfig:
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path",
         "browser_endpoint", "rag_pdf_engine",
+        "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "llm_enable_thinking", "aux_llm_enable_thinking")
@@ -174,6 +184,7 @@ class AgentConfig:
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path",
         "rag_pdf_engine",
+        "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
     )
 
     @classmethod

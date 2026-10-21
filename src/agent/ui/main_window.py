@@ -59,6 +59,21 @@ RAG_BACKENDS = (
 # 默认模型路径（#140 用户定参）：本地模式未指定时启动即加载这两个。
 DEFAULT_MAIN_MODEL_PATH = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
 DEFAULT_AUX_MODEL_PATH = "models/Qwen3.5-2B-MLX-4bit"
+# PDF 解析引擎下拉（docling / marker / OvisOCR2 第三方案）。
+PDF_ENGINES = (
+    ("docling", "docling"),
+    ("marker", "marker"),
+    ("OvisOCR2", "ovis"),
+)
+# OvisOCR2 后端下拉（当前仅 MLX-VLM 有可用权重，ONNX/GGUF 预留）。
+OCR_BACKENDS = (
+    ("MLX-VLM", "mlx"),
+    ("ONNX", "onnx"),
+    ("GGUF", "gguf"),
+)
+# OvisOCR2 默认模型（配置窗口默认值；改 rag/ovis_ocr.py 的 DEFAULT_* 同步生效）。
+DEFAULT_OCR_MODEL = "OvisOCR2-0.8B-MLX-4bit"
+DEFAULT_OCR_MODEL_PATH = "models/OvisOCR2-0.8B-MLX-4bit"
 # 启动时自动把默认模型加载备用。测试里置 1 跳过：加载数 GB 权重会让套件变成
 # 分钟级，且 CI 上多半没有对应运行时（见 tests/conftest.py）。
 AUTOLOAD_SKIP_ENV = "BASE_AGENT_SKIP_MODEL_AUTOLOAD"
@@ -423,13 +438,18 @@ class SyncKnowledgeWorker(QThread):
 
     def __init__(self, workspace: str, knowledge_base: str, embedding_model: str = "",
                  force: bool = False, rerank_model: str = "", pdf_engine: str = "docling",
-                 model_options: Optional[Dict[str, Any]] = None):
+                 model_options: Optional[Dict[str, Any]] = None,
+                 ocr_backend: str = "mlx", ocr_model: str = "",
+                 ocr_model_path: str = ""):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
         self._embedding_model = embedding_model
         self._rerank_model = rerank_model
         self._pdf_engine = pdf_engine or "docling"
+        self._ocr_backend = ocr_backend or "mlx"
+        self._ocr_model = ocr_model
+        self._ocr_model_path = ocr_model_path
         self._model_options = dict(model_options or {})
         self._force = force
         self._engine: Optional[RAGEngine] = None
@@ -506,8 +526,14 @@ class SyncKnowledgeWorker(QThread):
             if self._rerank_model:
                 # 非空 = 显式转发 config.rag_rerank_model，配置可覆盖。
                 _engine_kwargs["rerank_model"] = self._rerank_model
-            # PDF 主引擎（docling|marker，#134），配置可切换。
+            # PDF 主引擎（docling|marker|ovis，#134），配置可切换。
             _engine_kwargs["pdf_engine"] = self._pdf_engine
+            # OvisOCR2 模型（ovis 引擎 / PDF 兜底共用），配置可覆盖。
+            _engine_kwargs["ocr_backend"] = self._ocr_backend
+            if self._ocr_model:
+                _engine_kwargs["ocr_model"] = self._ocr_model
+            if self._ocr_model_path:
+                _engine_kwargs["ocr_model_path"] = self._ocr_model_path
             self._engine = RAGEngine(**_engine_kwargs)
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -1092,6 +1118,25 @@ class MainWindow(QMainWindow):
         self.embedding_model_edit = QLineEdit()
         self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
         self.embedding_model_path_btn = QPushButton("选择")
+        # --- PDF 引擎 + OvisOCR2（第三解析方案）---
+        self.pdf_engine_combo = QComboBox()
+        _fill_backend_combo(self.pdf_engine_combo, PDF_ENGINES)
+        self.pdf_engine_combo.setToolTip(
+            "docling：版面理解 + ocrmac OCR（默认）\n"
+            "marker：marker-pdf 2.x（surya OCR）\n"
+            "OvisOCR2：PyMuPDF + OvisOCR2 VLM（表格区域裁剪识别，"
+            "同时是 PDF/图像的兜底方案）"
+        )
+        self.ocr_backend_combo = QComboBox()
+        _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
+        self.ocr_backend_combo.setToolTip(
+            "OvisOCR2 推理后端。当前仅 MLX-VLM 有可用权重；"
+            "ONNX/GGUF 选中会给出明确错误并回退文本直取"
+        )
+        self.ocr_model_edit = QLineEdit()
+        self.ocr_model_path_edit = QLineEdit(placeholderText="本地 OvisOCR2 模型目录")
+        self.ocr_model_path_btn = QPushButton("选择")
+        self.ocr_model_path_btn.clicked.connect(self._on_select_ocr_model_path)
         # 精排始终启用，没有 disabled 选项；要临时关掉靠配置文件的
         # rag_rerank_enabled=false（会退化为向量距离排序）。
         self.reranker_backend_combo = QComboBox()
@@ -1237,6 +1282,21 @@ class MainWindow(QMainWindow):
         self.kb_apply_btn.clicked.connect(self._on_apply_config)
         dir_row.addWidget(self.kb_apply_btn)
         kb_lay.addLayout(dir_row)
+
+        # Row 1.5: PDF 引擎 | OCR 模型后端 | 模型/目录名 | 本地路径
+        # OvisOCR2 第三解析方案的配置（2026-10）：引擎三选一 + VLM 后端三选一。
+        ocr_row = QHBoxLayout()
+        ocr_row.setSpacing(8)
+        ocr_row.addWidget(QLabel("PDF 引擎"))
+        ocr_row.addWidget(self.pdf_engine_combo)
+        ocr_row.addWidget(QLabel("OCR 模型"))
+        ocr_row.addWidget(self.ocr_backend_combo)
+        ocr_row.addWidget(QLabel("模型/目录名"))
+        ocr_row.addWidget(self.ocr_model_edit, 2)
+        ocr_row.addWidget(QLabel("本地路径"))
+        ocr_row.addWidget(self.ocr_model_path_edit, 3)
+        ocr_row.addWidget(self.ocr_model_path_btn)
+        kb_lay.addLayout(ocr_row)
 
         # Row 2: Embedding 后端 | 模型名 | 本地路径 | 同步知识
         emb_row = QHBoxLayout()
@@ -1486,6 +1546,16 @@ class MainWindow(QMainWindow):
         )
         self.embedding_model_edit.setText(self.config.rag_embedding_model)
         self.embedding_model_path_edit.setText(self.config.rag_embedding_model_path)
+        _select_combo_backend(self.pdf_engine_combo,
+                              getattr(self.config, "rag_pdf_engine", "docling"))
+        _select_combo_backend(self.ocr_backend_combo,
+                              getattr(self.config, "rag_ocr_backend", "mlx"))
+        self.ocr_model_edit.setText(
+            getattr(self.config, "rag_ocr_model", "") or DEFAULT_OCR_MODEL
+        )
+        self.ocr_model_path_edit.setText(
+            getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
+        )
         _select_combo_backend(self.reranker_backend_combo, self.config.rag_rerank_backend)
         self.reranker_model_edit.setText(self.config.rag_rerank_model)
         self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
@@ -1546,6 +1616,20 @@ class MainWindow(QMainWindow):
         )
         self.config.rag_embedding_model_path = (
             self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
+        )
+        self.config.rag_pdf_engine = (
+            _combo_backend_value(self.pdf_engine_combo) or "docling"
+        )
+        self.config.rag_ocr_backend = (
+            _combo_backend_value(self.ocr_backend_combo) or "mlx"
+        )
+        self.config.rag_ocr_model = (
+            self.ocr_model_edit.text().strip()
+            or getattr(self.config, "rag_ocr_model", "") or DEFAULT_OCR_MODEL
+        )
+        self.config.rag_ocr_model_path = (
+            self.ocr_model_path_edit.text().strip()
+            or getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
         )
         self.config.rag_rerank_backend = (
             _combo_backend_value(self.reranker_backend_combo) or "fastembed"
@@ -1946,6 +2030,13 @@ class MainWindow(QMainWindow):
             path = QFileDialog.getExistingDirectory(self, "选择 Embedding 模型目录", start)
         if path:
             self.embedding_model_path_edit.setText(path)
+
+    def _on_select_ocr_model_path(self) -> None:
+        """选择 OvisOCR2 模型目录（三个后端都用目录形式）。"""
+        start = self._dialog_start(self.ocr_model_path_edit.text())
+        path = QFileDialog.getExistingDirectory(self, "选择 OvisOCR2 模型目录", start)
+        if path:
+            self.ocr_model_path_edit.setText(path)
 
     def _reranker_path_for_backend(self) -> str:
         """ONNX 是文件、MLX 是目录，两者在 config 里各存一份。"""
@@ -2551,6 +2642,9 @@ class MainWindow(QMainWindow):
             rerank_model=self.config.rag_rerank_model,
             # PDF 主引擎（docling|marker，#134）。
             pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
+            ocr_backend=getattr(self.config, "rag_ocr_backend", "mlx"),
+            ocr_model=getattr(self.config, "rag_ocr_model", ""),
+            ocr_model_path=getattr(self.config, "rag_ocr_model_path", ""),
             model_options={
                 "embedding_backend": self.config.rag_embedding_backend,
                 "embedding_model_path": self.config.rag_embedding_model_path,

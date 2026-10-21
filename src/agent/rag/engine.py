@@ -335,8 +335,26 @@ def _escape_like(s: str) -> str:
     return s.replace("'", "''")
 
 
+def _lightweight_fallback(filepath: str) -> tuple:
+    """PDF / 图像文件的轻量兜底：OvisOCR2 管线（2026-10 起取代 PyMuPDF+RapidOCR）。
+
+    PDF 与图像文件先走 OvisOCR2（PyMuPDF 取图 + VLM 转 markdown，表格
+    区域裁剪识别后填回原位）；引擎不可用或解析失败时退回
+    ``parsers.extract_text`` 作最终安全网（文本页直取 + 图页跳过告警）。
+    非 PDF/图像格式 ovis 直接返回 None，开销可忽略。
+    """
+    try:
+        from .ovis_ocr import extract_markdown as _ovis_extract
+        md = _ovis_extract(filepath)
+        if md and md.strip():
+            return md, True
+    except Exception as e:
+        logger.warning("OvisOCR2 兜底失败，退回轻量解析: %s", e)
+    return extract_text(filepath), False
+
+
 def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tuple:
-    """Extract text, preferring the configured Markdown engine (docling/marker).
+    """Extract text, preferring the configured Markdown engine (docling/marker/ovis).
 
     Returns ``(text, is_markdown)`` where ``is_markdown`` is True when the
     text came from a Markdown engine (so the caller can skip clean/normalize).
@@ -345,11 +363,26 @@ def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tupl
       1. 配置的主引擎「不可用」（未安装/导入失败）→ 尝试另一个 Markdown
          引擎。配置指向一个没有安装的引擎时，不该直接掉到轻量解析器而
          浪费另一个重型引擎。
-      2. 主引擎「可用但单文件转换失败」→ 走 parsers.py 的轻量兜底，与
-         #133 之前的语义一致。故意不跨引擎兜底：mid-ingest 冷启动另一个
+      2. 主引擎「可用但单文件转换失败」→ 走轻量兜底（OvisOCR2 管线 →
+         parsers.extract_text）。故意不跨引擎兜底：mid-ingest 冷启动另一个
          重型引擎（可能触发模型下载）会把个别坏文件放大成整库同步的
          长时间停顿。
     """
+    if pdf_engine == "ovis":
+        # 第三方案：PyMuPDF + OvisOCR2 VLM。不可用/失败 → 轻量兜底
+        # （其中会再试一次 ovis，失败标志已缓存，开销可忽略），不冷启动
+        # docling/marker 重型引擎。
+        try:
+            from .ovis_ocr import extract_markdown as _ovis_extract
+            md = _ovis_extract(filepath)
+            if md and md.strip():
+                return md, True
+            logger.info("ovis 引擎无输出，回退轻量解析: %s",
+                        os.path.basename(filepath))
+        except Exception as e:
+            logger.warning("ovis 引擎异常，回退轻量解析: %s", e)
+        return _lightweight_fallback(filepath)
+
     if pdf_engine == "marker":
         try:
             from .marker_parser import (extract_markdown as _extract_primary,
@@ -377,7 +410,7 @@ def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tupl
         if markdown is not None:
             return markdown, True
         # 主引擎可用但该文件转换失败 → 只走轻量兜底（见 docstring）。
-        return extract_text(filepath), False
+        return _lightweight_fallback(filepath)
 
     # 主引擎不可用（未安装/导入失败）→ 另一个 Markdown 引擎顶上；它若同样
     # 不可用，extract_markdown 会立即返回 None，开销可忽略。
@@ -385,7 +418,7 @@ def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tupl
         markdown = _extract_alt(filepath)
         if markdown is not None:
             return markdown, True
-    return extract_text(filepath), False
+    return _lightweight_fallback(filepath)
 
 
 def _shard_files_balanced(files: List[str], num_workers: int) -> List[List[str]]:
@@ -467,6 +500,9 @@ class RAGEngine:
         rerank_enabled: bool = True,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         pdf_engine: str = "docling",
+        ocr_backend: str = "mlx",
+        ocr_model: str = "",
+        ocr_model_path: str = "",
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -493,9 +529,16 @@ class RAGEngine:
         self._rerank_max_length = max(8, int(rerank_max_length))
         self._rerank_enabled = bool(rerank_enabled)
         self._parallel_workers = max(1, int(parallel_workers))
-        # PDF 主引擎（docling|marker）。未知值一律回退 docling，避免配置
-        # 笔误把整库同步打到意外的路径上。
-        self._pdf_engine = pdf_engine if pdf_engine in ("docling", "marker") else "docling"
+        # PDF 主引擎（docling|marker|ovis）。未知值一律回退 docling，避免配置
+        # 笔误把整库同步打到意外的路径上。ovis = PyMuPDF + OvisOCR2 VLM，
+        # 同时是 PDF/图像的轻量兜底（2026-10 起取代 PyMuPDF+RapidOCR）。
+        self._pdf_engine = pdf_engine if pdf_engine in ("docling", "marker", "ovis") else "docling"
+        # OvisOCR2 配置：ovis 主路与 PDF 兜底共用，惰性加载，同步结束释放。
+        try:
+            from .ovis_ocr import configure as _ovis_configure
+            _ovis_configure(ocr_backend, ocr_model, ocr_model_path)
+        except Exception as e:
+            logger.debug("RAG: ovis configure error: %s", e)
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出
@@ -1727,6 +1770,12 @@ class RAGEngine:
             release_converter()
         except Exception as e:
             logger.debug("RAG: release marker converter error: %s", e)
+        # OvisOCR2 VLM 单例（~0.9GB 统一内存）：ovis 主路 / PDF 兜底共用。
+        try:
+            from .ovis_ocr import release_engine
+            release_engine()
+        except Exception as e:
+            logger.debug("RAG: release ovis engine error: %s", e)
 
     def reload(self) -> None:
         """Drop the cached table handle so the next search sees fresh data.
