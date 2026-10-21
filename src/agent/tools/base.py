@@ -284,6 +284,14 @@ class ToolRegistry:
                 rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),
                 rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
                 pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
+                # OvisOCR2 + docling 动态倍率（2026-10 审查修复：此前漏转发，
+                # agent 侧 ingest 用模块默认值，配置窗口里的自定义模型路径与
+                # dynamic_scale 开关对它完全不生效）。
+                ocr_backend=getattr(self.config, "rag_ocr_backend", "mlx"),
+                ocr_model=getattr(self.config, "rag_ocr_model", ""),
+                ocr_model_path=getattr(self.config, "rag_ocr_model_path", ""),
+                docling_dynamic_scale=getattr(
+                    self.config, "rag_docling_dynamic_scale", False),
             )
             self._rag_engine = engine
 

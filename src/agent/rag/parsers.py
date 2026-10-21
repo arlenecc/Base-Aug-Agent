@@ -22,8 +22,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # RapidOCR ONNX Runtime 单实例约 500MB 内存。如果每个 worker 各加载一份，
 # 4 worker 同时遇到图片 PDF 时会占用 ~2GB 仅仅用于 OCR 模型。
-# 改为全局单例：所有 worker 共享同一个引擎实例，通过信号量串行执行
-# （RapidOCR 可能非线程安全，串行调用 engine(img) 避免竞态）。
+# 改为全局单例：所有 worker 共享同一个引擎实例，RapidOCR 调用通过信号量
+# 串行执行（RapidOCR 可能非线程安全，串行调用 engine(img) 避免竞态）。
+# 注意信号量**只包 RapidOCR 的 engine(img) 调用**（见 _ocr_image_cached），
+# 不包 ocrmac 通路：Apple Vision（VNRecognizeTextRequest）自身支持并发
+# 请求，旧实现把 ocrmac 也一起串行化，导致默认 pdf_engine 下 4 个 worker
+# 在 OCR 阶段全进程一把锁、并行度归零（2026-10 审查修复）。
 _OCR_SEMAPHORE = threading.Semaphore(1)
 _OCR_ENGINE = None  # 全局单例；None 表示尚未尝试加载
 _OCR_ENGINE_LOCK = threading.Lock()
@@ -474,40 +478,41 @@ def _extract_pdf(path: Path) -> str:
                 ocr_skipped_count += 1
                 continue
 
-            with _OCR_SEMAPHORE:
-                # 后端探测放在渲染之前：ocrmac 与 RapidOCR 都没有时整份文件
-                # 的图页都识别不了，早退可以省掉全部渲染开销。
-                if not _ocr_backend_available():
-                    ocr_unavailable = True
-                    ocr_skipped_count += 1
+            # 并发限流信号量已移入 _ocr_image_cached：ocrmac（ANE）本身可
+            # 并发，无需按页串行；仅 RapidOCR 的 engine(img) 调用需要限流。
+            # 后端探测放在渲染之前：ocrmac 与 RapidOCR 都没有时整份文件
+            # 的图页都识别不了，早退可以省掉全部渲染开销。
+            if not _ocr_backend_available():
+                ocr_unavailable = True
+                ocr_skipped_count += 1
+                continue
+            # 引擎单例在 ocr_recognize_array 内部按需取用（走 ocrmac 时
+            # 根本不会加载 RapidOCR，省掉 ~500MB）。每页从进程级单例取
+            # 引擎，页末即释放局部引用（#123）。
+            # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
+            # （release + 全局置 None）只影响触发回收的 worker，其它
+            # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
+            # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
+            # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
+            # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
+            # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
+            # DPI 上限 _OCR_DPI(150)；若原页在 150 DPI 下长边仍 > 1500px，
+            # _ocr_downscale_long_edge 会等比缩回到 1500px。
+            pix = page.get_pixmap(dpi=_OCR_DPI, colorspace=fitz.csGRAY)
+            try:
+                if _pixmap_is_blank(pix):
+                    # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
+                    # 空白纸页）：OCR 检测必然为空，直接跳过，省下每页
+                    # 2-5 秒的 OCR（真实日志中单文档可浪费 1 分钟以上）。
+                    blank_page_count += 1
                     continue
-                # 引擎单例在 ocr_recognize_array 内部按需取用（走 ocrmac 时
-                # 根本不会加载 RapidOCR，省掉 ~500MB）。每页从进程级单例取
-                # 引擎，页末即释放局部引用（#123）。
-                # 旧实现把引擎缓存在 worker 的循环级局部变量里：周期回收
-                # （release + 全局置 None）只影响触发回收的 worker，其它
-                # worker 仍抱着旧引擎继续用——最多 4 代引擎的原生缓存并存
-                # （每代 ~1-2GB），回收形同虚设，实测内存仍涨到 16GB。
-                # 每页取用后，任意时刻至多一代引擎存活，回收立即全局生效。
-                # 灰度渲染：OCR 模型输入本来就是灰度语义，且体积减半、
-                # 便于后续的暗页反色/对比度拉伸归一化（_ocr_preprocess）。
-                # DPI 上限 _OCR_DPI(150)；若原页在 150 DPI 下长边仍 > 1500px，
-                # _ocr_downscale_long_edge 会等比缩回到 1500px。
-                pix = page.get_pixmap(dpi=_OCR_DPI, colorspace=fitz.csGRAY)
-                try:
-                    if _pixmap_is_blank(pix):
-                        # 渲染后确认的纯色/近纯色页（纯色占位图、扫描件的
-                        # 空白纸页）：OCR 检测必然为空，直接跳过，省下每页
-                        # 2-5 秒的 OCR（真实日志中单文档可浪费 1 分钟以上）。
-                        blank_page_count += 1
-                        continue
-                    img = _ocr_preprocess(pix)
-                finally:
-                    # Pixmap 持有整页位图（数 MB），显式释放避免
-                    # 多页循环时峰值内存持续累积。
-                    pix = None
+                img = _ocr_preprocess(pix)
+            finally:
+                # Pixmap 持有整页位图（数 MB），显式释放避免
+                # 多页循环时峰值内存持续累积。
+                pix = None
 
-                ocr_text = ocr_recognize_array(img, page_num + 1, path.name)
+            ocr_text = ocr_recognize_array(img, page_num + 1, path.name)
 
             if ocr_text:
                 parts.append(ocr_text)
@@ -753,7 +758,12 @@ def _ocr_image_cached(engine, img, page_num: int, filename: str) -> str:
     1.x 返回 (result, elapse)，result 是 [box, text, score] 列表。
     """
     try:
-        out = engine(img)
+        # RapidOCR 可能非线程安全：串行化 engine(img) 调用（2026-10 审查
+        # 修复：信号量从 _extract_pdf 的整页 OCR 块移到这里——只串行
+        # RapidOCR，ocrmac/Apple Vision 通路恢复并发，4 worker 的并行度
+        # 不再被一把全进程锁归零）。
+        with _OCR_SEMAPHORE:
+            out = engine(img)
         if isinstance(out, tuple):
             out = out[0]
         txts = getattr(out, "txts", None)

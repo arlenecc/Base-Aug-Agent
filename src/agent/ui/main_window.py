@@ -2642,7 +2642,12 @@ class MainWindow(QMainWindow):
             from agent.model_backends import (
                 MLXLanguageBackend, MLXVLMBackend, ONNXLanguageBackend, LlamaCppBackend)
             _closed_extra = 0
-            for _o in _gc.get_objects():
+            # 模型加载 worker 在途时跳过扫描：worker 手里正拿着一个刚建好、
+            # 正在读权重的后端，此刻 close() 会把在途加载的资源收掉（表现为
+            # 「加载模型」随机失败）。此时新建的后端被 worker 引用着，不是孤儿，
+            # 也不会被扫描误杀的对象逻辑覆盖。
+            _gc_scan_safe = not any(self._model_busy.values())
+            for _o in _gc.get_objects() if _gc_scan_safe else ():
                 if isinstance(_o, (MLXLanguageBackend, MLXVLMBackend,
                                    ONNXLanguageBackend, LlamaCppBackend)):
                     if getattr(_o, "_model_obj", None) is not None and not getattr(_o, "_closed", False):
@@ -2693,6 +2698,12 @@ class MainWindow(QMainWindow):
                 "chunk_overlap": self.config.rag_chunk_overlap,
                 "rerank_backend": self.config.rag_rerank_backend,
                 "rerank_model_path": self.config.rag_rerank_model_path,
+                # MLX 交叉编码器是目录，与 ONNX 文件路径分开存；漏转发会让
+                # RAGEngine 用空 mlx 路径 → create_reranker_backend 抛错 →
+                # 静默回退 FastEmbedReranker（加载错误的 ~570MB 模型，
+                # MLX 精排路线完全失效，2026-10 审查修复）。
+                "rerank_mlx_model_path": getattr(
+                    self.config, "rag_rerank_mlx_model_path", ""),
                 "rerank_threads": self.config.onnx_threads,
                 "rerank_batch_size": self.config.rag_rerank_batch_size,
                 "rerank_max_length": self.config.rag_rerank_max_length,
@@ -3734,6 +3745,7 @@ class MainWindow(QMainWindow):
                                  wait_ms=2000, term_wait_ms=1000):
             self._fetch_worker = None
         # --- SyncKnowledgeWorker: cooperative cancel (finishes current file).
+        _sync_engine = getattr(self._sync_worker, "_engine", None)
         if self._shutdown_worker(self._sync_worker, "sync"):
             # terminate 路径下 finished 信号被 blockSignals 吞掉，
             # _on_sync_thread_finished 兜底不会触发——这里显式再摘一次
@@ -3741,6 +3753,15 @@ class MainWindow(QMainWindow):
             # 阻止数百 MB 资源回收）。
             self._remove_sync_tmp_handler(self._sync_worker)
             self._sync_worker = None
+        # terminate() 路径 run() 的 finally 不执行 → worker 侧 RAG 引擎
+        # （LanceDB 连接 / FastEmbed / reranker / OCR，共 ~600MB+）残留。
+        # 这里兜底关闭；close() 幂等（等价于重复 drop 缓存），正常结束
+        # 路径多调一次是无害的 no-op。
+        if _sync_engine is not None:
+            try:
+                _sync_engine.close()
+            except Exception as e:
+                logger.warning("UI: sync worker engine 兜底关闭失败: %s", e)
         # --- InstallDepsWorker: no cancel mechanism, just wait.
         if self._shutdown_worker(self._deps_worker, "deps",
                                  wait_ms=2000, term_wait_ms=1000):
@@ -3763,6 +3784,13 @@ class MainWindow(QMainWindow):
                 self._llm.close()
             except Exception as e:
                 logger.warning("UI: llm close error: %s", e)
+        # 辅助模型同样由 UI 持有并负责 close()（见 __init__ 的注释）：
+        # 关窗时若不关，MLX 权重（数 GB 统一内存）会残留到进程退出。
+        if self._aux_llm is not None:
+            try:
+                self._aux_llm.close()
+            except Exception as e:
+                logger.warning("UI: aux llm close error: %s", e)
 
         # --- Remove the QSignalLogHandler from the root logger.
         # Without this, the handler (which holds a reference to the QPlainTextEdit

@@ -129,6 +129,14 @@ def _get_engine():
             prompt = apply_chat_template(
                 processor, load_config(model_path), _PROMPT, num_images=1
             )
+            # MLX 内存上限（2026-10 审查修复）：此前只有嵌入/重排两个 MLX
+            # 入口调 _cap_mlx_memory_limits()，本引擎漏掉——当 embedding/
+            # rerank 都用非 MLX 后端时，进程里唯一的 MLX 使用者就是本 VLM，
+            # 其 Metal buffer cache 上限保持默认 recommendedMaxWorkingSetSize
+            # （16GB 机器 ≈ 15.2GB），正是同步期 phys_footprint 冲到 18-19GB
+            # 的根因。函数幂等，多处调用安全。
+            from .model_backends import _cap_mlx_memory_limits
+            _cap_mlx_memory_limits()
         except Exception as e:
             _engine_failed = True
             raise OvisUnavailable(f"OvisOCR2 加载失败: {model_path}: {e}") from e
@@ -140,17 +148,27 @@ def _get_engine():
 def release_engine() -> None:
     """释放 VLM 单例，归还其 ~0.9GB 统一内存。RAGEngine.close() 调用。"""
     global _engine, _engine_failed
-    with _engine_lock:
-        if _engine is not None:
-            _engine = None
-            try:
-                import mlx.core as mx
-                mx.clear_cache()
-            except Exception:
-                pass
-            logger.info("OvisOCR2 引擎已释放")
-        # 释放后允许下次重新尝试加载（用户可能刚修好模型目录）
-        _engine_failed = False
+    # 非阻塞拿推理锁：有 worker 正在 generate 时不能释放——置 None 只是
+    # 换掉单例引用，在途推理仍抱着旧模型，紧接着的 _get_engine() 会再造
+    # 一份 → 两代 ~0.9GB 并存（与 docling/marker 转换器两代并存的竞态同源）。
+    # 拿不到锁就跳过本次释放；close() 在下次同步结束会再调，届时回收。
+    if not _infer_lock.acquire(blocking=False):
+        logger.info("OvisOCR2 推理进行中，本次引擎释放跳过（留待下次回收）")
+        return
+    try:
+        with _engine_lock:
+            if _engine is not None:
+                _engine = None
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    pass
+                logger.info("OvisOCR2 引擎已释放")
+            # 释放后允许下次重新尝试加载（用户可能刚修好模型目录）
+            _engine_failed = False
+    finally:
+        _infer_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +289,29 @@ def _find_tables(page) -> list:
         if bbox and (t.row_count > 1 or t.col_count > 1):
             tables.append(tuple(float(v) for v in bbox))
     return tables
+
+
+def _vector_table_lines(page) -> int:
+    """页面原生矢量长直线数量（零渲染，用于文本页表格预筛）。
+
+    文本层页面的表格框线一定是 PDF 矢量绘制，数长直线即可判断「这页有
+    没有表格」，不需要渲染；与 docling_parser._vector_table_lines 同算法
+    （>=页面 30% 长宽的长直线），本地自包含避免跨模块私有引用。
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return 0
+    count = 0
+    w, h = float(page.rect.width), float(page.rect.height)
+    for d in drawings or ():
+        for item in d.get("items", ()):
+            if item and item[0] == "l":
+                p1, p2 = item[1], item[2]
+                if (abs(p1.x - p2.x) > w * 0.3
+                        or abs(p1.y - p2.y) > h * 0.3):
+                    count += 1
+    return count
 
 
 def _longest_run_span(row) -> Tuple[int, int]:
@@ -439,7 +480,17 @@ def _text_page_markdown(page) -> str:
     填回策略：按阅读序遍历文本块，落在表格区域内的块跳过，在「首个被
     跳过块」的位置插入该表格的 markdown——保持表格出现在原文的上下文
     位置，而不是简单堆到页尾。
+
+    性能（2026-10 审查修复）：旧实现无条件做 150 DPI 整页渲染 + 像素
+    投影——纯文本页（书的大多数）这次渲染必然被丢弃，500 页书 = 500 次
+    整页渲染（A4@150DPI ≈ 8.7MB 缓冲/页）。现在先用**零渲染**的矢量线
+    预筛：文本层页面上的表格框线一定是矢量绘制（get_drawings），
+    >=4 条长直线才值得进像素投影定位；没有矢量线的页面直接返回纯文本
+    （无线表的纯文字排版页，像素投影也找不到东西）。
     """
+    if _vector_table_lines(page) < 4:
+        return page.get_text("text").strip()
+
     tables = _table_regions(page)
     if not tables:
         return page.get_text("text").strip()
@@ -522,6 +573,12 @@ def _extract_pdf(path: Path) -> Optional[str]:
                 parts.append(md)
     finally:
         doc.close()
+        # 收尾冲一次 MuPDF 内部对象缓存：不足 50 页的文档（页内循环的
+        # 周期性 shrink 一次都不会触发）也会残留渲染/解析对象。
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
     return "\n\n".join(p for p in parts if p.strip()) or None
 
 

@@ -48,20 +48,26 @@ for _var, _val in (
 _MARKER_EXTENSIONS = {".pdf"}
 
 _converter = None
-_converter_lock = threading.Lock()
+# RLock：_get_converter 内部也拿这把锁，「取实例 + 转换」必须在同一把锁内
+# 原子完成（持锁调用 _get_converter 需要同线程重入，Lock 会死锁）。
+_converter_lock = threading.RLock()
 _converter_unavailable = False
 
 
 def is_marker_available() -> bool:
-    """Return True if marker can be imported."""
+    """Return True if marker is installed (importable).
+
+    用 ``find_spec`` 轻量探测，与 docling_parser.is_docling_available 同
+    语义：只查包是否存在，不真正 import——否则一次可用性探测就把 torch /
+    surya 全家桶拉进内存，而路由对每个文件都会调本函数。
+    """
     global _converter_unavailable
     if _converter_unavailable:
         return False
     try:
-        import marker  # noqa: F401
-        return True
-    except ImportError:
-        _converter_unavailable = True
+        import importlib.util
+        return importlib.util.find_spec("marker") is not None
+    except Exception:
         return False
 
 
@@ -155,18 +161,21 @@ def extract_markdown(filepath: str) -> Optional[str]:
     if path.suffix.lower() not in _MARKER_EXTENSIONS:
         return None
 
-    converter = _get_converter()
-    if converter is None:
-        return None
-
     try:
         # 与 docling 同样的理由：PdfConverter 未声明线程安全，ingest 的
         # 4 个 worker 线程必须串行化转换；surya 服务端按请求批处理，
         # 串行调用不损失吞吐。
+        # 取实例在锁内完成（2026-10 并发审查修复）：旧实现锁外取、锁内转，
+        # 与 release_converter 竞态会出现「A 转换完回收 → C 新建转换器 →
+        # B 仍用旧转换器」的两代并存——旧转换器的首次 convert 会再拉起一
+        # 整套 surya 服务端子进程，两组子进程并存直到 B 结束。
         with _converter_lock:
+            converter = _get_converter()
+            if converter is None:
+                return None
             rendered = converter(str(path))
             markdown = rendered.markdown
-        del rendered
+            del rendered
         if not markdown or not markdown.strip():
             logger.warning("marker extracted empty markdown from %s", path.name)
             return None

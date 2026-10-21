@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
 from .cleaner import clean_text, fix_hard_wraps, normalize_markdown
@@ -1216,8 +1216,11 @@ class RAGEngine:
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:
                     try:
-                        progress_callback(stats["files_extracted"] + stats["files_skipped"],
-                                          total_files, f"已写入 {total_added} 切片")
+                        # 写入线程与 ingest worker 并发改 stats：读也持锁，
+                        # 避免读到撕裂的中间值。
+                        with stats_lock:
+                            done = stats["files_extracted"] + stats["files_skipped"]
+                        progress_callback(done, total_files, f"已写入 {total_added} 切片")
                     except Exception as e:
                         logger.warning("RAG: on_batch callback error: %s", e)
 
@@ -1301,8 +1304,11 @@ class RAGEngine:
                     )
             _log("  所有 Worker 线程已结束")
         else:
-            # All files skipped — no new chunks written. Report current store count.
-            stats["chunks"] = store.count()
+            # All files skipped — no new chunks written. Report 0 like the
+            # cancelled branch (chunks_total is already tracked separately
+            # for the "全库总量" display; don't confuse it with this sync's
+            # written count).
+            stats["chunks"] = 0
             _log("  所有 %d 个文件均未修改，无需重新处理", total_files)
 
         cancelled = self._is_cancelled()
@@ -1386,7 +1392,7 @@ class RAGEngine:
         stats_lock: threading.Lock,
         old_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
         new_manifest: Optional[Dict[str, Dict[str, Any]]] = None,
-    ) -> None:
+    ) -> Set[str]:
         """Delete vectors and manifest entries for files removed from the KB.
 
         Runs on every ingest (force or not): if a file was in the manifest
@@ -1473,10 +1479,12 @@ class RAGEngine:
         if results:
             logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)
             for i, r in enumerate(results, 1):
-                source = os.path.basename(r.get("source", ""))
+                # 用 src_name 避免遮蔽同名方法参数（filter 语义是完整路径，
+                # 这里只是 basename 展示）。
+                src_name = os.path.basename(r.get("source", ""))
                 score = r.get("score", 0)
                 text_preview = r.get("text", "")[:80].replace("\n", " ")
-                logger.info("      [%d] %s (相关度: %.4f) | %s...", i, source, score, text_preview)
+                logger.info("      [%d] %s (相关度: %.4f) | %s...", i, src_name, score, text_preview)
         else:
             logger.info("  └─ ⚠ 检索完成: 无匹配结果 (耗时 %.2fs)", t_total)
         return results

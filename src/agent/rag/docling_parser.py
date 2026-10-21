@@ -40,8 +40,12 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # is None: _converter_lock = threading.Lock()」，这在并发首次调用时是典型的
 # check-then-act 竞态：两个线程各自新建一把锁，于是各自持自己的锁去创建
 # DocumentConverter —— 同时加载两份数百 MB 的模型。
+#
+# 为什么是 RLock 而不是 Lock：「取转换器」与「执行转换」必须原子化（见
+# _convert_with_scale），而 _get_converter 内部也要拿这把锁——同线程重入
+# 需求，Lock 会直接死锁。
 _converters: dict = {}
-_converter_lock = threading.Lock()
+_converter_lock = threading.RLock()
 _converter_unavailable = False
 
 
@@ -69,11 +73,33 @@ _convert_count = 0
 _convert_count_lock = threading.Lock()
 
 
+def _convert_with_scale(path: str, scale: float) -> Optional[str]:
+    """取转换器 + 转换 + 导出，全程持 _converter_lock（原子化）。
+
+    为什么必须原子化（2026-10 并发审查修复）：旧实现在锁外取实例、锁内
+    转换——worker B 在锁外拿到 C1 引用后阻塞在锁上，A 转换完触发周期
+    回收清空缓存，C 随即新建 C2，B 醒来用**旧的 C1** 转换：两代转换器
+    （各带一整套布局 + TableFormer ≈ 1.9GB 统一内存）并存，周期回收
+    「把峰值限制在一代内」的设计目标作废。放进同一把锁内后，B 醒来时
+    取到的是重建后的 C2，旧 C1 随 A 的局部引用释放而回收。
+    """
+    with _converter_lock:
+        converter = _get_converter(scale)
+        if converter is None:
+            return None
+        result = converter.convert(str(path))
+        md = result.document.export_to_markdown()
+        result = None
+        return md
+
+
 def _maybe_recycle_converter() -> None:
     """每 _DOCLING_RECYCLE_DOCS 篇冲刷一次 docling 原生缓存。
 
-    必须在 **_converter_lock 之外**调用：threading.Lock 不可重入，在持有锁的
-    转换流程里直接调 release_converter() 会死锁。
+    在 **_converter_lock 之外**调用（转换流程的 finally 里）：锁虽是
+    RLock 可重入，但回收会清空缓存，没必要把「等锁」的其它 worker 挡在
+    这次清理之外；真正保证「不出现两代并存」的是 _convert_with_scale 的
+    原子取用（清缓存后新建的实例只会被后续取用者看到）。
     """
     global _convert_count
     with _convert_count_lock:
@@ -559,9 +585,6 @@ def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
             tmpdir = tempfile.mkdtemp(prefix="docling_seg_")
             try:
                 for scale in sorted({s for s, _ in runs}, reverse=True):
-                    converter = _get_converter(scale)
-                    if converter is None:
-                        return None
                     for s, idxs in [r for r in runs if r[0] == scale]:
                         sub = fitz.open()
                         sub.insert_pdf(src, from_page=idxs[0], to_page=idxs[-1])
@@ -569,13 +592,9 @@ def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
                             tmpdir, f"seg_{scale:.2f}_{idxs[0]}_{idxs[-1]}.pdf")
                         sub.save(tmp)
                         sub.close()
-                        result = None
-                        with _converter_lock:
-                            result = converter.convert(tmp)
-                            md = result.document.export_to_markdown()
+                        md = _convert_with_scale(tmp, scale)
                         if md and md.strip():
                             parts[idxs[0]] = md
-                        result = None
                     # 该档全部转完，释放其转换器（只放这一把钥匙），把布局/
                     # TableFormer 模型占的统一内存还给系统；下一本书用到同档
                     # 位时惰性重建（~2s 模型加载 + ~10s 管线初始化）。
@@ -636,17 +655,12 @@ def extract_markdown(filepath: str) -> Optional[str]:
                 logger.warning("PDF 分段转换无输出，回退整篇转换: %s", path.name)
             markdown = None
 
-        converter = _get_converter(_OCR_SCALE_DEFAULT)
-        if converter is None:
-            return None
-
         # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
         # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
-        # 并发转换会互相踩踏（状态污染/崩溃）。这里用同一把锁串行化转换。
-        with _converter_lock:
-            result = converter.convert(str(path))
-            doc = result.document
-            markdown = doc.export_to_markdown()
+        # 并发转换会互相踩踏（状态污染/崩溃）；后来改成「锁外取实例、锁内
+        # 转换」，又与周期回收藏出两代并存的竞态（见 _convert_with_scale）。
+        # 现在取实例 + 转换 + 导出在同一把锁内原子完成。
+        markdown = _convert_with_scale(str(path), _OCR_SCALE_DEFAULT)
         if not markdown or not markdown.strip():
             logger.warning("docling extracted empty markdown from %s", path.name)
             return None
