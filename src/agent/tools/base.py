@@ -349,6 +349,11 @@ class ToolRegistry:
             retriever = cache.get(skills_dir)
             if retriever is not None:
                 return retriever
+            # 创建后复查关闭标志（与 _get_long_memory 同源竞态）：若 shutdown() 已
+            # 在读取 _shutdown=False 之后置 True 并跳过 close，新建的 retriever
+            # （LanceDB 连接）将无主泄漏。立即 close 丢弃。
+            if getattr(self, "_shutdown", False):
+                return None
             db_path = os.path.join(self.config.workspace, ".agent", "skill_index.lancedb")
             from ..rag.vector_store import get_or_create_embedding_function
             embedding_function = get_or_create_embedding_function(
@@ -365,6 +370,12 @@ class ToolRegistry:
                 db_path=db_path,
                 embedding_function=embedding_function,
             )
+            if getattr(self, "_shutdown", False):
+                try:
+                    retriever.close()
+                except Exception:
+                    pass
+                return None
             cache[skills_dir] = retriever
             setattr(self, "_skill_retriever", retriever)
             return retriever

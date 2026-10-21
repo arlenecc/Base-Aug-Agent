@@ -1093,7 +1093,6 @@ class ONNXLanguageBackend(_LazyLocalBackend):
                 input_ids = np.asarray(encoded["input_ids"], dtype=np.int64)
                 prompt_tokens = int(input_ids.size)
                 generated: List[int] = []
-                decoded = ""
                 parser = _TaggedOutputParser()
                 # prompt 已预置思考开标签（qwen3.x 模板）→ 生成内容直接是
                 # 思考正文，只有闭标签。不预置模式的话思考整段漏进对话区。
@@ -1101,7 +1100,14 @@ class ONNXLanguageBackend(_LazyLocalBackend):
                     parser.begin_reasoning()
                 eos = self._tokenizer.eos_token_id
                 eos_ids = set(eos if isinstance(eos, list) else [eos]) if eos is not None else set()
-                for _ in range(int(getattr(self.config, "max_tokens", 32768))):
+                # eos 缺失时无法识别终止符：退化为安全上限，避免跑满整段
+                # max_tokens（默认 32768 步，每步都空转推理，纯无效开销）。
+                _max_steps = int(getattr(self.config, "max_tokens", 32768))
+                if not eos_ids:
+                    _max_steps = min(_max_steps, 4096)
+                    logger.warning("[onnx] 模型未提供 eos_token_id，生成上限降至 %d 步", _max_steps)
+                _prev_len = 0
+                for _ in range(_max_steps):
                     outputs = self._session.run(None, self._feeds(encoded, input_ids))
                     logits = np.asarray(outputs[0])
                     if logits.ndim < 3:
@@ -1122,9 +1128,12 @@ class ONNXLanguageBackend(_LazyLocalBackend):
                     input_ids = np.concatenate(
                         (input_ids, np.asarray([[token]], dtype=np.int64)), axis=1
                     )
-                    new_decoded = self._tokenizer.decode(generated, skip_special_tokens=False)
-                    delta = new_decoded[len(decoded):]
-                    decoded = new_decoded
+                    # 增量解码：每步只解最新一个 token 再累加，避免全量
+                    # decode(generated) 的 O(n²) 总时间/内存。
+                    delta = self._tokenizer.decode(
+                        generated[_prev_len:], skip_special_tokens=False
+                    )
+                    _prev_len = len(generated)
                     yield from parser.feed(delta)
                 yield from parser.finish()
                 yield StreamEvent(

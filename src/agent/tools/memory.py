@@ -113,10 +113,22 @@ def _get_long_memory(registry: "ToolRegistry", config: AgentConfig) -> Optional[
         existing = getattr(registry, _LONG_MEMORY_SINGLETON_ATTR, None)
         if existing is not None:
             return existing
+        # 创建后复查关闭标志：若本线程在读取 _shutdown=False 之后、持锁之前
+        # shutdown() 已置 True 并（因 lm 尚未创建）跳过 close，我们刚建好的
+        # 实例就没有任何所有者、~137MB ONNX + LanceDB 连接永久泄漏。此时
+        # 立即 close 丢弃、返回 None，把竞态窗口彻底关死。
+        if getattr(registry, "_shutdown", False):
+            return None
         lm = LongTermMemory(
             path=os.path.join(config.workspace, ".agent", "long_memory.json"),
             **_embedding_options(config),
         )
+        if getattr(registry, "_shutdown", False):
+            try:
+                lm.close()
+            except Exception:
+                pass
+            return None
         setattr(registry, _LONG_MEMORY_SINGLETON_ATTR, lm)
         return lm
 

@@ -106,6 +106,11 @@ class FastEmbedEmbeddingFunction:
         # 这里的懒初始化——两个线程同时首次调用会各自加载一份 ~130MB 模型，
         # 后写覆盖先写，先建的那份成为纯泄漏。
         self._model_lock = threading.Lock()
+        # 跨模块共享同一 ONNX session（RAG 入库 + graph_memory + skill_retriever
+        # 同时飞）。fastembed 的 embed() 自管线程池复用 session，并发调用在个别
+        # 版本下偶发 Ort::Exception / 结果错位。用一把锁串行所有 embed 调用，
+        # 代价仅是跨模块并发退化为顺序，但消除了真实竞态。
+        self._embed_lock = threading.Lock()
 
     def _ensure_model(self):
         if self._model is not None:
@@ -180,16 +185,19 @@ class FastEmbedEmbeddingFunction:
         # Add document prefix for nomic-embed-text-v1.5
         prefixed = [_DOC_PREFIX + t if not t.startswith(_DOC_PREFIX) else t for t in input]
         if batch_size:
-            embeddings = list(self._model.embed(prefixed, batch_size=int(batch_size)))
+            with self._embed_lock:
+                embeddings = list(self._model.embed(prefixed, batch_size=int(batch_size)))
         else:
-            embeddings = list(self._model.embed(prefixed))
+            with self._embed_lock:
+                embeddings = list(self._model.embed(prefixed))
         return [e.tolist() for e in embeddings]
 
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query text with the query prefix."""
         self._ensure_model()
         prefixed = _QUERY_PREFIX + text if not text.startswith(_QUERY_PREFIX) else text
-        embeddings = list(self._model.embed([prefixed]))
+        with self._embed_lock:
+            embeddings = list(self._model.embed([prefixed]))
         return embeddings[0].tolist()
 
     def embed_documents(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:

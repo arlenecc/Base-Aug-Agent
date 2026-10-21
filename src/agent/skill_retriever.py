@@ -451,6 +451,22 @@ class SkillVectorStore:
             return 0
 
         with self._lock:
+            # 并发首次建表（agent 线程 + UI 线程同时 ensure_indexed）：另一个线程
+            # 可能已在持锁期间建好并持有 self._table。直接复用，避免把刚建好的表
+            # 丢掉、再重做一遍全量 embed（数千技能 ONNX 前向，浪费数分钟算力）。
+            if self._table is not None:
+                try:
+                    return self._table.count_rows()
+                except Exception:
+                    pass
+            if _SKILL_TABLE_NAME in db.table_names():
+                try:
+                    existing = db.open_table(_SKILL_TABLE_NAME)
+                    self._table = existing
+                    self._ensure_fts_index(existing)
+                    return existing.count_rows()
+                except Exception:
+                    pass
             # Drop old table if present.
             if _SKILL_TABLE_NAME in db.table_names():
                 db.drop_table(_SKILL_TABLE_NAME)

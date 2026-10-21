@@ -777,9 +777,15 @@ class Agent:
 
         from .llm_client import LLMClient
         if not isinstance(self.llm, LLMClient):
-            # Non-LLMClient (test mock / scripted): reuse self.llm (no shared
-            # socket state to race).
-            return self.llm
+            # 非 LLMClient：可能是本地后端（MLX/ONNX/LlamaCpp）或测试替身（Mock）。
+            # - 测试替身无共享 socket、无有状态生成，直接复用 self.llm（与旧行为一致）；
+            # - 本地后端带 _generation_lock 且与对话生成共用同一有状态生成对象，后台
+            #   抽取会占用生成锁、阻塞用户下一条回复。事实抽取是 best-effort，这里
+            #   放弃本地后端的后台抽取。
+            if getattr(self.llm, "_generation_lock", None) is None:
+                return self.llm
+            logger.debug("[memory] 本地后端不做后台事实抽取（避免占用生成锁/污染生成上下文）")
+            return None
 
         # 懒初始化会被两个线程并发触发：confirm 弹窗的
         # _describe_code_purpose（worker 线程）与抽取守护线程。不加锁会各自
@@ -1039,16 +1045,23 @@ class Agent:
                     self._is_context_too_long_error(err_str)
                     and shrink_count < self._max_shrinks_per_run
                 ):
-                    self._log(
-                        f"[context] LLM rejected prompt as too long: {err_str[:200]}; "
-                        f"shrinking and retrying (attempt {shrink_count + 1}/{self._max_shrinks_per_run})"
-                    )
-                    shrunk = self._shrink_context(reason="被动收缩: LLM context_length_exceeded")
-                    if shrunk:
-                        shrink_count += 1
-                        # Don't increment iteration — retry the same turn.
-                        iteration -= 1
-                        continue
+                    # 收缩逻辑必须自包含在独立 try 内：_shrink_context 内部会
+                    # json.dumps 历史消息，若历史含不可序列化 content 会抛 TypeError
+                    # 逸出本 except → on_finished 永不执行 → UI 永久 busy。失败就降级
+                    # 为「上报错误 + 结束」，绝不能让异常逸出 run()。
+                    try:
+                        self._log(
+                            f"[context] LLM rejected prompt as too long: {err_str[:200]}; "
+                            f"shrinking and retrying (attempt {shrink_count + 1}/{self._max_shrinks_per_run})"
+                        )
+                        shrunk = self._shrink_context(reason="被动收缩: LLM context_length_exceeded")
+                        if shrunk:
+                            shrink_count += 1
+                            # Don't increment iteration — retry the same turn.
+                            iteration -= 1
+                            continue
+                    except Exception as shrink_err:
+                        logger.error("[agent] context shrink failed: %s", shrink_err)
                 self._log(f"[agent] LLM stream error: {err_str}")
                 # on_error 也要隔离：它一旦抛出，下面的 on_finished 就永远
                 # 不会执行，UI 会一直停在忙碌状态（没有任何报错可见）。

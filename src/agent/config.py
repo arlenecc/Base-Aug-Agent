@@ -235,6 +235,30 @@ class AgentConfig:
                 return None
         except (TypeError, ValueError):
             return None
+        # 兜底：未登记在上面的字段，按 dataclass 声明的类型强制转换。这样新增
+        # int/float/bool 字段时不必同步维护上面的清单（遗漏会让 "32768" 字符串
+        # 或 32768.0 浮点原样进 dataclass，后续算术/比较在运行时炸掉）。
+        try:
+            ftype = cls.__dataclass_fields__.get(name)
+            if ftype is not None:
+                tname = str(ftype.type)
+                if "int" in tname and "float" not in tname:
+                    return int(value)
+                if "float" in tname:
+                    return float(value)
+                if tname == "bool" or "bool" in tname:
+                    if isinstance(value, bool):
+                        return value
+                    if isinstance(value, (int, float)):
+                        return bool(value)
+                    s = str(value).strip().lower()
+                    if s in ("true", "1", "yes", "on"):
+                        return True
+                    if s in ("false", "0", "no", "off", ""):
+                        return False
+                    return None
+        except (TypeError, ValueError):
+            return None
         return value
 
     @classmethod

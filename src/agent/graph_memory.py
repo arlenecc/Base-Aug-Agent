@@ -183,6 +183,12 @@ class GraphMemoryStore:
         in the JSON graph but missing from the vector table (so facts stored
         before the vector index existed become searchable too).
         """
+        # 已 close() 后（registry shutdown 已释放旧实例）仍有后台抽取线程持引用
+        # 在写路径上调到本方法 → 会重新 lancedb.connect 建连接且永不回收（泄漏）。
+        # 标记 _closed 的实例直接放弃初始化；重建的 store 是新实例（_closed 默认
+        # False）不受影响，正常重新初始化。
+        if getattr(self, "_closed", False):
+            return
         if self._vec_ready or self._vec_tried:
             # init 已定型（成功/失败各一次）。backfill 的重试必须走独立
             # 轻量路径——放在早退 gate 之后不可达，日志里「下次调用将重试」
@@ -229,18 +235,17 @@ class GraphMemoryStore:
             return
         if not self._vec_ready:
             return
-        # 非阻塞：已有线程在回填（embed 慢）时后来的调用直接跳过，
-        # 等它失败后下一次调用再试。
-        if not self._backfill_lock.acquire(blocking=False):
+        # 首检回填可能要 embed 成千上万条历史 observation（甚至触发模型下载），
+        # 若同步跑会阻塞调用 search() 的线程（agent/UI）数分钟无反馈。改为后台
+        # 线程异步回填：本次 search 先走 keyword 兜底，回填完成后下一次查询即享
+        # 语义检索。_backfill_lock 仍串行化单次回填；_backfilled 防止重复触发。
+        if getattr(self, "_backfill_thread", None) is not None and self._backfill_thread.is_alive():
             return
-        try:
-            try:
-                self._backfill_vectors()
-                self._backfilled = True
-            except Exception as e:
-                logger.warning("graph_memory: backfill failed (下次调用将重试): %s", e)
-        finally:
-            self._backfill_lock.release()
+        t = threading.Thread(
+            target=self._backfill_vectors, daemon=True, name="graph-backfill"
+        )
+        self._backfill_thread = t
+        t.start()
 
     def _backfill_vectors(self) -> None:
         """Index any observations present in the graph JSON but missing from
@@ -825,6 +830,9 @@ class GraphMemoryStore:
         # 允许重新初始化：否则 close 后 _ensure_vectors 会提前返回，
         # 后续（重建的）store 永远拿不到向量能力。
         self._vec_tried = False
+        # 标记已关闭：写路径（_ensure_vectors/_index_*）据此放弃重开连接，避免
+        # shutdown 与后台抽取线程的竞态泄漏（见 _ensure_vectors 顶部）。
+        self._closed = True
         # _backfilled 同样必须复位：它一旦为 True 就永久跳过 backfill，
         # 重建的 store 会漏掉「JSON 图里有、向量表里没有」的历史事实。
         self._backfilled = False

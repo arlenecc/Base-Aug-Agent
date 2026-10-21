@@ -54,6 +54,12 @@ def _is_ssrf_target(url: str) -> bool:
         return False
     if ip.is_loopback or ip.is_global:
         return False
+    # 0.0.0.0/8（含 0.0.0.0）：绑定全部接口的通配地址，作为目标会打到本机，
+    # 应一并拦截（ipaddress 把 0.0.0.0 判为 unspecified，不在其它分支里）。
+    if ip.is_unspecified or (
+        ip.version == 4 and ip in ipaddress.ip_network("0.0.0.0/8")
+    ):
+        return True
     # 链路本地（169.254.0.0/16 含 AWS/GCP/Azure 元数据；fe80::/10）
     if ip.is_link_local:
         return True
@@ -62,6 +68,22 @@ def _is_ssrf_target(url: str) -> bool:
         return False
     # IPv6 唯一本地地址 fd00::/8 —— 含 fd00:ec2::254（AWS IMDSv6）。
     return ip.is_private
+
+
+def _block_ssrf_redirect(response):
+    """httpx response 钩子：每个重定向 hop 都要重新过 SSRF 校验。
+
+    ``follow_redirects=True`` 时 httpx 会自动跟随 ``Location``，且**不会**对
+    重定向目标再调 ``_is_ssrf_target``——攻击者用开放重定向（``302 →
+    http://169.254.169.254/latest/meta-data/``）即可绕过输入 URL 的拦截偷到
+    云凭据。这里在每个 hop 前校验目标，命中即抛错中断跟随。
+    """
+    next_req = getattr(response, "next_request", None)
+    if next_req is not None and _is_ssrf_target(str(next_req.url)):
+        from httpx import HTTPError
+        raise HTTPError(
+            f"refusing to follow redirect to blocked address: {next_req.url}"
+        )
 
 
 def _read_capped(client, url: str) -> str:
@@ -151,8 +173,13 @@ class WebScanTool(Tool):
     def bind(self, config: AgentConfig, registry: ToolRegistry) -> None:
         self.config = config
         self.registry = registry
-        self._http = httpx.Client(timeout=30.0, follow_redirects=True,
-                                  headers={"User-Agent": "base-agent/0.1"})
+        self._http = httpx.Client(
+            timeout=30.0,
+            follow_redirects=True,
+            headers={"User-Agent": "base-agent/0.1"},
+            # 每个重定向 hop 都重新校验目标，防止 SSRF 经开放重定向绕过输入校验。
+            event_hooks={"response": [_block_ssrf_redirect]},
+        )
 
     def run(self, url: str, raw: bool = False) -> ToolResult:
         # 协议白名单：url 由模型提供，不加限制的话 file:// / gopher:// 等

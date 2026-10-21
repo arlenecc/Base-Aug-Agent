@@ -161,7 +161,8 @@ def _wrap(_orig, _op):
 
 
 for _n in ("remove", "unlink", "rmdir", "mkdir", "makedirs", "rename",
-           "replace", "truncate", "link", "symlink", "chmod", "utime"):
+           "renames", "replace", "truncate", "link", "symlink", "chmod",
+           "utime", "mkfifo", "mknod", "make_archive"):
     _orig_fn = getattr(os, _n, None)
     if _orig_fn is not None:
         setattr(os, _n, _wrap(_orig_fn, _n))
@@ -170,8 +171,9 @@ _real_os_open = os.open
 
 
 def _guarded_os_open(path, flags, *a, **kw):
-    # O_WRONLY / O_RDWR 才是写；只带 O_CREAT 的只读打开无害。
-    if flags & (os.O_WRONLY | os.O_RDWR):
+    # O_WRONLY / O_RDWR 是写；O_CREAT 也会在路径不存在时**创建文件**，落在
+    # workspace 外同样是越权写，一并拦下（如 os.open(p, O_CREAT | O_RDONLY)）。
+    if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
         _check(path, "open for write")
     return _real_os_open(path, flags, *a, **kw)
 

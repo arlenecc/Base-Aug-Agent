@@ -1849,9 +1849,12 @@ class MainWindow(QMainWindow):
         self._llm = new_llm
         self._agent = new_agent
         # 兜底关闭被换下的旧后端（已加载且与新后端不是同一对象才关，避免双关）。
+        # 注意：判断依据应是「对象有 close() 且未关闭」，不能依赖后端特有的
+        # _model_obj —— LLMClient 没有 _model_obj，旧判断会漏关它、泄漏 httpx
+        # 连接池（每次「应用配置」换模型即泄漏一个）。
         for _old in (_old_llm, _old_aux):
             if _old is not None and _old is not new_llm and _old is not new_aux \
-                    and getattr(_old, "_model_obj", None) is not None \
+                    and getattr(_old, "close", None) is not None \
                     and not getattr(_old, "_closed", False):
                 try:
                     _old.close()
