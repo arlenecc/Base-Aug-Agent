@@ -799,6 +799,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 156 | 首检 `search()` 同步全量回填向量（模型下载时卡数分钟）；技能检索每次查询全目录 `os.walk`+`stat` | 首次语义检索阻塞调用线程；每次检索附带目录遍历 | 首检回填改为后台 daemon 线程异步执行（本次先走 keyword 兜底）；mtime 计算节流留待后续 |
 | 157 | MLX 聊天/视觉后端加载时不调 MLX buffer cache 上限（默认≈95% RAM） | 本地模型对话时 cache 涨到系统上限 → 内存冲到 13G+ 卡死（权重仅 ~3G，差额全是 cache） | 两个 MLX 后端 `_ensure_loaded` 内 `mx.set_cache_limit(1GB)` 封顶 scratch buffer（不限权重体积，免大模型加载失败） |
 | 158 | llama.cpp (GGUF) 后端用 `max_context_tokens`(默认 32768) 当 `n_ctx`，加载时一次性预分配 KV cache | 发句「hi」内存冲到 23G+ 卡死（权重~4G+KV~17G+嵌入~2G）；MLX/API 按需增长不受影响 | 新增 `local_llm_n_ctx`(默认 16384) 封顶预分配；后端暴露 `context_window`，agent 收缩阈值改用 `model_context_limit` 防喂超 |
+| 159 | #157 把 MLX buffer cache 压到 1GB 过激，prefill 长上下文时大注意力矩阵每步反复释放重分配 | 内存不爆了但每句话都卡半天、且历史越长越卡 | 抽出统一 `apply_mlx_memory_policy()`：cache 封顶 `min(40% RAM,6GB)`、总内存封顶 `min(当前,80% RAM)`；聊天/VLM/RAG 三处复用同一策略 |
 
 ## 部署
 
