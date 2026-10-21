@@ -787,6 +787,16 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 144 | ovis `release_engine()` 与在途推理竞态：置 None 后紧接着重建 | 两代 ~0.9GB 引擎并存（#141 同源） | 非阻塞获取 `_infer_lock`，在途推理时跳过本次释放，留待下次回收 |
 | 145 | 全跳过分支把全库总量当成本次写入量（`stats["chunks"] = store.count()`）；`_on_batch` 读 stats 不持锁；检索日志变量遮蔽 `source` 参数；`_cleanup_deleted_files` 返回注解错误 | UI「本次同步切片数」显示误导；极小概率读到撕裂的进度值 | 全跳过分支改为 0（与取消分支对齐）；读 stats 加锁；循环变量改名；返回注解修正 `Set[str]` |
 | 146 | 生命周期兜底缺口：① 关窗不关辅助 LLM；② terminate() 杀掉的 sync worker 不走 finally，RAG 引擎 ~600MB 残留；③ 模型加载在途时同步前 gc 扫描会关掉加载中的后端；④ agent 侧 RAGEngine 少转发 4 个 OCR/动态倍率参数；⑤ SyncKnowledgeWorker 漏 `rerank_mlx_model_path` | 数 GB MLX 权重残留到进程退出；同步前 gc 扫描让「加载模型」随机失败；agent 路径 OCR 引擎选择静默失效 | closeEvent 补 `_aux_llm.close()` 与 sync worker 引擎兜底关闭（close 幂等）；gc 扫描加 `_model_busy` 守卫；`tools/base.py` 补 `ocr_backend/ocr_model/ocr_model_path/docling_dynamic_scale` 转发；SyncKnowledgeWorker 补 `rerank_mlx_model_path`；ovis `_extract_pdf` finally 补 `store_shrink(100)` |
+| 147 | `agent.run()` 的 except 分支内调用 `_shrink_context`，其内部 `json.dumps` 抛异常会逸出 `run()` | UI 永久 busy（on_finished 永不执行） | 收缩调用包进独立 try/except，失败仅降级为上报错误 + 结束，绝不逸出 |
+| 148 | `web.py` SSRF 只校验输入 URL，全局 `follow_redirects=True` 让 `302 → 链路本地/元数据地址` 绕过校验 | 云凭据 / 内网被窃取 | httpx 挂 `event_hooks["response"]` 对每个重定向 hop 重新过 SSRF 校验；`_is_ssrf_target` 补充拦截 `0.0.0.0/8` |
+| 149 | `agent.py` 后台事实抽取线程复用本地后端（带 `_generation_lock`）的 `self.llm` | 抽取占用生成锁、阻塞用户下一条回复，并污染生成上下文 | 仅带 `_generation_lock` 的本地后端跳过后台抽取；测试替身等无状态对象仍复用 |
+| 150 | `ToolRegistry.shutdown()` 与 `_get_long_memory`/`get_skill_retriever` 创建之间竞态 | 重建 Agent 时泄漏一个长期记忆/技能检索器单例（~137MB + 连接） | 两个 getter 创建后复查 `_shutdown`，已关闭则立即 close 丢弃 |
+| 151 | `graph_memory.close()` 后守护抽取线程仍调写路径 → 重新 `lancedb.connect` 且永不回收 | 进程级 LanceDB 连接泄漏 | close 置 `_closed`，`_ensure_vectors` 顶部已关闭实例直接放弃重开 |
+| 152 | `SkillRetriever.build()` 持锁后无条件 drop 重建，并发首次建表互相丢弃 | 全量 embed 被重复执行，浪费数分钟 | 持锁后再检查表/self._table，命中则复用 |
+| 153 | 共享 FastEmbed ONNX 单例被 RAG/记忆/技能并发 embed | 偶发 `Ort::Exception` 或向量错位 | `EmbeddingFunction` 的 embed 调用统一加 `_embed_lock` 串行 |
+| 154 | `config.py` 新增数值/布尔字段漏登记到强转清单，旧配置字符串原样进 dataclass | 重启即崩溃或算术运行时错 | `_coerce` 兜底按 dataclass 声明类型（从 `__dataclass_fields__`）强转 |
+| 155 | `_rebuild_agent` 孤儿后端关闭守卫依赖 `_model_obj`，`LLMClient` 无此属性 | OpenAI 后端 httpx 连接池泄漏 | 守卫改为「有 `close()` 且未 `_closed`」 |
+| 156 | 首检 `search()` 同步全量回填向量（模型下载时卡数分钟）；技能检索每次查询全目录 `os.walk`+`stat` | 首次语义检索阻塞调用线程；每次检索附带目录遍历 | 首检回填改为后台 daemon 线程异步执行（本次先走 keyword 兜底）；mtime 计算节流留待后续 |
 
 ## 部署
 
