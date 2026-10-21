@@ -15,7 +15,7 @@
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性。`code_run` 走独立子进程组，超时时 **SIGTERM → SIGKILL killpg** 真正杀掉整棵进程树（线程版只能等进程退出），同时立起取消标志文件供 `_cancelled()` 协作退出
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling 转换器全局单例且同步结束后显式释放；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker 和 logger handler；`VectorStore` 用**在途操作计数 + 条件变量**保证 `clear()`/`close()`/`reload()` 不与在途检索/写入并发；「应用配置」的重资源释放移到后台线程，不冻结界面
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling/marker/ovis 转换器全局单例且同步结束后显式释放，转换器「取+用」在同一把锁内原子完成、释放前非阻塞抢推理锁（避免两代模型并存，#141/#144）；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker、logger handler、主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎；`VectorStore` 用**在途操作计数 + 条件变量**保证 `clear()`/`close()`/`reload()` 不与在途检索/写入并发；「应用配置」的重资源释放移到后台线程，不冻结界面
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；`code_run` 在**受限子进程**中执行且写路径防护覆盖 `builtins.open` / `io.open` / `os.*` 写类操作 / `pathlib.Path` / `shutil`，`rename`/`link`/`symlink` 的**目标路径**同样校验；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https、拦截云元数据地址（SSRF）并限制响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
@@ -316,11 +316,11 @@ MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：
 - **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
-- **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 通过全局信号量串行执行，单例引擎避免多 worker 重复加载模型。
+- **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 引擎全局单例（多 worker 不重复加载模型）；并发限流仅包 RapidOCR 的推理调用（ocrmac/ANE 路径可并发），docling/marker/ovis 转换器「取+用」在同一把锁内原子完成，避免周期回收时两代模型并存（#141/#142/#144）。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
 - **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内按文本长度降序分桶后再拆子批，子批大小由自适应控制器实测吞吐动态调整（2-64，初始 16、步长 2：更快则继续上调、变慢回退；持续劣化自动降档避让，环境变快重新爬升；超长文本另由形状预算钳制条数，RSS 软墙 8GB 兜底），累计持 GIL 达到阈值才主动让出（不逐个 sleep），让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
-- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB，仅图片 PDF 入库时加载）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB）、docling/marker 转换器（各 ~1.9GB）、OvisOCR2 VLM（~0.9GB）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时补关主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎，并移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
@@ -331,12 +331,14 @@ MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：
 
 **统一解析引擎（docling）**：Word、Excel、PowerPoint、PDF、EPUB 通过 [docling](https://docling-project.github.io/) 统一解析，直接输出结构化 Markdown（含布局、表格、标题、图片 OCR）。docling 未安装时自动回退到按格式的轻量解析器。
 
+**PDF 解析引擎三选一**（`rag_pdf_engine`，配置窗口单选钮）：`docling`（默认，版面理解 + ocrmac OCR）/ `marker`（marker-pdf 2.x，surya OCR）/ `ovis`（PyMuPDF + OvisOCR2-0.8B MLX-VLM 逐页转录，同时是所有引擎单文件失败时的轻量兜底）。docling 的 OCR 渲染倍率默认全篇固定 2.0；曾实现的逐页动态倍率因 +87% 耗时零收益已改为配置项 `rag_docling_dynamic_scale`（默认关闭）。
+
 | 格式 | 扩展名 | 解析方式 |
 |------|--------|------|
 | Word | `.docx`, `.doc` | docling（回退 `python-docx`） |
 | Excel | `.xlsx`, `.xls` | docling（回退 `openpyxl`） |
 | PowerPoint | `.pptx`, `.ppt` | docling（回退 `python-pptx`） |
-| PDF | `.pdf` | docling（图片型/纯扫描走 `rapidocr-onnxruntime`） |
+| PDF | `.pdf` | `rag_pdf_engine` 三选一（docling / marker / ovis），图片页走引擎自带 OCR 或 RapidOCR |
 | EPUB | `.epub` | docling（回退 `ebooklib`） |
 | MOBI/AZW | `.mobi`, `.azw3` | calibre（可选） |
 | 纯文本 | `.txt`, `.md`, `.csv` | 无额外依赖 |
@@ -594,6 +596,8 @@ src/agent/
 ├── rag/
 │   ├── engine.py            # RAG 引擎（编排：扫描→对比→解析→清洗→切片→向量化→清理→保存）
 │   ├── docling_parser.py    # docling 统一解析器（Word/Excel/PPT/PDF/EPUB → Markdown）
+│   ├── marker_parser.py     # marker-pdf 解析器（PDF 解析引擎第二方案）
+│   ├── ovis_ocr.py          # OvisOCR2 多模态 OCR（PDF 引擎第三方案 + 单文件兜底）
 │   ├── parsers.py           # 按格式的轻量解析器（docling 回退方案 + MOBI/HTML/文本）
 │   ├── cleaner.py           # 文本清洗（去标签/URL/控制字符/零宽字符/空白归一化）
 │   ├── chunker.py           # Token 级别递归切片 + 分片回退链编排
@@ -777,6 +781,12 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 139 | 上一轮后端感知预算仍沿袭 #126 的「内存安全优先于下限」语义：超长文本下 `budget // max_len²` 可能算成 0，子批被**夹到 1 条**。单条长切片会把吞吐打到最优的 50-69%（实测低于 4 条即明显掉），且模型加载 / ONNX 会话初始化的固定成本被单条摊得极薄——纯亏 | 超长切片（>1732 字符）入库时子批恒为 1，吞吐塌陷且调优器无法在可行域内爬山 | `_shape_cap_size` 与 `_embedding_batch_for` 的形状预算**下限改为 2 条**（与调优器探索下限 `_SUBBATCH_MIN` 对齐，两者不再互相打架）：`min(size, max(_SUBBATCH_MIN, budget // max_len²))`。请求本身不足 2 条时按请求返回，不为凑下限放大批次（单条直调仍为 1）。副作用：未知/默认后端在 >1732 字符切片上从 1 条变 2 条——int8 ONNX @8192 B=2 实测内存可接受；调优器 report() 收到的仍是钳制后实际条数 |
 | 135 | 子批区间 1-5 / 初始 2 是 fastembed(ONNX CPU) 时代的标定（「子批增大吞吐单调变差」）。MLX 直载后曲线反转：短切片 2→88、8→152、16→178、32→205、64→205、128→190 条/s；长切片（~1200 字符）与子批数无关（1-16 均 13.2 条/s）。原区间把吞吐锁在最优的 50-69% | 默认后端换成 MLX 后自适应器仍按旧曲线取小批，白白损失一半吞吐 | 区间改为 **2-64、初始 16、步长 2**（用户定参），RSS 软墙保留 8GB；`rag_embedding_batch_size` 默认 8→16 并夹 `[2,64]`；形状预算仍可把单批压到 1（内存硬约束优先于下限）；子批测试改为常量驱动（改档位不改测试）；实测 96 条语料 batch 8→16：173→211 条/s（+22%） |
 | 140 | 配置窗口原本是一长条平铺行：主模型后端、远程模型名、Base URL/API Key、采样参数、目录、Embedding、Reranker 全挤在一起，「本地 vs 接口」只是下拉框里的一项，加载/更换模型没有显式入口，也没有辅助模型 | 配置项语义混杂、找不到该点哪里；主模型一换就要重新读数 GB 权重；轻量子任务（上下文摘要）只能占用主模型的推理队列 | 配置窗口重构成**两个分区**：① **Agent 模型配置**——主模型模式二选一（本地 / OpenAI 兼容接口，默认本地）；本地模式两行（模型类型 MLX-LM/MLX-VLM/ONNX/GGUF + 本地路径 + 选择；采样参数 + **加载模型** + **卸载**），接口模式两行（Base URL / API Key / 模型 + 获取模型；采样参数 + 应用配置）；下方**辅助模型**同本地模式结构、独立采样参数。② **知识同步配置**——目录；Embedding（后端 + 模型名 + 本地路径 + 同步知识）；Reranker（后端 + 模型名 + 本地路径 + 停止同步）。`llama_cpp` 在 UI 上一律改名 **GGUF**，Embedding 下拉补齐 GGUF 项。启动即默认加载主/辅模型（后台线程，`BASE_AGENT_SKIP_MODEL_AUTOLOAD=1` 可跳过）；「加载模型」主动把权重读进内存并直接交给 agent，「卸载」释放后给 agent 换新懒加载后端；**按签名复用**已加载权重，应用配置不再重复读数 GB；加载期间配置变更则丢弃陈旧结果；辅助模型参数改为**实时视图**（`_AuxConfigView`），改完即生效无需重载。辅助模型接入 agent 的上下文摘要，失败自动回退主模型。默认主模型 `qwen3.5-4b-agentic-coder-v4-4bit-mlx`、辅助 `Qwen3.5-2B-MLX-4bit`；旧配置无 `llm_mode` 时按 `llm_backend` 反推，不会把 OpenAI 用户静默切到本地 |
+| 141 | docling/marker 转换器「锁外取实例 + 锁内转换」与周期回收并发 | 两代转换器并存（各 ~1.9GB 统一内存），回收形同虚设 | 改 `RLock` + 「取+用」原子化（`_convert_with_scale` 同锁完成取实例与 convert）；marker 同款修复 + `is_marker_available()` 改 `find_spec` 轻量探测（旧版真 import 会拉起 ~2s 重依赖） |
+| 142 | OCR 信号量包住整页「渲染+预处理+OCR」 | ocrmac（ANE）本可并发被整页串行化，白损吞吐 | 信号量移入 `_ocr_image_cached` 仅包 RapidOCR 的 `engine(img)`；`_extract_pdf` 外层包裹移除 |
+| 143 | ovis 文本页一律走 HTML DOM 表格解析；MLX 加载后无内存上限 | 纯文本页整页 DOM 解析浪费；MLX 缓存随推理增长 | `_vector_table_lines(page)`（`get_drawings()` 数长直线，<4 条跳过表格填回）；引擎加载后调 `_cap_mlx_memory_limits()` |
+| 144 | ovis `release_engine()` 与在途推理竞态：置 None 后紧接着重建 | 两代 ~0.9GB 引擎并存（#141 同源） | 非阻塞获取 `_infer_lock`，在途推理时跳过本次释放，留待下次回收 |
+| 145 | 全跳过分支把全库总量当成本次写入量（`stats["chunks"] = store.count()`）；`_on_batch` 读 stats 不持锁；检索日志变量遮蔽 `source` 参数；`_cleanup_deleted_files` 返回注解错误 | UI「本次同步切片数」显示误导；极小概率读到撕裂的进度值 | 全跳过分支改为 0（与取消分支对齐）；读 stats 加锁；循环变量改名；返回注解修正 `Set[str]` |
+| 146 | 生命周期兜底缺口：① 关窗不关辅助 LLM；② terminate() 杀掉的 sync worker 不走 finally，RAG 引擎 ~600MB 残留；③ 模型加载在途时同步前 gc 扫描会关掉加载中的后端；④ agent 侧 RAGEngine 少转发 4 个 OCR/动态倍率参数；⑤ SyncKnowledgeWorker 漏 `rerank_mlx_model_path` | 数 GB MLX 权重残留到进程退出；同步前 gc 扫描让「加载模型」随机失败；agent 路径 OCR 引擎选择静默失效 | closeEvent 补 `_aux_llm.close()` 与 sync worker 引擎兜底关闭（close 幂等）；gc 扫描加 `_model_busy` 守卫；`tools/base.py` 补 `ocr_backend/ocr_model/ocr_model_path/docling_dynamic_scale` 转发；SyncKnowledgeWorker 补 `rerank_mlx_model_path`；ovis `_extract_pdf` finally 补 `store_shrink(100)` |
 
 ## 部署
 
