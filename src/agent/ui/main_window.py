@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
     QStatusBar, QFileDialog, QCheckBox, QScrollArea, QGroupBox,
-    QRadioButton, QFrame,
+    QRadioButton, QFrame, QButtonGroup,
 )
 
 from ..agent import Agent, AgentCallbacks
@@ -59,12 +59,19 @@ RAG_BACKENDS = (
 # 默认模型路径（#140 用户定参）：本地模式未指定时启动即加载这两个。
 DEFAULT_MAIN_MODEL_PATH = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
 DEFAULT_AUX_MODEL_PATH = "models/Qwen3.5-2B-MLX-4bit"
-# PDF 解析引擎下拉（docling / marker / OvisOCR2 第三方案）。
+# PDF 解析引擎三选一（docling / marker / OvisOCR2 第三方案）。
 PDF_ENGINES = (
     ("docling", "docling"),
     ("marker", "marker"),
     ("OvisOCR2", "ovis"),
 )
+# 各引擎单选钮的悬停说明（横排常显，tooltip 补充细节）。
+_PDF_ENGINE_TIPS = {
+    "docling": "docling：版面理解 + ocrmac OCR（默认）",
+    "marker": "marker：marker-pdf 2.x（surya OCR，服务端进程架构）",
+    "ovis": "OvisOCR2：PyMuPDF + OvisOCR2 VLM，表格区域裁剪识别后填回原位，"
+            "同时是 PDF/图像的兜底方案",
+}
 # OvisOCR2 后端下拉（当前仅 MLX-VLM 有可用权重，ONNX/GGUF 预留）。
 OCR_BACKENDS = (
     ("MLX-VLM", "mlx"),
@@ -77,6 +84,24 @@ DEFAULT_OCR_MODEL_PATH = "models/OvisOCR2-0.8B-MLX-4bit"
 # 启动时自动把默认模型加载备用。测试里置 1 跳过：加载数 GB 权重会让套件变成
 # 分钟级，且 CI 上多半没有对应运行时（见 tests/conftest.py）。
 AUTOLOAD_SKIP_ENV = "BASE_AGENT_SKIP_MODEL_AUTOLOAD"
+
+
+def _select_pdf_engine_radio(window, value: str) -> None:
+    """按引擎配置值勾选横排单选钮；未知值回落 docling（默认）。"""
+    radios = getattr(window, "pdf_engine_radios", None) or {}
+    target = value if value in radios else "docling"
+    for v, rb in radios.items():
+        rb.setChecked(v == target)
+
+
+def _checked_pdf_engine(window) -> str:
+    """读横排单选钮当前勾选的引擎配置值；全未勾选回落 docling。"""
+    radios = getattr(window, "pdf_engine_radios", None) or {}
+    for v in ("docling", "marker", "ovis"):
+        rb = radios.get(v)
+        if rb is not None and rb.isChecked():
+            return v
+    return "docling"
 
 
 def _fill_backend_combo(combo: QComboBox, items) -> None:
@@ -1118,15 +1143,18 @@ class MainWindow(QMainWindow):
         self.embedding_model_edit = QLineEdit()
         self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
         self.embedding_model_path_btn = QPushButton("选择")
-        # --- PDF 引擎 + OvisOCR2（第三解析方案）---
-        self.pdf_engine_combo = QComboBox()
-        _fill_backend_combo(self.pdf_engine_combo, PDF_ENGINES)
-        self.pdf_engine_combo.setToolTip(
-            "docling：版面理解 + ocrmac OCR（默认）\n"
-            "marker：marker-pdf 2.x（surya OCR）\n"
-            "OvisOCR2：PyMuPDF + OvisOCR2 VLM（表格区域裁剪识别，"
-            "同时是 PDF/图像的兜底方案）"
-        )
+        # --- PDF 解析引擎（三选一横排单选）+ 自定义 OCR 模型 ---
+        # 单选钮而不是下拉：三个引擎是互斥三选一，横排常显比收起的下拉
+        # 更易发现（尤其 OvisOCR2 是新方案）。QButtonGroup 显式保证互斥
+        # （不依赖父控件相同的隐式自动互斥）。
+        self.pdf_engine_group = QButtonGroup(self)
+        self.pdf_engine_radios = {}
+        for _label, _value in PDF_ENGINES:
+            _rb = QRadioButton(_label)
+            _rb.setProperty("engine_value", _value)
+            _rb.setToolTip(_PDF_ENGINE_TIPS.get(_value, ""))
+            self.pdf_engine_group.addButton(_rb)
+            self.pdf_engine_radios[_value] = _rb
         self.ocr_backend_combo = QComboBox()
         _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
         self.ocr_backend_combo.setToolTip(
@@ -1283,13 +1311,20 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.kb_apply_btn)
         kb_lay.addLayout(dir_row)
 
-        # Row 1.5: PDF 引擎 | OCR 模型后端 | 模型/目录名 | 本地路径
-        # OvisOCR2 第三解析方案的配置（2026-10）：引擎三选一 + VLM 后端三选一。
+        # Row 1.5: PDF 解析引擎（三选一单选钮横列，独立一行）
+        engine_row = QHBoxLayout()
+        engine_row.setSpacing(8)
+        engine_row.addWidget(QLabel("PDF 解析引擎"))
+        for _value in ("docling", "marker", "ovis"):
+            engine_row.addWidget(self.pdf_engine_radios[_value])
+        engine_row.addStretch(1)
+        kb_lay.addLayout(engine_row)
+
+        # Row 1.6: 自定义 OCR 模型后端 | 模型/目录名 | 本地路径
+        # OvisOCR2 第三解析方案的模型配置（2026-10）。
         ocr_row = QHBoxLayout()
         ocr_row.setSpacing(8)
-        ocr_row.addWidget(QLabel("PDF 引擎"))
-        ocr_row.addWidget(self.pdf_engine_combo)
-        ocr_row.addWidget(QLabel("OCR 模型"))
+        ocr_row.addWidget(QLabel("自定义 OCR 模型"))
         ocr_row.addWidget(self.ocr_backend_combo)
         ocr_row.addWidget(QLabel("模型/目录名"))
         ocr_row.addWidget(self.ocr_model_edit, 2)
@@ -1546,8 +1581,7 @@ class MainWindow(QMainWindow):
         )
         self.embedding_model_edit.setText(self.config.rag_embedding_model)
         self.embedding_model_path_edit.setText(self.config.rag_embedding_model_path)
-        _select_combo_backend(self.pdf_engine_combo,
-                              getattr(self.config, "rag_pdf_engine", "docling"))
+        _select_pdf_engine_radio(self, getattr(self.config, "rag_pdf_engine", "docling"))
         _select_combo_backend(self.ocr_backend_combo,
                               getattr(self.config, "rag_ocr_backend", "mlx"))
         self.ocr_model_edit.setText(
@@ -1617,9 +1651,7 @@ class MainWindow(QMainWindow):
         self.config.rag_embedding_model_path = (
             self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
         )
-        self.config.rag_pdf_engine = (
-            _combo_backend_value(self.pdf_engine_combo) or "docling"
-        )
+        self.config.rag_pdf_engine = _checked_pdf_engine(self) or "docling"
         self.config.rag_ocr_backend = (
             _combo_backend_value(self.ocr_backend_combo) or "mlx"
         )
