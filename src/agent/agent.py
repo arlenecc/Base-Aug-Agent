@@ -209,6 +209,13 @@ class Agent:
         # the LLM API returns a context_length_exceeded-style error.
         self.max_context_tokens = int(getattr(config, "max_context_tokens", 32000))
         self.context_shrink_ratio = float(getattr(config, "context_shrink_ratio", 0.9))
+        # 后端实际上下文硬上限：llama.cpp 有固定 n_ctx（KV 预分配上限），喂超会报错；
+        # MLX/API 后端不设该属性，回落到逻辑窗口 max_context_tokens。收缩阈值据此
+        # 计算，保证历史不会被压到超出后端硬上限（#158）。
+        _bctx = getattr(self.llm, "context_window", None)
+        self.model_context_limit = (
+            min(self.max_context_tokens, _bctx) if _bctx else self.max_context_tokens
+        )
         # Cap shrink attempts per run() so a misconfigured LLM can't loop
         # forever on summarize-then-retry.
         self._max_shrinks_per_run = 3
@@ -393,10 +400,15 @@ class Agent:
 
     def _should_shrink_context(self) -> bool:
         """Return True if the estimated context size exceeds the shrink
-        threshold (context_shrink_ratio * max_context_tokens)."""
+        threshold (context_shrink_ratio * model_context_limit).
+
+        Uses ``model_context_limit`` (which respects llama.cpp's hard ``n_ctx``)
+        rather than the logical ``max_context_tokens`` so the shrink keeps the
+        history inside the backend's actual context window (#158).
+        """
         if self.max_context_tokens <= 0:
             return False
-        threshold = int(self.max_context_tokens * self.context_shrink_ratio)
+        threshold = int(self.model_context_limit * self.context_shrink_ratio)
         return self._estimate_history_tokens() > threshold
 
     @staticmethod

@@ -61,6 +61,13 @@ class AgentConfig:
     local_model_threads: int = 4
     local_model_batch_size: int = 512
     local_gpu_layers: int = -1
+    # llama.cpp (GGUF) 专用：KV cache 大小（n_ctx）。llama.cpp 会在**加载时一次性
+    # 预分配**整个 KV cache，随 n_ctx 线性膨胀——7B 模型 n_ctx=32768 约预占 17GB
+    # 统一内存，直接把 16G 机器吃爆（表现就是「发句 hi 内存就冲到 20G+ 卡死」）。
+    # 该值独立于 max_context_tokens（逻辑上下文窗口，MLX/API 后端按需增长 KV、
+    # 不受影响），只约束 llama.cpp 的预分配上限。16384 对 7B 约 8.6GB、13B 约
+    # 13GB，16G 机器可承受；内存更小的机器可调到 8192，显存更大的可调大。
+    local_llm_n_ctx: int = 16384
     onnx_threads: int = 4
     temperature: float = 0.7
     max_tokens: int = 32768
@@ -156,6 +163,7 @@ class AgentConfig:
         "max_tokens", "top_k", "max_iterations", "max_history",
         "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
+        "local_llm_n_ctx",
         "onnx_threads", "rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",

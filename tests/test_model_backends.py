@@ -49,6 +49,35 @@ def _feed(parser, text, step=3):
     return events
 
 
+def test_llamacpp_n_ctx_bounded_by_local_llm_n_ctx(monkeypatch):
+    """#158：llama.cpp 的 n_ctx 必须封顶到 local_llm_n_ctx，否则加载时按默认
+    max_context_tokens(32768) 预分配 KV cache，7B 模型约 17GB，直接把内存吃爆。"""
+    from agent.model_backends import LlamaCppBackend
+
+    monkeypatch.setattr(
+        "agent.model_backends.resolve_model_path", lambda p, *a, **k: "/tmp/fake.gguf"
+    )
+
+    cfg = AgentConfig()
+    cfg.llm_backend = "llama_cpp"
+    cfg.llm_model_path = "/tmp/fake.gguf"
+    cfg.max_context_tokens = 32768
+    cfg.local_llm_n_ctx = 16384
+    backend = LlamaCppBackend(cfg.llm_model_path, cfg)
+    assert backend._n_ctx == 16384
+    assert backend.context_window == 16384
+
+    # local_llm_n_ctx 超过逻辑窗口时不反向放大（保持 ≤ max_context_tokens）。
+    cfg.local_llm_n_ctx = 65536
+    backend2 = LlamaCppBackend(cfg.llm_model_path, cfg)
+    assert backend2._n_ctx == 32768
+
+    # 极端小值有下限保护。
+    cfg.local_llm_n_ctx = 1
+    backend3 = LlamaCppBackend(cfg.llm_model_path, cfg)
+    assert backend3._n_ctx >= 512
+
+
 def test_tagged_parser_splits_reasoning_content_and_tool_call():
     parser = _TaggedOutputParser()
     events = []

@@ -1182,6 +1182,22 @@ class LlamaCppBackend(_LazyLocalBackend):
     def __init__(self, model_path: str, config: Any):
         super().__init__(resolve_model_path(model_path, expect_file=True), config)
         self._llama = None
+        # KV cache 预分配上限：见 config.local_llm_n_ctx。llama.cpp 加载时会按
+        # n_ctx 一次性预占整段 KV cache，取 max_context_tokens（默认 32768）会让
+        # 7B 模型预占 ~17GB，直接把内存吃爆（#158）。这里封到 local_llm_n_ctx，
+        # 且不超过逻辑窗口 max_context_tokens。
+        self._n_ctx = max(
+            512,
+            min(
+                int(getattr(config, "max_context_tokens", 32768)),
+                int(getattr(config, "local_llm_n_ctx", 16384)),
+            ),
+        )
+
+    @property
+    def context_window(self) -> int:
+        """后端硬上下文上限（#158）：agent 收缩阈值据此计算，避免喂超 n_ctx。"""
+        return self._n_ctx
 
     def _chat_handler(self):
         projection = getattr(self.config, "llm_vision_projection_path", "") or ""
@@ -1225,7 +1241,7 @@ class LlamaCppBackend(_LazyLocalBackend):
                 ) from e
             self._llama = Llama(
                 model_path=self.model_path,
-                n_ctx=max(512, int(getattr(self.config, "max_context_tokens", 32768))),
+                n_ctx=self._n_ctx,
                 n_batch=max(1, int(getattr(self.config, "local_model_batch_size", 512))),
                 n_threads=max(1, int(getattr(self.config, "local_model_threads", 4))),
                 n_gpu_layers=int(getattr(self.config, "local_gpu_layers", -1)),
