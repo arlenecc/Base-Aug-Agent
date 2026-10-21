@@ -119,10 +119,25 @@ def is_supported(ext: str) -> bool:
 #   3. 其余扫描件：先全量扫描分类，检测到
 #      表格的页面                              → 高保档
 #   4. 其余页面                                → 默认档
+# 注意：这条路径**默认不跑**（_dynamic_scale_enabled=False，全篇固定 2.0），
+# 由 config.rag_docling_dynamic_scale 显式开启——实测代价/收益不稳定，
+# 详见该配置项与开关处的注释。
 _OCR_SCALE_DEFAULT = 2.0   # 144 DPI
 _OCR_SCALE_TABLE = 2.5     # 180 DPI，表格页专用（边框/小字号对分辨率敏感）
 _SOURCE_DPI_CEILING = 150  # 原始扫描分辨率阈值
 _TEXT_LAYER_MIN_CHARS = 100  # 文本层字符数下限：达到即视为文本层页
+
+# 动态 OCR 倍率总开关（2026-10 实测后默认关闭，见 config.py
+# rag_docling_dynamic_scale 的代价/收益记录）。关闭时全篇固定 2.0，
+# 上面的逐页分析与分段转换整条路径不跑（分析本身 0.2s/5 页不是问题，
+# 问题是表格页升档后 OCR 像素 ×1.56 + 多建一个档位转换器）。
+_dynamic_scale_enabled = False
+
+
+def configure_dynamic_scale(enabled: bool) -> None:
+    """RAGEngine.__init__ 调用：设置动态 OCR 倍率开关（默认关）。"""
+    global _dynamic_scale_enabled
+    _dynamic_scale_enabled = bool(enabled)
 # 分类用的像素分析渲染 DPI。必须 >=150：扫描件通常按 300 DPI 栅格化，
 # 100 DPI 的 3:1 盒式降采样会把目录页的点线（leader dots）平均成连续
 # 灰带（(3×0+7×255)/10≈178 < 250 非白阈值），点线页被误判成表格；
@@ -608,10 +623,11 @@ def extract_markdown(filepath: str) -> Optional[str]:
     watchdog.daemon = True
     watchdog.start()
     try:
-        # PDF 走动态 scale：先逐页分析分类，再按档位切连续段分段转换、
-        # 按序拼接。分析或分段任一失败都回退下面的「整篇 + 默认档」老路径
-        # ——动态调整永远是优化，绝不让它成为新故障点。
-        if suffix == ".pdf":
+        # PDF 走动态 scale（**需 config.rag_docling_dynamic_scale 显式开启**，
+        # 默认关闭全篇固定 2.0）：先逐页分析分类，再按档位切连续段分段
+        # 转换、按序拼接。分析或分段任一失败都回退下面的「整篇 + 默认档」
+        # 老路径——动态调整永远是优化，绝不让它成为新故障点。
+        if suffix == ".pdf" and _dynamic_scale_enabled:
             profiles = _analyze_pdf_pages(path)
             if profiles is not None:
                 markdown = _extract_pdf_by_scale(path, profiles)

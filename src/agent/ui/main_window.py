@@ -465,7 +465,8 @@ class SyncKnowledgeWorker(QThread):
                  force: bool = False, rerank_model: str = "", pdf_engine: str = "docling",
                  model_options: Optional[Dict[str, Any]] = None,
                  ocr_backend: str = "mlx", ocr_model: str = "",
-                 ocr_model_path: str = ""):
+                 ocr_model_path: str = "",
+                 docling_dynamic_scale: bool = False):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -475,6 +476,7 @@ class SyncKnowledgeWorker(QThread):
         self._ocr_backend = ocr_backend or "mlx"
         self._ocr_model = ocr_model
         self._ocr_model_path = ocr_model_path
+        self._docling_dynamic_scale = bool(docling_dynamic_scale)
         self._model_options = dict(model_options or {})
         self._force = force
         self._engine: Optional[RAGEngine] = None
@@ -559,6 +561,8 @@ class SyncKnowledgeWorker(QThread):
                 _engine_kwargs["ocr_model"] = self._ocr_model
             if self._ocr_model_path:
                 _engine_kwargs["ocr_model_path"] = self._ocr_model_path
+            # docling 动态 OCR 倍率（默认关，全篇固定 2.0）。
+            _engine_kwargs["docling_dynamic_scale"] = self._docling_dynamic_scale
             self._engine = RAGEngine(**_engine_kwargs)
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -2677,6 +2681,8 @@ class MainWindow(QMainWindow):
             ocr_backend=getattr(self.config, "rag_ocr_backend", "mlx"),
             ocr_model=getattr(self.config, "rag_ocr_model", ""),
             ocr_model_path=getattr(self.config, "rag_ocr_model_path", ""),
+            docling_dynamic_scale=getattr(
+                self.config, "rag_docling_dynamic_scale", False),
             model_options={
                 "embedding_backend": self.config.rag_embedding_backend,
                 "embedding_model_path": self.config.rag_embedding_model_path,

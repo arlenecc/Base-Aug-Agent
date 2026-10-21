@@ -134,6 +134,12 @@ class AgentConfig:
     rag_ocr_backend: str = "mlx"
     rag_ocr_model: str = "OvisOCR2-0.8B-MLX-4bit"
     rag_ocr_model_path: str = "models/OvisOCR2-0.8B-MLX-4bit"
+    # docling 动态 OCR 倍率（逐页分析：表格页升 ocr_options.scale=2.5）。
+    # 2026-10 实测（5 页中文扫描书，MPS + ocrmac，离线计时）：表格密集件
+    # 耗时 +87%（20.0s vs 10.7s），而 char 级质量收益不稳定（输出字符数
+    # 完全一致），且目录页装饰线会被误判成表格页——故默认关闭，全篇固定
+    # scale=2.0。需要表格高保真的用户在配置文件里开 true。
+    rag_docling_dynamic_scale: bool = False
 
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
@@ -173,6 +179,7 @@ class AgentConfig:
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
+                    "rag_docling_dynamic_scale",
                     "llm_enable_thinking", "aux_llm_enable_thinking")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。

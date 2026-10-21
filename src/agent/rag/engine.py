@@ -503,6 +503,7 @@ class RAGEngine:
         ocr_backend: str = "mlx",
         ocr_model: str = "",
         ocr_model_path: str = "",
+        docling_dynamic_scale: bool = False,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -539,6 +540,13 @@ class RAGEngine:
             _ovis_configure(ocr_backend, ocr_model, ocr_model_path)
         except Exception as e:
             logger.debug("RAG: ovis configure error: %s", e)
+        # docling 动态 OCR 倍率（默认关，全篇固定 scale=2.0；表格密集件
+        # 实测 +87% 耗时而 char 级质量收益为零，见 config 项注释）。
+        try:
+            from .docling_parser import configure_dynamic_scale
+            configure_dynamic_scale(docling_dynamic_scale)
+        except Exception as e:
+            logger.debug("RAG: docling dynamic scale configure error: %s", e)
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出

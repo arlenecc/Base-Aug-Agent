@@ -199,6 +199,88 @@ def test_contiguous_runs_split_and_order():
 
 # ---------- 分析缓存与失败回退 ----------
 
+# ---------- 动态倍率开关（默认关，config.rag_docling_dynamic_scale） ----------
+
+def _fake_converter(markdown="# fake"):
+    class _Doc:
+        def export_to_markdown(self):
+            return markdown
+
+    class _Result:
+        document = _Doc()
+
+    class _FakeConverter:
+        def convert(self, path):
+            return _Result()
+
+    return _FakeConverter()
+
+
+def _one_page_pdf(tmp_path, name="one.pdf"):
+    """最小单页 PDF（有文本层，内容随意——门控测试只关心路由）。"""
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((72, 100), "Any page content for routing tests." * 3)
+    pdf = tmp_path / name
+    doc.save(str(pdf))
+    doc.close()
+    return pdf
+
+
+def test_dynamic_scale_default_off(tmp_path, monkeypatch):
+    """默认关闭：extract_markdown 不走逐页分析，整篇固定 2.0（用户要求的默认行为）。"""
+    pdf = _one_page_pdf(tmp_path)
+    analyzed = []
+    monkeypatch.setattr(dp, "is_docling_available", lambda: True)
+    monkeypatch.setattr(dp, "_analyze_pdf_pages",
+                        lambda p: analyzed.append(p) or None)
+    scales_seen = []
+
+    def _fake_get(scale=dp._OCR_SCALE_DEFAULT):
+        scales_seen.append(scale)
+        return _fake_converter()
+
+    monkeypatch.setattr(dp, "_get_converter", _fake_get)
+    md = dp.extract_markdown(str(pdf))
+    assert md == "# fake"
+    assert not analyzed, "默认关闭时不应触发逐页分析"
+    assert scales_seen == [dp._OCR_SCALE_DEFAULT], \
+        f"默认应只用 2.0 档转换器，实际: {scales_seen}"
+
+
+def test_dynamic_scale_opt_in(tmp_path, monkeypatch):
+    """显式开启后：走逐页分析 + 分段转换路径。"""
+    pdf = _one_page_pdf(tmp_path, name="one2.pdf")
+    seg_calls = []
+    dp.configure_dynamic_scale(True)
+    try:
+        monkeypatch.setattr(dp, "is_docling_available", lambda: True)
+        monkeypatch.setattr(dp, "_analyze_pdf_pages", lambda p: "FAKE_PROFILES")
+        monkeypatch.setattr(dp, "_extract_pdf_by_scale",
+                            lambda p, profiles: seg_calls.append(profiles) or "# seg")
+        md = dp.extract_markdown(str(pdf))
+    finally:
+        dp.configure_dynamic_scale(False)  # 恢复默认，避免污染其它测试
+    assert md == "# seg"
+    assert seg_calls == ["FAKE_PROFILES"]
+
+
+def test_configure_dynamic_scale_semantics():
+    """开关语义：配置即状态，默认关闭。"""
+    assert dp._dynamic_scale_enabled is False
+    dp.configure_dynamic_scale(True)
+    assert dp._dynamic_scale_enabled is True
+    dp.configure_dynamic_scale(False)
+    assert dp._dynamic_scale_enabled is False
+
+
+def test_config_default_off():
+    """config.py 默认值：动态倍率关闭（2026-10 实测代价/收益不成比例）。"""
+    from agent.config import AgentConfig
+
+    assert AgentConfig().rag_docling_dynamic_scale is False
+
+
 def test_analysis_cache_hit(tmp_path):
     """同文件二次分析命中缓存（同一对象）。"""
     profiles = _analyze(tmp_path, [_text_page_image()], dpi=300, name="c.pdf")
