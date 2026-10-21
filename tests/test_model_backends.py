@@ -78,6 +78,48 @@ def test_llamacpp_n_ctx_bounded_by_local_llm_n_ctx(monkeypatch):
     assert backend3._n_ctx >= 512
 
 
+def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
+    """#159：统一 MLX 内存策略必须把 buffer cache 从默认 95% RAM 封顶到 ~6GB
+    （避免 prefill 长上下文时大注意力矩阵每步反复释放重分配 → 生成抖动卡顿），
+    并把总内存封顶到 ~80% RAM（避免 OS 换页卡死）。同时验证幂等。"""
+    from agent import model_backends as mb
+    import sys, types
+
+    class FakeMX:
+        def __init__(self):
+            self.memory_limit = 15 * 1024 ** 3   # 默认 95% RAM（16G 机器）
+            self.cache_limit = 15 * 1024 ** 3
+        def get_memory_limit(self):
+            return self.memory_limit
+        def get_cache_limit(self):
+            return self.cache_limit
+        def set_memory_limit(self, v):
+            self.memory_limit = v
+        def set_cache_limit(self, v):
+            self.cache_limit = v
+
+    fake = FakeMX()
+    mlx_pkg = types.ModuleType("mlx")
+    mlx_core = types.ModuleType("mlx.core")
+    mlx_core.get_memory_limit = fake.get_memory_limit
+    mlx_core.get_cache_limit = fake.get_cache_limit
+    mlx_core.set_memory_limit = fake.set_memory_limit
+    mlx_core.set_cache_limit = fake.set_cache_limit
+    monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+    monkeypatch.setattr(mb, "_mlx_ram_bytes", lambda: 16 * 1024 ** 3)
+
+    mb.apply_mlx_memory_policy()
+    # 总内存封顶到 80% RAM = 12.8GB（低于默认 15GB）
+    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.80)
+    # buffer cache 封顶到 6GB（远低于默认 15GB，且远大于原 1GB 抖动阈值）
+    assert fake.cache_limit == 6 * 1024 ** 3
+    # 幂等：再调用值不变、不报错
+    mb.apply_mlx_memory_policy()
+    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.80)
+    assert fake.cache_limit == 6 * 1024 ** 3
+
+
 def test_tagged_parser_splits_reasoning_content_and_tool_call():
     parser = _TaggedOutputParser()
     events = []

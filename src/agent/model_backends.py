@@ -433,6 +433,43 @@ class _LazyLocalBackend:
         return self
 
 
+def _mlx_ram_bytes() -> int:
+    """返回物理内存字节数；取不到时兜底 16GB。"""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return 16 * 1024 ** 3
+
+
+def apply_mlx_memory_policy() -> None:
+    """统一 MLX 内存策略（幂等，可多次调用）。聊天后端与 RAG 嵌入后端共用，
+    保证一致、互不压低。
+
+    memory_limit：取「当前上限」与「~80% 物理 RAM」的较小值。默认 95% RAM
+        （16G 机器 ~15G）会把统一内存吃满到系统上限，物理内存耗尽后系统换页 →
+        卡死。压到 80% 给系统留余量即可避免；同时不抬高用户主动设的更严上限。
+    cache_limit：取「当前上限」与「min(40% RAM, 6GB)（至少 1GB）」的较小值。
+        默认 95% RAM 的 buffer cache 会一路涨到系统上限；但上一版压到 1GB 又会
+        在 prefill/长上下文时让 `[seq,seq]` 注意力矩阵（单层即可超 1GB）每步
+        反复释放重分配 → 生成抖动卡顿（表现为「每句话都卡、历史越长越卡」）。
+        6GB 量级既能封顶、又足够跨层复用。
+    """
+    try:
+        import mlx.core as mx
+
+        ram = _mlx_ram_bytes()
+        mem_cap = max(int(ram * 0.80), 6 * 1024 ** 3)
+        cur_mem = int(mx.get_memory_limit())
+        mx.set_memory_limit(min(cur_mem, mem_cap))
+
+        cache_cap = min(int(ram * 0.40), 6 * 1024 ** 3)
+        cache_cap = max(cache_cap, 1024 ** 3)
+        cur_cache = int(mx.get_cache_limit())
+        mx.set_cache_limit(min(cur_cache, cache_cap))
+    except Exception as e:  # pragma: no cover - 失败不影响加载
+        logger.debug("设置 MLX 内存策略失败（忽略）: %s", e)
+
+
 class MLXLanguageBackend(_LazyLocalBackend):
     """Direct MLX-LM text model backend."""
 
@@ -476,27 +513,10 @@ class MLXLanguageBackend(_LazyLocalBackend):
             except ImportError as e:
                 raise LLMError("MLX-LM 未安装，请安装: pip install mlx-lm") from e
             logger.info("正在从本地加载 MLX-LM: %s", self.model_path)
-            # wired memory limit：mlx_lm CLI 默认会设，不设时 macOS 可能把
-            # GPU 工作集换页，吞吐明显下降（实测 decode 与 prefill 都受影响）。
-            # 失败不影响加载，只是少一层性能保障。
-            try:
-                from mlx_lm.utils import maybe_set_recommended_wired_limit
-
-                limit = maybe_set_recommended_wired_limit()
-                if limit:
-                    logger.info("MLX wired memory limit 已设置: %.1f GB", limit / 1024 ** 3)
-            except Exception as e:  # pragma: no cover - 性能优化，失败无所谓
-                logger.debug("设置 wired memory limit 失败（忽略）: %s", e)
-            # 限制 MLX Metal buffer cache 上限（默认≈95% RAM，即 16G 机器 ~15G）。
-            # 不调的话，长对话生成时 buffer cache 一路涨到系统上限，物理内存被吃满后
-            # 系统换页 → 内存冲到十几 G 并卡死（ovis_ocr.py 同款根因）。这里只封顶
-            # 可复用的 scratch buffer（cache），不限制模型权重体积——避免大模型因
-            # 内存上限被压到 8GB 而加载失败（RAG 的辅助模型才需要更严的全局上限）。
-            try:
-                import mlx.core as mx
-                mx.set_cache_limit(1024 ** 3)  # 1GB
-            except Exception as e:  # pragma: no cover - 失败不影响加载
-                logger.debug("设置 MLX cache 上限失败（忽略）: %s", e)
+            # 统一 MLX 内存策略：总内存封顶 ~80% RAM（防 OS 换页卡死），buffer
+            # cache 封顶 ~6GB（防 prefill 长上下文时大注意力矩阵每步反复释放重分配
+            # 造成的生成抖动）。详见 apply_mlx_memory_policy。
+            apply_mlx_memory_policy()
             self._model_obj, self._tokenizer = load(
                 self.model_path,
                 lazy=False,
@@ -768,13 +788,9 @@ class MLXVLMBackend(_LazyLocalBackend):
             if config_path.exists():
                 self._model_config = json.loads(config_path.read_text(encoding="utf-8"))
             logger.info("正在从本地加载 MLX-VLM: %s", self.model_path)
-            # 同 MLXLLMBackend：封顶 MLX Metal buffer cache，避免长对话生成把
-            # 物理内存吃满到系统上限后换页卡死。只限 cache，不限制模型权重体积。
-            try:
-                import mlx.core as mx
-                mx.set_cache_limit(1024 ** 3)  # 1GB
-            except Exception as e:  # pragma: no cover - 失败不影响加载
-                logger.debug("设置 MLX cache 上限失败（忽略）: %s", e)
+            # 同 MLXLLMBackend：统一 MLX 内存策略（总内存封顶 80% RAM、buffer
+            # cache 封顶 ~6GB），避免长对话/prefill 长上下文抖动或内存吃满换页卡死。
+            apply_mlx_memory_policy()
             self._model_obj, self._processor = load(self.model_path, lazy=False, strict=True)
             logger.info("MLX-VLM 加载完成: %s", self.model_path)
 

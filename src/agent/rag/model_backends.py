@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from ..model_backends import resolve_model_path
+from ..model_backends import resolve_model_path, apply_mlx_memory_policy
 
 logger = logging.getLogger(__name__)
 
@@ -25,37 +25,26 @@ EMBEDDING_BACKENDS = ("fastembed", "mlx", "onnx", "llama_cpp")
 # 间接产生（见 VectorStore.__init__），create_reranker_backend 仍容错处理。
 RERANKER_BACKENDS = ("fastembed", "mlx", "onnx")
 
-# MLX Metal buffer cache 上限（#fix: 同步期 phys_footprint 冲到 18-19GB）。
-# MLX 默认 memory_limit = recommendedMaxWorkingSetSize（实测 16GB 机器 =
-# 15.2GB，即 95% RAM），MetalAllocator 的 buffer cache 会一路涨到这个上限
-# 才被迫 release_cached_buffers——嵌入/重排批间释放的中间缓冲全部滞留在
-# cache 里，而 phys_footprint 把统一内存的 GPU 分配也计入，于是被推到接近
-# 物理内存。这不是泄漏，是默认上限太高：cache_limit 压到 1GB（超出立即归还
-# 系统，批间复用仍够用），memory_limit 仅在默认过高时压到 8GB 作兜底；
-# 模型权重/激活的实际占用不受影响。
+# MLX 内存策略：复用聊天后端同款 apply_mlx_memory_policy（#fix: 同步期
+# phys_footprint 冲到 18-19GB）。MLX 默认 memory_limit = 95% RAM（16G 机器
+# ~15G），buffer cache 会一路涨到系统上限；但单纯把 cache 压到 1GB 又会
+# 在 prefill 长上下文时让 `[seq,seq]` 注意力矩阵每步反复释放重分配 → 生成
+# 抖动卡顿。统一策略：总内存封顶 ~80% RAM（防 OS 换页卡死）、buffer cache
+# 封顶 ~6GB（既能封顶又足够跨层复用）。聊天后端与 RAG 共用，保证一致。
 _MLX_MEM_CAP_DONE = False
 
 
 def _cap_mlx_memory_limits() -> None:
-    """限制 MLX Metal buffer cache，避免同步期统一内存被 cache 吃满。"""
+    """限制 MLX 内存，避免同步期统一内存被 cache 吃满或 prefill 抖动。
+
+    直接复用聊天后端的统一策略 apply_mlx_memory_policy（见 model_backends.py），
+    保证两端内存上限一致、互不压低。
+    """
     global _MLX_MEM_CAP_DONE
     if _MLX_MEM_CAP_DONE:
         return
-    try:
-        import mlx.core as mx
-        before_mem = int(mx.get_memory_limit())
-        _GB = 1024 ** 3
-        mx.set_cache_limit(1 * _GB)
-        if before_mem > 8 * _GB:
-            mx.set_memory_limit(8 * _GB)
-        _MLX_MEM_CAP_DONE = True
-        logger.info(
-            "MLX 内存上限已设: cache_limit=1GB, memory_limit %.2fGB→%.2fGB "
-            "(默认约 95%% RAM，会把 buffer cache 一路涨到系统上限)",
-            before_mem / _GB, mx.get_memory_limit() / _GB,
-        )
-    except Exception as e:
-        logger.warning("设置 MLX 内存上限失败(忽略): %s", e)
+    apply_mlx_memory_policy()
+    _MLX_MEM_CAP_DONE = True
 
 _DEFAULT_DOC_PREFIX = "search_document: "
 _DEFAULT_QUERY_PREFIX = "search_query: "
