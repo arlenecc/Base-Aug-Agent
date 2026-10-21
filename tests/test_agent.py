@@ -46,6 +46,28 @@ def test_agent_streams_content_and_stops(config, recording_callbacks):
     assert recording_callbacks.usages == [{"total_tokens": 5, "prompt_tokens": 2, "completion_tokens": 3}]
 
 
+def test_warmup_primes_backend_with_full_system_prompt(config, recording_callbacks):
+    """#160：warmup 用完整 system prompt（含工具 schema）调用后端预热前缀，
+    且不写历史、不产生用户可见输出。"""
+    class _PrimeBackend:
+        def __init__(self):
+            self.calls = []
+
+        def prime_prefix_cache(self, system_prompt, tools=None):
+            self.calls.append((system_prompt, tools))
+
+    backend = _PrimeBackend()
+    agent = Agent(llm=backend, config=config, callbacks=recording_callbacks)
+    agent.warmup()
+
+    assert len(backend.calls) == 1
+    sysp, tools = backend.calls[0]
+    assert isinstance(sysp, str) and sysp          # 完整 system prompt
+    assert isinstance(tools, list) and tools       # 工具 schema 一并渲染进前缀
+    assert agent._history == []                    # 预热不写历史
+    assert recording_callbacks.content == []       # 不产生用户可见输出
+
+
 def test_agent_streams_reasoning(config, recording_callbacks):
     mock = MockLLM([[_evt("reasoning", "thinking..."),
                      _evt("content", "answer"),

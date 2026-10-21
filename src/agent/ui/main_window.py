@@ -380,22 +380,40 @@ class BridgeCallbacks(AgentCallbacks):
 
 
 class AgentWorker(QThread):
-    """跑一轮对话的工作线程。
+    """跑对话的**常驻**工作线程（``run()`` 循环，不每条消息退出）。
 
-    **实例由 MainWindow 常驻复用**（见 _ensure_agent_worker），不是每条消息
-    新建一个 —— MLX 的 KV 前缀缓存与其 stream 是线程局部的，换线程复用上一轮
-    的缓存会让 MLX 抛 "There is no Stream(gpu, N) in current thread"。
-    QThread 在 run() 返回后允许再次 start()（实测可重启）。
+    为什么必须常驻（MLX 的硬约束）：KV 前缀缓存与其 stream 是**线程局部**的。
+    换一个 OS 线程复用上一轮的缓存，MLX 会抛
+        RuntimeError: There is no Stream(gpu, N) in current thread
+    （已实测确认）。若每条消息让 ``run()`` 跑完返回、下次再 ``start()``，Qt 会
+    在新 OS 线程上执行 ``run()``——缓存每轮作废，于是每轮都全量 prefill
+    （3500 token ~25s，表现为「每句话都卡几十秒」）。
+
+    因此：首次 ``_ensure_agent_worker`` 里 ``start()`` 一次；之后每条消息只
+    ``set_input(text)`` 唤醒同一线程。``cancel()`` 让循环退出（关窗时用）。
     """
+
+    warmup_done = pyqtSignal()
 
     def __init__(self, agent: Agent, callbacks: BridgeCallbacks):
         super().__init__()
         self._agent = agent
         self._callbacks = callbacks
-        self._user_text: Optional[str] = None
+        self._cond = threading.Condition()
+        self._pending_text: Optional[str] = None
+        self._warmup_pending = False
+        self._stopping = False
 
     def set_input(self, text: str) -> None:
-        self._user_text = text
+        with self._cond:
+            self._pending_text = text
+            self._cond.notify()
+
+    def request_warmup(self) -> None:
+        """请求在本线程预热（只 prefill system+tools 前缀，不生成、不写历史）。"""
+        with self._cond:
+            self._warmup_pending = True
+            self._cond.notify()
 
     def set_agent(self, agent: Agent) -> None:
         """更新本轮要跑的 agent。
@@ -405,14 +423,41 @@ class AgentWorker(QThread):
         """
         self._agent = agent
 
+    def cancel(self) -> None:
+        """让常驻循环退出（关窗时用；取消当前生成用 callbacks.cancel()）。"""
+        with self._cond:
+            self._stopping = True
+            self._cond.notify()
+
     def run(self) -> None:  # type: ignore[override]
-        try:
-            assert self._user_text is not None
-            self._agent.run(self._user_text)
-        except Exception as e:
-            self._callbacks.bridge.error.emit(f"{type(e).__name__}: {e}")
-        finally:
-            self._callbacks.bridge.finished.emit()
+        while True:
+            with self._cond:
+                while (self._pending_text is None
+                       and not self._warmup_pending
+                       and not self._stopping):
+                    self._cond.wait()
+                if self._stopping:
+                    return
+                text = self._pending_text
+                self._pending_text = None
+                # 有真实输入时优先处理输入；预热留到空闲时再做。
+                do_warmup = text is None and self._warmup_pending
+                if do_warmup:
+                    self._warmup_pending = False
+            if do_warmup:
+                try:
+                    self._agent.warmup()
+                except Exception:
+                    pass
+                finally:
+                    self.warmup_done.emit()
+                continue
+            try:
+                self._agent.run(text)
+            except Exception as e:
+                self._callbacks.bridge.error.emit(f"{type(e).__name__}: {e}")
+            finally:
+                self._callbacks.bridge.finished.emit()
 
 
 class FetchModelsWorker(QThread):
@@ -861,6 +906,11 @@ class MainWindow(QMainWindow):
         # 启动自动加载期间：加载失败只记日志不弹窗（开机就弹模态框很吵，
         # 而且用户还没看到界面，点了也不知道在回应什么）。
         self._model_autoloading: bool = False
+        # 预热（prefill system+tools 前缀）状态：状态栏要能区分「模型已加载」
+        # 与「真正可对话」。预热期间状态栏显示「正在预热模型…」，结束后显示
+        # 「就绪」——否则用户无从判断什么时候才轮到自己输入。
+        self._warmup_in_progress: bool = False
+        self._warmup_started: Optional[float] = None
         # 切换主模型模式（本地/OpenAI）时若 agent 正在对话，无法安全重建，
         # 先记下、等本轮结束（_on_finished）再应用，避免把正在跑的 worker 的
         # 后端换掉导致崩溃。
@@ -1869,7 +1919,7 @@ class MainWindow(QMainWindow):
         # the old agent's tools/MCP/httpx mid-execution, causing the running
         # AgentWorker to crash when its next tool call hits destroyed tools.
         # The user must wait for the current turn to finish (or stop it first).
-        if self._busy or self._is_worker_running(self._worker):
+        if self._busy:
             QMessageBox.warning(
                 self, "正在运行",
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再应用配置。",
@@ -1955,7 +2005,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # pragma: no cover - 防御
             logger.warning("UI: 保存模式失败: %s", e)
         self._update_model_controls()
-        if self._busy or self._is_worker_running(self._worker):
+        if self._busy:
             # 对话进行中无法安全重建 agent：标记延迟到本轮结束（_on_finished）
             # 再应用，避免把正在跑的 worker 的后端换掉导致崩溃。
             self._pending_mode_sync = True
@@ -2280,7 +2330,7 @@ class MainWindow(QMainWindow):
                 self, "请稍候", "正在处理另一个模型操作。"
             )
             return
-        if self._busy or self._is_worker_running(self._worker):
+        if self._busy:
             QMessageBox.warning(
                 self, "正在运行",
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再加载模型。",
@@ -2357,7 +2407,7 @@ class MainWindow(QMainWindow):
         if self._model_busy.get(role, False):
             QMessageBox.information(self, "请稍候", "正在处理另一个模型操作。")
             return
-        if self._busy or self._is_worker_running(self._worker):
+        if self._busy:
             QMessageBox.warning(
                 self, "正在运行",
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再卸载模型。",
@@ -2408,6 +2458,12 @@ class MainWindow(QMainWindow):
                     self._agent.aux_llm = llm
             self._append_log(f"[model] {label} 已加载: {payload.get('detail', '')}")
             self.status_label.setText(f"{label}已加载")
+            if role == "main":
+                # 后台预热 system+tools 前缀：让用户第一次输入直接命中 KV 缓存
+                # （否则首条要全量 prefill system + 工具 schema，约 20s）。
+                # 放在状态栏写入之后：预热会把状态改成「正在预热模型…」，
+                # 若反过来会被「主模型已加载」盖掉，用户就看不出还没就绪。
+                self._request_warmup()
         except Exception as e:
             QMessageBox.critical(self, f"{label}加载失败", f"{type(e).__name__}: {e}")
             self.status_label.setText(f"{label}加载失败")
@@ -2974,15 +3030,15 @@ class MainWindow(QMainWindow):
             RuntimeError: There is no Stream(gpu, N) in current thread
         表现为「第一条消息正常、第二条必崩」。
 
-        后端已有跨线程作废兜底（model_backends 的 _kv_thread_uid），但那等于
+        后端已有跨线程作废兜底（model_backends 的 _kv_thread_ident），但那等于
         每轮都把缓存丢掉重建——多轮对话的提速收益就没了。让所有对话跑在同一条
-        常驻线程上，缓存跨轮也能命中，提速才真正生效。
-
-        QThread 在 run() 返回后允许再次 start()（已实测三轮连续重启）。
+        **常驻**线程上（AgentWorker.run 循环，不每条消息退出），缓存跨轮才真正
+        命中。注意：QThread 重新 start() 会跑在**新的 OS 线程**上，所以绝不能
+        每条消息 start 一次——只在首次创建时 start，之后仅 set_input 唤醒。
         """
         worker = self._worker
         if worker is None:
-            # 只在首次（或 closeEvent 关掉之后）创建。
+            # 只在首次（或 closeEvent 关掉之后）创建并启动一次。
             worker = AgentWorker(self._agent, self._callbacks)
             self._worker = worker
             # 换新线程 → 上一轮线程建的 KV 缓存必须作废：OS 线程终止后
@@ -2990,11 +3046,44 @@ class MainWindow(QMainWindow):
             # ident** 而被后端误判成同线程，复用已失效的缓存照样崩。这里
             # 显式失效，与后端 _kv_thread_ident 检查构成双保险。
             self._invalidate_llm_kv_caches()
+            worker.warmup_done.connect(self._on_warmup_done)
+            worker.start()
             return worker
         # agent 可能已被 _rebuild_agent 换掉（改配置 / 换模型）：必须换上新的，
         # 否则新一轮跑的还是旧 agent（旧模型、旧工具）。
         worker.set_agent(self._agent)
         return worker
+
+    def _request_warmup(self) -> None:
+        """让常驻对话线程预填 system+tools 的 KV 前缀（不生成、不写历史）。
+
+        只在主模型加载完成、agent 空闲时调用。预热跑在常驻线程上，保证缓存与
+        后续生成同线程；用户此时若发消息，输入优先，预热留到空闲再做。
+        """
+        try:
+            if self._agent is None or self._busy:
+                return
+            worker = self._ensure_agent_worker()
+            worker.request_warmup()
+            self._warmup_in_progress = True
+            self._warmup_started = time.monotonic()
+            self.status_label.setText("正在预热模型…（结束后显示「就绪」）")
+            self._append_log("[warmup] 后台预热 system+tools 前缀…")
+        except Exception as e:  # pragma: no cover - 预热失败不影响对话
+            logger.debug("UI: 预热请求失败（忽略）: %s", e)
+
+    def _on_warmup_done(self) -> None:
+        elapsed: Optional[float] = None
+        if self._warmup_started is not None:
+            elapsed = max(0.0, time.monotonic() - self._warmup_started)
+            self._warmup_started = None
+        self._warmup_in_progress = False
+        suffix = f"（{elapsed:.1f}s）" if elapsed is not None else ""
+        self._append_log(f"[warmup] 预热完成，首条输入可直接命中缓存{suffix}")
+        # 只在「模型仍在且空闲」时改成就绪，避免盖掉「正在生成…」「已卸载」等
+        # 更贴近当下的事实。
+        if not self._busy and not self._sync_busy and self._llm is not None:
+            self.status_label.setText(f"就绪{suffix}")
 
     def _invalidate_llm_kv_caches(self) -> None:
         """失效主/辅助模型的跨轮 KV 缓存（换线程、切模型等场景）。
@@ -3012,14 +3101,11 @@ class MainWindow(QMainWindow):
     def _on_send(self) -> None:
         if self._busy:
             return
-        # 只看 _busy 是不够的：_on_finished 在 worker 没能 2s 内 join 时会保留
-        # self._worker 并把 _busy 置 False。此时再发送会**覆盖**那个仍在运行的
-        # QThread 的最后一个 Python 引用 —— GC 一旦回收就是 Qt 的
-        # "QThread: Destroyed while thread is still running" qFatal，进程直接
-        # 退出（无提示）。必须等旧线程真正结束。
-        if self._is_worker_running(self._worker):
-            self.status_label.setText("上一轮对话仍在收尾，请稍候再发送")
-            return
+        # 常驻 worker 线程始终 isRunning(True)（等待下一条消息），所以这里
+        # **不能**再用 `_is_worker_running(self._worker)` 判「上一轮未结束」——
+        # 那会永远拒绝发送。忙碌状态统一由 self._busy 表示（_on_send 置位、
+        # _on_finished 复位），且 _on_finished 只在本轮 agent.run 返回后触发，
+        # 届时 worker 已回到等待态，发送是安全的。
         # 同步知识库时禁止对话：两个线程会并发读写同一个 LanceDB 目录，
         # 且同步结束的 reload_rag() 会把 agent 正在用的表句柄置空重开。
         if self._sync_busy or self._is_worker_running(self._sync_worker):
@@ -3057,8 +3143,8 @@ class MainWindow(QMainWindow):
         # 注意这里**不能**再连 finished → deleteLater：线程要留着复用。
         self._finish_handled = False
         worker = self._ensure_agent_worker()
+        # 常驻线程：首次已在 _ensure_agent_worker 里 start()，之后只唤醒。
         worker.set_input(text)
-        worker.start()
 
     def _on_stop(self) -> None:
         # 终止当前 agent 对话（不再处理同步取消，同步取消由 _on_stop_sync 负责）
@@ -3240,6 +3326,12 @@ class MainWindow(QMainWindow):
         self.think_view.insertPlainText(text)
         self._pin_to_bottom(self.think_view)
 
+    # 结果冗长、对当前对话没有增量价值的工具：内容只进日志，聊天区最多留一行
+    # 「已完成」摘要。典型是 rag_status——它会把知识库目录、切片数、整份已索引
+    # 文件清单一次性打出来（实测 80 个文件 ~3000 字符），对话里既挤满屏幕也白白
+    # 占据上下文；用户真正关心的内容由随后的 rag_search 结果给出。
+    _LOG_ONLY_TOOLS = frozenset({"rag_status"})
+
     def _on_tool_start(self, name: str, args: Any) -> None:
         import json as _json
         # 工具调用前必须先把攒下的流式文本落地，否则工具输出会插在它前面。
@@ -3250,20 +3342,36 @@ class MainWindow(QMainWindow):
             pretty = _json.dumps(args, ensure_ascii=False)
         except Exception:
             pretty = str(args)
-        self._append_chat(f'<p class="t">🔧 <b>{self._escape(name)}</b>({self._escape(pretty)})…</p>')
         self._append_log(f"[tool-start] {name} {pretty}")
+        if name in self._LOG_ONLY_TOOLS:
+            # 聊天区连调用行也不写：整个调用只留结尾一行摘要，避免「有头无尾」。
+            return
+        self._append_chat(f'<p class="t">🔧 <b>{self._escape(name)}</b>({self._escape(pretty)})…</p>')
 
     def _on_tool_end(self, name: str, result: Any) -> None:
         out = result.to_message() if hasattr(result, "to_message") else str(result)
+        ok = getattr(result, "success", True)
+        self._append_log(f"[tool-end] {name} success={ok} :: {out[:4000]}")
+        if name in self._LOG_ONLY_TOOLS:
+            # 失败必须让用户直接看见；成功只留一行「完成」——状态内容本身
+            # 对当前对话没有增量价值（后面的 rag_search 结果才是要看的）。
+            if ok:
+                self._append_chat(
+                    f'<p class="t">↳ <b>{self._escape(name)}</b> → 完成</p>'
+                )
+            else:
+                self._append_chat(
+                    f'<p class="sys">↳ <b>{self._escape(name)}</b> → {self._escape(out[:200])}</p>'
+                )
+            return
         # 长输出保留头 + 尾：报错摘要、最终状态几乎总在末尾，只截开头会让
         # 用户（和模型）看不到关键信息。完整内容进日志面板。
         if len(out) > 400:
             snippet = f"{out[:260]}\n  …（省略 {len(out) - 380} 字符）…\n{out[-120:]}"
         else:
             snippet = out
-        cls = "t" if getattr(result, "success", True) else "sys"
+        cls = "t" if ok else "sys"
         self._append_chat(f'<p class="{cls}">↳ <b>{self._escape(name)}</b> → {self._escape(snippet)}</p>')
-        self._append_log(f"[tool-end] {name} success={getattr(result,'success',True)} :: {out[:4000]}")
         # task_plan 变更后立即刷新右上面板：不依赖 600ms 轮询，避免「新计划写盘了
         # 但面板还停在旧计划 / 多次更新只看到最后一帧」的问题（#计划面板）。轮询
         # 仍作为兜底。
@@ -3346,20 +3454,10 @@ class MainWindow(QMainWindow):
         if self._pending_mode_sync and not self._sync_busy:
             self._pending_mode_sync = False
             self._apply_mode_sync()
-        # Join the worker thread before dropping our reference. bridge.finished
-        # is emitted from the worker's `finally`, so run() has already returned
-        # and wait() returns near-instantly -- but without it, dropping the last
-        # Python reference can GC the QThread while its OS thread is still
-        # winding down, which Qt aborts as "destroyed while still running".
-        if worker is not None and not self._join_worker(worker, msecs=300):
-            # 超时不能照样丢弃引用：线程还在跑时 GC 会被 Qt abort。用定时器
-            # 异步重试——旧实现在这里阻塞等 2s，同步跑 ONNX 时主线程被 GIL
-            # 饿死，很容易命中。常驻 worker 的引用一直保留在 self._worker
-            # （_on_send 会据此拒绝新消息），无需重新赋值。
-            self._schedule_worker_join(worker)
-        # Now that streaming is done and the worker thread has joined, it's
-        # safe to show the skill-suggestion modal dialog without blocking
-        # the UI event loop during streaming.
+        # 常驻 worker 每条消息后**不会**结束（run() 回到等待态），所以这里
+        # 不能 join（会等一个永不返回的线程），也不能 schedule_worker_join；
+        # 引用一直保留在 self._worker，下一条消息只 set_input 唤醒。
+        # 现在流式已结束，可以安全弹出技能建议对话框。
         self._show_pending_skill_dialog()
 
     def _shutdown_worker(self, worker, label: str, cancel: bool = False,

@@ -1977,26 +1977,41 @@ class VectorStore:
 
     @_store_op
     def list_sources(self) -> List[str]:
-        """Return unique source filenames in the store."""
+        """Return unique source filenames in the store.
+
+        性能关键：**不要**用 ``table.to_arrow(columns=["source"])`` 做列投影。
+        本地 LanceDB 版本不接受 ``columns`` 参数，会直接抛 TypeError，随后
+        兜底的 ``table.to_arrow().to_pylist()`` 会把整表（57 万行 × 768 维
+        向量 + 全文）读进 Python，实测单次 200+ 秒、约 2GB 内存。而
+        ``status()`` 每次都要调用它，于是表现为「每句消息都卡几分钟」。
+
+        改用查询构造器的 ``select([...])``——它把列投影下推到 Lance 存储层，
+        只读 ``source`` 列（实测 57 万行约 0.6 秒）。
+        """
         self._ensure_initialized()
         table = self._ensure_table()
-        if table is None or table.count_rows() == 0:
+        if table is None:
             return []
-        # 用 pyarrow compute 的 unique() 在 Arrow 层去重，
-        # 避免 to_pylist() 把全部行转换成 Python 对象（10 万行 = 10 万字符串）
+        try:
+            count = table.count_rows()
+        except Exception:
+            count = 0
+        if count == 0:
+            return []
         try:
             import pyarrow.compute as pc
-            arrow_tbl = table.to_arrow(columns=["source"])
+            # 投影下推：只读 source 列，避免把向量列一起读出来。
+            arrow_tbl = table.search().select(["source"]).limit(count).to_arrow()
             unique_sources = pc.unique(arrow_tbl["source"]).to_pylist()
             return sorted([s for s in unique_sources if s])
+        except Exception as e:
+            logger.debug("list_sources 投影查询失败，回退全表读: %s", e)
+        # 兜底：全表读（会连同向量一起读，很慢——仅当投影路径不可用时）。
+        try:
+            all_data = table.to_arrow().to_pylist()
+            return sorted({r.get("source", "") for r in all_data if r and r.get("source")})
         except Exception:
-            # Fallback: load source column and dedupe in Python
-            try:
-                all_data = table.to_arrow(columns=["source"]).to_pylist()
-            except Exception:
-                all_data = table.to_arrow().to_pylist()
-            sources = sorted({r.get("source", "") for r in all_data if r and r.get("source")})
-            return sources
+            return []
 
     # ------------------------------------------------------------------
     # documents metadata table (Meta-context + Targeted RAG)
@@ -2119,9 +2134,14 @@ class VectorStore:
             try:
                 cols = ["doc_id", "doc_name", "digest", "chapters", "md_path"]
                 try:
-                    rows = table.to_arrow(columns=cols).to_pylist()
+                    # 同 list_sources：to_arrow() 不接受 columns 参数，用查询
+                    # 构造器的 select() 做投影下推，避免把整表（含完整 markdown）
+                    # 读进内存。
+                    n = table.count_rows()
+                    rows = table.search().select(cols).limit(n).to_arrow().to_pylist()
                 except Exception:
-                    # 旧表没有 md_path 列 → 退化为全列读取（仍不含 markdown 之外的重列）。
+                    # 旧表没有 md_path 列 / 投影不支持 → 退化为全列读取，
+                    # 但随后会 pop 掉 markdown，绝不长期缓存。
                     rows = table.to_arrow().to_pylist()
             except Exception as e:
                 logger.warning("读取文档元数据失败: %s", e)

@@ -533,7 +533,12 @@ class MLXLanguageBackend(_LazyLocalBackend):
             n += 1
         return n
 
-    def _prompt(self, messages: List[Dict[str, Any]], tools) -> Any:
+    def _prompt(
+        self,
+        messages: List[Dict[str, Any]],
+        tools,
+        add_generation_prompt: bool = True,
+    ) -> Any:
         # enable_thinking 由配置面板的「思考模式」开关控制
         # （config.llm_enable_thinking；辅助模型经 _AuxConfigView 映射到
         # aux_llm_enable_thinking）：
@@ -548,7 +553,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
         # 老 tokenizer 不认识该参数时 TypeError 会被下面的兜底吃掉。
         kwargs: Dict[str, Any] = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": add_generation_prompt,
             "enable_thinking": bool(
                 getattr(self.config, "llm_enable_thinking", True)
             ),
@@ -573,6 +578,52 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         continue
             kwargs.pop("tools", None)
             return self._tokenizer.apply_chat_template(messages, **kwargs)
+
+    def prime_prefix_cache(self, system_prompt: str, tools=None) -> None:
+        """只 **prefill**（不生成）「system + tools」这段公共前缀，填好 KV 缓存。
+
+        为什么这样做：真实生成会往缓存里追加输出 token，而混合架构
+        （ArraysCache）不可裁剪，一旦缓存里多了几个 token，下一条 prompt 就
+        不再是它的前缀 → 缓存整体作废 → 首条真实输入仍要全量 prefill（~20s）。
+        这里只跑前向、不采样，缓存恰好等于「system+tools」前缀；首条真实 prompt
+        以它开头，可直接命中复用（只 prefill 新增的 user 轮 token）。
+
+        必须在**常驻对话线程**上调用（KV 缓存与 stream 是线程局部的），
+        由 AgentWorker 的 warmup 任务保证。
+        """
+        self._ensure_loaded()
+        with self._generation_lock:
+            try:
+                prompt = self._prompt(
+                    [{"role": "system", "content": system_prompt}],
+                    tools,
+                    add_generation_prompt=False,
+                )
+                encode = getattr(self._tokenizer, "encode", None)
+                if not callable(encode):
+                    return
+                ids = encode(prompt)
+                if not isinstance(ids, list):
+                    ids = list(ids)
+                if not ids:
+                    return
+                import mlx.core as mx
+                from mlx_lm.models.cache import make_prompt_cache
+
+                cache = make_prompt_cache(self._model_obj)
+                model = self._model_obj
+                # 分块前向填 KV；与 stream_generate 的 prefill 同款（input[None]）。
+                step = 2048
+                for i in range(0, len(ids), step):
+                    chunk = ids[i:i + step]
+                    model(mx.array([chunk]), cache=cache)
+                    mx.eval([c.state for c in cache])
+                self._kv_cache = cache
+                self._kv_ids = list(ids)
+                self._kv_thread_ident = threading.get_ident()
+                logger.info("MLX 预热: 已预填 %d token 的 system+tools 前缀", len(ids))
+            except Exception as e:  # pragma: no cover - 预热失败不影响正常对话
+                logger.warning("MLX 预热失败（忽略）: %s", e)
 
     def chat_stream(self, messages, tools=None, temperature=0.7):
         self._ensure_loaded()
@@ -632,7 +683,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 # 建的就整份作废，在本线程重建。跨线程复用会让 MLX 在**当前**
                 # 线程的 stream 表里找不到建缓存那个线程的 stream：
                 #   RuntimeError: There is no Stream(gpu, N) in current thread
-                # 每条消息都是新的 AgentWorker 线程，所以不检查就是「第二轮必崩」。
+                # 因此 AgentWorker 必须常驻同一 OS 线程（不能每条消息 start 一次）。
                 if (self._kv_cache is not None
                         and self._kv_thread_ident != threading.get_ident()):
                     logger.info(

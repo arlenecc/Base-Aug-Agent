@@ -267,6 +267,70 @@ def test_load_and_unload_local_model(qtbot, tmp_path, monkeypatch):
     assert loaded._closed                     # 旧的被关掉释放内存
     assert win._agent.llm is not loaded       # agent 拿到了全新的后端
     assert win.llm_load_btn.text() == "加载模型"
+
+
+def test_warmup_status_shown_in_status_bar(qtbot, tmp_path, monkeypatch):
+    """预热期间状态栏显示「正在预热模型…」，完成后显示「就绪」。
+
+    用户反馈：预热结束的提示只写在独立日志窗口里，主界面看不出什么时候
+    才真正可用，所以状态栏必须承担这个「就绪」信号。
+    """
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    class _StubWorker:
+        def __init__(self):
+            self.requests = 0
+
+        def request_warmup(self):
+            self.requests += 1
+
+    stub = _StubWorker()
+    monkeypatch.setattr(win, "_ensure_agent_worker", lambda: stub)
+    win._busy = False
+    win._llm = object()  # _on_warmup_done 只在模型仍在时改成就绪
+
+    win._request_warmup()
+    assert stub.requests == 1
+    assert win._warmup_in_progress
+    assert "正在预热模型" in win.status_label.text()
+
+    win._on_warmup_done()
+    assert not win._warmup_in_progress
+    assert win.status_label.text().startswith("就绪")
+
+
+def test_rag_status_result_kept_out_of_chat_view(qtbot, tmp_path, monkeypatch):
+    """rag_status 的状态详情（含整份文件清单）只进日志窗口。
+
+    用户反馈：一次 rag_status 就往对话里塞几十行文件清单，既挤满聊天区也白占
+    上下文；这里确认聊天区只剩一行摘要，完整内容可在日志窗口查。
+    """
+    from agent.tools.base import ToolResult
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    win.chat_view.clear()
+    win.log_view.clear()
+
+    out = (
+        "知识库状态:\n"
+        "  知识库目录: /tmp/kb/\n"
+        "  已存储切片数: 572200\n"
+        "  已索引文件数: 80\n"
+        + "\n".join(f"    - book-{i}.epub" for i in range(80))
+    )
+    win._on_tool_start("rag_status", {})
+    win._on_tool_end("rag_status", ToolResult(success=True, output=out))
+
+    chat = win.chat_view.toPlainText()
+    assert "book-0.epub" not in chat        # 文件清单不进聊天区
+    assert "572200" not in chat             # 状态细节也不进
+    assert "↳ rag_status → 完成" in chat    # 只留一行完成提示
+
+    log = win.log_view.toPlainText()
+    assert "572200" in log                  # 完整状态在日志里
+    assert "book-79.epub" in log
     assert win.llm_load_btn.styleSheet() == ""  # 卸载后恢复默认样式（不再绿色）
 
 

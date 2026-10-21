@@ -263,6 +263,22 @@ class Agent:
             except Exception:  # pragma: no cover - defensive
                 pass
 
+    def warmup(self) -> None:
+        """预热本地后端：只 prefill「system + tools」前缀，不生成、不写历史。
+
+        让用户第一次真实输入直接命中 KV 缓存（否则首条要全量 prefill system
+        + 工具 schema，约 20s）。必须在常驻对话线程上调用（KV 缓存线程局部），
+        由 AgentWorker 的 warmup 任务保证。对不支持的 backend（HTTP）是 no-op。
+        """
+        try:
+            prime = getattr(self.llm, "prime_prefix_cache", None)
+            if not callable(prime):
+                return
+            tools = self.tools.schemas() if self.tools is not None else None
+            prime(self._system_prompt(), tools)
+        except Exception as e:  # pragma: no cover - 预热失败不影响正常对话
+            self._log(f"[warmup] 预热失败（忽略）: {e}")
+
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._history = []
