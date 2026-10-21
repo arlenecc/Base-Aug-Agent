@@ -797,6 +797,7 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 154 | `config.py` 新增数值/布尔字段漏登记到强转清单，旧配置字符串原样进 dataclass | 重启即崩溃或算术运行时错 | `_coerce` 兜底按 dataclass 声明类型（从 `__dataclass_fields__`）强转 |
 | 155 | `_rebuild_agent` 孤儿后端关闭守卫依赖 `_model_obj`，`LLMClient` 无此属性 | OpenAI 后端 httpx 连接池泄漏 | 守卫改为「有 `close()` 且未 `_closed`」 |
 | 156 | 首检 `search()` 同步全量回填向量（模型下载时卡数分钟）；技能检索每次查询全目录 `os.walk`+`stat` | 首次语义检索阻塞调用线程；每次检索附带目录遍历 | 首检回填改为后台 daemon 线程异步执行（本次先走 keyword 兜底）；mtime 计算节流留待后续 |
+| 157 | MLX 聊天/视觉后端加载时不调 MLX buffer cache 上限（默认≈95% RAM） | 本地模型对话时 cache 涨到系统上限 → 内存冲到 13G+ 卡死（权重仅 ~3G，差额全是 cache） | 两个 MLX 后端 `_ensure_loaded` 内 `mx.set_cache_limit(1GB)` 封顶 scratch buffer（不限权重体积，免大模型加载失败） |
 
 ## 部署
 

@@ -487,6 +487,16 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     logger.info("MLX wired memory limit 已设置: %.1f GB", limit / 1024 ** 3)
             except Exception as e:  # pragma: no cover - 性能优化，失败无所谓
                 logger.debug("设置 wired memory limit 失败（忽略）: %s", e)
+            # 限制 MLX Metal buffer cache 上限（默认≈95% RAM，即 16G 机器 ~15G）。
+            # 不调的话，长对话生成时 buffer cache 一路涨到系统上限，物理内存被吃满后
+            # 系统换页 → 内存冲到十几 G 并卡死（ovis_ocr.py 同款根因）。这里只封顶
+            # 可复用的 scratch buffer（cache），不限制模型权重体积——避免大模型因
+            # 内存上限被压到 8GB 而加载失败（RAG 的辅助模型才需要更严的全局上限）。
+            try:
+                import mlx.core as mx
+                mx.set_cache_limit(1024 ** 3)  # 1GB
+            except Exception as e:  # pragma: no cover - 失败不影响加载
+                logger.debug("设置 MLX cache 上限失败（忽略）: %s", e)
             self._model_obj, self._tokenizer = load(
                 self.model_path,
                 lazy=False,
@@ -758,6 +768,13 @@ class MLXVLMBackend(_LazyLocalBackend):
             if config_path.exists():
                 self._model_config = json.loads(config_path.read_text(encoding="utf-8"))
             logger.info("正在从本地加载 MLX-VLM: %s", self.model_path)
+            # 同 MLXLLMBackend：封顶 MLX Metal buffer cache，避免长对话生成把
+            # 物理内存吃满到系统上限后换页卡死。只限 cache，不限制模型权重体积。
+            try:
+                import mlx.core as mx
+                mx.set_cache_limit(1024 ** 3)  # 1GB
+            except Exception as e:  # pragma: no cover - 失败不影响加载
+                logger.debug("设置 MLX cache 上限失败（忽略）: %s", e)
             self._model_obj, self._processor = load(self.model_path, lazy=False, strict=True)
             logger.info("MLX-VLM 加载完成: %s", self.model_path)
 
