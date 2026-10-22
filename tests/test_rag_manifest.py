@@ -632,3 +632,76 @@ def test_cached_markdown_with_comments_is_self_healed(monkeypatch, tmp_path):
     engine.ingest(force=False)     # 文件未改 → 命中缓存 → 自愈
     healed = open(md_path, encoding="utf-8").read()
     assert "<!--" not in healed
+
+
+def test_clean_markdown_document_strips_all_noise_and_keeps_semantics():
+    """clean_markdown_document 统一清理 docling/marker/pandoc 的噪音标签，
+    但不破坏 Markdown 语义语法，且保护代码块。"""
+    from agent.rag.cleaner import clean_markdown_document
+
+    md = (
+        "# 标题\n\n"
+        "<!-- image -->\n"                                  # HTML 注释
+        "<div class='x'>正文段落</div>\n"                   # raw HTML（留正文）
+        "脚注<sup>1</sup>示例\n"                            # <sup>（留数字）
+        "![图1](figures/a.png)\n"                          # Markdown 图片（整段删）
+        "参见[目录](#toc-index)与[索引](#idx)\n"            # 内部锚点链接（留文字）
+        "\n```\nvector<int> x = f<a, b>();\n```\n"          # 代码块内 < > 不动
+        "\n| a | b |\n| - | - |\n| 1 | 2 |\n"              # 表格语法保留
+    )
+    out = clean_markdown_document(md)
+    assert "<!--" not in out
+    assert "<div" not in out and "</div>" not in out
+    assert "<sup>" not in out
+    assert "![图1]" not in out and "figures/a.png" not in out
+    assert "](#toc-index)" not in out and "](#idx)" not in out
+    # 链接文字 / 正文 / 脚注数字保留
+    assert "正文段落" in out
+    assert "脚注" in out and "1" in out
+    assert "目录" in out and "索引" in out
+    # 语义语法保留
+    assert "# 标题" in out
+    assert "| a | b |" in out
+    # 代码块内 < > 受保护
+    assert "vector<int> x = f<a, b>();" in out
+
+
+def test_clean_markdown_document_is_idempotent():
+    from agent.rag.cleaner import clean_markdown_document
+
+    md = "# 标题\n\n<!-- image -->\n<div>x</div>\n![a](b.png)\n[目录](#t)\n"
+    once = clean_markdown_document(md)
+    twice = clean_markdown_document(once)
+    assert once == twice
+
+
+def test_docling_markdown_full_cleanup_on_ingest(monkeypatch, tmp_path):
+    """docling 输出含注释/raw HTML/图片/内部链接 → 入库前一并清掉。"""
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(
+        tmp_path, store, extra_files={"scan.pdf": b"%PDF-1.4 fake"})
+    docling_md = (
+        "# 报告标题\n\n第一段。\n\n"
+        "<!-- image -->\n"
+        "<div class='cap'>图注</div>\n"
+        "![图](fig.png)\n"
+        "见[附录](#app)。\n"
+    )
+    monkeypatch.setattr(
+        "agent.rag.engine._extract_with_pdf_engine",
+        lambda fp, pe="docling": (docling_md, True),
+    )
+    engine.ingest(force=True)
+    md_files = [f for f in os.listdir(engine.markdown_dir) if f.endswith(".md")]
+    cached = open(os.path.join(engine.markdown_dir, md_files[0]), encoding="utf-8").read()
+    assert "<!--" not in cached
+    assert "<div" not in cached
+    assert "![图]" not in cached and "fig.png" not in cached
+    assert "](#app)" not in cached
+    assert "# 报告标题" in cached and "图注" in cached and "附录" in cached
+    assert all(
+        "<!--" not in r.get("text", "")
+        and "<div" not in r.get("text", "")
+        and "](#" not in r.get("text", "")
+        for r in store.records
+    )

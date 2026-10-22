@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
-from .cleaner import clean_text, fix_hard_wraps, normalize_markdown, strip_html_comments
+from .cleaner import clean_text, fix_hard_wraps, normalize_markdown, clean_markdown_document
 from .chunker import chunk_documents
 from .document_outline import build_digest, build_toc
 from .pandoc_parser import (
@@ -944,17 +944,18 @@ class RAGEngine:
                                 try:
                                     with open(md_path, "r", encoding="utf-8") as f:
                                         raw = f.read()
-                                    # 自愈：历史版本（未剥注释）缓存的 markdown 可能
-                                    # 含 <!-- image --> 等注释，读出来顺手落盘，避免
-                                    # 每次同步都重复剥、且让脏缓存被永久修好。
-                                    if "<!--" in raw:
-                                        raw = strip_html_comments(raw)
+                                    # 自愈：历史缓存（旧版本只剥了部分噪音）可能仍含
+                                    # <!-- image --> 注释 / raw HTML 标签 / Markdown
+                                    # 图片语法 / 内部锚点链接，读出时跑一遍完整清理并
+                                    # 落盘，让脏缓存被永久修好（clean_markdown_document
+                                    # 幂等，无变化的文件不会触发重写）。
+                                    cleaned = clean_markdown_document(raw)
+                                    if cleaned != raw:
                                         try:
                                             with open(md_path, "w", encoding="utf-8") as f:
-                                                f.write(raw)
+                                                f.write(cleaned)
                                         except OSError:
                                             pass
-                                    cleaned = raw
                                     if not cleaned.strip():
                                         raise OSError("cached markdown is empty")
                                     _log("    ├─ 清洗文本: %s (使用缓存 Markdown, %d 字符)", fname, len(cleaned))
@@ -965,10 +966,12 @@ class RAGEngine:
                                 if is_markdown:
                                     # docling/marker/ovis 已输出规范 Markdown，不跑
                                     # clean_text（其 <[^>]+> 会误删标题/表格/上标语法）。
-                                    # 但 docling 默认把图片/图题导出成 <!-- image -->
-                                    # 占位注释（marker 也会透传少量 HTML 注释），必须
-                                    # 单独剥掉，否则大量进入切片/嵌入。
-                                    cleaned = strip_html_comments(text)
+                                    # 但三引擎都会吐非正文噪音：docling 默认把图片/图题
+                                    # 导出成 <!-- image --> 注释、pandoc/marker 透传 raw
+                                    # HTML 标签与 Markdown 图片/内部锚点链接……统一用
+                                    # clean_markdown_document 无损清理（剥噪音、留正文，
+                                    # 保护代码块），否则大量进入切片/嵌入。
+                                    cleaned = clean_markdown_document(text)
                                     _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
                                 else:
                                     # ---- 2. 清洗文本 ----

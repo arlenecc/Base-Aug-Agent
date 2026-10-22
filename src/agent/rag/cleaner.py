@@ -5,6 +5,8 @@ import logging
 import re
 from typing import List, Optional
 
+from .pandoc_parser import strip_markdown_noise, strip_raw_html
+
 logger = logging.getLogger(__name__)
 
 # 行内 <br> 变体（<br>、<br/>、<br />）——在通用标签剥离之前先替换为空格，
@@ -132,6 +134,39 @@ def strip_html_comments(text: str) -> str:
     if not text:
         return ""
     return re.sub(r'<!--[\s\S]*?-->', ' ', text)
+
+
+def clean_markdown_document(markdown: str) -> str:
+    """对 docling/marker/pandoc 输出的「规范 Markdown」做无损噪音清理。
+
+    这些路径在 engine 里被当作已成型 Markdown，不跑 :func:`clean_text`
+    （其 ``<[^>]+>`` 会误删标题/表格/上标等语义语法）。但三个引擎都会往
+    markdown 里吐「非正文噪音」，必须统一剥掉，否则大量进入切片与嵌入：
+
+      * **HTML 注释**：docling 默认把图片/图题导出成 ``<!-- image -->``，
+        marker/docling 偶尔透传其它 ``<!-- ... -->``（如 ``<!-- page ... -->``、
+        ``<!-- formula -->``）。
+      * **raw HTML 标签**：pandoc 转 docx/html/epub 会透传 ``<div>`` /
+        ``<span class=...>`` / ``<a id=...>`` / ``<sup>`` / ``<table>`` 等；
+        marker 也会吐 ``<sup>`` 脚注与原始 HTML；docling 在含 HTML 的源上
+        同理。仅剥标签、保留标签内正文，且要求标签首字母开头（避开散文
+        ``a < b`` 这类比较运算）。
+      * **Markdown 图片语法** ``![...](...)``：pandoc 转 epub/图版 PDF 会
+        产出成百上千条（图片本身不入库，留着只污染切片）；其它引擎个别情况
+        也会产。
+      * **内部锚点链接** ``[文字](#锚点)``：epub 的目录页/交叉引用会产出海量
+        这类导航噪音；剥掉链接语法但**保留链接文字**（目录条目名有语义）。
+
+    代码块（围栏/缩进）与行内代码 span 受保护——里面的 ``< >`` / ``![](x)``
+    是示例内容，不是噪音。顺序：注释 → raw HTML → 图片 → 内部链接。
+    幂等，pandoc 路径在 parser 里已做过同类清理，再跑一次零副作用。
+    """
+    if not markdown:
+        return ""
+    md = strip_html_comments(markdown)   # <!-- image --> 等注释
+    md = strip_raw_html(md)              # <div>/<span>/<sup>/<a> 等标签（留正文）
+    md = strip_markdown_noise(md)        # ![...](...) 与 [文字](#...)
+    return md
 
 
 def clean_text(text: str) -> str:
