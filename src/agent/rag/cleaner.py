@@ -122,6 +122,31 @@ def fix_hard_wraps(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
 
 
+# HTML 表格块：复杂表格 markdown 无法无损表示，须保留原始 <table> 块而非
+# 当普通标签剥掉（否则只剩散落文字、丢失行列结构）。清洗时整体掩成占位符、
+# 还原，避免被标签剥离/实体/控制字符等步骤损坏。用私用区字符做占位，避开
+# clean_text 里对 \x00 控制字符与各类零宽/空白的删除。
+_TABLE_BLOCK_RE = re.compile(r'<table\b[^>]*>[\s\S]*?</table>', re.IGNORECASE)
+
+
+def _mask_table_blocks(text: str):
+    """把 ``<table>...</table>`` 块掩成占位符，返回 (掩码文本, 还原函数)。"""
+    blocks: List[str] = []
+
+    def _repl(m: "re.Match") -> str:
+        blocks.append(m.group(0))
+        return f"\uE000{len(blocks) - 1}\uE000"
+
+    masked = _TABLE_BLOCK_RE.sub(_repl, text)
+
+    def _restore(t: str) -> str:
+        for i, b in enumerate(blocks):
+            t = t.replace(f"\uE000{i}\uE000", b)
+        return t
+
+    return masked, _restore
+
+
 def strip_html_comments(text: str) -> str:
     """只剥 HTML 注释（``<!-- ... -->``），不动任何 Markdown 语法。
 
@@ -159,6 +184,11 @@ def clean_markdown_document(markdown: str) -> str:
 
     代码块（围栏/缩进）与行内代码 span 受保护——里面的 ``< >`` / ``![](x)``
     是示例内容，不是噪音。顺序：注释 → raw HTML → 图片 → 内部链接。
+
+    **表格块保留**：复杂表格 markdown 无法无损表示，整段 ``<table>...</table>``
+    会被原样保留（含 ``<tr>/<td>/<th>`` 行列结构，不剥标签），而不是被拆散成
+    散落文字。docling/marker 默认把表格导成 markdown ``|`` 语法（本就保留）；
+    个别源（HTML 透传、raw HTML 块）产出的 HTML 表格块也借此保住。
     幂等，pandoc 路径在 parser 里已做过同类清理，再跑一次零副作用。
     """
     if not markdown:
@@ -178,6 +208,11 @@ def clean_text(text: str) -> str:
 
     # 0. 硬回车归一：CRLF/CR → LF（后续步骤统一按 \n 处理）。
     text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # 0.25 保护 HTML 表格块：复杂表格 markdown 表达不了，保留原始 <table>
+    # 块（含行列结构），待全部清洗步骤跑完后再还原，避免被标签/实体/控制
+    # 字符等步骤损坏。
+    text, _restore_tables = _mask_table_blocks(text)
 
     # 0.5 行内 <br> → 空格（必须在通用标签剥离之前，否则单词粘连）。
     text = _BR_RE.sub(' ', text)
@@ -215,6 +250,10 @@ def clean_text(text: str) -> str:
 
     # 10. Collapse multiple spaces (but preserve newlines)
     text = re.sub(r'[ \t]+', ' ', text)
+
+    # 10.5 还原 HTML 表格块：标签/实体/控制字符等步骤已跑完，把 <table>
+    # 块还原回正文，再交給下方行级垃圾过滤与空行收敛（表格内部行列结构保留）。
+    text = _restore_tables(text)
 
     # 11. Remove lines that are just garbage (very short, no letters/digits)
     lines = text.split('\n')

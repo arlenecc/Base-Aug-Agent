@@ -251,6 +251,29 @@ _INDENT_CODE_RE = re.compile(r'^(?:\t| {4,})\S')
 # 转义时，`` `[^`]+` `` 的掩码匹配不上），这些转义序列必须先掩掉。
 _ESCAPED_RE = re.compile(r'\\[`<>]')
 
+# HTML 表格块：复杂表格 markdown 无法无损表示，须保留原始 <table> 块（含行列
+# 结构），整体掩成占位符、剥离其余 raw HTML 后再还原——避免逐行剥标签时把
+# <table>/<tr>/<td> 拆散成散落文字、丢失表格结构。
+_TABLE_BLOCK_RE = re.compile(r'<table\b[^>]*>[\s\S]*?</table>', re.IGNORECASE)
+
+
+def _mask_table_blocks(text: str):
+    """把 ``<table>...</table>`` 块掩成占位符，返回 (掩码文本, 还原函数)。"""
+    blocks: list = []
+
+    def _repl(m: "re.Match") -> str:
+        blocks.append(m.group(0))
+        return '\x00T%d\x00' % (len(blocks) - 1)
+
+    masked = _TABLE_BLOCK_RE.sub(_repl, text)
+
+    def _restore(t: str) -> str:
+        for i, b in enumerate(blocks):
+            t = t.replace('\x00T%d\x00' % i, b)
+        return t
+
+    return masked, _restore
+
 
 def _strip_html_line(line: str, code_spans: list) -> str:
     """单行剥标签：先掩掉行内代码 span 与转义序列（里面的 < > 不能动）。"""
@@ -340,9 +363,13 @@ def strip_raw_html(markdown: str) -> str:
     """
     if not markdown:
         return markdown
+    # 保护 HTML 表格块：复杂表格 markdown 表达不了，保留原始 <table> 块（含
+    # 行列结构），整体掩掉后再剥其余 raw HTML，避免逐行剥标签把表格拆散。
+    masked, restore = _mask_table_blocks(markdown)
     # 围栏/缩进代码块的跳过逻辑统一由 _strip_outside_code 处理（图片与内部
     # 链接的剥离共用同一套保护）。
-    stripped_md = _strip_outside_code(markdown, lambda line: _strip_html_line(line, []))
+    stripped_md = _strip_outside_code(masked, lambda line: _strip_html_line(line, []))
+    stripped_md = restore(stripped_md)
     return re.sub(r'[ \t]{2,}', ' ', stripped_md)
 
 

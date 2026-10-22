@@ -705,3 +705,59 @@ def test_docling_markdown_full_cleanup_on_ingest(monkeypatch, tmp_path):
         and "](#" not in r.get("text", "")
         for r in store.records
     )
+
+
+def test_clean_markdown_document_preserves_html_table_blocks():
+    """复杂表格以 HTML <table> 块形式出现时，整段保留而不是被拆散。"""
+    from agent.rag.cleaner import clean_markdown_document
+
+    table = (
+        "<table>\n"
+        "  <tr><th>姓名</th><th>年龄</th></tr>\n"
+        "  <tr><td>张三</td><td>30</td></tr>\n"
+        "</table>"
+    )
+    md = f"# 标题\n\n正文。\n\n{table}\n\n结尾。\n"
+    out = clean_markdown_document(md)
+    assert "<table>" in out and "</table>" in out
+    assert "<tr>" in out and "<td>" in out and "<th>" in out
+    assert "张三" in out and "30" in out
+    # 同时其它噪音仍被清掉
+    assert "<!--" not in out
+
+
+def test_clean_text_preserves_html_table_blocks():
+    """clean_text（非 markdown 路径）也保住 <table> 块，不被 <[^>]+> 剥掉。"""
+    from agent.rag.cleaner import clean_text
+
+    table = (
+        "<table>\n<tr><td>cell &amp; more</td></tr>\n</table>"
+    )
+    out = clean_text(f"前面文字。\n\n{table}\n\n后面文字。")
+    assert "<table>" in out and "</table>" in out
+    assert "<tr>" in out and "<td>" in out
+    assert "cell" in out and "more" in out
+
+
+def test_docling_markdown_keeps_table_block_on_ingest(monkeypatch, tmp_path):
+    """docling 输出若含 HTML <table> 块（复杂表格），入库时整段保留。"""
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(
+        tmp_path, store, extra_files={"scan.pdf": b"%PDF-1.4 fake"})
+    docling_md = (
+        "# 报告\n\n正文。\n\n"
+        "<table>\n<tr><th>项目</th><th>值</th></tr>\n"
+        "<tr><td>精度</td><td>95%</td></tr>\n</table>\n\n"
+        "<!-- image -->\n"
+    )
+    monkeypatch.setattr(
+        "agent.rag.engine._extract_with_pdf_engine",
+        lambda fp, pe="docling": (docling_md, True),
+    )
+    engine.ingest(force=True)
+    md_files = [f for f in os.listdir(engine.markdown_dir) if f.endswith(".md")]
+    cached = open(os.path.join(engine.markdown_dir, md_files[0]), encoding="utf-8").read()
+    assert "<table>" in cached and "</table>" in cached
+    assert "<tr>" in cached and "<td>" in cached and "精度" in cached and "95%" in cached
+    assert "<!--" not in cached
+    assert all("<table>" in r.get("text", "") for r in store.records if "精度" in r.get("text", ""))
