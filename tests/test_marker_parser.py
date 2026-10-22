@@ -88,13 +88,13 @@ def test_extract_markdown_conversion_error_returns_none(monkeypatch, tmp_path):
 
 
 def test_release_converter_shuts_down_models(monkeypatch):
-    """release_converter must call shutdown_models with the artifact dict."""
+    """release_converter must call shutdown_models for every pooled converter."""
     from agent.rag import marker_parser as mp
 
-    calls = {}
+    calls = []
 
     def _fake_shutdown(artifact_dict):
-        calls["artifact"] = artifact_dict
+        calls.append(artifact_dict)
 
     import types, sys
 
@@ -102,20 +102,21 @@ def test_release_converter_shuts_down_models(monkeypatch):
     fake_marker_models.shutdown_models = _fake_shutdown
     monkeypatch.setitem(sys.modules, "marker.models", fake_marker_models)
 
-    converter = types.SimpleNamespace(artifact_dict={"layout": "x"})
-    monkeypatch.setattr(mp, "_converter", converter, raising=False)
+    c1 = types.SimpleNamespace(artifact_dict={"layout": "1"})
+    c2 = types.SimpleNamespace(artifact_dict={"layout": "2"})
+    monkeypatch.setattr(mp, "_converters", [c1, c2])
     mp.release_converter()
-    assert calls["artifact"] == {"layout": "x"}
-    assert mp._converter is None
+    assert calls == [{"layout": "1"}, {"layout": "2"}]
+    assert mp._converters == []
 
 
-def test_release_converter_noop_when_singleton_absent():
-    """release_converter with no singleton must not raise."""
+def test_release_converter_noop_when_pool_empty():
+    """release_converter with an empty pool must not raise."""
     from agent.rag import marker_parser as mp
 
-    saved = mp._converter
+    saved = mp._converters
     try:
-        mp._converter = None
+        mp._converters = []
         mp.release_converter()  # should not raise
     finally:
-        mp._converter = saved
+        mp._converters = saved

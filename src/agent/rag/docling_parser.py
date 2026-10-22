@@ -31,22 +31,32 @@ logger = logging.getLogger(__name__)
 # 对 epub 纯属浪费，故显式排除。若某天需要 docling 处理 epub，这里再加回。
 _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"}
 
-# Converter singletons keyed by OCR scale: docling models are heavy, so share
-# instances across all workers (access is guarded by a lock — DocumentConverter
-# is not documented as thread-safe). 动态 scale 方案下最多并存 2 个实例
-# （默认档 / 高保档），由 _analyze_pdf_pages 的分类结果决定用哪把钥匙。
+# Converter 实例池（按 OCR scale 分桶，每桶一个 list）。docling 模型很重，跨
+# worker 共享实例；DocumentConverter 未声明线程安全，存取/构建由 _pool_lock
+# 保护，并发执行转换由 _conv_gate（按文件大小限流）控制。
 #
-# 锁必须在模块导入时就创建好。旧实现在 _get_converter() 里「if _converter_lock
-# is None: _converter_lock = threading.Lock()」，这在并发首次调用时是典型的
-# check-then-act 竞态：两个线程各自新建一把锁，于是各自持自己的锁去创建
-# DocumentConverter —— 同时加载两份数百 MB 的模型。
+# 并发策略（见 _conv_gate 与 _LARGE_FILE_THRESHOLD / _SMALL_FILE_CONCURRENCY）：
+#   * 小文件（< 20MB）：最多 2 个转换器实例并发转换，加快小文件吞吐。
+#   * 大文件（>= 20MB）：独占（1 个实例），防止大文件并发把内存撑爆。
+# 实例池容量上限 = _SMALL_FILE_CONCURRENCY，避免无限制新建实例。
 #
-# 为什么是 RLock 而不是 Lock：「取转换器」与「执行转换」必须原子化（见
-# _convert_with_scale），而 _get_converter 内部也要拿这把锁——同线程重入
-# 需求，Lock 会直接死锁。
-_converters: dict = {}
-_converter_lock = threading.RLock()
+# 锁必须在模块导入时就创建好。旧实现在 _get_converter() 里「if 锁 is None:
+# 新建锁」是典型 check-then-act 竞态：两线程各自建锁，各自持锁去创建
+# DocumentConverter —— 同时加载两份数百 MB 模型。
+#
+# 为什么 _pool_lock 是 Lock 而非 RLock：取/还实例与构建不再需要「取实例」和
+# 「执行转换」同锁重入——执行转换的并发约束已交给 _conv_gate，_pool_lock 只
+# 负责池的取/还/构建这段临界区，纯互斥、无重入需求。
+from .concurrency_gate import SizeAwareConversionGate
+
+_converters: dict = {}            # scale(round) -> 空闲实例 list
+_pool_lock = threading.Lock()     # 保护 _converters 的取/还/构建
 _converter_unavailable = False
+
+# 按文件大小限流的并发闸门参数。
+_LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
+_SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
+_conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
 
 
 def release_converter() -> None:
@@ -54,9 +64,11 @@ def release_converter() -> None:
 
     Mirrors ``parsers.release_ocr_engine()``: ingestion runs in short bursts
     (a sync job), after which the converters' models would otherwise stay
-    resident for the whole process lifetime.
+    resident for the whole process lifetime. 只清空闲池里的实例——正在被某路
+    转换持有的实例会在该路 _release_pooled_converter 时自然归还（或随引用
+    回收），不会被这里强行打断。
     """
-    with _converter_lock:
+    with _pool_lock:
         _converters.clear()
 
 
@@ -74,16 +86,23 @@ _convert_count_lock = threading.Lock()
 
 
 def _convert_with_scale(path: str, scale: float) -> Optional[str]:
-    """取转换器 + 转换 + 导出，全程持 _converter_lock（原子化）。
+    """取转换器 + 转换 + 导出，全程持大小闸门（按文件大小限流并发实例数）。
 
-    为什么必须原子化（2026-10 并发审查修复）：旧实现在锁外取实例、锁内
-    转换——worker B 在锁外拿到 C1 引用后阻塞在锁上，A 转换完触发周期
-    回收清空缓存，C 随即新建 C2，B 醒来用**旧的 C1** 转换：两代转换器
-    （各带一整套布局 + TableFormer ≈ 1.9GB 统一内存）并存，周期回收
-    「把峰值限制在一代内」的设计目标作废。放进同一把锁内后，B 醒来时
-    取到的是重建后的 C2，旧 C1 随 A 的局部引用释放而回收。
+    并发约束不再靠「全局排他锁」串行化所有转换，而是交给 _conv_gate：
+      * 小文件（< 20MB）最多 _SMALL_FILE_CONCURRENCY(2) 路并发转换；
+      * 大文件（>= 20MB）独占（1 路），防止大文件并发把内存撑爆。
+
+    取/还实例走 _pool_lock 保护的空闲池（最多 2 个并存实例），见
+    _get_converter / _release_pooled_converter。闸门只控制「同一时刻有几路
+    转换在跑」，实例池控制「最多建几个实例」，二者解耦。
     """
-    with _converter_lock:
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        size = 0
+    _conv_gate.acquire(size)
+    converter = None
+    try:
         converter = _get_converter(scale)
         if converter is None:
             return None
@@ -91,15 +110,19 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
         md = result.document.export_to_markdown()
         result = None
         return md
+    finally:
+        _release_pooled_converter(scale, converter)
+        _conv_gate.release(size)
 
 
 def _maybe_recycle_converter() -> None:
     """每 _DOCLING_RECYCLE_DOCS 篇冲刷一次 docling 原生缓存。
 
-    在 **_converter_lock 之外**调用（转换流程的 finally 里）：锁虽是
-    RLock 可重入，但回收会清空缓存，没必要把「等锁」的其它 worker 挡在
-    这次清理之外；真正保证「不出现两代并存」的是 _convert_with_scale 的
-    原子取用（清缓存后新建的实例只会被后续取用者看到）。
+    在 **_conv_gate / _pool_lock 之外**调用（转换流程的 finally 里，且
+    _convert_with_scale 已 _conv_gate.release 之后）：只清空闲池里的实例
+    （release_converter 取 _pool_lock），不会打断正在跑的转换；真正保证
+    「不出现两代并存」的是 _conv_gate 的限流——清缓存后新建的实例只会被
+    后续取用者看到。
     """
     global _convert_count
     with _convert_count_lock:
@@ -176,8 +199,8 @@ _NONWHITE_LEVEL = 250      # 非白：抓住被降采样成 ~246 浅灰的印刷
 _MAX_LINE_THICK = 5        # 框线带最大厚度（像素）：文字行/照片通带排除
 
 
-def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
-    """Lazily build and cache the docling DocumentConverter for an OCR scale.
+def _build_converter(scale: float):
+    """构建一个新的 docling DocumentConverter（含版本兼容降级）。
 
     管线降配（版本兼容，全部包在 try/except 中，任何失败都回退默认构造）：
     accelerator 强制 MPS + 限 4 线程。docling 2.x 在 macOS 上默认
@@ -189,86 +212,111 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
     缓存反而 3.94→4.80GB 持续涨。附带收益：布局挪到 GPU 后，CPU 核让给
     RapidOCR 与嵌入模型，消除同步期的 CPU 争抢（调优器「降档避让」）。
 
-    ``scale`` 是该实例的 OCR 渲染倍率（72 DPI × scale），由调用方按页分类
-    结果选取：默认档 / 高保档，见 _OCR_SCALE_* 常量与 _analyze_pdf_pages。
-    同一 scale 的转换器全局共享一个实例（按 scale 键控）。
+    ``scale`` 是该实例的 OCR 渲染倍率（72 DPI × scale），见 _OCR_SCALE_*
+    常量与 _analyze_pdf_pages。构建失败抛异常，由调用方标记 unavailable。
+    """
+    from docling.document_converter import DocumentConverter
+
+    converter = None
+    try:
+        from docling.datamodel.accelerator_options import (
+            AcceleratorDevice,
+            AcceleratorOptions,
+        )
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            OcrAutoOptions,
+            PdfPipelineOptions,
+        )
+        from docling.document_converter import PdfFormatOption
+
+        pdf_opts = PdfPipelineOptions()
+        pdf_opts.accelerator_options = AcceleratorOptions(
+            num_threads=4, device=AcceleratorDevice.MPS
+        )
+        # 注意：这里**不要**动 pdf_opts.images_scale。
+        # images_scale 管的是版面/表格/图片描述模型用的**整页图**
+        # （page.image），与 OCR 渲染是两条独立通路；本机实测其默认
+        # 值是 1.0（72 DPI），把它设成 150/72 只会**抬高**整页图
+        # 分辨率、增加内存，与你想要的「限制」正好相反。
+        # OCR 的渲染倍率由下面的 OcrAutoOptions.scale 控制。
+        # OCR 引擎用 auto 探测（2026-10 实验切换）：
+        #   1. ocrmac（Apple Vision，系统级加速）优先；
+        #   2. 未安装 ocrmac / 请求语言不被 Vision 支持时自动回退
+        #      rapidocr（onnxruntime 后端），候选序见 docling
+        #      auto_ocr_model.py。
+        # lang 必须显式含 zh-Hans：OcrMacOptions 的字段默认值只有
+        # 西语系（en/es/fr/de），中文书会被 Vision 拒识；而 rapidocr
+        # 收到多语言时取第一个（zh-Hans → ch），回退路径不受影响。
+        # scale 是 OCR 的渲染倍率：页面按「72 DPI × scale」渲染
+        # （2.0 → 144 DPI，2.5 → 180 DPI，按页分类动态选取，见
+        # _analyze_pdf_pages）。docling 是对每个 OCR 区域**裁剪后**
+        # 单独渲染（get_page_image(scale=..., cropbox=ocr_rect)），
+        # 降 scale 直接减少送进 ocrmac/rapidocr 的像素量。
+        pdf_opts.ocr_options = OcrAutoOptions(
+            lang=["zh-Hans", "en-US"],
+            scale=scale,
+        )
+        converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
+        )
+        logger.info("docling DocumentConverter initialized (PDF 管线 MPS 加速 + 转换后归还缓存 + OCR scale=%.2f, OCR=auto: ocrmac→rapidocr)", scale)
+    except Exception as e:
+        # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
+        # 降配入口就用默认构造——正确性不受影响，默认 device='auto'
+        # 在 macOS 上同样走 MPS，只是少了 num_threads 限线程；
+        # 缓存护栏在 extract_markdown 的 finally 里兜底生效。
+        logger.info("docling 管线降配不可用（%s），使用默认配置", e)
+        converter = DocumentConverter()
+    return converter
+
+
+def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
+    """从空闲池取一个转换器，没有则惰性新建（全局最多 _SMALL_FILE_CONCURRENCY
+    个并存实例，跨 scale 桶合计也受此上限约束）。返回 None 表示 docling
+    不可用（导入/构建失败，已标记 _converter_unavailable）。
+
+    空闲池的取/还在 _pool_lock 下完成；构建较重（import torch + 加载模型），
+    刻意放到锁外，避免持池锁时阻塞其它 worker 取还实例。
     """
     global _converter_unavailable
     key = round(float(scale), 3)
-    cached = _converters.get(key)
-    if cached is not None:
-        return cached
-    if _converter_unavailable:
+    with _pool_lock:
+        pool = _converters.get(key)
+        if pool:
+            return pool.pop()
+        if _converter_unavailable:
+            return None
+    # 锁外构建（耗时、且可能 import torch，不应持池锁）。
+    try:
+        converter = _build_converter(scale)
+    except ImportError:
+        logger.info("docling not installed; falling back to per-format parsers")
+        _converter_unavailable = True
         return None
-    with _converter_lock:
-        cached = _converters.get(key)
-        if cached is not None:
-            return cached
-        try:
-            from docling.document_converter import DocumentConverter
+    except Exception as e:
+        logger.warning("failed to init docling converter: %s", e)
+        _converter_unavailable = True
+        return None
+    logger.info("docling DocumentConverter initialized (pooled, scale=%.2f)", scale)
+    return converter
 
-            converter = None
-            try:
-                from docling.datamodel.accelerator_options import (
-                    AcceleratorDevice,
-                    AcceleratorOptions,
-                )
-                from docling.datamodel.base_models import InputFormat
-                from docling.datamodel.pipeline_options import (
-                    OcrAutoOptions,
-                    PdfPipelineOptions,
-                )
-                from docling.document_converter import PdfFormatOption
 
-                pdf_opts = PdfPipelineOptions()
-                pdf_opts.accelerator_options = AcceleratorOptions(
-                    num_threads=4, device=AcceleratorDevice.MPS
-                )
-                # 注意：这里**不要**动 pdf_opts.images_scale。
-                # images_scale 管的是版面/表格/图片描述模型用的**整页图**
-                # （page.image），与 OCR 渲染是两条独立通路；本机实测其默认
-                # 值是 1.0（72 DPI），把它设成 150/72 只会**抬高**整页图
-                # 分辨率、增加内存，与你想要的「限制」正好相反。
-                # OCR 的渲染倍率由下面的 OcrAutoOptions.scale 控制。
-                # OCR 引擎用 auto 探测（2026-10 实验切换）：
-                #   1. ocrmac（Apple Vision，系统级加速）优先；
-                #   2. 未安装 ocrmac / 请求语言不被 Vision 支持时自动回退
-                #      rapidocr（onnxruntime 后端），候选序见 docling
-                #      auto_ocr_model.py。
-                # lang 必须显式含 zh-Hans：OcrMacOptions 的字段默认值只有
-                # 西语系（en/es/fr/de），中文书会被 Vision 拒识；而 rapidocr
-                # 收到多语言时取第一个（zh-Hans → ch），回退路径不受影响。
-                # scale 是 OCR 的渲染倍率：页面按「72 DPI × scale」渲染
-                # （2.0 → 144 DPI，2.5 → 180 DPI，按页分类动态选取，见
-                # _analyze_pdf_pages）。docling 是对每个 OCR 区域**裁剪后**
-                # 单独渲染（get_page_image(scale=..., cropbox=ocr_rect)），
-                # 降 scale 直接减少送进 ocrmac/rapidocr 的像素量。
-                pdf_opts.ocr_options = OcrAutoOptions(
-                    lang=["zh-Hans", "en-US"],
-                    scale=key,
-                )
-                converter = DocumentConverter(
-                    format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)}
-                )
-                logger.info("docling DocumentConverter initialized (PDF 管线 MPS 加速 + 转换后归还缓存 + OCR scale=%.2f, OCR=auto: ocrmac→rapidocr)", key)
-            except Exception as e:
-                # docling 版本差异（2.13x 前后多次移动模块路径）：拿不到
-                # 降配入口就用默认构造——正确性不受影响，默认 device='auto'
-                # 在 macOS 上同样走 MPS，只是少了 num_threads 限线程；
-                # 缓存护栏在 extract_markdown 的 finally 里兜底生效。
-                logger.info("docling 管线降配不可用（%s），使用默认配置", e)
-                converter = DocumentConverter()
-            _converters[key] = converter
-            logger.info("docling DocumentConverter initialized (global singleton, scale=%.2f)", key)
-            return converter
-        except ImportError:
-            logger.info("docling not installed; falling back to per-format parsers")
-            _converter_unavailable = True
-            return None
-        except Exception as e:
-            logger.warning("failed to init docling converter: %s", e)
-            _converter_unavailable = True
-            return None
+def _release_pooled_converter(scale: float, converter) -> None:
+    """把用过的转换器还回空闲池（按 scale 分桶），供后续并发复用。
+
+    只保留每桶最多 _SMALL_FILE_CONCURRENCY 个空闲实例，避免无限增长；多余
+    的丢弃引用（模型内存靠进程结束 / 周期回收释放，且每次 convert 后已
+    torch.mps.empty_cache() 归还 MPS 缓存）。key 可能已被周期回收 pop 掉，
+    用 setdefault 兜底。
+    """
+    if converter is None:
+        return
+    key = round(float(scale), 3)
+    with _pool_lock:
+        pool = _converters.setdefault(key, [])
+        if len(pool) < _SMALL_FILE_CONCURRENCY:
+            pool.append(converter)
 
 
 def _flush_mps_cache() -> None:
@@ -598,7 +646,7 @@ def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
                     # 该档全部转完，释放其转换器（只放这一把钥匙），把布局/
                     # TableFormer 模型占的统一内存还给系统；下一本书用到同档
                     # 位时惰性重建（~2s 模型加载 + ~10s 管线初始化）。
-                    with _converter_lock:
+                    with _pool_lock:
                         _converters.pop(round(float(scale), 3), None)
             finally:
                 import shutil
@@ -681,7 +729,8 @@ def extract_markdown(filepath: str) -> Optional[str]:
         # 放在 finally：成功与异常路径都清，防止异常密集时缓存照样累积。
         _flush_mps_cache()
         # 周期性冲刷 docling 原生缓存（见 _maybe_recycle_converter 注释）。
-        # 必须在 _converter_lock 之外：Lock 不可重入。
+        # _convert_with_scale 的 finally 已先 _conv_gate.release，这里不再持
+        # 任何闸门/池锁，回收只清空闲池。
         try:
             _maybe_recycle_converter()
         except Exception as e:  # 绝不能让回收逻辑影响解析结果

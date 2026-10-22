@@ -27,6 +27,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from .concurrency_gate import SizeAwareConversionGate
+
 logger = logging.getLogger(__name__)
 
 # surya 服务端（fast_layout / ocr_error / VLM 推理）由 marker 在首次转换时
@@ -47,11 +49,20 @@ for _var, _val in (
 # to docling / lightweight parsers without touching marker at all.
 _MARKER_EXTENSIONS = {".pdf"}
 
-_converter = None
-# RLock：_get_converter 内部也拿这把锁，「取实例 + 转换」必须在同一把锁内
-# 原子完成（持锁调用 _get_converter 需要同线程重入，Lock 会死锁）。
-_converter_lock = threading.RLock()
+# 转换器空闲池（list）。marker 的 PdfConverter 未声明线程安全，存取/构建由
+# _pool_lock 保护，并发执行转换由 _conv_gate（按文件大小限流）控制。
+#
+# 并发策略（见 _conv_gate 与阈值常量）：小文件（< 20MB）最多 2 个实例并发
+# 转换（各拉起一套 surya 服务端子进程），大文件（>= 20MB）独占，防止大文件
+# 并发把内存撑爆。空闲池上限 = _SMALL_FILE_CONCURRENCY。
+_converters: list = []
+_pool_lock = threading.Lock()
 _converter_unavailable = False
+
+# 按文件大小限流的并发闸门参数（与 docling_parser 同语义）。
+_LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
+_SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
+_conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
 
 
 def is_marker_available() -> bool:
@@ -75,76 +86,98 @@ def is_supported(ext: str) -> bool:
     return ext.lower() in _MARKER_EXTENSIONS
 
 
-def _get_converter():
-    """Lazily build and cache the marker PdfConverter singleton.
+def _build_converter():
+    """构建一个新的 marker PdfConverter（含版本兼容降级）。
 
     Models are NOT loaded here: create_model_dict() only constructs thin
     clients; the surya server subprocesses spawn on the first convert()
-    call and stay alive until shutdown_models().  Any construction
-    failure marks marker unavailable so the engine chain falls back to
-    docling without retrying a broken import on every page.
+    call and stay alive until shutdown_models(). 构建失败抛异常，由调用方
+    标记 unavailable。
     """
-    global _converter, _converter_unavailable
-    if _converter is not None:
-        return _converter
-    if _converter_unavailable:
-        return None
-    with _converter_lock:
-        if _converter is not None:
-            return _converter
-        try:
-            from marker.config.parser import ConfigParser
-            from marker.converters.pdf import PdfConverter
-            from marker.models import create_model_dict
+    from marker.config.parser import ConfigParser
+    from marker.converters.pdf import PdfConverter
+    from marker.models import create_model_dict
 
-            config_parser = ConfigParser({
-                "output_format": "markdown",
-                # RAG 管线只要文本：关闭图片裁剪/编码（每张图一次页面
-                # 渲染 + PNG 编码，扫描件/幻灯片类 PDF 上开销显著），
-                # markdown 中保留图片占位行为空。
-                "extract_images": False,
-                # 不用 LLM 后处理（需要 API key，且离线场景不可用）。
-                "use_llm": False,
-            })
-            converter = PdfConverter(
-                config=config_parser.generate_config_dict(),
-                artifact_dict=create_model_dict(),
-                processor_list=config_parser.get_processors(),
-                renderer=config_parser.get_renderer(),
-                llm_service=config_parser.get_llm_service(),
-            )
-            _converter = converter
-            logger.info("marker PdfConverter initialized (global singleton)")
-            return converter
-        except ImportError:
-            logger.info("marker not installed; engine chain falls back to docling")
-            _converter_unavailable = True
+    config_parser = ConfigParser({
+        "output_format": "markdown",
+        # RAG 管线只要文本：关闭图片裁剪/编码（每张图一次页面
+        # 渲染 + PNG 编码，扫描件/幻灯片类 PDF 上开销显著），
+        # markdown 中保留图片占位行为空。
+        "extract_images": False,
+        # 不用 LLM 后处理（需要 API key，且离线场景不可用）。
+        "use_llm": False,
+    })
+    converter = PdfConverter(
+        config=config_parser.generate_config_dict(),
+        artifact_dict=create_model_dict(),
+        processor_list=config_parser.get_processors(),
+        renderer=config_parser.get_renderer(),
+        llm_service=config_parser.get_llm_service(),
+    )
+    return converter
+
+
+def _get_converter():
+    """从空闲池取一个转换器，没有则惰性新建（最多 _SMALL_FILE_CONCURRENCY 个
+    并存实例）。返回 None 表示 marker 不可用（导入/构建失败，已标记
+    _converter_unavailable）。
+
+    空闲池的取/还在 _pool_lock 下完成；构建较重（拉起 surya 客户端），放到
+    锁外，避免持池锁时阻塞其它 worker 取还实例。
+    """
+    global _converter_unavailable
+    with _pool_lock:
+        if _converters:
+            return _converters.pop()
+        if _converter_unavailable:
             return None
-        except Exception as e:
-            logger.warning("failed to init marker converter: %s", e)
-            _converter_unavailable = True
-            return None
+    # 锁外构建（拉起 surya 客户端，较重）。
+    try:
+        converter = _build_converter()
+    except ImportError:
+        logger.info("marker not installed; engine chain falls back to docling")
+        _converter_unavailable = True
+        return None
+    except Exception as e:
+        logger.warning("failed to init marker converter: %s", e)
+        _converter_unavailable = True
+        return None
+    logger.info("marker PdfConverter initialized (pooled)")
+    return converter
+
+
+def _release_pooled_converter(converter) -> None:
+    """把用过的转换器还回空闲池；只保留最多 _SMALL_FILE_CONCURRENCY 个空闲
+    实例，避免无限增长（多余的丢弃引用，surya 子进程在 release_converter
+    时统一关停）。
+    """
+    if converter is None:
+        return
+    with _pool_lock:
+        if len(_converters) < _SMALL_FILE_CONCURRENCY:
+            _converters.append(converter)
 
 
 def release_converter() -> None:
-    """Shut down surya server subprocesses and drop the converter singleton.
+    """Shut down surya server subprocesses and drop all pooled converters.
 
     Mirrors ``docling_parser.release_converter()``: ingestion runs in
     short bursts, and marker's server children (VLM layout + recognition)
     would otherwise stay resident — each potentially holding GB of model
-    weights — for the whole process lifetime.
+    weights — for the whole process lifetime. 只清空闲池里的实例；正在被某
+    路转换持有的实例会在该路 _release_pooled_converter 时归还（或随引用
+    回收），不会被这里强行打断。
     """
-    global _converter
-    with _converter_lock:
-        if _converter is None:
-            return
+    with _pool_lock:
+        converters = list(_converters)
+        _converters.clear()
+    for c in converters:
         try:
             from marker.models import shutdown_models
 
-            shutdown_models(_converter.artifact_dict)
+            shutdown_models(c.artifact_dict)
         except Exception as e:
             logger.debug("marker: shutdown_models error: %s", e)
-        _converter = None
 
 
 def extract_markdown(filepath: str) -> Optional[str]:
@@ -162,20 +195,28 @@ def extract_markdown(filepath: str) -> Optional[str]:
         return None
 
     try:
-        # 与 docling 同样的理由：PdfConverter 未声明线程安全，ingest 的
-        # 4 个 worker 线程必须串行化转换；surya 服务端按请求批处理，
-        # 串行调用不损失吞吐。
-        # 取实例在锁内完成（2026-10 并发审查修复）：旧实现锁外取、锁内转，
-        # 与 release_converter 竞态会出现「A 转换完回收 → C 新建转换器 →
-        # B 仍用旧转换器」的两代并存——旧转换器的首次 convert 会再拉起一
-        # 整套 surya 服务端子进程，两组子进程并存直到 B 结束。
-        with _converter_lock:
+        # PdfConverter 未声明线程安全，并发执行转换由 _conv_gate 限流：
+        #   * 小文件（< 20MB）最多 2 路并发（各一套 surya 子进程）；
+        #   * 大文件（>= 20MB）独占，防止大文件并发把内存撑爆。
+        # 取/还实例走 _pool_lock 保护的空闲池（最多 2 个并存实例）。闸门只
+        # 控制「同时几路在跑」、池控制「最多建几个实例」，二者解耦；两代
+        # 并存竞态由闸门限流（而非全局排他锁）规避，转换完即归还实例。
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        _conv_gate.acquire(size)
+        converter = None
+        try:
             converter = _get_converter()
             if converter is None:
                 return None
             rendered = converter(str(path))
             markdown = rendered.markdown
             del rendered
+        finally:
+            _release_pooled_converter(converter)
+            _conv_gate.release(size)
         if not markdown or not markdown.strip():
             logger.warning("marker extracted empty markdown from %s", path.name)
             return None
