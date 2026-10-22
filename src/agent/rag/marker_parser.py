@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -63,6 +64,28 @@ _converter_unavailable = False
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
 _SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
 _conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
+
+# 闸门等待超过该秒数就打 INFO 日志（诊断「很久没输出」：区分等闸门 vs convert）。
+_GATE_WAIT_LOG_S = 5.0
+
+
+def configure_concurrency(small_capacity: Optional[int] = None,
+                          large_threshold_bytes: Optional[int] = None) -> None:
+    """RAGEngine.__init__ 调用：热更新大小闸门参数（不换闸门对象）。
+
+    默认值来自模块常量（小文件 2 路并发 / 20MB 独占）；config 的
+    rag_pdf_small_concurrency / rag_pdf_large_threshold_mb 经 engine 转发到
+    这里。内存吃紧的机器把 rag_pdf_small_concurrency 设 1 即退回全串行。
+    """
+    capacity = _SMALL_FILE_CONCURRENCY if small_capacity is None else int(small_capacity)
+    threshold = _LARGE_FILE_THRESHOLD if large_threshold_bytes is None \
+        else int(large_threshold_bytes)
+    capacity = max(1, capacity)
+    _conv_gate.configure(threshold, capacity)
+    logger.info(
+        "marker 转换并发闸门：小文件(< %.1fMB) 最多 %d 路并发，大文件独占",
+        threshold / (1024 * 1024), capacity,
+    )
 
 
 def is_marker_available() -> bool:
@@ -205,7 +228,18 @@ def extract_markdown(filepath: str) -> Optional[str]:
             size = path.stat().st_size
         except OSError:
             size = 0
+        t_wait = time.monotonic()
         _conv_gate.acquire(size)
+        waited = time.monotonic() - t_wait
+        if waited >= _GATE_WAIT_LOG_S:
+            # 诊断「很久没输出」：卡在等闸门（大文件独占/并发已满）会打本日志，
+            # 卡在 convert 本身则不会。
+            logger.info(
+                "marker 转换闸门等待 %.1fs 后开始转换（%s）: %s",
+                waited,
+                "大文件独占转换中" if size >= _conv_gate.threshold else "小文件并发已满",
+                path.name,
+            )
         converter = None
         try:
             converter = _get_converter()

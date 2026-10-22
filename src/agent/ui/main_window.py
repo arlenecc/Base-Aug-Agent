@@ -513,7 +513,9 @@ class SyncKnowledgeWorker(QThread):
                  ocr_model_path: str = "",
                  ocr_gguf_path: str = "", ocr_mmproj_path: str = "",
                  ocr_vlm_handler: str = "mtmd", ocr_chat_format: str = "",
-                 docling_dynamic_scale: bool = False):
+                 docling_dynamic_scale: bool = False,
+                 pdf_small_concurrency: int = 2,
+                 pdf_large_threshold_mb: float = 20.0):
         super().__init__()
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -528,6 +530,10 @@ class SyncKnowledgeWorker(QThread):
         self._ocr_vlm_handler = ocr_vlm_handler or "mtmd"
         self._ocr_chat_format = ocr_chat_format
         self._docling_dynamic_scale = bool(docling_dynamic_scale)
+        # PDF 大小限流并发：小文件并发路数 / 大文件阈值 MB（engine 转给两个
+        # 转换器的并发闸门）。内存吃紧时配 1 路即全串行。
+        self._pdf_small_concurrency = max(1, int(pdf_small_concurrency))
+        self._pdf_large_threshold_mb = float(pdf_large_threshold_mb)
         self._model_options = dict(model_options or {})
         self._force = force
         self._engine: Optional[RAGEngine] = None
@@ -614,6 +620,9 @@ class SyncKnowledgeWorker(QThread):
                 _engine_kwargs["ocr_model_path"] = self._ocr_model_path
             # docling 动态 OCR 倍率（默认关，全篇固定 2.0）。
             _engine_kwargs["docling_dynamic_scale"] = self._docling_dynamic_scale
+            # PDF 大小限流并发（小文件并发 / 大文件独占阈值）。
+            _engine_kwargs["pdf_small_concurrency"] = self._pdf_small_concurrency
+            _engine_kwargs["pdf_large_threshold_mb"] = self._pdf_large_threshold_mb
             self._engine = RAGEngine(**_engine_kwargs)
             self._emit_log("[rag] RAG 引擎初始化完成，开始同步...")
             stats = self._engine.ingest(
@@ -2846,6 +2855,11 @@ class MainWindow(QMainWindow):
             ocr_chat_format=getattr(self.config, "rag_ocr_chat_format", ""),
             docling_dynamic_scale=getattr(
                 self.config, "rag_docling_dynamic_scale", False),
+            # PDF 大小限流并发：小文件并发路数 / 大文件阈值 MB。
+            pdf_small_concurrency=getattr(
+                self.config, "rag_pdf_small_concurrency", 2),
+            pdf_large_threshold_mb=getattr(
+                self.config, "rag_pdf_large_threshold_mb", 20.0),
             model_options={
                 "embedding_backend": self.config.rag_embedding_backend,
                 "embedding_model_path": self.config.rag_embedding_model_path,

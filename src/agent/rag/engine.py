@@ -508,6 +508,8 @@ class RAGEngine:
         ocr_vlm_handler: str = "",
         ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
+        pdf_small_concurrency: int = 2,
+        pdf_large_threshold_mb: float = 20.0,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -555,6 +557,19 @@ class RAGEngine:
             configure_dynamic_scale(docling_dynamic_scale)
         except Exception as e:
             logger.debug("RAG: docling dynamic scale configure error: %s", e)
+        # PDF 转换按文件大小限流（小文件 N 路并发 / 大文件独占）。内存吃紧的
+        # 机器把 rag_pdf_small_concurrency 设 1 即退回全串行。
+        try:
+            threshold_bytes = max(1.0, float(pdf_large_threshold_mb)) * 1024 * 1024
+            from .docling_parser import configure_concurrency as _dc_cfg
+            _dc_cfg(max(1, int(pdf_small_concurrency)), int(threshold_bytes))
+        except Exception as e:
+            logger.debug("RAG: docling concurrency configure error: %s", e)
+        try:
+            from .marker_parser import configure_concurrency as _mk_cfg
+            _mk_cfg(max(1, int(pdf_small_concurrency)), int(threshold_bytes))
+        except Exception as e:
+            logger.debug("RAG: marker concurrency configure error: %s", e)
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出

@@ -179,6 +179,17 @@ class AgentConfig:
     # scale=2.0。需要表格高保真的用户在配置文件里开 true。
     rag_docling_dynamic_scale: bool = False
 
+    # PDF 转换按文件大小限流（docling / marker 两个转换器共用一套参数）：
+    #   - rag_pdf_small_concurrency：小于阈值的「小文件」最多几路并发转换。
+    #     2 = 同时持两个转换器实例（小文件吞吐约 2x），但 MPS 上两份模型
+    #     权重常驻、并发 OCR 的峰值统一内存也约 2x。同步时若系统内存压力
+    #     大 / 疯狂 swap，把它设成 1 即退回全串行（与加此功能前一致）。
+    #   - rag_pdf_large_threshold_mb：大于等于该大小的文件视为「大文件」，
+    #     独占单实例串行转换——大文件（扫描书）单册峰值内存就很高，并发
+    #     两份会把统一内存撑爆。
+    rag_pdf_small_concurrency: int = 2
+    rag_pdf_large_threshold_mb: float = 20.0
+
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
 
@@ -197,10 +208,12 @@ class AgentConfig:
         "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
         "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
+        "rag_pdf_small_concurrency",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
     )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
+                     "rag_pdf_large_threshold_mb",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout")
     _STR_FIELDS = (

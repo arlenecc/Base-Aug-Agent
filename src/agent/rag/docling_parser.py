@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -49,14 +50,24 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # 负责池的取/还/构建这段临界区，纯互斥、无重入需求。
 from .concurrency_gate import SizeAwareConversionGate
 
-_converters: dict = {}            # scale(round) -> 空闲实例 list
-_pool_lock = threading.Lock()     # 保护 _converters 的取/还/构建
+# 实例池（按 OCR scale 分桶）：scale -> [[converter, uses], ...]（**空闲**实例）。
+# uses = 该实例已服务的转换次数。池里每个条目是 [实例, 已服务次数]，退役判定
+# 挂在实例上，不挂全局计数——理由见 _release_pooled_converter 的注释。
+_converters: dict = {}
+# 借出中的实例登记表：[[converter, uses], ...]。取用时登记、归还时按 identity
+# 找到条目累加 uses。没有这张表就无法知道「池里这个实例已经服过多少役」。
+_checked_out: list = []
+_pool_lock = threading.Lock()     # 保护 _converters / _checked_out 的取还/构建
 _converter_unavailable = False
 
 # 按文件大小限流的并发闸门参数。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
 _SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
 _conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
+
+# 闸门等待超过该秒数就打 INFO 日志——同步期「很久没输出」时，这条日志能直接
+# 区分「卡在等闸门（大文件独占/并发已满）」与「卡在 convert 本身」。
+_GATE_WAIT_LOG_S = 5.0
 
 
 def release_converter() -> None:
@@ -100,7 +111,18 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
         size = Path(path).stat().st_size
     except OSError:
         size = 0
+    t_wait = time.monotonic()
     _conv_gate.acquire(size)
+    waited = time.monotonic() - t_wait
+    if waited >= _GATE_WAIT_LOG_S:
+        # 同步期「很久没输出」时，这条日志直接区分：卡在等闸门（大文件独占中 /
+        # 小文件并发已满）还是卡在 convert 本身（后者不会有本日志）。
+        logger.info(
+            "docling 转换闸门等待 %.1fs 后开始转换（%s）: %s",
+            waited,
+            "大文件独占转换中" if size >= _conv_gate.threshold else "小文件并发已满",
+            getattr(path, "name", path),
+        )
     converter = None
     try:
         converter = _get_converter(scale)
@@ -116,13 +138,16 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
 
 
 def _maybe_recycle_converter() -> None:
-    """每 _DOCLING_RECYCLE_DOCS 篇冲刷一次 docling 原生缓存。
+    """每 _DOCLING_RECYCLE_DOCS 篇全局冲刷一次：清空空闲池 + 周期重建日志。
 
     在 **_conv_gate / _pool_lock 之外**调用（转换流程的 finally 里，且
     _convert_with_scale 已 _conv_gate.release 之后）：只清空闲池里的实例
-    （release_converter 取 _pool_lock），不会打断正在跑的转换；真正保证
-    「不出现两代并存」的是 _conv_gate 的限流——清缓存后新建的实例只会被
-    后续取用者看到。
+    （release_converter 取 _pool_lock），不会打断正在跑的转换。
+
+    注意：**防缓存累积的主护栏是 _release_pooled_converter 的按实例退役**
+    （每个实例服满 _DOCLING_RECYCLE_DOCS 篇即丢弃重建），与本函数互补——
+    本函数负责「批与批之间把空闲实例的内存还掉」，按实例退役负责「任何实例
+    都不允许无限期服役」。两者都只动空闲/已归还的实例。
     """
     global _convert_count
     with _convert_count_lock:
@@ -277,14 +302,17 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
     不可用（导入/构建失败，已标记 _converter_unavailable）。
 
     空闲池的取/还在 _pool_lock 下完成；构建较重（import torch + 加载模型），
-    刻意放到锁外，避免持池锁时阻塞其它 worker 取还实例。
+    刻意放到锁外，避免持池锁时阻塞其它 worker 取还实例。取到的实例同时登记
+    进 _checked_out（携带 uses 计数），归还时按这份计数决定退役还是回池。
     """
     global _converter_unavailable
     key = round(float(scale), 3)
     with _pool_lock:
         pool = _converters.get(key)
         if pool:
-            return pool.pop()
+            entry = pool.pop()
+            _checked_out.append(entry)
+            return entry[0]
         if _converter_unavailable:
             return None
     # 锁外构建（耗时、且可能 import torch，不应持池锁）。
@@ -298,25 +326,68 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
         logger.warning("failed to init docling converter: %s", e)
         _converter_unavailable = True
         return None
+    with _pool_lock:
+        _checked_out.append([converter, 0])
     logger.info("docling DocumentConverter initialized (pooled, scale=%.2f)", scale)
     return converter
 
 
 def _release_pooled_converter(scale: float, converter) -> None:
-    """把用过的转换器还回空闲池（按 scale 分桶），供后续并发复用。
+    """把用过的转换器还回空闲池（按 scale 分桶），或按服役次数退役。
 
-    只保留每桶最多 _SMALL_FILE_CONCURRENCY 个空闲实例，避免无限增长；多余
-    的丢弃引用（模型内存靠进程结束 / 周期回收释放，且每次 convert 后已
-    torch.mps.empty_cache() 归还 MPS 缓存）。key 可能已被周期回收 pop 掉，
-    用 setdefault 兜底。
+    **为什么按实例退役（2026-10 修复）**：docling 用 OcrAutoOptions 自行实例化
+    的 OCR/ORT 原生缓存按输入形状在同步过程中单调增长，旧设计用「全局单例 +
+    每 50 篇重建」把峰值限制在一代内。改成实例池后，池里的实例会被反复复用，
+    若只靠全局 50 篇计数清空**空闲**池：正被借出（转换中）的实例躲过那次清理，
+    回池后继续服役，缓存跨转换持续累积——同步越久内存越高，直到 swap 把整个
+    机器拖慢（「很久没输出」的直接嫌疑）。因此退役判定必须挂在**每个实例**
+    自己的 uses 上：服满 _DOCLING_RECYCLE_DOCS 篇就丢弃引用（模型内存随 GC
+    回收），下次取用惰性重建新一代。
+
+    只保留每桶最多 _SMALL_FILE_CONCURRENCY 个空闲实例，避免无限增长；key
+    可能已被周期回收 pop 掉，用 setdefault 兜底。
     """
     if converter is None:
         return
     key = round(float(scale), 3)
     with _pool_lock:
+        entry = None
+        for i, e in enumerate(_checked_out):
+            if e[0] is converter:      # identity：pydantic 的 __eq__ 又贵又险
+                entry = _checked_out.pop(i)
+                break
+        if entry is None:
+            # 未经本池借出（测试 stub 了 _get_converter / 直接构建）：按新实例计。
+            entry = [converter, 0]
+        entry[1] += 1
+        if entry[1] >= _DOCLING_RECYCLE_DOCS:
+            logger.info(
+                "docling 转换器实例服役满 %d 篇，退役重建（冲刷 OCR/ORT 原生缓存）",
+                entry[1],
+            )
+            return                     # 丢弃引用：不还池，下次惰性重建新一代
         pool = _converters.setdefault(key, [])
         if len(pool) < _SMALL_FILE_CONCURRENCY:
-            pool.append(converter)
+            pool.append(entry)
+
+
+def configure_concurrency(small_capacity: Optional[int] = None,
+                          large_threshold_bytes: Optional[int] = None) -> None:
+    """RAGEngine.__init__ 调用：热更新大小闸门参数（不换闸门对象）。
+
+    默认值来自模块常量（小文件 2 路并发 / 20MB 独占）；config 的
+    rag_pdf_small_concurrency / rag_pdf_large_threshold_mb 经 engine 转发到
+    这里。内存吃紧的机器把 rag_pdf_small_concurrency 设 1 即退回全串行。
+    """
+    capacity = _SMALL_FILE_CONCURRENCY if small_capacity is None else int(small_capacity)
+    threshold = _LARGE_FILE_THRESHOLD if large_threshold_bytes is None \
+        else int(large_threshold_bytes)
+    capacity = max(1, capacity)
+    _conv_gate.configure(threshold, capacity)
+    logger.info(
+        "docling 转换并发闸门：小文件(< %.1fMB) 最多 %d 路并发，大文件独占",
+        threshold / (1024 * 1024), capacity,
+    )
 
 
 def _flush_mps_cache() -> None:
@@ -727,7 +798,13 @@ def extract_markdown(filepath: str) -> Optional[str]:
         doc = None
         # 每次转换后归还 MPS 缓存（护栏，见 _flush_mps_cache 注释）。
         # 放在 finally：成功与异常路径都清，防止异常密集时缓存照样累积。
-        _flush_mps_cache()
+        # 有其它转换在飞时跳过：empty_cache 只释放分配器里「未占用」的缓存块，
+        # 此时另一路转换可能正要重新分配——清了也是立刻再分配，纯属抖动，且
+        # 与另一路的分配动作争抢分配器锁；顺序执行（大文件独占的常见形态，
+        # 也是唯一真正需要归还的时机）时才清。最后一班离开时 active()==0，
+        # 缓存照样会被归还，护栏不漏。
+        if _conv_gate.active() == 0:
+            _flush_mps_cache()
         # 周期性冲刷 docling 原生缓存（见 _maybe_recycle_converter 注释）。
         # _convert_with_scale 的 finally 已先 _conv_gate.release，这里不再持
         # 任何闸门/池锁，回收只清空闲池。

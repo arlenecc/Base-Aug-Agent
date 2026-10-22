@@ -44,6 +44,27 @@ class SizeAwareConversionGate:
         self._read_cv = threading.Condition(self._lock)
         self._write_cv = threading.Condition(self._lock)
 
+    def configure(self, threshold: int, small_capacity: int) -> None:
+        """热更新参数（引擎初始化时调用）。
+
+        刻意**不更换闸门对象**、只在锁内改写字段：若换对象，已 acquire 的
+        在飞持有者还挂在旧闸门上，新旧两个闸门各自计数，限流与互斥直接失效
+        （最坏情况两个大文件同时开跑）。阈值热改后，已入场的大文件照常独占
+        到结束，新请求按新阈值分类。
+        """
+        with self._lock:
+            self.threshold = int(threshold)
+            self.small_capacity = max(1, int(small_capacity))
+
+    def active(self) -> int:
+        """当前在飞的转换数（小文件读者 + 大文件写者）。
+
+        供调用方判断「还有没有别的转换在跑」——例如 docling 每次转换后
+        归还 MPS 缓存，只有自己是最后一班（active()==0）时才真正需要清。
+        """
+        with self._lock:
+            return self._readers + (1 if self._writing else 0)
+
     def acquire(self, size: int) -> None:
         """申请入场许可；必要时阻塞。
 
