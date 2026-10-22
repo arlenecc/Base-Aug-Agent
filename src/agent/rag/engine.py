@@ -1147,7 +1147,31 @@ class RAGEngine:
 
             # Step 4: 主线程消费队列，逐文件增量写入 vector store
             _log("━━━ Step 4/6: 向量化 + 存入向量库 ━━━")
+            # 已消费文件的累计切片边界（按消费顺序）：取消/失败时用它判断哪些
+            # 文件**已经完整入库**，只有这些文件才写进同步记录——下次同步跳过
+            # 它们，从剩余文件继续，已完成的解析/清洗/切片/向量化不白做。
+            written_files: List[tuple] = []   # (filepath, n_chunks, 累计切片数)
+            cum_chunks = 0
+            # 已真正 table.add 提交的切片数（每批回调刷新）。
+            committed_chunks = {"n": 0}
+
+            def _fully_written_files() -> Dict[str, Dict[str, Any]]:
+                """返回已完整入库的文件 → manifest 条目。
+
+                判据：该文件的切片全部落在已提交的批次里（累计边界 ≤ 已提交数）。
+                只写了一半的文件不返回——下次重新处理（幂等：add_streaming 会先按
+                source 删旧记录再插入），绝不会出现「记录已同步但内容缺一半」。
+                """
+                done: Dict[str, Dict[str, Any]] = {}
+                for fp, _n, cum_end in written_files:
+                    if cum_end > committed_chunks["n"]:
+                        break
+                    if fp in pending_manifest:
+                        done[fp] = pending_manifest[fp]
+                return done
+
             def _chunk_iter() -> Iterator[Dict[str, Any]]:
+                nonlocal cum_chunks
                 sentinels_seen = 0
                 # 必须等于实际启动的 worker 数（num_workers），而不是
                 # self._parallel_workers：文件数少于默认并发数时，实际启动的
@@ -1202,6 +1226,9 @@ class RAGEngine:
                         logger.warning("RAG: failed to update manifest for %s: %s", filepath, e)
                     for c in doc_chunks:
                         yield c
+                    # 记下这个文件的累计切片边界（是否真的入库由 committed_chunks 决定）
+                    cum_chunks += n_chunks
+                    written_files.append((filepath, n_chunks, cum_chunks))
                     # 进度反馈：每消费完一个文件回调一次。
                     if progress_callback is not None:
                         try:
@@ -1212,6 +1239,8 @@ class RAGEngine:
                             logger.warning("RAG: progress_callback error: %s", e)
 
             def _on_batch(batch_added: int, total_added: int) -> None:
+                # 记录已提交切片数：取消/失败时据此判断哪些文件已完整入库。
+                committed_chunks["n"] = total_added
                 _mem_mark(f"向量化批次 +{batch_added} (累计 {total_added})")
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:
@@ -1255,16 +1284,29 @@ class RAGEngine:
                 # 让阻塞在 q.put 上的 worker 立即退出（成功路径是空操作）。
                 _abort.set()
 
-            # 只有整条写入链路成功完成才提交 manifest；失败/取消路径下这些
-            # 文件下次同步会被重新处理（幂等），保证不会出现「manifest 记录
-            # 了但向量库里只有半个文件」的永久性内容缺失。
+            # 取消 / 写入失败时：只把「已完整入库」的文件写进同步记录。
+            # 用户点「停止同步」后，本次已经解析、清洗、切片、入库的文件应当保留
+            # 记录，下次同步直接从剩余文件开始，而不是全部从头再来（已完成的
+            # 重活不白做）。只写了一半的文件不记录，下次重做（幂等：add_streaming
+            # 会先按 source 删旧记录再插入），绝不会出现「记录已同步但内容缺一半」。
+            kept_files = 0
             if write_failed:
+                kept = _fully_written_files()
+                kept_files = len(kept)
                 pending_manifest.clear()
-                _log("  ⚠ 写入失败，本次处理的 %d 个文件将不在同步记录中（下次同步会重新处理）",
-                     stats["files_extracted"])
+                pending_manifest.update(kept)
+                new_manifest.update(kept)
+                _log("  ⚠ 写入失败：保留 %d 个已完整入库文件的同步记录，"
+                     "其余 %d 个文件下次同步重新处理",
+                     len(kept), len(files_to_process) - len(kept))
             elif self._is_cancelled():
+                kept = _fully_written_files()
+                kept_files = len(kept)
                 pending_manifest.clear()
-                _log("  ⚠ 同步被取消，本次处理的文件不写入同步记录")
+                new_manifest.update(kept)
+                _log("  ⚠ 同步被取消：%d 个文件已完整入库并记录，"
+                     "下次同步从剩余 %d 个文件继续",
+                     len(kept), len(files_to_process) - len(kept))
             else:
                 new_manifest.update(pending_manifest)
 
@@ -1316,8 +1358,10 @@ class RAGEngine:
             stats["cancelled"] = True
             # 记本次写入量而非全库总数：UI 展示的是「这次同步了多少切片」。
             stats["chunks"] = added
-            _log("⚠ 同步已被用户取消: %d/%d 文件已提取, %d 切片已存储",
-                        stats["files_extracted"], stats["files_found"], stats["chunks"])
+            _log("⚠ 同步已被用户取消: %d/%d 文件已提取, %d 切片已存储"
+                 "（%d 个文件已完整入库，下次同步从剩余文件继续）",
+                 stats["files_extracted"], stats["files_found"], stats["chunks"],
+                 kept_files)
 
         # Step 5: 清理已删除文件
         _log("━━━ Step 5/6: 清理已删除文件 ━━━")

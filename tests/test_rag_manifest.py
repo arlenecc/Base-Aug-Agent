@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -438,3 +439,115 @@ def test_incremental_sync_visible_to_existing_engine(tmp_path, rag_engine_factor
     r3 = agent_engine.search("Python", top_k=3)
     assert len(r3) >= 1, "旧内容仍应可搜到"
     agent_engine.close()
+
+
+# ---------------------------------------------------------------------------
+# 取消后续传：已完整入库的文件保留记录，下次从剩余文件继续
+# ---------------------------------------------------------------------------
+
+class _CancelOnSecondFileStore(_FakeStore):
+    """消费到第二个文件的切片时模拟用户点「停止同步」。
+
+    与具体哪个文件先被消费无关（worker 分片/调度会变顺序）：第一个文件必然
+    已完整写完，第二个刚开始就停。
+    """
+
+    def __init__(self, engine):
+        super().__init__()
+        self._engine = engine
+
+    def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
+        added = 0
+        first_source = None
+        for chunk in chunk_iter:
+            src = chunk.get("source", "")
+            if first_source is None:
+                first_source = src
+            elif src != first_source:
+                self._engine.cancel()      # 模拟「停止同步」按钮
+                break
+            self.records.append(chunk)
+            added += 1
+        self._count += added
+        if on_batch:
+            on_batch(added, added)
+        return added
+
+
+def _clear_manifest(engine) -> None:
+    """直接删 manifest 文件（_save_manifest 是读改写合并，传 {} 清不掉）。"""
+    mf = Path(_manifest_path(engine._rag_dir))
+    if mf.exists():
+        mf.unlink()
+
+
+def _make_two_file_kb(engine):
+    """在 KB 里放第二个文件（第一个由 _make_engine 创建）。"""
+    kb = Path(engine._knowledge_base)
+    (kb / "b.txt").write_text("second document with quite a lot of body text " * 40)
+    return kb
+
+
+def test_cancelled_sync_keeps_completed_files_and_resumes(tmp_path):
+    """停止同步：已完整入库的文件写进 manifest，下次同步只处理剩余文件。"""
+    engine, kb = _make_engine(tmp_path, _FakeStore())
+    _make_two_file_kb(engine)
+
+    # 先跑一次完整同步，确认两个文件都能处理
+    full_store = _FakeStore()
+    engine._store = full_store
+    stats = engine.ingest(force=False)
+    assert stats["files_extracted"] == 2
+    assert len(_load_manifest(engine._rag_dir)) == 2
+
+    # 重新从「首次同步」开始：写完第一个文件就取消
+    _clear_manifest(engine)
+    stop_store = _CancelOnSecondFileStore(engine)
+    engine._store = stop_store
+    stats = engine.ingest(force=False)
+    assert stats["cancelled"] is True
+
+    manifest = _load_manifest(engine._rag_dir)
+    assert len(manifest) == 1                       # 只有第一个文件被记录
+    kept_name = os.path.basename(next(iter(manifest)))
+    assert kept_name in ("a.txt", "b.txt")
+    # 只入库了那一个文件的切片，且全部来自它
+    assert stop_store.records
+    assert all(r.get("source", "").endswith(kept_name) for r in stop_store.records)
+
+    # 重新同步：已完成的那个被跳过，只处理剩下的
+    resume_store = _FakeStore()
+    engine._store = resume_store
+    stats2 = engine.ingest(force=False)
+    assert stats2["files_skipped"] == 1
+    assert stats2["files_extracted"] == 1
+    assert all(r.get("source", "").endswith(kept_name) is False
+               for r in resume_store.records)
+    assert len(_load_manifest(engine._rag_dir)) == 2
+
+
+def test_cancelled_mid_file_keeps_nothing(tmp_path):
+    """取消发生在第一个文件内部（只写了一半）时，不写任何记录。"""
+    engine, kb = _make_engine(tmp_path, _FakeStore())
+    _make_two_file_kb(engine)
+    _clear_manifest(engine)
+
+    class _StopImmediately(_FakeStore):
+        def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
+            self._engine_ref = engine
+            engine.cancel()          # 一片都没写就取消
+            return 0
+
+    store = _StopImmediately()
+    engine._store = store
+    stats = engine.ingest(force=False)
+    assert stats["cancelled"] is True
+    assert len(_load_manifest(engine._rag_dir)) == 0   # 没有完整入库的文件
+    assert len(store.records) == 0
+
+    # 下次同步从头处理两个文件
+    store2 = _FakeStore()
+    engine._store = store2
+    stats2 = engine.ingest(force=False)
+    assert stats2["files_skipped"] == 0
+    assert stats2["files_extracted"] == 2

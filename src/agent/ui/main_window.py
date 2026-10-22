@@ -2837,8 +2837,9 @@ class MainWindow(QMainWindow):
             if not isinstance(stats, dict):
                 stats = {}
             if stats.get("cancelled"):
-                self.status_label.setText("同步已取消")
-                self._append_log("[rag] 同步已用户取消")
+                self.status_label.setText("同步已取消（已完成部分已保留，下次从剩余文件继续）")
+                self._append_log("[rag] 同步已用户取消：已完整入库的文件已记录，"
+                                "下次同步将从剩余文件继续")
                 return
             self.status_label.setText("知识库同步完成")
             files = stats.get("files_found", 0)
