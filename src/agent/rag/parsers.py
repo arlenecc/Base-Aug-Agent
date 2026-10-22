@@ -369,16 +369,16 @@ def _ocr_binarize(img):
 
 
 def _ocr_preprocess(pix):
-    """OCR 输入预处理。管线顺序即代码顺序：
+    """OCR 输入解码：Pixmap → 灰度 ndarray（仅做像素解码，不做归一化/二值化）。
 
-        灰度解码 → 长边 Lanczos 缩放到 ≤1500px → 归一化（暗色反色 + 对比度
-        拉伸）→ 锐化 → 二值化
+    完整预处理（长边缩放 → 归一化 → 锐化 → 可选二值化）由
+    :func:`ocr_recognize_array` 内部按引擎分别施加：ocrmac 走灰度（不二值化）、
+    RapidOCR 兜底走二值化。两条调用通路（_extract_pdf / pandoc_parser）都只把
+    灰度 ndarray 交给 ocr_recognize_array，避免重复预处理，也避免 Otsu 二值化
+    污染 ocrmac 的输入。
 
-    DPI 与灰度在**渲染侧**保证（_extract_pdf 用 _OCR_DPI=150 +
-    colorspace=fitz.csGRAY 渲染），这里只做像素级处理。
-
-    返回 ndarray（不编码 PNG）：RapidOCR 接受 ndarray 输入，省掉 PNG
-    编码 + 引擎内部解码两步开销。
+    返回 ndarray（不编码 PNG）：RapidOCR 接受 ndarray 输入，省掉 PNG 编码 +
+    引擎内部解码两步开销。
     """
     import numpy as np
 
@@ -386,21 +386,28 @@ def _ocr_preprocess(pix):
     if pix.n != 1:  # 防御：非灰度渲染时按行内多通道扁平处理
         img = img.reshape(-1, pix.n).mean(axis=1).astype(np.uint8)
     img = img.reshape(pix.height, pix.width)
-    return _ocr_preprocess_array(img)
+    return img
 
 
-def _ocr_preprocess_array(img):
+def _ocr_preprocess_array(img, binarize: bool = True):
     """对**灰度 ndarray** 执行完整 OCR 预处理管线。
 
-    与 PDF 图片页共用同一套归一化：长边 Lanczos 缩放 → 归一化（暗色反色 +
-    对比度拉伸）→ 锐化 → 二值化。扫描版 epub 的图片 OCR（pandoc_parser）
-    复用本函数，保证两条通路的预处理完全一致。
+    长边 Lanczos 缩放 → 归一化（暗色反色 + 对比度拉伸）→ 锐化 → （可选）二值化。
+    扫描版 epub 的图片 OCR（pandoc_parser）与 PDF 图片页复用本函数，保证两条
+    通路的预处理完全一致。
+
+    ``binarize`` 控制最后一步 Otsu 二值化：
+      * ``True``（默认）—— 强制纯黑白，利于 RapidOCR 的 det/rec；
+      * ``False`` —— 保留灰度，给 ocrmac(Apple Vision) 用。Otsu 二值化会抹掉
+        Vision 依赖的抗锯齿笔画与灰度过渡，使 ocrmac 反而读不出字、逐页回退
+        RapidOCR；故 ocrmac 通路传 ``False``（见 :func:`ocr_recognize_array`）。
     """
     img = _ocr_downscale_long_edge(img)
     img = _ocr_normalize(img)
     if _OCR_SHARPEN:
         img = _ocr_sharpen(img)
-    if _OCR_BINARIZE:
+    # 二值化只给 RapidOCR 兜底通路：见上方 docstring。
+    if binarize and _OCR_BINARIZE:
         img = _ocr_binarize(img)
     return img
 
@@ -708,13 +715,19 @@ def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
 
     ``page_num`` / ``filename`` 仅用于 RapidOCR 失败时的日志定位。
     """
-    text = _ocrmac_recognize(img)
+    # ocrmac(Apple Vision) 优先：走**灰度**（不二值化）——Otsu 二值化会让
+    # Vision 读不出字（见 _ocr_preprocess_array 的 binarize 参数说明）。
+    gray = _ocr_preprocess_array(img, binarize=False)
+    text = _ocrmac_recognize(gray)
     if text:
         return text
+    # 本页 ocrmac 未装/异常/无文字 → 用 RapidOCR 补充。RapidOCR 的 det/rec 在
+    # 纯黑白样本上训练，二值化更利检测，故这条兜底通路单独做二值化。
+    binimg = _ocr_preprocess_array(img, binarize=True)
     ocr_engine = _get_ocr_engine()
     if ocr_engine is None:
         return ""
-    return _ocr_image_cached(ocr_engine, img, page_num, filename)
+    return _ocr_image_cached(ocr_engine, binimg, page_num, filename)
 
 
 def _ocr_backend_available() -> bool:

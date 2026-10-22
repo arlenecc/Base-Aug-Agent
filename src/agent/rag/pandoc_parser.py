@@ -609,8 +609,10 @@ def _ocr_image_array(img) -> str:
 def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
     """对扫描版 epub 的图片逐张 OCR，返回拼接正文（无可识别内容返回 None）。
 
-    预处理复用 ``parsers._ocr_preprocess_array``——与 PDF 图片页**完全一致**的
-    归一化：长边 Lanczos ≤1500px、灰度、USM 锐化、Otsu 二值化。
+    预处理（长边 Lanczos ≤1500px、灰度、USM 锐化、可选 Otsu 二值化）由
+    ``parsers.ocr_recognize_array`` 统一施加——与 PDF 图片页**完全一致**，且按引擎
+    分流：ocrmac 走灰度（不二值化，避免 Vision 读不出字）、RapidOCR 兜底走二值化。
+    这里只把图片解码成灰度 ndarray 交给它。
 
     内存：逐张读取、识别后立即释放，不会把整本书的图片（可达数百 MB）常驻。
     """
@@ -625,8 +627,6 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
 
     import numpy as np
     from PIL import Image
-
-    from .parsers import _ocr_preprocess_array
 
     parts: List[str] = []
     done = 0
@@ -644,7 +644,9 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
             del pil
             arr = np.asarray(gray, dtype=np.uint8)
             del gray
-            arr = _ocr_preprocess_array(arr)
+            # 仅送灰度原图：完整预处理（缩放/归一化/锐化/二值化）由
+            # parsers.ocr_recognize_array 内部按引擎分别施加——ocrmac 走灰度、
+            # RapidOCR 兜底走二值化。这里若先做二值化会把 ocrmac 的输入污染掉。
             text = _ocr_image_array(arr)
             del arr
             if text and text.strip():
