@@ -110,10 +110,19 @@ def test_e2e_code_run_confirms_only_risky(config, recording_callbacks):
 
 
 def test_e2e_skill_suggested_after_repeat(config, recording_callbacks):
+    """重复意图 + 本轮确实需要规划（用到 task_plan）才建议固化。
+
+    寒暄 / 单次查询这类轮次达到次数也不提示（见 agent._SKILL_SUGGEST_MIN_TOOLS）。
+    """
     from agent.skills import SkillManager
 
     sm = SkillManager(path=os.path.join(config.workspace, ".agent", "skills.json"))
-    llm = _ScriptedLLM([[_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})]] * 3)
+    plan_tc = [{"id": "c1", "function": {"name": "task_plan", "arguments": json.dumps(
+        {"op": "create", "goal": "deploy", "steps": ["build", "publish"]})}}]
+    llm = _ScriptedLLM([
+        [_evt("done", tool_calls=plan_tc, usage={"total_tokens": 1})],
+        [_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})],
+    ] * 3)
     agent = Agent(llm=llm, config=config, callbacks=recording_callbacks, skills=sm)
     # first request: no suggestion
     agent.run("deploy to staging")

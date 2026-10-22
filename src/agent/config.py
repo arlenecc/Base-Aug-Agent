@@ -68,6 +68,25 @@ class AgentConfig:
     # 不受影响），只约束 llama.cpp 的预分配上限。16384 对 7B 约 8.6GB、13B 约
     # 13GB，16G 机器可承受；内存更小的机器可调到 8192，显存更大的可调大。
     local_llm_n_ctx: int = 16384
+    # MLX 专用：prefill 分块大小（一次前向喂多少 token）。越大越快（少几次
+    # kernel 启动与同步），峰值内存越高；太小则长 prompt 的 prefill 被切成很多
+    # 块、白白多付同步开销。2861 token 的预热前缀一次喂完完全没问题。
+    local_llm_prompt_batch_size: int = 4096
+    # 投机解码（speculative decoding）：用**已加载的辅助模型**当草稿模型给主模型
+    # 起草，主模型一次性并行验证，不额外加载任何东西。草稿模型必须与主模型同
+    # 词表（默认主/辅助都是 qwen3.5，vocab 248320，天然匹配）。
+    #
+    # **默认关闭**：mlx_lm 的投机解码要求 prompt cache 可裁剪，而 qwen3.5 是混合
+    # 架构、线性层用 ArraysCache（不可裁剪），与本项目的 KV 前缀缓存互斥——同时
+    # 用会直接抛
+    #   ValueError: Speculative decoding requires a trimmable prompt cache (got {'ArraysCache'})
+    # 实测：前缀缓存省掉的是每轮 ~2900 token 的 prefill（约 16s），远大于投机解码
+    # 的生成收益。只有在不传 prompt_cache 的场合（纯 transformer 模型、或放弃前缀
+    # 复用）才打开。
+    llm_speculative: bool = False
+    # 每轮让草稿模型先起草多少个 token（mlx_lm 的 num_draft_tokens）。太大反而
+    # 会因为拒绝率高而浪费算力，2~4 是常见甜点区。
+    llm_num_draft_tokens: int = 3
     onnx_threads: int = 4
     temperature: float = 0.7
     max_tokens: int = 32768
@@ -163,8 +182,8 @@ class AgentConfig:
         "max_tokens", "top_k", "max_iterations", "max_history",
         "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
-        "local_llm_n_ctx",
-        "onnx_threads", "rag_embedding_batch_size", "rag_embedding_max_length",
+        "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
+        "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
     )
@@ -188,7 +207,8 @@ class AgentConfig:
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale",
-                    "llm_enable_thinking", "aux_llm_enable_thinking")
+                    "llm_enable_thinking", "aux_llm_enable_thinking",
+                    "llm_speculative")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (

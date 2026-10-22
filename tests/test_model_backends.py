@@ -81,7 +81,8 @@ def test_llamacpp_n_ctx_bounded_by_local_llm_n_ctx(monkeypatch):
 def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
     """#159：统一 MLX 内存策略必须把 buffer cache 从默认 95% RAM 封顶到 ~6GB
     （避免 prefill 长上下文时大注意力矩阵每步反复释放重分配 → 生成抖动卡顿），
-    并把总内存封顶到 ~80% RAM（避免 OS 换页卡死）。同时验证幂等。"""
+    并把总内存封顶到 ~65% RAM（80% 时用户实测冲到 13G 后整机卡顿，需要给系统
+    留更多余量）。同时验证幂等。"""
     from agent import model_backends as mb
     import sys, types
 
@@ -110,13 +111,13 @@ def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
     monkeypatch.setattr(mb, "_mlx_ram_bytes", lambda: 16 * 1024 ** 3)
 
     mb.apply_mlx_memory_policy()
-    # 总内存封顶到 80% RAM = 12.8GB（低于默认 15GB）
-    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.80)
+    # 总内存封顶到 65% RAM = 10.4GB（低于默认 15GB，给系统留 ~5.6G）
+    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.65)
     # buffer cache 封顶到 6GB（远低于默认 15GB，且远大于原 1GB 抖动阈值）
     assert fake.cache_limit == 6 * 1024 ** 3
     # 幂等：再调用值不变、不报错
     mb.apply_mlx_memory_policy()
-    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.80)
+    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.65)
     assert fake.cache_limit == 6 * 1024 ** 3
 
 
@@ -937,3 +938,38 @@ def test_config_default_embedding_length_8192(tmp_path):
     path = tmp_path / "cfg.json"
     path.write_text(json.dumps({"rag_embedding_max_length": 0}))
     assert AgentConfig.load(str(path)).rag_embedding_max_length == 8
+
+
+def test_template_messages_replays_raw_content_without_extra_think_block():
+    """历史里带 raw_content 的 assistant 消息必须渲染出与生成时相同的序列。
+
+    之前 `reasoning_content = ""` 会让模板插入空思考块 `<think>\\n\\n</think>\\n\\n`，
+    raw 里没有 `</think>`（模型直接吐工具调用）时同样会插——两种都会让公共前缀
+    掉到上一轮 prompt 的最后一个 token，KV 缓存整份作废。
+    """
+    from agent.model_backends import _template_messages
+
+    tool_raw = "<tool_call>\n<function=rag_status>\n</tool_call>"
+    out = _template_messages(
+        [{"role": "assistant", "content": None, "raw_content": tool_raw,
+          "tool_calls": [{"id": "c1"}]}],
+        think_opened=True,
+    )
+    msg = out[0]
+    assert msg["content"] == tool_raw + "\n</think>"   # 补闭合标签，不插空思考块
+    assert "reasoning_content" not in msg              # 旧实现的空字符串暗门已移除
+    assert "tool_calls" not in msg                     # raw 里已有 XML，避免重复渲染
+
+    think_raw = "让我想想\n</think>\n\n答案是 42\n"
+    out2 = _template_messages(
+        [{"role": "assistant", "content": "答案是 42", "raw_content": think_raw}],
+        think_opened=True,
+    )
+    assert out2[0]["content"] == think_raw             # 已有闭合标签则原样使用
+
+    # 思考模式关闭时生成提示不预置 <think>，不能补闭合标签。
+    out3 = _template_messages(
+        [{"role": "assistant", "content": None, "raw_content": tool_raw}],
+        think_opened=False,
+    )
+    assert out3[0]["content"] == tool_raw

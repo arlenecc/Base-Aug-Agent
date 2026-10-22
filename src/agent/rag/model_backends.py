@@ -29,7 +29,7 @@ RERANKER_BACKENDS = ("fastembed", "mlx", "onnx")
 # phys_footprint 冲到 18-19GB）。MLX 默认 memory_limit = 95% RAM（16G 机器
 # ~15G），buffer cache 会一路涨到系统上限；但单纯把 cache 压到 1GB 又会
 # 在 prefill 长上下文时让 `[seq,seq]` 注意力矩阵每步反复释放重分配 → 生成
-# 抖动卡顿。统一策略：总内存封顶 ~80% RAM（防 OS 换页卡死）、buffer cache
+# 抖动卡顿。统一策略：总内存封顶 ~65% RAM（防 OS 换页卡死、给系统留余量）、buffer cache
 # 封顶 ~6GB（既能封顶又足够跨层复用）。聊天后端与 RAG 共用，保证一致。
 _MLX_MEM_CAP_DONE = False
 

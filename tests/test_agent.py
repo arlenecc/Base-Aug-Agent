@@ -68,6 +68,52 @@ def test_warmup_primes_backend_with_full_system_prompt(config, recording_callbac
     assert recording_callbacks.content == []       # 不产生用户可见输出
 
 
+def test_system_prompt_stays_static_context_goes_to_messages(config, recording_callbacks):
+    """#162：系统提示必须跨轮恒定，动态上下文挂在消息尾部。
+
+    动态块（记忆/技能/计划/知识库状态）一旦进了系统提示，每次变化都会让
+    system 段的 token 序列改变，MLX 的 ArraysCache 不可裁剪 → 整份前缀缓存
+    作废、每轮重新全量 prefill。
+    """
+    from agent.agent import SYSTEM_PROMPT
+
+    mock = MockLLM([[_evt("content", "ok"), _evt("done", usage={"total_tokens": 1})]])
+    agent = Agent(llm=mock, config=config, callbacks=recording_callbacks)
+    agent.run("hi")
+
+    assert agent._system_prompt() == SYSTEM_PROMPT
+    msgs = mock.calls[0]["messages"]
+    assert msgs[0]["content"] == SYSTEM_PROMPT      # 系统消息里没有任何动态内容
+
+    user_msg = msgs[1]
+    assert user_msg["role"] == "user"
+    assert user_msg["content"].startswith("hi")
+    ctx = agent._dynamic_context()
+    if ctx:                                          # 有动态内容 → 挂在消息尾部
+        assert agent._CTX_HEADER in user_msg["content"]
+        assert ctx in user_msg["content"]
+    else:
+        assert user_msg["content"] == "hi"
+
+
+def test_context_attached_only_when_it_changes(config, recording_callbacks, monkeypatch):
+    """上下文只在内容变化时重新挂载：已挂过的块留在旧消息里，不重复占用上下文，
+    也保证「从不改写已有消息」——前缀缓存因此始终对得上。"""
+    agent = Agent(llm=object(), config=config, callbacks=recording_callbacks)
+
+    monkeypatch.setattr(agent, "_dynamic_context", lambda: "CTX-A")
+    first = agent._attach_context("工具结果1")
+    assert "CTX-A" in first
+
+    second = agent._attach_context("工具结果2")     # 内容没变 → 不再挂
+    assert "CTX-A" not in second
+    assert second == "工具结果2"
+
+    monkeypatch.setattr(agent, "_dynamic_context", lambda: "CTX-B")
+    third = agent._attach_context("工具结果3")      # 变了 → 出现在这条新消息里
+    assert "CTX-B" in third
+
+
 def test_agent_streams_reasoning(config, recording_callbacks):
     mock = MockLLM([[_evt("reasoning", "thinking..."),
                      _evt("content", "answer"),

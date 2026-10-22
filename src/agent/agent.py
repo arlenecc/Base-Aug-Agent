@@ -151,6 +151,9 @@ _MAX_EMPTY_NUDGES = 2                 # 空响应重试次数
 _MAX_REFLECTION_NUDGES = 2            # 连续失败反思注入次数
 _IDENTICAL_FAIL_GUIDANCE_AT = 2       # 相同调用失败几次后附加重试指引
 _CONSECUTIVE_FAIL_NUDGE_AT = 4        # 连续失败几次后注入反思提醒
+# 「保存为技能」提示的门槛：本轮用到 task_plan（说明需要规划），或工具调用达到
+# 这个次数（说明是多步完成）。寒暄、问询、单次查询都不满足 → 不提示。
+_SKILL_SUGGEST_MIN_TOOLS = 3
 
 _EMPTY_RESPONSE_NUDGE = (
     "[系统提示] 你上一条回复是空的。请反思当前任务目标：如果还没完成，"
@@ -234,6 +237,14 @@ class Agent:
         self._tool_schema_version: int = -2  # -2 = 从未计算过
         # _system_prompt 缓存附带的工具状态版本号（见 _system_prompt）。
         self._cached_prompt_state = -2
+        # 动态上下文（_dynamic_context）的逐轮缓存：turn + state_version 作键。
+        self._ctx_cache_turn = -1
+        self._ctx_cache_state = -2
+        self._ctx_cache_text: Optional[str] = None
+        # 本轮**原始**用户输入（不含挂载的上下文块），供技能匹配使用。
+        self._last_user_text = ""
+        # 上一次实际挂到消息尾部的上下文块：内容不变就不重复挂载。
+        self._last_ctx_text = ""
         # UI 回调异常计数（见 _safe_callback）：只记录前几条，避免刷屏。
         self._callback_errors = 0
 
@@ -287,6 +298,13 @@ class Agent:
         # Invalidate cached prompt
         self._cached_prompt_turn = -1
         self._cached_prompt = ""
+        # 上下文块缓存与「上次挂了什么」一并归零：历史清空后下一条消息需要
+        # 重新挂一份完整上下文（旧的已经不在对话里了）。
+        self._ctx_cache_turn = -1
+        self._ctx_cache_state = -2
+        self._ctx_cache_text = None
+        self._last_ctx_text = ""
+        self._last_user_text = ""
         # 「清空对话」= 会话状态归零：任务计划属于当前会话，一并清除，
         # 否则旧计划会在新会话的系统提示里残留、误导模型。
         try:
@@ -533,6 +551,10 @@ class Agent:
         # 历史被整体改写，本地后端的 KV 前缀必然对不齐。虽然后端会自己检测到
         # 并重建，这里主动失效更直接（也顺便释放显存里的缓存）。
         self._invalidate_local_kv_cache()
+        # 旧消息（含它们挂载的上下文块）被丢弃/摘要了 → 下一条消息必须重新挂
+        # 一份完整上下文，否则模型再也看不到知识库状态、任务计划等。
+        self._last_ctx_text = ""
+        self._ctx_cache_turn = -1
         # Recompute incremental counter after shrink (cheaper than full O(n) scan
         # on every turn, and only runs when context actually shrinks).
         self._log(
@@ -555,7 +577,9 @@ class Agent:
             role = msg.get("role", "?")
             content = msg.get("content")
             if isinstance(content, str):
-                text = content
+                # 剥掉动态上下文块：摘要只关心对话本身（上下文每次都会重新
+                # 挂载，不需要留在摘要里）。
+                text = self._strip_context(content)
             elif content is None:
                 text = ""
             else:
@@ -688,7 +712,9 @@ class Agent:
         recent: List[str] = []
         for msg in reversed(self._history):
             role = msg.get("role")
-            content = (msg.get("content") or "").strip()
+            # 剥掉挂在消息尾部的动态上下文块：它是环境信息，既不该进抽取输入
+            # （会被当成对话内容抽出无意义事实），也不该参与下面的长度判据。
+            content = self._strip_context((msg.get("content") or "").strip())
             if role in ("user", "assistant") and content:
                 recent.append(f"{'User' if role == 'user' else 'Assistant'}: {content}")
                 if len(recent) >= 6:
@@ -699,12 +725,14 @@ class Agent:
         # 跳过无实质内容的对话：最新一条 user 消息过短（如「read data.txt」、
         # 「write and read back」这类单句指令）说明没有可抽取的持久事实，
         # 抽取只会浪费一次 LLM 调用。这与旧行为保持一致（user/assistant 均
-        # 需 >= 20 字符才抽取）。
-        last_user = ""
-        for msg in reversed(self._history):
-            if msg.get("role") == "user" and msg.get("content"):
-                last_user = msg["content"].strip()
-                break
+        # 需 >= 20 字符才抽取）。注意必须用**原始**用户输入判定：消息里还挂
+        # 着上下文块，直接量长度会让短指令也被误判成「有内容」。
+        last_user = self._last_user_text.strip()
+        if not last_user:
+            for msg in reversed(self._history):
+                if msg.get("role") == "user" and msg.get("content"):
+                    last_user = self._strip_context(msg["content"].strip())
+                    break
         if len(last_user) < 20:
             return
         if len((assistant_reply or "").strip()) < 20:
@@ -926,14 +954,24 @@ class Agent:
         self._log(f"USER: {user_input}")
 
         # skill suggestion (固化) - non-blocking
+        #
+        # 只在这里**计数**，是否真的弹出「保存为技能」由本轮的实际复杂度决定：
+        # 寒暄、问询、单次查询这类「不需要计划、也不是多步完成」的请求不该提示
+        # （用户明确要求）。判定放在工具执行处（见下方 _maybe_offer_skill）。
+        pending_skill = None
         try:
-            suggested = self.skills.record_request(user_input)
-            if suggested is not None:
-                self.callbacks.on_skill_suggested(suggested)
+            pending_skill = self.skills.record_request(user_input)
         except Exception as e:  # pragma: no cover
             self._log(f"[skills] record_request error: {e}")
+        skill_offered = False
+        tool_calls_done = 0
+        used_plan = False
 
-        self._history.append({"role": "user", "content": user_input})
+        self._last_user_text = user_input
+        # 动态上下文（记忆/技能/计划/知识库状态）挂在这条 user 消息的尾部，
+        # 而不是系统提示里：这样它变化时只影响这条新消息，前面恒定的
+        # system + tools 前缀（约 3000 token）仍可复用 KV 缓存。
+        self._history.append({"role": "user", "content": self._attach_context(user_input)})
 
         self._trim_history()
 
@@ -1213,6 +1251,13 @@ class Agent:
             raw_output = getattr(self.llm, "last_raw_output", "")
             if raw_output:
                 assistant_msg["raw_content"] = raw_output
+            else:
+                # 诊断：没有原文镜像 → 下一轮只能用「解析后」的历史渲染，几乎必然
+                # 与生成序列对不上，KV 前缀缓存整份作废。
+                self._log(
+                    f"[kv] 本轮无 raw_content（tool_calls={len(tool_calls)}, "
+                    f"content_len={len(''.join(content_buf))}）→ 下一轮前缀会失配"
+                )
             if tool_calls:
                 # Ensure every tool_call has a non-empty id. Some local models
                 # omit it; without an id the tool result cannot be correlated
@@ -1311,6 +1356,15 @@ class Agent:
                         )
                 last_tool_sig = sig
                 self._history.append(tool_msg)
+                tool_calls_done += 1
+                if name == "task_plan":
+                    used_plan = True
+                # 只在「真的需要计划、或是多步完成」时才提示固化技能：单条查询、
+                # 寒暄、一次问答走不到这里或不够阈值，用户就不会被打扰。
+                if (pending_skill is not None and not skill_offered
+                        and (used_plan or tool_calls_done >= _SKILL_SUGGEST_MIN_TOOLS)):
+                    self._safe_callback("on_skill_suggested", pending_skill)
+                    skill_offered = True
 
             # 防线 3：连续多次失败后注入反思提醒（次数有上限，防止提醒本身
             # 变成新的循环）。重置计数器，让下一次提醒需要重新积累失败。
@@ -1448,28 +1502,41 @@ class Agent:
         return msgs
 
     def _system_prompt(self) -> str:
-        """Build the full system prompt: base + memory + matched skill.
+        """**静态**系统提示：跨轮恒定不变（KV 前缀缓存命中的前提）。
 
-        Caches the prompt within a single agent turn (self._turn_idx) so that
-        _estimate_history_tokens() and _build_messages() don't recompute it
-        twice for the same turn.  Memory and skill match results are stable
-        within one LLM call cycle.
+        旧实现把工作记忆、命中的技能、任务计划、知识库状态都拼进系统提示。
+        这些内容一变，system 段的 token 序列就跟着变：qwen3.5 的 KV 缓存是
+        混合架构（ArraysCache）**不可裁剪**，于是整份缓存作废、每轮重新全量
+        prefill（实测前缀 3477 token，任一动态块变化就掉到 3043 甚至更低，
+        判定失败即整份丢弃）。
 
-        缓存键还包含 registry 的 state_version：task_plan 这类状态型工具
-        会在同一次 run() 内改写注入系统提示的数据（任务计划），不把版本
-        计入键的话，后续迭代拿到的仍是旧提示——模型看不到自己刚写的计划。
+        现在系统提示只留恒定部分（工具 schema 由后端单独渲染），所有会变的内容
+        走 ``_dynamic_context()``，挂在每条 user / tool 消息的**尾部**——「变」
+        只发生在对话末尾的新消息上，前面的前缀因此恒定可复用。
+        """
+        return SYSTEM_PROMPT
+
+    def _dynamic_context(self) -> str:
+        """随会话变化的上下文：工作记忆/当天事实 + 命中技能 + 任务计划 + 知识库状态。
+
+        返回 ``''`` 表示当前没有可注入内容。渲染时挂在新消息尾部（见
+        ``_attach_context``），**不**进系统提示，以免污染 KV 前缀缓存。
+
+        缓存键沿用旧实现的 registry ``state_version``：task_plan 这类状态型
+        工具会在一次 run() 内改写这些数据（任务计划），不计入版本的话后续迭代
+        拿到的仍是旧内容——模型看不到自己刚写的计划。同时也避免每条工具消息
+        都重算一次知识库状态（list_sources 虽已优化到 ~0.6s，但仍不该重复跑）。
         """
         try:
             state_ver = getattr(self.tools, "state_version", 0) if self.tools else 0
         except Exception:
             state_ver = 0
-        if (hasattr(self, "_cached_prompt_turn")
-                and self._cached_prompt_turn == self._turn_idx
-                and self._cached_prompt_state == state_ver
-                and hasattr(self, "_cached_prompt")):
-            return self._cached_prompt
+        if (getattr(self, "_ctx_cache_turn", -1) == self._turn_idx
+                and getattr(self, "_ctx_cache_state", -1) == state_ver
+                and getattr(self, "_ctx_cache_text", None) is not None):
+            return self._ctx_cache_text
 
-        base = SYSTEM_PROMPT
+        blocks: List[str] = []
 
         try:
             from .tools.memory import _work_memory
@@ -1512,19 +1579,19 @@ class Agent:
                 if compact_wm:
                     parts.append("# Work memory (scratchpad)\n" +
                                  json.dumps(compact_wm, ensure_ascii=False, separators=(",", ":")))
-                base += "\n\n" + "\n\n".join(parts)
+                blocks.append("\n\n".join(parts))
         except Exception:  # pragma: no cover
             pass
         # inject matched skill prompt
         try:
-            # Find the latest user message — skills match user intents, not
-            # assistant/tool messages. self._history[-1] after the first turn
-            # is an assistant message whose content may be None.
-            user_text = ""
-            for msg in reversed(self._history):
-                if msg.get("role") == "user" and msg.get("content"):
-                    user_text = msg["content"]
-                    break
+            # 用本轮**原始**用户输入匹配技能：历史里的 user 消息带有已挂载的
+            # 上下文块，拿它匹配会掺进环境文本。
+            user_text = self._last_user_text
+            if not user_text:
+                for msg in reversed(self._history):
+                    if msg.get("role") == "user" and msg.get("content"):
+                        user_text = msg["content"]
+                        break
             matched = self.skills.match(user_text) if user_text else None
             if matched:
                 # 技能 prompt 是用户自写的原文，长度不可控；截断并提示用
@@ -1533,18 +1600,19 @@ class Agent:
                 if len(sp) > _MAX_SKILL_PROMPT_CHARS:
                     sp = (sp[:_MAX_SKILL_PROMPT_CHARS] +
                           "\n…（已截断，用 skill_load 读取完整技能内容）")
-                base += f"\n\n# Active skill: {matched.name}\n{sp}"
+                blocks.append(f"# Active skill: {matched.name}\n{sp}")
         except Exception:  # pragma: no cover
             pass
 
-        # Inject the current task plan so every iteration (and every post-shrink
-        # request) re-anchors the model to the goal and its progress. The plan
-        # lives in the system prompt, which context shrinking never touches.
+        # Inject the current task plan so every iteration re-anchors the model
+        # to the goal and its progress. 它不再是「系统提示里不会被收缩掉的内容」，
+        # 而是挂在消息尾部：计划变了就在下一条消息里给出新版本，代价只是新增
+        # 的那一段，不影响已缓存的前缀。
         try:
             from .planner import load_plan, render_plan
             plan = load_plan(self.config.workspace)
             if plan is not None:
-                base += "\n\n" + render_plan(plan)
+                blocks.append(render_plan(plan))
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -1565,26 +1633,61 @@ class Agent:
                     )
                     if len(sources) > 8:
                         source_list += f" (and {len(sources) - 8} more)"
-                    base += (
-                        f"\n\n# Knowledge base\n"
+                    blocks.append(
+                        f"# Knowledge base\n"
                         f"{chunks} chunks in {len(sources)} file(s): {source_list}. "
                         f"Answer from these via `rag_search`."
                     )
                 else:
-                    base += (
-                        f"\n\n# Knowledge base\n"
-                        f"Configured but empty. Use `rag_ingest` to index."
+                    blocks.append(
+                        "# Knowledge base\n"
+                        "Configured but empty. Use `rag_ingest` to index."
                     )
         except Exception:  # pragma: no cover
             pass
 
-        self._cached_prompt_turn = self._turn_idx
-        self._cached_prompt_state = state_ver
-        self._cached_prompt = base
-        return base
+        text = "\n\n".join(b for b in blocks if b)
+        self._ctx_cache_turn = self._turn_idx
+        self._ctx_cache_state = state_ver
+        self._ctx_cache_text = text
+        return text
+
+    # 动态上下文块挂到消息尾部时的标题：让模型知道这是环境信息，不是用户说的。
+    _CTX_HEADER = "# 会话上下文（内容变化时重新给出）"
+
+    def _attach_context(self, content: str) -> str:
+        """把动态上下文挂到一条 user / tool 消息的**尾部**。
+
+        只在内容**变化**时挂：与上次注入完全相同的块不再重复（它仍在更早的消息
+        里，模型照样看得到），避免工具密集的回合把同一段几百 token 的文本重复
+        塞进上下文。因为只「追加到新消息」而从不改写已有消息，前面已缓存的
+        system + tools 前缀始终对得上。
+        """
+        try:
+            ctx = self._dynamic_context()
+        except Exception:  # pragma: no cover - 注入失败不影响对话
+            return content
+        if not ctx or ctx == self._last_ctx_text:
+            return content
+        self._last_ctx_text = ctx
+        return f"{content}\n\n{self._CTX_HEADER}\n{ctx}"
+
+    def _strip_context(self, content: str) -> str:
+        """去掉挂在消息尾部的动态上下文块，还原消息原始内容。
+
+        事实抽取、上下文摘要等「回看历史」的场合要用消息**本身**的内容：上下文
+        块是环境信息（知识库状态、任务计划……），量长度会污染判定（短指令被当成
+        长文本），内容也会污染输入（把知识库状态抽成「事实」）。
+        """
+        marker = f"\n\n{self._CTX_HEADER}"
+        idx = content.find(marker)
+        return content[:idx] if idx != -1 else content
 
     def _tool_message(self, tool_call: Dict[str, Any], result) -> Dict[str, Any]:
         content = result.to_message() if hasattr(result, "to_message") else str(result)
+        # 工具结果后面同样挂上（变化时才挂）：本轮刚写的任务计划、知识库状态等
+        # 在下一次迭代就能被模型看到，且不破坏前缀。
+        content = self._attach_context(content)
         return {
             "role": "tool",
             "tool_call_id": tool_call.get("id", ""),

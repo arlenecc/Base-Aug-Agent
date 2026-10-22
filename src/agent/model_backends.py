@@ -135,7 +135,74 @@ def _coerce_param(raw: str) -> Any:
     return obj
 
 
-def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _clone_prompt_cache(caches: Any) -> Optional[List[Any]]:
+    """复制一份 prompt cache（用于「静态头缓存 + 每轮克隆」）。
+
+    为什么需要：开启思考模式时，聊天模板会**剥掉**历史 assistant 消息里的
+    ``<think>…</think>``（只要它后面还有消息），于是「重放历史」永远无法逐
+    token 复现生成序列 → 跨轮 KV 前缀必然失配。而 ArraysCache（线性注意力）
+    不可裁剪，失配就整份作废、全量 prefill。
+
+    解法：缓存只保留**静态头**（system + 工具 schema，恒定不变），每轮生成时
+    克隆一份出来用——克隆体被生成过程追加，母本始终停在头的长度，下一轮继续用。
+    失败的代价从「prefill 整个 prompt」降到「只 prefill 头之后的对话部分」。
+
+    复制失败返回 None（调用方退化为新建缓存）。
+    """
+    if caches is None:
+        return None
+    try:
+        import copy
+        import mlx.core as mx
+    except Exception:  # pragma: no cover - 没有 mlx 就没有缓存可言
+        return None
+    def _copy_comp(v):
+        """逐份复制：数组要真的复制（克隆体生成时会原地写入，共享会改坏母本），
+        列表要新建容器（ArraysCache 用 list 存每层状态），None / 标量原样保留。"""
+        if v is None:
+            return None
+        if isinstance(v, (list, tuple)):
+            return type(v)(_copy_comp(x) for x in v)
+        if hasattr(v, "shape"):
+            return mx.array(v)
+        return v
+
+    cloned: List[Any] = []
+    try:
+        for c in caches:
+            new = copy.copy(c)          # 浅拷：拿到同类对象与属性壳
+            state = getattr(c, "state", None)
+            if state is not None:
+                new.state = tuple(_copy_comp(s) for s in state)
+            meta = getattr(c, "meta_state", None)
+            if meta is not None:
+                new.meta_state = tuple(_copy_comp(m) for m in meta)
+            cloned.append(new)
+    except Exception as e:  # pragma: no cover - 结构变了就放弃优化
+        logger.debug("克隆 prompt cache 失败（退化为全量 prefill）: %s", e)
+        return None
+    return cloned or None
+
+
+def _resolve_enable_thinking(config: Any) -> bool:
+    """归一「思考模式」开关：未配置（None）视为**开启**。
+
+    ``bool(None)`` 是 False，直接 ``bool(getattr(cfg, "llm_enable_thinking", True))``
+    会把「用户从没设过」当成「用户关掉了」。后果是模板在渲染历史消息时剥掉
+    ``<think>…</think>``，而生成提示是带 ``<think>`` 的 → 重放与生成序列错位 →
+    KV 前缀缓存每轮整份作废。
+    """
+    value = getattr(config, "llm_enable_thinking", True)
+    if value is None:
+        return True
+    if isinstance(value, str):
+        # 手工编辑配置里常见 "false" —— bool("false") 是 True，必须按字面解析。
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
+
+def _template_messages(messages: List[Dict[str, Any]],
+                       think_opened: bool = True) -> List[Dict[str, Any]]:
     """把 agent 历史消息适配成 chat template 友好的形状。两件事：
 
     1. **tool_calls 的 arguments 还原成 dict。** agent 内部（以及 OpenAI 兼容
@@ -145,11 +212,13 @@ def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     2. **有 raw_content 时用它重建忠实序列（KV 前缀复用的关键）。**
        本地后端会把模型原始输出（含工具调用 XML）记在 ``raw_content`` 上；
        直接渲染它，模板输出就与上一轮生成序列**逐 token 一致**，下一轮
-       prefill 才能命中缓存。做法（已用真实 tokenizer 验证 2600/2600 对齐）：
-         - ``content`` = 思考开标签 + 换行 + raw_content；
-         - ``reasoning_content`` = ""（**字符串**）。
-       后者是模板的暗门：它是字符串时模板跳过「按 think 闭标签自动拆分」，
-       否则标签会被剥掉、序列就对不上了。
+       prefill 才能命中缓存。做法（已用真实 tokenizer 验证对齐）：
+         - ``content`` = raw_content（**原样**，不再手工补思考开标签）；
+         - **不设置** ``reasoning_content``。
+       旧实现补 ``THO + "\\n"`` 并把 ``reasoning_content`` 设成空字符串当「跳过
+       自动拆分」的暗门；实测当前 tokenizer 会把空字符串渲染成
+       ``<think>\\n\\n</think>\\n\\n``（多一个空思考块），序列从 assistant 块起
+       就与生成时不一致 → 前缀缓存整份作废、每轮全量 prefill。
        raw 文本里已含工具调用的 XML，所以同时要**丢掉结构化的 tool_calls**，
        否则模板会再渲染一遍，变成重复内容。
 
@@ -163,8 +232,22 @@ def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         copied = dict(msg)
         raw = copied.get("raw_content")
         if raw and copied.get("role") == "assistant":
-            copied["content"] = THO + "\n" + raw
-            copied["reasoning_content"] = ""
+            # raw 就是「生成提示之后模型真正吐出的那串文本」——把它原样作为
+            # content，模板会按 enable_thinking 补上与生成提示相同的 `<think>\n`
+            # 前缀，于是渲染结果与上一轮生成序列逐 token 一致（已实测）。
+            #
+            # 旧实现在这里再拼一个 THO + "\n"，并用 `reasoning_content = ""`
+            # 当「跳过自动拆分」的暗门。实测当前 tokenizer 会把这个空字符串渲染
+            # 成 `<think>\n\n</think>\n\n`（多出一个空思考块），序列从 assistant
+            # 块起就对不齐 → 公共前缀掉到上轮 prompt 的最后一个 token，KV 缓存
+            # 整份作废（每轮重新全量 prefill）。所以这里不再设置该字段。
+            #
+            # 第二个坑：raw 里若没有 `</think>`（模型直接吐工具调用、没写思考），
+            # 模板同样会先插一个空思考块再拼原文。补一个闭合标签即可让整段按
+            # 推理渲染、与生成时逐 token 对齐——多出来的 `</think>` 落在缓存区
+            # **之后**，不影响前缀比对。
+            copied["content"] = raw if ("</think>" in raw or not think_opened) else raw + "\n</think>"
+            copied.pop("reasoning_content", None)
             # raw 里已含工具调用 XML，结构化字段再渲染一遍会重复。
             copied.pop("tool_calls", None)
             out.append(copied)
@@ -419,9 +502,53 @@ class _LazyLocalBackend:
         self._load_lock = threading.RLock()
         self._generation_lock = threading.RLock()
         self._closed = False
+        # 草稿模型（投机解码用）：由 UI 把已加载的辅助模型后端挂进来，见
+        # set_draft_model()。默认 None → 退化为普通解码。
+        self._draft_backend: Optional[Any] = None
 
     def list_models(self) -> List[str]:
         return [self.model]
+
+    # ------------------------------------------------------------------
+    def set_draft_model(self, backend: Optional[Any]) -> None:
+        """挂上/摘掉投机解码用的草稿模型后端（通常是已加载的辅助模型）。
+
+        草稿模型必须与主模型**同词表**（mlx_lm 的硬性要求）。这里只做保守校验：
+        词表对不上就静默禁用投机解码，绝不影响正常生成。
+        """
+        self._draft_backend = backend
+
+    def _draft_model_obj(self) -> Optional[Any]:
+        """取出可用的草稿模型对象；不可用返回 None（退化为普通解码）。"""
+        if not bool(getattr(self.config, "llm_speculative", True)):
+            return None
+        backend = getattr(self, "_draft_backend", None)
+        if backend is None or backend is self:
+            return None
+        if getattr(backend, "_closed", False):
+            return None
+        model = getattr(backend, "_model_obj", None)
+        if model is None:
+            return None
+        # 同词表校验：主模型与草稿模型的 vocab_size 必须一致，否则投机解码的
+        # 拒绝采样无从比较 logits。
+        try:
+            main_vocab = getattr(self._model_obj, "vocab_size", None)
+            draft_vocab = getattr(model, "vocab_size", None)
+            if main_vocab and draft_vocab and int(main_vocab) != int(draft_vocab):
+                logger.debug("投机解码禁用：草稿模型词表 %s != 主模型 %s",
+                             draft_vocab, main_vocab)
+                return None
+        except Exception:  # pragma: no cover - 校验失败按禁用处理
+            return None
+        # 草稿后端正在被别处占用（例如 RAG 浓缩）时不抢：两边同时用一个模型
+        # 会在 MLX 的线程局部 stream 上打架。
+        lock = getattr(backend, "_generation_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            return None
+        if lock is not None:
+            lock.release()
+        return model
 
     def _check_open(self) -> None:
         if self._closed:
@@ -445,9 +572,11 @@ def apply_mlx_memory_policy() -> None:
     """统一 MLX 内存策略（幂等，可多次调用）。聊天后端与 RAG 嵌入后端共用，
     保证一致、互不压低。
 
-    memory_limit：取「当前上限」与「~80% 物理 RAM」的较小值。默认 95% RAM
+    memory_limit：取「当前上限」与「~65% 物理 RAM」的较小值。默认 95% RAM
         （16G 机器 ~15G）会把统一内存吃满到系统上限，物理内存耗尽后系统换页 →
-        卡死。压到 80% 给系统留余量即可避免；同时不抬高用户主动设的更严上限。
+        卡死。80% 虽然不换页了，但只给系统留 ~3G（用户实测冲到 13G 后整机
+        卡顿），所以再压到 65%：16G 机器上限 ~10.4G，系统始终保有余量；
+        同时不抬高用户主动设的更严上限。
     cache_limit：取「当前上限」与「min(40% RAM, 6GB)（至少 1GB）」的较小值。
         默认 95% RAM 的 buffer cache 会一路涨到系统上限；但上一版压到 1GB 又会
         在 prefill/长上下文时让 `[seq,seq]` 注意力矩阵（单层即可超 1GB）每步
@@ -458,7 +587,7 @@ def apply_mlx_memory_policy() -> None:
         import mlx.core as mx
 
         ram = _mlx_ram_bytes()
-        mem_cap = max(int(ram * 0.80), 6 * 1024 ** 3)
+        mem_cap = max(int(ram * 0.65), 6 * 1024 ** 3)
         cur_mem = int(mx.get_memory_limit())
         mx.set_memory_limit(min(cur_mem, mem_cap))
 
@@ -482,6 +611,10 @@ class MLXLanguageBackend(_LazyLocalBackend):
         # 旧序列」时复用，否则整体重建——最坏退化为无缓存，不会出错。
         self._kv_cache = None
         self._kv_ids: List[int] = []
+        # 静态头缓存（system + 工具 schema）的**母本**与它的 token 序列：只读，
+        # 每轮生成都用它的克隆体（见 _clone_prompt_cache）。
+        self._head_cache = None
+        self._head_ids: List[int] = []
         # 创建该缓存的 **OS 线程**标识（threading.get_ident()）。
         # **MLX 的 prompt cache 与其 stream 是线程局部的**：缓存（及 stream）
         # 在 A 线程创建、却在 B 线程用于生成时，MLX 在 B 线程的 stream 表里
@@ -513,9 +646,9 @@ class MLXLanguageBackend(_LazyLocalBackend):
             except ImportError as e:
                 raise LLMError("MLX-LM 未安装，请安装: pip install mlx-lm") from e
             logger.info("正在从本地加载 MLX-LM: %s", self.model_path)
-            # 统一 MLX 内存策略：总内存封顶 ~80% RAM（防 OS 换页卡死），buffer
-            # cache 封顶 ~6GB（防 prefill 长上下文时大注意力矩阵每步反复释放重分配
-            # 造成的生成抖动）。详见 apply_mlx_memory_policy。
+            # 统一 MLX 内存策略：总内存封顶 ~65% RAM（防 OS 换页卡死、给系统留
+            # 余量），buffer cache 封顶 ~6GB（防 prefill 长上下文时大注意力矩阵
+            # 每步反复释放重分配造成的生成抖动）。详见 apply_mlx_memory_policy。
             apply_mlx_memory_policy()
             self._model_obj, self._tokenizer = load(
                 self.model_path,
@@ -551,17 +684,23 @@ class MLXLanguageBackend(_LazyLocalBackend):
         # 缺省时走 else 分支，照样输出 "<think>\n" 开头——即「未设置」会被当成
         # 开思考，开关就失效了。所以必须显式传值。
         # 老 tokenizer 不认识该参数时 TypeError 会被下面的兜底吃掉。
+        #
+        # 未配置（None）必须当成 **True**：bool(None) 是 False，会把「没设置过」
+        # 当成「用户关掉了思考」，于是模板在渲染历史时剥掉 `<think>…</think>`，
+        # 而生成时提示是带着 `<think>` 的——两边序列从 assistant 块起就错位，
+        # KV 前缀缓存整份作废（实测：公共前缀掉到上轮 prompt 的最后一个 token）。
+        thinking = _resolve_enable_thinking(self.config)
         kwargs: Dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": add_generation_prompt,
-            "enable_thinking": bool(
-                getattr(self.config, "llm_enable_thinking", True)
-            ),
+            "enable_thinking": thinking,
         }
         if tools:
             kwargs["tools"] = tools
         # arguments 还原成 dict：模板按 mapping 渲染历史 tool_calls 的参数。
-        messages = _template_messages(messages)
+        # think_opened：生成提示是否预置了 <think>（思考模式开关），决定历史里
+        # 的 raw_content 该怎么补闭合标签才能与生成序列对齐。
+        messages = _template_messages(messages, think_opened=thinking)
         try:
             return self._tokenizer.apply_chat_template(messages, **kwargs)
         except TypeError:
@@ -578,6 +717,20 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         continue
             kwargs.pop("tools", None)
             return self._tokenizer.apply_chat_template(messages, **kwargs)
+
+    def _usable_head_cache(self):
+        """返回可用的静态头缓存母本 (cache, ids)；不可用返回 (None, [])。
+
+        线程亲和性：母本与其 stream 同样是线程局部的，换线程复用会让 MLX 抛
+        ``No Stream in current thread``，所以必须校验建缓存的线程。
+        """
+        head = getattr(self, "_head_cache", None)
+        head_ids = getattr(self, "_head_ids", None)
+        if head is None or not head_ids:
+            return None, []
+        if getattr(self, "_head_thread_ident", None) != threading.get_ident():
+            return None, []
+        return head, head_ids
 
     def prime_prefix_cache(self, system_prompt: str, tools=None) -> None:
         """只 **prefill**（不生成）「system + tools」这段公共前缀，填好 KV 缓存。
@@ -613,7 +766,9 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 cache = make_prompt_cache(self._model_obj)
                 model = self._model_obj
                 # 分块前向填 KV；与 stream_generate 的 prefill 同款（input[None]）。
-                step = 2048
+                # 默认 4096 → 常见前缀（system+tools ≈ 2900 token）一次喂完，省掉
+                # 第二次前向的 kernel 启动与同步开销。
+                step = max(512, int(getattr(self.config, "local_llm_prompt_batch_size", 4096)))
                 for i in range(0, len(ids), step):
                     chunk = ids[i:i + step]
                     model(mx.array([chunk]), cache=cache)
@@ -621,6 +776,13 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 self._kv_cache = cache
                 self._kv_ids = list(ids)
                 self._kv_thread_ident = threading.get_ident()
+                # 留一份**母本**：它永不参与生成（生成只会用克隆体），长度永远停在
+                # 「system + 工具 schema」。思考模式下历史重放对不齐时，用它把
+                # 全量 prefill 降级为「只 prefill 头之后的对话部分」。
+                self._head_cache = _clone_prompt_cache(cache)
+                self._head_ids = list(ids)
+                # 母本同样是线程局部的（同 _kv_thread_ident 的理由）。
+                self._head_thread_ident = threading.get_ident()
                 logger.info("MLX 预热: 已预填 %d token 的 system+tools 前缀", len(ids))
             except Exception as e:  # pragma: no cover - 预热失败不影响正常对话
                 logger.warning("MLX 预热失败（忽略）: %s", e)
@@ -702,17 +864,61 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         cache, reuse = self._kv_cache, common
                     else:
                         # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
+                        # 诊断：打印公共前缀位置，配合「本轮比上轮短多少」判断是
+                        # 历史被改写（common 远小于缓存）还是头部被改（common 很小）。
+                        logger.info(
+                            "MLX KV 前缀未命中: 公共前缀 %d（缓存 %d / 本轮 %d）→ 整份重建",
+                            common, len(self._kv_ids), len(ids),
+                        )
+                        try:
+                            dec = self._tokenizer.decode
+                            lo = max(0, common - 6)
+                            logger.info(
+                                "MLX KV 分歧点: 缓存侧=%r || 本轮侧=%r",
+                                dec(self._kv_ids[lo:common + 6]),
+                                dec(ids[lo:common + 6]),
+                            )
+                        except Exception:  # pragma: no cover - 仅诊断
+                            pass
+
                         self._kv_cache = None
                         self._kv_ids = []
+                        # 降级：改用**静态头缓存的克隆体**。头（system + 工具
+                        # schema）恒定且重放必然一致，所以即便历史里的思考段被
+                        # 模板剥掉，头这一段照样对得上——本轮只需 prefill 头之后
+                        # 的对话部分，而不是整个 prompt。
+                        head, head_ids = self._usable_head_cache()
+                        if head is not None and head_ids:
+                            head_common = self._common_prefix_len(ids, head_ids)
+                            if head_common == len(head_ids):
+                                cloned = _clone_prompt_cache(head)
+                                if cloned is not None:
+                                    cache, reuse = cloned, head_common
+                                    logger.info(
+                                        "MLX KV 降级复用静态头: 跳过 %d token（本 prompt %d）",
+                                        reuse, len(ids),
+                                    )
                 if cache is not None and reuse >= len(ids):
                     # 缓存已完整覆盖本轮 prompt → 没有可喂的新 token，
                     # ids[reuse:] 为空，mlx_lm 直接报
                     # "Either input_embeddings or prompt (or both) must be provided"。
                     # 这种情况（重发同一条、历史改写后 prompt 变短）不复用，
                     # 整轮重新 prefill——正确性优先，代价只是一次全量 prefill。
-                    logger.debug("MLX KV 缓存已覆盖全部 prompt（%d/%d），本轮不复用",
-                                 reuse, len(ids))
+                    logger.info("MLX KV 缓存已覆盖全部 prompt（%d/%d），本轮不复用",
+                                reuse, len(ids))
                     cache, reuse = None, 0
+                if cache is None:
+                    # 同样先试静态头缓存的克隆体（没有预热过、或缓存刚被作废）。
+                    head, head_ids = self._usable_head_cache()
+                    if (head is not None and head_ids and ids is not None
+                            and self._common_prefix_len(ids, head_ids) == len(head_ids)):
+                        cloned = _clone_prompt_cache(head)
+                        if cloned is not None:
+                            cache, reuse = cloned, len(head_ids)
+                            logger.info(
+                                "MLX KV 复用静态头: 跳过 %d token（本 prompt %d）",
+                                reuse, len(ids),
+                            )
                 if cache is None:
                     try:
                         from mlx_lm.models.cache import make_prompt_cache
@@ -730,35 +936,61 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 gen_kwargs = {}
                 if cache is not None:
                     gen_kwargs["prompt_cache"] = cache
+                # prefill 分块：一次前向喂多少 token。默认 4096 让常见前缀
+                # （system+tools ≈ 2900 token）一次喂完，省掉多余的同步开销。
+                gen_kwargs["prefill_step_size"] = max(
+                    512, int(getattr(self.config, "local_llm_prompt_batch_size", 4096))
+                )
+                # 投机解码：草稿模型 = 已加载的辅助模型（同词表，无需额外加载）。
+                # 注意：mlx_lm 要求 prompt cache 可裁剪才允许投机解码，而 qwen3.5
+                # 的 ArraysCache 不可裁剪 → 传 prompt_cache 时必须关掉，否则
+                # ValueError。所以只有本轮没有缓存可复用（reuse == 0）才启用。
+                draft = None if (cache is not None and reuse) else self._draft_model_obj()
+                draft_lock = None
+                if draft is not None:
+                    draft_lock = getattr(self._draft_backend, "_generation_lock", None)
+                    if draft_lock is not None:
+                        draft_lock.acquire()
+                    gen_kwargs["draft_model"] = draft
+                    gen_kwargs["num_draft_tokens"] = max(
+                        1, int(getattr(self.config, "llm_num_draft_tokens", 3))
+                    )
+                    logger.info("MLX 投机解码启用：草稿模型=%s，num_draft_tokens=%d",
+                                getattr(self._draft_backend, "model", "?"),
+                                gen_kwargs["num_draft_tokens"])
 
                 prompt_tokens = 0
                 completion_tokens = 0
                 gen_ids: List[int] = []
                 raw_text = ""
-                for response in stream_generate(
-                    self._model_obj,
-                    self._tokenizer,
-                    ids[reuse:] if reuse else prompt,
-                    max_tokens=int(getattr(self.config, "max_tokens", 32768)),
-                    sampler=sampler,
-                    logits_processors=logits_processors,
-                    **gen_kwargs,
-                ):
-                    tok_id = getattr(response, "token", None)
-                    if tok_id is not None:
-                        gen_ids.append(int(tok_id))
-                    # 原始生成文本（含工具调用 XML）——agent 无法从事件重建：
-                    # tool_call 段被 _TaggedOutputParser 吃掉转成结构化调用，
-                    # 文本不进 content/reasoning 事件。这里逐片攒下，交给
-                    # agent 存进历史的 raw_content，供下一轮前缀复用。
-                    raw_text += getattr(response, "text", "") or ""
-                    prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
-                    completion_tokens = int(
-                        getattr(response, "generation_tokens", completion_tokens + 1)
-                        or completion_tokens + 1
-                    )
-                    for event in parser.feed(getattr(response, "text", "")):
-                        yield event
+                try:
+                    for response in stream_generate(
+                        self._model_obj,
+                        self._tokenizer,
+                        ids[reuse:] if reuse else prompt,
+                        max_tokens=int(getattr(self.config, "max_tokens", 32768)),
+                        sampler=sampler,
+                        logits_processors=logits_processors,
+                        **gen_kwargs,
+                    ):
+                        tok_id = getattr(response, "token", None)
+                        if tok_id is not None:
+                            gen_ids.append(int(tok_id))
+                        # 原始生成文本（含工具调用 XML）——agent 无法从事件重建：
+                        # tool_call 段被 _TaggedOutputParser 吃掉转成结构化调用，
+                        # 文本不进 content/reasoning 事件。这里逐片攒下，交给
+                        # agent 存进历史的 raw_content，供下一轮前缀复用。
+                        raw_text += getattr(response, "text", "") or ""
+                        prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+                        completion_tokens = int(
+                            getattr(response, "generation_tokens", completion_tokens + 1)
+                            or completion_tokens + 1
+                        )
+                        for event in parser.feed(getattr(response, "text", "")):
+                            yield event
+                finally:
+                    if draft_lock is not None:
+                        draft_lock.release()
                 yield from parser.finish()
                 # 记录本轮完整序列，供下一轮前缀比对。被取消（生成中途 break）
                 # 时 gen_ids 不完整，序列对不上，下一轮自动重建，不会错位。
@@ -770,6 +1002,10 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         self._kv_ids = ids + gen_ids
                     # ids 为 None（tokenizer 无 encode）→ 不记录缓存序列，
                     # 下一轮退化为无缓存字符串路径。
+                logger.info(
+                    "MLX 本轮生成结束: gen_ids=%d raw_len=%d draft=%s",
+                    len(gen_ids), len(raw_text), draft is not None,
+                )
                 self.last_raw_output = raw_text
                 yield StreamEvent(
                     "done",
@@ -793,6 +1029,8 @@ class MLXLanguageBackend(_LazyLocalBackend):
             self._tokenizer = None
             self._kv_cache = None
             self._kv_ids = []
+            self._head_cache = None
+            self._head_ids = []
             self._kv_thread_ident = None
             try:
                 import gc
@@ -809,6 +1047,9 @@ class MLXLanguageBackend(_LazyLocalBackend):
 
         混合架构的 ArraysCache 不可裁剪，缓存只能整用或整弃；对不齐时
         chat_stream 会自动重建，这里只是让调用方在已知历史变更时提前释放。
+
+        **静态头缓存保留**：它只含 system + 工具 schema，与历史无关，历史改写
+        后依然可用（下一轮直接降级复用它，省掉头部的 prefill）。
         """
         self._kv_cache = None
         self._kv_ids = []
@@ -839,7 +1080,7 @@ class MLXVLMBackend(_LazyLocalBackend):
             if config_path.exists():
                 self._model_config = json.loads(config_path.read_text(encoding="utf-8"))
             logger.info("正在从本地加载 MLX-VLM: %s", self.model_path)
-            # 同 MLXLLMBackend：统一 MLX 内存策略（总内存封顶 80% RAM、buffer
+            # 同 MLXLLMBackend：统一 MLX 内存策略（总内存封顶 65% RAM、buffer
             # cache 封顶 ~6GB），避免长对话/prefill 长上下文抖动或内存吃满换页卡死。
             apply_mlx_memory_policy()
             self._model_obj, self._processor = load(self.model_path, lazy=False, strict=True)
@@ -897,8 +1138,8 @@ class MLXVLMBackend(_LazyLocalBackend):
                 # 思考模式开关。mlx_vlm 的 apply_chat_template 是否接受
                 # enable_thinking 取决于具体模型的模板，不能假定——先带上试，
                 # 不认识（TypeError）就退掉重试，只牺牲这一个 kwarg。
-                template_kwargs["enable_thinking"] = bool(
-                    getattr(self.config, "llm_enable_thinking", True)
+                template_kwargs["enable_thinking"] = _resolve_enable_thinking(
+                    self.config
                 )
                 try:
                     prompt = apply_chat_template(
@@ -1043,13 +1284,14 @@ class ONNXLanguageBackend(_LazyLocalBackend):
         kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
-            "enable_thinking": bool(
-                getattr(self.config, "llm_enable_thinking", True)
-            ),
+            "enable_thinking": _resolve_enable_thinking(self.config),
         }
         if tools:
             kwargs["tools"] = tools
-        messages = _template_messages(messages)
+        messages = _template_messages(
+            messages,
+            think_opened=bool(kwargs.get("enable_thinking", True)),
+        )
         # 老 tokenizer 可能不认识 enable_thinking / tools：逐个退掉再试，
         # 避免一次 TypeError 把两个参数一起丢掉。
         try:

@@ -176,17 +176,26 @@ def test_tool_recreate_replaces_old_plan(plan_tool):
 
 
 # ---------------------------------------------------------------------------
-# Agent integration: plan injected into system prompt, cleared on reset
+# Agent integration: plan lives in the per-message context block (NOT the
+# static system prompt), cleared on reset
 # ---------------------------------------------------------------------------
 
-def test_plan_injected_into_system_prompt(config):
-    from agent.agent import Agent
+def test_plan_injected_as_dynamic_context(config):
+    """计划属于动态上下文：挂在消息尾部，绝不进系统提示。
+
+    系统提示必须跨轮恒定，否则 MLX 的 KV 前缀缓存（ArraysCache 不可裁剪）
+    会因这一个块的变动整份作废，每轮都要重新全量 prefill。
+    """
+    from agent.agent import Agent, SYSTEM_PROMPT
     save_plan(config.workspace, TaskPlan(goal="写一份周报", steps=[PlanStep(text="收集数据")]))
     agent = Agent(llm=object(), config=config, callbacks=object())
-    prompt = agent._system_prompt()
-    assert "写一份周报" in prompt
-    assert "收集数据" in prompt
-    assert "# Current task plan" in prompt
+    ctx = agent._dynamic_context()
+    assert "写一份周报" in ctx
+    assert "收集数据" in ctx
+    assert "# Current task plan" in ctx
+    # 静态部分不含任何动态内容
+    assert agent._system_prompt() == SYSTEM_PROMPT
+    assert "写一份周报" not in agent._system_prompt()
 
 
 def test_reset_clears_plan(config):
@@ -195,11 +204,14 @@ def test_reset_clears_plan(config):
     agent = Agent(llm=object(), config=config, callbacks=object())
     agent.reset()
     assert load_plan(config.workspace) is None
-    assert "# Current task plan" not in agent._system_prompt()
+    assert "# Current task plan" not in agent._dynamic_context()
 
 
 def test_plan_survives_context_shrink(config):
-    """计划在系统提示里，上下文收缩只压 _history，目标不应被摘要掉。"""
+    """计划存在 workspace 里，上下文收缩压的是 _history，目标不会被摘要掉。
+
+    收缩后计划由下一条消息的上下文块重新给出（旧的挂载随旧消息一起消失）。
+    """
     from agent.agent import Agent
 
     class SummarizeLLM:
@@ -219,5 +231,5 @@ def test_plan_survives_context_shrink(config):
 
     shrunk = agent._shrink_context(reason="test")
     assert shrunk
-    # 收缩后系统提示仍包含计划
-    assert "跨收缩目标X" in agent._system_prompt()
+    # 收缩后计划仍能从动态上下文取到（并会被重新挂到下一条消息上）
+    assert "跨收缩目标X" in agent._dynamic_context()

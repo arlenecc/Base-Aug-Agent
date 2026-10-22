@@ -49,6 +49,20 @@ def _make_window(tmp_path, monkeypatch):
     return win
 
 
+def _install_stub_warmup_worker(win, monkeypatch):
+    """把常驻对话线程换成桩：只记录预热请求，不起真线程。"""
+    class _StubWorker:
+        def __init__(self):
+            self.requests = 0
+
+        def request_warmup(self):
+            self.requests += 1
+
+    stub = _StubWorker()
+    monkeypatch.setattr(win, "_ensure_agent_worker", lambda: stub)
+    return stub
+
+
 def _flush_reason(win):
     """思考区走 100ms 攒批写入（见 MainWindow._on_reasoning）。
 
@@ -331,6 +345,36 @@ def test_rag_status_result_kept_out_of_chat_view(qtbot, tmp_path, monkeypatch):
     log = win.log_view.toPlainText()
     assert "572200" in log                  # 完整状态在日志里
     assert "book-79.epub" in log
+
+
+def test_context_shrink_and_clear_chat_rewarm(qtbot, tmp_path, monkeypatch):
+    """上下文压缩 / 清空对话作废缓存后，要排队一次预热。
+
+    这两个事件发生在「缓存已失效」之后，若不补预热，用户下一条消息就得等
+    一次全量 prefill。压缩发生在一轮对话内部（_busy=True），此时仍要排队，
+    由常驻 worker 在本轮结束后执行。
+    """
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    stub = _install_stub_warmup_worker(win, monkeypatch)
+    win._llm = object()
+
+    # 1) 对话进行中发生压缩：照样排队，但不改状态栏、不记耗时。
+    win._busy = True
+    win.status_label.setText("正在生成…")
+    win._on_context_shrunk("早期内容的摘要", "上下文超限")
+    assert stub.requests == 1
+    assert win._warmup_in_progress
+    assert win._warmup_started is None      # 忙时不记时（预热要等本轮结束）
+    assert win.status_label.text() == "正在生成…"   # 不覆盖当前状态
+
+    # 2) 清空对话后也要补一次（此时空闲，正常显示预热中）。
+    win._busy = False
+    win._warmup_in_progress = False
+    win._on_clear_chat()
+    assert stub.requests == 2
+    assert win._warmup_in_progress
+    assert "正在预热模型" in win.status_label.text()
     assert win.llm_load_btn.styleSheet() == ""  # 卸载后恢复默认样式（不再绿色）
 
 
@@ -692,8 +736,14 @@ def test_skill_suggestion_cached_during_run_shown_after_finish(qtbot, tmp_path, 
     # Before running, no pending skill.
     assert win._pending_skill is None
 
-    # Run a turn whose user text matches the recorded intent.
-    llm = _ScriptedLLM([[_evt("content", "done"), _evt("done", usage={"total_tokens": 3})]])
+    # Run a turn whose user text matches the recorded intent，且确实需要规划
+    # （用到 task_plan）——简单问答/单次查询现在已经不提示固化技能了。
+    tc_plan = [{"id": "c1", "function": {"name": "task_plan", "arguments": json.dumps(
+        {"op": "create", "goal": "deploy", "steps": ["build", "publish"]})}}]
+    llm = _ScriptedLLM([
+        [_evt("done", tool_calls=tc_plan, usage={"total_tokens": 3})],
+        [_evt("content", "done"), _evt("done", usage={"total_tokens": 3})],
+    ])
     win._agent.llm = llm
     win._agent.max_iterations = 3
     win.send_editor.setPlainText("deploy to staging")
@@ -738,9 +788,13 @@ def test_skill_suggestion_does_not_block_streaming(qtbot, tmp_path, monkeypatch)
     # Pre-populate so the next run triggers a suggestion.
     win._agent.skills.record_request("deploy to staging")
 
-    # Stream content first, then done — suggestion fires at run() start
-    # but dialog must not appear until _on_finished.
-    llm = _ScriptedLLM([[_evt("content", "streamed-content"), _evt("done", usage={"total_tokens": 3})]])
+    # 先规划（task_plan）再输出：只有这种「需要计划/多步」的轮次才会提示固化。
+    tc_plan = [{"id": "c1", "function": {"name": "task_plan", "arguments": json.dumps(
+        {"op": "create", "goal": "deploy", "steps": ["build", "publish"]})}}]
+    llm = _ScriptedLLM([
+        [_evt("done", tool_calls=tc_plan, usage={"total_tokens": 3})],
+        [_evt("content", "streamed-content"), _evt("done", usage={"total_tokens": 3})],
+    ])
     win._agent.llm = llm
     win._agent.max_iterations = 3
     win.send_editor.setPlainText("deploy to staging")
@@ -900,3 +954,119 @@ def test_append_chat_scrolls_to_bottom(qtbot, tmp_path, monkeypatch):
     win._append_chat("<p>tail</p>")
     sb = win.chat_view.verticalScrollBar()
     assert sb.value() == sb.maximum()
+
+
+def test_scratch_cache_released_when_idle(qtbot, tmp_path, monkeypatch):
+    """一轮结束（空闲）时释放 MLX 临时缓冲；同步进行中不动它。
+
+    运行期从不 clear_cache() 会让 prefill/生成攒下的 buffer 一直占着统一内存，
+    用户实测顶到 13G 后整机换页卡顿。
+    """
+    import sys, types
+    import agent.ui.main_window as mw
+
+    calls = []
+
+    class FakeMX:
+        @staticmethod
+        def clear_cache():
+            calls.append(1)
+
+    mlx_pkg = types.ModuleType("mlx")
+    mlx_core = types.ModuleType("mlx.core")
+    mlx_core.clear_cache = FakeMX.clear_cache
+    monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+
+    win._sync_busy = False
+    win._release_mlx_scratch_cache()
+    assert calls == [1]
+
+    calls.clear()
+    win._sync_busy = True           # 同步/检索进行中：不清理（那边正在复用 buffer）
+    win._release_mlx_scratch_cache()
+    assert calls == []
+
+
+def _skill_dialog_probe(win, monkeypatch):
+    """返回记录「是否弹过保存技能对话框」的计数器。"""
+    from PyQt6.QtWidgets import QMessageBox, QInputDialog
+
+    calls = {"n": 0}
+
+    def _track_question(*a, **k):
+        calls["n"] += 1
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", _track_question)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("x", True))
+    return calls
+
+
+def test_no_skill_suggestion_for_chitchat(qtbot, tmp_path, monkeypatch):
+    """寒暄 / 单次问答：不提示保存为技能。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    calls = _skill_dialog_probe(win, monkeypatch)
+
+    for _ in range(3):
+        win._agent.skills.record_request("你好啊")
+    llm = _ScriptedLLM([[_evt("content", "你好！"), _evt("done", usage={"total_tokens": 3})]])
+    win._agent.llm = llm
+    win.send_editor.setPlainText("你好啊")
+    win._on_send()
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+
+    assert calls["n"] == 0
+    assert "你好！" in win.chat_view.toHtml()
+
+
+def test_no_skill_suggestion_for_single_query(qtbot, tmp_path, monkeypatch):
+    """只调用一次工具的查询：不提示。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    calls = _skill_dialog_probe(win, monkeypatch)
+
+    for _ in range(3):
+        win._agent.skills.record_request("查一下知识库")
+    tc = [{"id": "c1", "function": {"name": "rag_status", "arguments": "{}"}}]
+    llm = _ScriptedLLM([
+        [_evt("done", tool_calls=tc, usage={"total_tokens": 3})],
+        [_evt("content", "查到了"), _evt("done", usage={"total_tokens": 3})],
+    ])
+    win._agent.llm = llm
+    win.send_editor.setPlainText("查一下知识库")
+    win._on_send()
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+
+    assert calls["n"] == 0
+
+
+def test_skill_suggestion_after_multi_step_turn(qtbot, tmp_path, monkeypatch):
+    """多步完成（≥3 次工具调用）：才提示保存为技能。"""
+    win = _make_window(tmp_path, monkeypatch)
+    qtbot.addWidget(win)
+    calls = _skill_dialog_probe(win, monkeypatch)
+
+    for _ in range(3):
+        win._agent.skills.record_request("整理这份报告")
+
+    def tc(i, name):
+        return [{"id": f"c{i}", "function": {"name": name, "arguments": "{}"}}]
+
+    llm = _ScriptedLLM([
+        [_evt("done", tool_calls=tc(1, "rag_status"), usage={"total_tokens": 3})],
+        [_evt("done", tool_calls=tc(2, "rag_status"), usage={"total_tokens": 3})],
+        [_evt("done", tool_calls=tc(3, "rag_status"), usage={"total_tokens": 3})],
+        [_evt("content", "整理好了"), _evt("done", usage={"total_tokens": 3})],
+    ])
+    win._agent.llm = llm
+    win._agent.max_iterations = 6
+    win.send_editor.setPlainText("整理这份报告")
+    win._on_send()
+    qtbot.waitUntil(lambda: not win._busy, timeout=5000)
+
+    assert calls["n"] == 1

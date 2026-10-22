@@ -2398,6 +2398,8 @@ class MainWindow(QMainWindow):
             if self._agent is not None:
                 self._agent.aux_llm = self._ensure_aux_llm()
         self._refresh_model_buttons()
+        # 卸载后草稿模型引用必须同步摘掉，否则主模型会拿着已关闭的后端去投机解码。
+        self._wire_draft_model()
         self._append_log(f"[model] {label} 已卸载")
         logger.info("UI: %s 已卸载", label)
         return True
@@ -2458,6 +2460,8 @@ class MainWindow(QMainWindow):
                     self._agent.aux_llm = llm
             self._append_log(f"[model] {label} 已加载: {payload.get('detail', '')}")
             self.status_label.setText(f"{label}已加载")
+            # 主/辅助任一加载完成都要重新接线草稿模型（投机解码）。
+            self._wire_draft_model()
             if role == "main":
                 # 后台预热 system+tools 前缀：让用户第一次输入直接命中 KV 缓存
                 # （否则首条要全量 prefill system + 工具 schema，约 20s）。
@@ -2469,6 +2473,26 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"{label}加载失败")
         finally:
             self._refresh_model_buttons()
+
+    def _wire_draft_model(self) -> None:
+        """把已加载的辅助模型挂成主模型的草稿模型（投机解码）。
+
+        不额外加载任何东西：辅助模型本来就在内存里（RAG 浓缩 / 事实抽取也用它）。
+        两者必须同词表（现在默认主/辅助都是 qwen3.5，vocab 248320）；不匹配时后端
+        会在生成时自行禁用投机解码。
+        """
+        main_llm = getattr(self, "_llm", None)
+        aux_llm = getattr(self, "_aux_llm", None)
+        setter = getattr(main_llm, "set_draft_model", None)
+        if not callable(setter):
+            return
+        try:
+            if aux_llm is not None and not getattr(aux_llm, "_closed", False):
+                setter(aux_llm)
+            else:
+                setter(None)
+        except Exception as e:  # pragma: no cover - 接线失败不影响对话
+            logger.debug("UI: 挂载草稿模型失败（忽略）: %s", e)
 
     def _on_model_load_failed(self, role: str, detail: str) -> None:
         self._model_busy[role] = False
@@ -3054,20 +3078,36 @@ class MainWindow(QMainWindow):
         worker.set_agent(self._agent)
         return worker
 
-    def _request_warmup(self) -> None:
+    def _request_warmup(self, allow_busy: bool = False) -> None:
         """让常驻对话线程预填 system+tools 的 KV 前缀（不生成、不写历史）。
 
-        只在主模型加载完成、agent 空闲时调用。预热跑在常驻线程上，保证缓存与
-        后续生成同线程；用户此时若发消息，输入优先，预热留到空闲再做。
+        预热跑在常驻线程上，保证缓存与后续生成同线程；用户此时若发消息，输入
+        优先，预热留到空闲再做。
+
+        ``allow_busy=True`` 用于「缓存已被作废但当前正在跑一轮」的场景
+        （上下文压缩 / 清空对话会把历史改写、缓存整份失效）。这类事件发生在
+        一轮对话**内部**，所以不能按空闲过滤掉请求——否则用户下一条消息又要
+        全量 prefill。常驻 worker 会在当前轮跑完后才执行预热，不会打断正在
+        进行的对话。
         """
         try:
-            if self._agent is None or self._busy:
+            if self._agent is None:
+                return
+            # 主模型权重还没读进来就别预热：prime_prefix_cache 会先 _ensure_loaded()，
+            # 等于在后台偷偷触发一次完整模型加载（几 GB、几十秒）。「清空对话」
+            # 这类入口在模型加载完成前被点到时尤其不能这么做。
+            if not self._is_model_loaded("main"):
+                return
+            if self._busy and not allow_busy:
                 return
             worker = self._ensure_agent_worker()
             worker.request_warmup()
             self._warmup_in_progress = True
-            self._warmup_started = time.monotonic()
-            self.status_label.setText("正在预热模型…（结束后显示「就绪」）")
+            if not self._busy:
+                # 忙的时候不记时：预热要等本轮结束才跑，现在起算的耗时没有
+                # 意义（会把自己等待对话的那段时间算进去）。
+                self._warmup_started = time.monotonic()
+                self.status_label.setText("正在预热模型…（结束后显示「就绪」）")
             self._append_log("[warmup] 后台预热 system+tools 前缀…")
         except Exception as e:  # pragma: no cover - 预热失败不影响对话
             logger.debug("UI: 预热请求失败（忽略）: %s", e)
@@ -3084,6 +3124,8 @@ class MainWindow(QMainWindow):
         # 更贴近当下的事实。
         if not self._busy and not self._sync_busy and self._llm is not None:
             self.status_label.setText(f"就绪{suffix}")
+        # 预热 prefill 会一次性申请大量临时缓冲，完了立刻归还系统。
+        self._release_mlx_scratch_cache()
 
     def _invalidate_llm_kv_caches(self) -> None:
         """失效主/辅助模型的跨轮 KV 缓存（换线程、切模型等场景）。
@@ -3459,6 +3501,26 @@ class MainWindow(QMainWindow):
         # 引用一直保留在 self._worker，下一条消息只 set_input 唤醒。
         # 现在流式已结束，可以安全弹出技能建议对话框。
         self._show_pending_skill_dialog()
+        # 一轮结束（agent 空闲）→ 把 MLX 的可复用临时缓冲归还系统。否则
+        # prefill/生成期间攒下的 buffer 会一直占着不释放，一路顶到统一内存
+        # 上限（用户实测 13G → 系统换页卡顿）。只清不再引用的缓存数组，模型
+        # 权重和 KV 前缀缓存不受影响。
+        self._release_mlx_scratch_cache()
+
+    def _release_mlx_scratch_cache(self) -> None:
+        """空闲时释放 MLX 的临时缓冲（mx.clear_cache()）。
+
+        同步/检索进行中不清理：那边正在按形状复用 buffer，清掉等于白扔一次
+        预热，而且它自己有按子批清理的节奏。
+        """
+        if self._sync_busy:
+            return
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception as e:  # pragma: no cover - 清理失败不影响对话
+            logger.debug("UI: mx.clear_cache() 失败（忽略）: %s", e)
 
     def _shutdown_worker(self, worker, label: str, cancel: bool = False,
                          wait_ms: int = 3000, term_wait_ms: int = 2000) -> bool:
@@ -3615,6 +3677,10 @@ class MainWindow(QMainWindow):
             f'{(" 摘要：" + self._escape(preview) + "…") if preview else ""}</p>'
         )
         self._append_log(f"[context] shrunk: {reason} | {preview}")
+        # 压缩改写了历史 → agent 已作废旧 KV 缓存，下一条消息本要全量 prefill。
+        # 这里排队一次预热（排在常驻线程「本轮跑完」之后），把这段等待挪到
+        # 用户还没输入的时候。
+        self._request_warmup(allow_busy=True)
 
     # ------------------------------------------------------------------
     # helpers
@@ -3753,6 +3819,9 @@ class MainWindow(QMainWindow):
             self._poll_task_plan()
         except Exception:
             pass
+        # reset() 作废旧 KV 缓存；新会话的第一条消息同样不该等 prefill，
+        # 这里立刻排队一次预热（此时一般不在对话中）。
+        self._request_warmup(allow_busy=True)
 
     @staticmethod
     def _escape(text: str) -> str:
