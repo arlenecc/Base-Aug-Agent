@@ -20,8 +20,41 @@ MB = 1024 * 1024
 # store 层：假 LanceDB 表
 # ---------------------------------------------------------------------------
 
+class _FakeQuery:
+    """忠实模拟 lancedb 0.40 的查询构造器：select 投影 + limit。"""
+
+    def __init__(self, table: "_FakeLanceTable") -> None:
+        self._table = table
+        self._cols = None
+        self._limit = None
+
+    def select(self, cols):
+        self._cols = list(cols)
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
+    def to_arrow(self):
+        cols = self._cols or ["id", "text", "source", "ingested_at"]
+        rows = self._table._rows
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        # select 不存在的列 → ValueError（真实 lancedb 的行为）
+        for c in cols:
+            if c == "ingested_at" and not self._table._support_ts:
+                raise ValueError(f"Schema error: No field named {c}")
+        return pa.table({c: [r.get(c) for r in rows] for c in cols})
+
+
 class _FakeLanceTable:
-    """最小 LanceDB 表假件：to_arrow(columns=...) 投影 + delete(where)。"""
+    """最小 LanceDB 表假件。
+
+    刻意忠实复刻两个「坑」行为，防止实现退化：
+      1. ``to_arrow()`` **不接受** columns kwarg（lancedb 0.40 TypeError，#160）；
+      2. 列投影只能走 ``search().select([...]).limit(n).to_arrow()``。
+    """
 
     def __init__(self, rows, support_ts: bool = True):
         # rows: [{id, text, source, ingested_at}]
@@ -29,19 +62,18 @@ class _FakeLanceTable:
         self._support_ts = support_ts
         self.delete_predicates: list = []
 
-    def to_arrow(self, columns=None):
-        cols = columns or ["id", "text", "source"]
-        if not self._support_ts and "ingested_at" in cols:
-            raise ValueError("column ingested_at not found")
-        data = {}
-        for c in cols:
-            if c == "ingested_at" and not self._support_ts:
-                continue
-            data[c] = [r.get(c) for r in self._rows]
-        return pa.table(data)
+    def to_arrow(self, **kwargs):
+        if kwargs:
+            raise TypeError(
+                "LanceTable.to_arrow() got an unexpected keyword argument %r"
+                % next(iter(kwargs)))
+        return _FakeQuery(self).to_arrow()
 
     def count_rows(self) -> int:
         return len(self._rows)
+
+    def search(self) -> _FakeQuery:
+        return _FakeQuery(self)
 
     def delete(self, where: str):
         self.delete_predicates.append(where)
@@ -319,3 +351,40 @@ def test_records_carry_ingested_at(tmp_path):
     assert len(records) == 1
     assert _INGESTED_AT in records[0]
     assert records[0][_INGESTED_AT] > 0
+
+
+# ---------------------------------------------------------------------------
+# 真实 LanceDB 表（不 mock 表对象）——用户实测踩过 to_arrow(columns=) TypeError，
+# 这里确保投影走查询构造器（#160 同坑）。
+# ---------------------------------------------------------------------------
+
+def test_scan_duplicate_texts_against_real_lancedb(tmp_path):
+    import lancedb
+
+    from agent.rag.vector_store import _TABLE_NAME, VectorStore
+
+    persist = tmp_path / "lancedb"
+    persist.mkdir()
+    db = lancedb.connect(str(persist))
+    db.create_table(_TABLE_NAME, [
+        {"id": "a_0", "text": "同一段内容", "source": "/kb/a.txt",
+         "chunk_index": 0, "text_fts": "同一段 内容", "ingested_at": 200.0},
+        {"id": "b_0", "text": "同一段内容", "source": "/kb/b.txt",
+         "chunk_index": 0, "text_fts": "同一段 内容", "ingested_at": 100.0},
+        {"id": "a_1", "text": "独有内容", "source": "/kb/a.txt",
+         "chunk_index": 1, "text_fts": "独有 内容", "ingested_at": 200.0},
+    ])
+    store = VectorStore(persist_dir=str(persist))
+    store._ensure_initialized = lambda: None       # type: ignore[method-assign]
+    store._ensure_table = lambda: db.open_table(_TABLE_NAME)  # type: ignore[method-assign]
+
+    scan = store.scan_duplicate_texts()
+    assert scan["total"] == 3
+    assert len(scan["groups"]) == 1
+    g = scan["groups"][0]
+    assert g["keep"]["id"] == "b_0"                # 最早入库
+    assert [d["id"] for d in g["drop"]] == ["a_0"]
+
+    deleted = store.delete_by_ids(["a_0"])
+    assert deleted == 1
+    assert store.count() == 2

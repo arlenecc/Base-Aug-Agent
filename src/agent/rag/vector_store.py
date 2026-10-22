@@ -2054,14 +2054,28 @@ class VectorStore:
         if table is None:
             return {"total": 0, "groups": [], "source_counts": {}}
         try:
-            arrow = table.to_arrow(columns=["id", "text", "source", _INGESTED_AT])
+            count = table.count_rows()
+        except Exception:
+            count = 0
+        if count == 0:
+            return {"total": 0, "groups": [], "source_counts": {}}
+        # 列投影必须走查询构造器 select([...])——**不能**用
+        # to_arrow(columns=[...])：lancedb 0.40 的 LanceTable.to_arrow 不接受
+        # columns kwarg（TypeError，#160 同一坑；list_sources 因此改走 select）。
+        # limit(count) 取全表（与 list_sources 同模式）。
+        try:
+            arrow = (table.search()
+                     .select(["id", "text", "source", _INGESTED_AT])
+                     .limit(count).to_arrow())
         except Exception as e:
             # 旧表没有 ingested_at 列（迁移未跑/失败）：退化为不按时间保留，
             # 组内按 (source, id) 字典序取第一份——仍然确定，只是「最早」语义
-            # 退化为「字典序最早」。
-            logger.debug("scan_duplicate_texts: %s 列读取失败，退化分组: %s",
+            # 退化为「字典序最早」。select 缺列抛 ValueError，这里接住。
+            logger.debug("scan_duplicate_texts: %s 列投影失败，退化分组: %s",
                          _INGESTED_AT, e)
-            arrow = table.to_arrow(columns=["id", "text", "source"])
+            arrow = (table.search()
+                     .select(["id", "text", "source"])
+                     .limit(count).to_arrow())
         rows = arrow.to_pylist()
         has_ts = _INGESTED_AT in arrow.schema.names
         by_text: Dict[str, List[Dict[str, Any]]] = {}
