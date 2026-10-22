@@ -37,6 +37,13 @@ _mem_proc = None
 _mem_stop: Optional[threading.Event] = None
 _mem_peak = 0
 
+# 同步心跳间隔（秒）：同步是事件驱动日志的——每个文件打「开始处理/解析完成/
+# 切片完成」，但**单个大文件（扫描书 OCR/版面/表格）可能连续跑几分钟**，期间
+# 没有任何输出，用户看到「很久没日志」会以为卡死。心跳线程按间隔补一条
+# 「进行中」进度（已耗时 / 已完成 x·y / 各在飞文件已处理时长），让长转换期间
+# 每分钟都有反馈。RAG_HEARTBEAT_S=0 关闭，可调间隔。
+_HEARTBEAT_INTERVAL_S = float(os.environ.get("RAG_HEARTBEAT_S", "60") or 0)
+
 
 def _mem_rss() -> int:
     global _mem_proc
@@ -799,6 +806,50 @@ class RAGEngine:
                 mem_thread.join(timeout=2.0)
             return stats
 
+        # 同步心跳：在飞文件登记表 + 周期打点线程。worker 每开始处理一个文件
+        # 就登记（filepath -> 开始时间），处理完（任何出口）注销；心跳读这张
+        # 表报告「谁还在跑、跑了多久」。默认 60s 一条，RAG_HEARTBEAT_S=0 关。
+        _inflight: Dict[str, float] = {}
+        _inflight_lock = threading.Lock()
+        _hb_stop = threading.Event()
+
+        def _file_started(fp: str, t0: float) -> None:
+            with _inflight_lock:
+                _inflight[fp] = t0
+
+        def _file_finished(fp: str) -> None:
+            with _inflight_lock:
+                _inflight.pop(fp, None)
+
+        def _heartbeat() -> None:
+            while not _hb_stop.wait(_HEARTBEAT_INTERVAL_S):
+                try:
+                    now = time.monotonic()
+                    with _inflight_lock:
+                        items = sorted(_inflight.items(), key=lambda kv: kv[1])
+                    with stats_lock:
+                        done = stats["files_extracted"] + stats["files_skipped"]
+                    if items:
+                        detail = ", ".join(
+                            f"{os.path.basename(fp)}({now - t0:.0f}s)"
+                            for fp, t0 in items[:4]
+                        )
+                        if len(items) > 4:
+                            detail += f" 等{len(items)}个"
+                        _log("  ⏱ 同步进行中 (已 %.0fs): 已完成 %d/%d 个文件, "
+                             "处理中 %d 个 [%s]",
+                             now - t_start, done, total_files, len(items), detail)
+                    else:
+                        _log("  ⏱ 同步进行中 (已 %.0fs): 已完成 %d/%d 个文件"
+                             "（当前无文件在处理：向量化/收尾阶段）",
+                             now - t_start, done, total_files)
+                    _flush_logs("同步进行中...")
+                except Exception:
+                    pass  # 心跳是纯观测，绝不影响同步主流程
+
+        if _HEARTBEAT_INTERVAL_S > 0:
+            threading.Thread(target=_heartbeat, daemon=True).start()
+
         # Step 2: load manifest and partition
         _log("━━━ Step 2/6: 增量对比（Manifest） ━━━")
         manifest = _load_manifest(self._rag_dir)
@@ -940,6 +991,16 @@ class RAGEngine:
             def _worker(filepaths: List[str]) -> None:
                 """单个 worker：处理分配给它的文件列表，把 chunks 推入队列。"""
                 worker_id = threading.get_ident()
+                # 心跳注销辅助：当前在飞文件（兜底也靠它——worker 级 catch-all
+                # 异常发生时保证登记表不留下幽灵条目）。
+                _cur_fp = None
+
+                def _finish_cur() -> None:
+                    nonlocal _cur_fp
+                    if _cur_fp is not None:
+                        _file_finished(_cur_fp)
+                        _cur_fp = None
+
                 _log("  [Worker-%d] 启动，负责 %d 个文件", worker_id % 1000, len(filepaths))
                 try:
                     for filepath in filepaths:
@@ -954,6 +1015,11 @@ class RAGEngine:
                         t0 = time.monotonic()
                         _log("  [%d/%d] 开始处理: %s", file_no, len(files_to_process), fname)
                         _flush_logs(fname)
+                        # 心跳登记：本文件进入处理（含可能几分钟的 PDF 转换），
+                        # 任何出口都要 _finish_cur 注销（见下方各 continue/
+                        # return 与循环末尾）。
+                        _cur_fp = filepath
+                        _file_started(filepath, t0)
                         try:
                             # ---- 1. 解析文件 ----
                             # 路由优先级：pandoc（epub 系电子书/docx/html/LaTeX）
@@ -999,12 +1065,14 @@ class RAGEngine:
                             logger.warning("    └─ ❌ 解析失败: %s (耗时 %.2fs): %s", fname, time.monotonic() - t0, e)
                             with stats_lock:
                                 stats["errors"].append(msg)
+                            _finish_cur()
                             continue
                         if not text.strip():
                             msg = f"{os.path.basename(filepath)}: extracted text is empty"
                             logger.warning("    └─ ⚠ 提取文本为空: %s", fname)
                             with stats_lock:
                                 stats["errors"].append(msg)
+                            _finish_cur()
                             continue
                         # clean → chunk → put 包在 try 中，避免 clean_text/
                         # normalize_markdown/chunk_documents 异常导致 worker
@@ -1185,6 +1253,7 @@ class RAGEngine:
                             logger.error("    └─ ❌ 清洗/切片失败: %s: %s", fname, e, exc_info=True)
                             with stats_lock:
                                 stats["errors"].append(msg)
+                            _finish_cur()
                             continue
 
                         with stats_lock:
@@ -1199,6 +1268,7 @@ class RAGEngine:
                         _flush_logs(f"✅ {fname} ({len(doc_chunks)}切片)")
 
                         if self._is_cancelled():
+                            _finish_cur()
                             return
                         # 背压：队列满时阻塞，避免内存堆积。
                         # 使用 timeout + 循环检查取消标志，避免主线程因
@@ -1211,10 +1281,12 @@ class RAGEngine:
                             except queue.Full:
                                 continue
                         else:
+                            _finish_cur()
                             return
                         # Release local references so memory is freed before
                         # the next file is loaded (important for large PDFs:
                         # without this, doc_chunks stays alive until next iter).
+                        _finish_cur()
                         del doc_chunks, item
                 except Exception as e:
                     # 兜底：任何未预期的异常都记录，避免 worker 静默死亡。
@@ -1222,6 +1294,9 @@ class RAGEngine:
                     with stats_lock:
                         stats["errors"].append(f"worker: {e}")
                 finally:
+                    # 心跳兜底注销：异常路径可能跳过各出口的 _finish_cur，
+                    # 这里保证登记表不留下幽灵条目（心跳永远只报真实在飞文件）。
+                    _finish_cur()
                     # 投递哨兵也要带超时，防止队列满且主线程已退出消费时
                     # worker 永久卡在 put。
                     _log("  [Worker-%d] 完成所有文件，发送完成信号", worker_id % 1000)
@@ -1520,6 +1595,7 @@ class RAGEngine:
             if mem_thread is not None and _mem_stop is not None:
                 _mem_stop.set()
                 mem_thread.join(timeout=2.0)
+            _hb_stop.set()
             return stats
 
         t_total = time.monotonic() - t_start
@@ -1543,6 +1619,7 @@ class RAGEngine:
         if mem_thread is not None and _mem_stop is not None:
             _mem_stop.set()
             mem_thread.join(timeout=2.0)
+        _hb_stop.set()
         return stats
 
     def _dedupe_by_fingerprint(

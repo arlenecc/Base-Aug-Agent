@@ -946,3 +946,53 @@ def test_docling_markdown_whitespace_compressed_on_ingest(monkeypatch, tmp_path)
         "\n\n\n" not in r.get("text", "")
         for r in store.records
     )
+
+
+def test_sync_heartbeat_logs_progress_during_long_file(monkeypatch, tmp_path):
+    """长转换期间有心跳进度日志；同步结束后心跳停止（默认 60s，测试调小）。"""
+    import time as _time
+
+    import agent.rag.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "_HEARTBEAT_INTERVAL_S", 0.3)
+
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(tmp_path, store)
+    (kb / "slow.pdf").write_bytes(b"%PDF-1.4 fake")
+
+    def _slow_extract(fp, pe="docling"):
+        _time.sleep(1.5)                       # 模拟分钟级 PDF 转换
+        return "# 慢文件\n\n" + "正文内容" * 100, True
+
+    monkeypatch.setattr(engine_mod, "_extract_with_pdf_engine", _slow_extract)
+
+    logs: list = []
+    stats = engine.ingest(force=True, log_callback=logs.append)
+    assert stats["files_extracted"] == 1
+
+    hb = [l for l in logs if "同步进行中" in l]
+    assert hb, "长转换期间应出现心跳进度日志"
+    assert any("slow.pdf" in l and "处理中 1 个" in l for l in hb), hb
+
+    # 同步结束后心跳停止：等在飞心跳落地后不应再有新行
+    _time.sleep(0.8)
+    n = len(logs)
+    _time.sleep(0.8)
+    assert len(logs) == n
+
+
+def test_sync_heartbeat_disabled_with_zero_interval(monkeypatch, tmp_path):
+    """RAG_HEARTBEAT_S=0 时完全不打心跳（不污染日志）。"""
+    import time as _time
+
+    import agent.rag.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "_HEARTBEAT_INTERVAL_S", 0)
+
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(tmp_path, store)
+    (kb / "a.txt").write_text("普通小文件，内容足够长以便切片。" * 5, encoding="utf-8")
+
+    logs: list = []
+    engine.ingest(force=True, log_callback=logs.append)
+    assert not any("同步进行中" in l for l in logs)
