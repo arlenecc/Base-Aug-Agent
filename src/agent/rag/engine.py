@@ -320,6 +320,38 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+# 采样指纹：头/中/尾各取这么多字节。整库同步时对每个「size 疑似冲突」的
+# 文件读 3×64KB，判别字节级副本的代价相对一次 PDF 解析（分钟级）可忽略。
+_FP_SAMPLE_BYTES = 64 * 1024
+
+
+def _file_fingerprint(filepath: str) -> str:
+    """文件采样指纹：size + 头/中/尾三段采样内容的 sha256 摘要。
+
+    用途：判别「同一本书放在不同目录」的**字节级副本**——在解析前就去重，
+    省掉一次完整的 PDF/Office 解析（OCR/版面/表格，分钟级），也避免同一
+    内容多份向量进库造成检索噪声。三段采样 + size 对「同内容同字节」的副本
+    足够；对「同内容但字节不同」（重新保存、格式转换）无能为力——那类由
+    同步后的 content_hash 清洗兜底（见 _cleanup_duplicate_content）。
+
+    小文件（<= 3 段采样总量）直接全量读，指纹即完整内容摘要。
+    """
+    size = os.path.getsize(filepath)
+    h = hashlib.sha256()
+    h.update(b"fp-v1\x00")
+    h.update(str(size).encode("ascii"))
+    with open(filepath, "rb") as f:
+        if size <= _FP_SAMPLE_BYTES * 3:
+            h.update(f.read())
+            return h.hexdigest()
+        h.update(f.read(_FP_SAMPLE_BYTES))               # 头段
+        f.seek(max(0, size // 2 - _FP_SAMPLE_BYTES // 2))
+        h.update(f.read(_FP_SAMPLE_BYTES))               # 中段
+        f.seek(max(0, size - _FP_SAMPLE_BYTES))
+        h.update(f.read(_FP_SAMPLE_BYTES))               # 尾段
+    return h.hexdigest()
+
+
 def _escape_like(s: str) -> str:
     """Escape a value used inside a SQL ``LIKE`` literal (with ``ESCAPE '\\'``).
 
@@ -715,6 +747,7 @@ class RAGEngine:
             "files_extracted": 0,
             "files_skipped": 0,
             "files_deleted": 0,
+            "files_deduped": 0,
             "total_chars": 0,
             "chunks": 0,
             "errors": [],
@@ -777,6 +810,9 @@ class RAGEngine:
         files_to_process: List[str] = []  # new/modified files needing full pipeline
         skipped_detail: List[str] = []
         new_detail: List[str] = []
+        # 当前磁盘上的文件集合：副本条目（duplicate_of）的「规范源晋升」要用——
+        # 规范源被删/移走时，副本升级为待处理，否则书会从知识库里消失。
+        current_file_set = set(all_files)
         for filepath in all_files:
             # TOCTOU：rglob 扫描与 os.stat 之间文件可能被删除/重命名（编辑器
             # 临时文件、用户操作、云盘同步）。_chunk_iter 对同一竞态已做了
@@ -797,7 +833,22 @@ class RAGEngine:
                         f"{os.path.basename(filepath)}: 文件签名失败（扫描后已消失）: {e}")
                 continue
             prev = manifest.get(filepath)
+            # 副本晋升：本文件此前被判定为另一路径的副本（duplicate_of），若
+            # 规范源已不在本次扫描结果里（被删/移走），这个副本就是仅存的
+            # 一份——必须升级为待处理，否则内容会从知识库中消失。
+            promoted = bool(
+                prev is not None
+                and prev.get("duplicate_of")
+                and prev["duplicate_of"] not in current_file_set
+            )
+            # dup_retry：上一轮「规范源解析失败、本副本被让位」留下的重试标记
+            # （见 _cleanup_duplicate_content）。带此标记的条目即使
+            # mtime/size 没变也要重新处理——否则规范源一直失败时，副本永远
+            # 被让位，书会从知识库里消失。
+            retry_dup = bool(prev is not None and prev.get("dup_retry"))
             if (not force
+                    and not promoted
+                    and not retry_dup
                     and prev is not None
                     and prev.get("mtime") == sig["mtime"]
                     and prev.get("size") == sig["size"]):
@@ -814,7 +865,12 @@ class RAGEngine:
                         logger.warning("RAG: progress_callback error: %s", e)
             else:
                 files_to_process.append(filepath)
-                reason = "新增" if prev is None else "已修改"
+                if promoted:
+                    reason = "副本晋升"
+                elif retry_dup:
+                    reason = "副本重试"
+                else:
+                    reason = "新增" if prev is None else "已修改"
                 new_detail.append(f"  → 待处理({reason}): {os.path.basename(filepath)}")
         # 汇总输出
         if skipped_detail:
@@ -833,6 +889,17 @@ class RAGEngine:
                     f"增量对比: {len(files_to_process)}待处理, {stats['files_skipped']}跳过")
             except Exception:
                 pass
+
+        # Step 2.5: 跨目录副本去重（解析前，按文件采样指纹）
+        # 同一本书放在不同目录 = 字节完全相同的副本。逐个解析既浪费（一次
+        # PDF OCR/版面/表格是分钟级），又让同一内容多份向量进库、检索重复
+        # 命中（噪声）。这里只解析每组指纹的第一个（规范源），其余记 manifest
+        # 为 duplicate_of、不解析不写向量；历史上真入过库的副本的残留向量由
+        # Step 5.5 的 content_hash 清洗兜底。
+        self._dedupe_by_fingerprint(
+            files_to_process, all_files, manifest, new_manifest,
+            stats, stats_lock, _log,
+        )
 
         # Step 2b: 初始化向量库
         if progress_callback is not None:
@@ -1411,6 +1478,15 @@ class RAGEngine:
         else:
             _log("  无已删除文件需要清理")
 
+        # Step 5.5: 按 content_hash 清洗副本向量（同步收尾，manifest 保存前）
+        # 两类「同一内容多来源」：① 历史遗留——本功能前已入库的副本，manifest
+        # 里多条同 content_hash 且都带向量；② 指纹漏网——同内容不同字节（重新
+        # 保存的 PDF、docx→pdf 导出），解析时指纹不同都入了库。每组只保留一个
+        # 规范源，其余来源的向量/digest/缓存一并清掉，manifest 标记副本；
+        # 规范源没能入库的副本标记 dup_retry，下轮改由它优先。
+        self._cleanup_duplicate_content(
+            new_manifest, manifest, stats, stats_lock, _log)
+
         # Step 6: 保存 manifest
         _log("━━━ Step 6/6: 保存同步记录 ━━━")
         try:
@@ -1449,9 +1525,10 @@ class RAGEngine:
         t_total = time.monotonic() - t_start
         _log("══════════════════════════════════════════")
         _log("✅ 知识库同步完成 (耗时 %.1fs)", t_total)
-        _log("   扫描文件: %d | 新增/更新: %d | 跳过(未修改): %d | 清理删除: %d",
+        _log("   扫描文件: %d | 新增/更新: %d | 跳过(未修改): %d | 清理删除: %d | 副本去重: %d",
             stats["files_found"], stats["files_extracted"],
             stats["files_skipped"], stats["files_deleted"],
+            stats.get("files_deduped", 0),
         )
         _log("   总字符数: %d | 向量切片: %d | 错误: %d",
             stats["total_chars"], stats["chunks"], len(stats.get("errors", [])),
@@ -1467,6 +1544,228 @@ class RAGEngine:
             _mem_stop.set()
             mem_thread.join(timeout=2.0)
         return stats
+
+    def _dedupe_by_fingerprint(
+        self,
+        files_to_process: List[str],
+        all_files: List[str],
+        manifest: Dict[str, Dict[str, Any]],
+        new_manifest: Dict[str, Dict[str, Any]],
+        stats: Dict[str, Any],
+        stats_lock: threading.Lock,
+        log,
+    ) -> List[str]:
+        """跨目录字节级副本去重（解析前）：同指纹只留一个规范源解析入库。
+
+        同一本书放在不同目录 = 字节完全相同的副本。逐个解析既浪费（一次
+        PDF OCR/版面/表格是分钟级），又让同一内容多份向量进库、检索时重复
+        命中（噪声）。判别用「文件采样指纹」（_file_fingerprint）：size 相同
+        是必要条件，所以只对 size 冲突的文件现算指纹——包括与**旧 manifest
+        条目** size 冲突的（规范源可能已入库、本次未修改，没必要重解析）。
+
+        规范源选取：优先「已在库里的」（不在本次待处理列表 → 零代价），其次
+        路径字典序（确定性，跨同步稳定）。被跳过的副本记 new_manifest 为
+        ``duplicate_of`` 条目（mtime/size 仍在，下次同步直接认出），不解析、
+        不写向量；它历史上若真入过库（旧条目有 chunk_count），残留向量由
+        Step 5.5 的 _cleanup_duplicate_content 补清。
+
+        返回被跳过（未解析）的副本路径列表。
+        """
+        if not files_to_process:
+            return []
+        # size → [paths]，覆盖全部当前文件（不止待处理的）：已入库文件可能
+        # 就是规范源。分区循环里已 stat 过一次，这里无法复用（作用域在
+        # ingest 内），但 os.stat 本身极便宜，可忽略。
+        by_size: Dict[int, List[str]] = {}
+        sigs: Dict[str, Dict[str, Any]] = {}
+        for fp in all_files:
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue  # TOCTOU：扫描后消失，分区循环已记 error
+            by_size.setdefault(st.st_size, []).append(fp)
+            sigs[fp] = {"mtime": st.st_mtime, "size": st.st_size}
+        # 候选 size：当前文件内部冲突的，加上与旧 manifest 条目冲突的。
+        known_sizes = {
+            e.get("size") for e in manifest.values() if e.get("size") is not None
+        }
+        candidate_sizes = {s for s, ps in by_size.items() if len(ps) > 1}
+        candidate_sizes |= known_sizes & set(by_size)
+        if not candidate_sizes:
+            return []
+        fp_registry: Dict[str, str] = {}
+        for s in candidate_sizes:
+            for fp in by_size[s]:
+                try:
+                    fp_registry[fp] = _file_fingerprint(fp)
+                except OSError as e:
+                    logger.warning(
+                        "  ⚠ 副本指纹计算失败（该文件不参与去重）: %s: %s",
+                        os.path.basename(fp), e,
+                    )
+        # 指纹分组 → 每组选规范源
+        groups: Dict[str, List[str]] = {}
+        for fp, fg in fp_registry.items():
+            groups.setdefault(fg, []).append(fp)
+        # 上一轮标记过「规范源失败、让我重试」的路径 → 这些规范源本轮避开
+        # （否则规范源一直解析失败时，副本永远被让位，书从知识库里消失）。
+        failed_canonicals = {
+            e["dup_retry"] for e in manifest.values() if e.get("dup_retry")
+        }
+        to_process = set(files_to_process)
+        skipped: List[str] = []
+        for paths in groups.values():
+            if len(paths) < 2:
+                continue
+            # 规范源：没失败过的优先，其次已入库的（False < True，零代价），
+            # 最后路径字典序（确定性，跨同步稳定）。
+            canonical = sorted(
+                paths,
+                key=lambda p: (p in failed_canonicals, p in to_process, p),
+            )[0]
+            for p in sorted(paths):
+                if p == canonical or p not in to_process:
+                    continue
+                entry = dict(sigs.get(p) or _file_signature(p))
+                entry["duplicate_of"] = canonical
+                new_manifest[p] = entry
+                to_process.discard(p)
+                skipped.append(p)
+                try:
+                    rel = os.path.relpath(canonical, self._knowledge_base)
+                except ValueError:
+                    rel = canonical
+                log("  ⤷ 跳过(目录副本): %s → 与 %s 字节相同，不重复解析入库",
+                    os.path.basename(p), rel)
+                with stats_lock:
+                    stats["files_deduped"] = stats.get("files_deduped", 0) + 1
+                    stats["files_skipped"] += 1
+        files_to_process[:] = [p for p in files_to_process if p in to_process]
+        if skipped:
+            log("  副本去重: %d 个文件与规范源字节相同，已跳过解析（不重复入库）",
+                len(skipped))
+        return skipped
+
+    def _purge_source_vectors(self, store, source: str) -> bool:
+        """彻底清除一个来源的向量 + digest 行 + markdown 缓存文件。
+
+        markdown 缓存必须一起删：Step 7 的 ensure_digests_for_cached_documents
+        按缓存文件重建 digest 行，不删缓存等于白清（副本又会回到 rag_outline）。
+        单来源失败不中断整体清理（调用方逐来源隔离，下次同步重试）。
+        """
+        try:
+            store.delete_by_source(source)
+            rel = os.path.relpath(source, self._knowledge_base)
+            store.delete_document(rel)
+            store.delete_document(os.path.basename(source))
+            store.delete_document(source)
+            try:
+                cache = os.path.join(self._markdown_dir, _safe_filename(rel) + ".md")
+                if os.path.exists(cache):
+                    os.unlink(cache)
+            except OSError as e:
+                logger.debug("RAG: 删除副本 markdown 缓存失败(忽略) %s: %s", source, e)
+            return True
+        except Exception as e:
+            logger.warning("  ⚠ 清理副本来源失败 %s: %s（下次同步将重试）", source, e)
+            return False
+
+    def _cleanup_duplicate_content(
+        self,
+        new_manifest: Dict[str, Dict[str, Any]],
+        old_manifest: Dict[str, Dict[str, Any]],
+        stats: Dict[str, Any],
+        stats_lock: threading.Lock,
+        log,
+    ) -> Set[str]:
+        """按 content_hash 清洗副本向量（同步收尾，manifest 保存前）。
+
+        两类「同一内容多来源」：
+          1. **历史遗留**：本功能上线前已入库的副本——manifest 里多条同
+             content_hash、且都真的有向量；
+          2. **指纹漏网**：同内容不同字节（重新保存的 PDF、docx→pdf 导出）——
+             解析时指纹不同都入了库，但清洗后文本的 content_hash 相同。
+        每组只保留一个规范源（路径字典序第一个，确定性），其余来源的向量 /
+        digest / markdown 缓存一并清掉，manifest 标记 ``duplicate_of``。
+
+        另外补清 Step 2.5 标记的字节级副本：若它历史上真入过库（旧条目有
+        chunk_count），残留向量在这里删掉；从没入过库的新副本没有向量可清。
+        规范源本次没能入库（解析失败/取消）的副本，条目改成 ``dup_retry``
+        重试标记——分区循环见标记即重新处理，Step 2.5 选规范源时避开这个
+        失败过的规范源，书不会因规范源失败而从知识库里消失。
+
+        幂等：标记过 duplicate_of 的条目不再参与分组；向量已删时
+        delete_by_source 是空操作，不会每轮同步重复劳动。
+
+        返回被标记 dup_retry 的副本路径集合（仅用于日志/测试观测）。
+        """
+        if not new_manifest:
+            return set()
+        # 1. content_hash 分组（只收没被标记过副本的条目——已标记的说明
+        #    已在之前的同步里处理过，不该被反复拉起）。
+        by_hash: Dict[str, List[str]] = {}
+        for path, entry in new_manifest.items():
+            if entry.get("duplicate_of"):
+                continue
+            ch = entry.get("content_hash")
+            if ch:
+                by_hash.setdefault(ch, []).append(path)
+        # 待清洗表：path -> 规范源（先收集再动手，避免白初始化向量库）
+        purge: Dict[str, str] = {}
+        for paths in by_hash.values():
+            if len(paths) < 2:
+                continue
+            canonical = sorted(paths)[0]
+            for p in sorted(paths):
+                if p != canonical:
+                    purge[p] = canonical
+        # 2. 字节级副本：补清历史残留向量 + 规范源缺失时晋升
+        promoted: Set[str] = set()
+        for p, entry in list(new_manifest.items()):
+            dup_of = entry.get("duplicate_of")
+            if not dup_of:
+                continue
+            if dup_of not in new_manifest:
+                # 规范源本次没能入库（解析失败/取消/从未成功）：把副本条目改
+                # 成 dup_retry 重试标记（mtime/size 保留）——分区循环见标记即
+                # 重新处理，Step 2.5 选规范源时也会避开这个失败过的规范源。
+                # 书不会因规范源失败而从知识库里消失；两个都一直失败时按
+                # 「轮流当规范源」交替重试，错误在 stats 里可见。
+                entry = dict(new_manifest[p])
+                entry.pop("content_hash", None)
+                entry.pop("chunk_count", None)
+                entry["dup_retry"] = dup_of
+                new_manifest[p] = entry
+                promoted.add(p)
+                log("  ⤷ 副本重试: %s（规范源 %s 未入库，下轮同步改由本副本优先）",
+                    os.path.basename(p), os.path.basename(dup_of))
+                continue
+            if p in purge:
+                continue  # 已在内容分组里安排过清洗
+            old = old_manifest.get(p) or {}
+            if old.get("chunk_count"):
+                purge[p] = dup_of  # 历史上真入过库 → 有残留向量要清
+        if not purge:
+            return promoted
+        # 3. 有活才初始化向量库：全部跳过的同步不该白拉嵌入模型。
+        store = self._get_store()
+        cleaned = 0
+        for p, canonical in purge.items():
+            if not self._purge_source_vectors(store, p):
+                continue  # 清失败：保留原条目，下次同步重试
+            entry = dict(new_manifest.get(p) or _file_signature(p))
+            entry.pop("content_hash", None)
+            entry.pop("chunk_count", None)
+            entry["duplicate_of"] = canonical
+            new_manifest[p] = entry
+            cleaned += 1
+            log("  ⤷ 清洗(副本): %s → 与 %s 重复，已删除其向量",
+                os.path.basename(p), os.path.basename(canonical))
+            with stats_lock:
+                stats["files_deduped"] = stats.get("files_deduped", 0) + 1
+        if cleaned:
+            log("  副本清洗: 共清除 %d 个重复来源的向量（保留规范源）", cleaned)
+        return promoted
 
     def _cleanup_deleted_files(
         self,
