@@ -120,6 +120,20 @@ def fix_hard_wraps(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
 
 
+def strip_html_comments(text: str) -> str:
+    """只剥 HTML 注释（``<!-- ... -->``），不动任何 Markdown 语法。
+
+    供 docling/marker/ovis 等「规范 Markdown」路径使用——这些路径在 engine
+    里被当作已成型 Markdown，故意不跑 :func:`clean_text`（后者 ``<[^>]+>``
+    会误删标题/表格/上标等语法）。但 docling 默认把图片/图题导出成
+    ``<!-- image -->`` 占位注释，marker 也会透传少量 HTML 注释，若不单独剥掉
+    就会大量进入切片与嵌入。仅移除注释是零风险的。
+    """
+    if not text:
+        return ""
+    return re.sub(r'<!--[\s\S]*?-->', ' ', text)
+
+
 def clean_text(text: str) -> str:
     """Clean extracted text: remove garbage tags, normalize whitespace,
     strip non-printable characters, and collapse redundant blank lines."""

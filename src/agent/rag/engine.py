@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
-from .cleaner import clean_text, fix_hard_wraps, normalize_markdown
+from .cleaner import clean_text, fix_hard_wraps, normalize_markdown, strip_html_comments
 from .chunker import chunk_documents
 from .document_outline import build_digest, build_toc
 from .pandoc_parser import (
@@ -943,7 +943,18 @@ class RAGEngine:
                                 # ---- 2. 使用缓存的 Markdown ----
                                 try:
                                     with open(md_path, "r", encoding="utf-8") as f:
-                                        cleaned = f.read()
+                                        raw = f.read()
+                                    # 自愈：历史版本（未剥注释）缓存的 markdown 可能
+                                    # 含 <!-- image --> 等注释，读出来顺手落盘，避免
+                                    # 每次同步都重复剥、且让脏缓存被永久修好。
+                                    if "<!--" in raw:
+                                        raw = strip_html_comments(raw)
+                                        try:
+                                            with open(md_path, "w", encoding="utf-8") as f:
+                                                f.write(raw)
+                                        except OSError:
+                                            pass
+                                    cleaned = raw
                                     if not cleaned.strip():
                                         raise OSError("cached markdown is empty")
                                     _log("    ├─ 清洗文本: %s (使用缓存 Markdown, %d 字符)", fname, len(cleaned))
@@ -952,10 +963,12 @@ class RAGEngine:
                                     cache_is_fresh = False
                             if not cache_is_fresh:
                                 if is_markdown:
-                                    # docling 已输出规范 Markdown，无需再清洗/转换，
-                                    # 直接作为最终文本（省去 clean_text 的 HTML 剥离，
-                                    # 避免误删 Markdown 标题/表格语法）。
-                                    cleaned = text
+                                    # docling/marker/ovis 已输出规范 Markdown，不跑
+                                    # clean_text（其 <[^>]+> 会误删标题/表格/上标语法）。
+                                    # 但 docling 默认把图片/图题导出成 <!-- image -->
+                                    # 占位注释（marker 也会透传少量 HTML 注释），必须
+                                    # 单独剥掉，否则大量进入切片/嵌入。
+                                    cleaned = strip_html_comments(text)
                                     _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
                                 else:
                                     # ---- 2. 清洗文本 ----

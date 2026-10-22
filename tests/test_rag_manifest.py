@@ -551,3 +551,84 @@ def test_cancelled_mid_file_keeps_nothing(tmp_path):
     stats2 = engine.ingest(force=False)
     assert stats2["files_skipped"] == 0
     assert stats2["files_extracted"] == 2
+
+
+# ---------------------------------------------------------------------------
+# docling/marker 规范 Markdown 路径的 HTML 注释剥离（<!-- image --> 等）
+# ---------------------------------------------------------------------------
+
+
+
+def _make_engine_only_kb(tmp_path, fake_store=None, extra_files=None):
+    """Build a RAGEngine WITHOUT the default a.txt (so file counts are exact)."""
+    from agent.rag.engine import RAGEngine
+
+    kb = tmp_path / "kb"
+    kb.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    engine = RAGEngine(workspace=str(ws), knowledge_base=str(kb))
+    if fake_store is not None:
+        engine._store = fake_store
+    if extra_files:
+        for name, content in extra_files.items():
+            (kb / name).write_bytes(content)
+    return engine, kb
+
+
+def test_docling_markdown_strips_image_comments_on_ingest(monkeypatch, tmp_path):
+    """docling 输出的规范 Markdown 含 <!-- image --> → 入库前被剥掉。
+
+    旧行为：is_markdown 分支直接 cleaned = text（跳过 clean_text），导致
+    docling 默认导出的 `<!-- image -->` 占位注释原样进入缓存与切片。
+    """
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(
+        tmp_path, store, extra_files={"scan.pdf": b"%PDF-1.4 fake"})
+    docling_md = (
+        "# 报告标题\n\n第一段正文内容。\n\n<!-- image -->\n\n"
+        "第二段，紧跟在图片占位之后。\n"
+    )
+    monkeypatch.setattr(
+        "agent.rag.engine._extract_with_pdf_engine",
+        lambda fp, pe="docling": (docling_md, True),
+    )
+    stats = engine.ingest(force=True)
+    assert stats["files_extracted"] == 1
+
+    md_files = [f for f in os.listdir(engine.markdown_dir) if f.endswith(".md")]
+    assert md_files
+    cached = open(os.path.join(engine.markdown_dir, md_files[0]), encoding="utf-8").read()
+    assert "<!--" not in cached                 # 缓存文件已剥注释
+    assert "# 报告标题" in cached
+    # 切片里也不应出现注释标记
+    assert all("<!--" not in r.get("text", "") for r in store.records)
+
+
+def test_cached_markdown_with_comments_is_self_healed(monkeypatch, tmp_path):
+    """历史上缓存的含 <!-- image --> 的 markdown，命中缓存时自愈落盘。
+
+    parse 阶段必须不抛异常（用 monkeypatch 保证），随后 cache_is_fresh 命中
+    已存的脏缓存，读取时剥掉注释并回写。
+    """
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(
+        tmp_path, store, extra_files={"scan.pdf": b"%PDF-1.4 fake"})
+
+    from agent.rag.engine import _safe_filename
+    rel = os.path.relpath(str(kb / "scan.pdf"), kb)
+    name = _safe_filename(rel) + ".md"
+    md_path = os.path.join(engine.markdown_dir, name)
+    os.makedirs(engine.markdown_dir, exist_ok=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# 标题\n\n<!-- image -->\n\n正文。\n")
+    assert "<!--" in open(md_path, encoding="utf-8").read()
+
+    # 解析阶段不抛异常（返回什么都行，cache 命中后会用缓存覆盖 parsed text）
+    monkeypatch.setattr(
+        "agent.rag.engine._extract_with_pdf_engine",
+        lambda fp, pe="docling": ("# parsed-placeholder", True),
+    )
+    engine.ingest(force=False)     # 文件未改 → 命中缓存 → 自愈
+    healed = open(md_path, encoding="utf-8").read()
+    assert "<!--" not in healed
