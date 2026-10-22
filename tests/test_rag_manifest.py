@@ -761,3 +761,188 @@ def test_docling_markdown_keeps_table_block_on_ingest(monkeypatch, tmp_path):
     assert "<tr>" in cached and "<td>" in cached and "精度" in cached and "95%" in cached
     assert "<!--" not in cached
     assert all("<table>" in r.get("text", "") for r in store.records if "精度" in r.get("text", ""))
+
+
+# ---------------------------------------------------------------------------
+# 空白压缩：markdown / 纯文本里不必要的空行与行尾空格收敛（保留格式、提密度）
+# ---------------------------------------------------------------------------
+
+def test_compress_markdown_whitespace_collapses_blanks_and_trailing():
+    """连续空行收敛为 1 个、行尾空格剥掉、首尾空行去掉。"""
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = (
+        "\n\n"
+        "# 标题   \n"
+        "\n\n\n\n"
+        "第一段。\n"
+        "   \n"
+        "\n"
+        "第二段。   \n"
+        "\n\n\n"
+    )
+    out = compress_markdown_whitespace(md)
+    assert out == "# 标题\n\n第一段。\n\n第二段。"
+    assert "\n\n\n" not in out
+    assert not out.startswith("\n") and not out.endswith("\n")
+    assert "标题   " not in out and "段。   " not in out
+
+
+def test_compress_markdown_whitespace_protects_code_blocks():
+    """围栏代码块逐字不动：内部空行、行尾空白、缩进全部保留。"""
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = (
+        "前置段。\n"
+        "\n\n\n"
+        "```python\n"
+        "def f():   \n"
+        "\n"
+        "\n"
+        "    return 1   \n"
+        "```\n"
+        "\n\n\n"
+        "后继段。\n"
+    )
+    out = compress_markdown_whitespace(md)
+    assert "def f():   " in out            # 代码内行尾空白不动
+    assert "    return 1   " in out        # 代码内缩进 + 行尾空白不动
+    assert "```python\n" in out
+    # 代码块内部两个连续空行保留
+    block = out.split("```python\n", 1)[1].split("\n```", 1)[0]
+    assert block == "def f():   \n\n\n    return 1   "
+    # 围栏外的连续空行仍被收敛
+    assert "前置段。\n\n```python" in out
+    assert "```\n\n后继段。" in out
+
+
+def test_compress_markdown_whitespace_protects_indented_code():
+    """4 空格缩进的代码行逐字保留（含行尾空白）。"""
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = "段一。\n\n    code_line();   \n    another();\n\n段二。\n"
+    out = compress_markdown_whitespace(md)
+    assert "    code_line();   " in out
+    assert "    another();" in out
+    assert out == "段一。\n\n    code_line();   \n    another();\n\n段二。"
+
+
+def test_compress_markdown_whitespace_protects_table_blocks():
+    """HTML <table> 块整体不动（内部空行/换行/缩进逐字保留）。"""
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = (
+        "前段。\n\n\n"
+        "<table>\n"
+        "  <tr>\n\n"
+        "    <td>x</td>\n"
+        "  </tr>\n"
+        "</table>\n\n\n"
+        "后段。\n"
+    )
+    out = compress_markdown_whitespace(md)
+    assert "<table>\n  <tr>\n\n    <td>x</td>\n  </tr>\n</table>" in out
+    assert "前段。\n\n<table>" in out
+    assert "</table>\n\n后段。" in out
+    assert "\n\n\n" not in out
+
+
+def test_compress_markdown_whitespace_keeps_structure_and_indent():
+    """标题/列表/引用/表格/行首缩进等格式保留，只剥行尾空白。"""
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = (
+        "## 小节   \n"
+        "\n"
+        "- 列表项一   \n"
+        "  - 嵌套项   \n"
+        "\n"
+        "> 引用行   \n"
+        "\n"
+        "| a | b |\n"
+        "| - | - |\n"
+        "| 1 | 2 |\n"
+        "\n"
+        "    缩进段落保留行首\n"
+    )
+    out = compress_markdown_whitespace(md)
+    assert "## 小节\n" in out
+    assert "- 列表项一\n" in out
+    assert "  - 嵌套项\n" in out          # 嵌套缩进保留
+    assert "> 引用行\n" in out
+    assert "| a | b |\n| - | - |\n| 1 | 2 |" in out
+    assert "    缩进段落保留行首" in out   # 4 空格缩进行当代码行保护
+    assert "\n\n" in out                  # 单空行段落分隔保留
+    assert "\n\n\n" not in out
+
+
+def test_compress_markdown_whitespace_idempotent():
+    from agent.rag.cleaner import compress_markdown_whitespace
+
+    md = "# 标题\n\n\n第一段。   \n\n\n\n第二段。\n"
+    once = compress_markdown_whitespace(md)
+    twice = compress_markdown_whitespace(once)
+    assert once == twice
+
+
+def test_clean_markdown_document_compresses_whitespace():
+    """公开入口 clean_markdown_document 也做空白压缩（剥注释后残留的空行）。"""
+    from agent.rag.cleaner import clean_markdown_document
+
+    md = (
+        "# 报告\n\n\n"
+        "<!-- image -->\n"
+        "\n\n"
+        "<div>正文段</div>   \n"
+        "\n\n\n"
+        "![图](a.png)\n"
+        "\n\n"
+        "结尾。\n"
+    )
+    out = clean_markdown_document(md)
+    assert out == "# 报告\n\n正文段\n\n结尾。"
+    assert "<!--" not in out and "<div" not in out and "![图]" not in out
+    assert "\n\n\n" not in out
+
+
+def test_clean_text_collapses_blank_runs_and_spaces():
+    """纯文本路径（clean_text）保证空行收敛、行尾/连续空格清除。"""
+    from agent.rag.cleaner import clean_text
+
+    out = clean_text("第一段。   \n\n\n\n第二段，含   多个   空格。\n\n\n")
+    assert "\n\n\n" not in out
+    assert out == "第一段。\n\n第二段，含 多个 空格。"
+
+
+def test_docling_markdown_whitespace_compressed_on_ingest(monkeypatch, tmp_path):
+    """docling 输出带大量空行/行尾空格 → 落库的缓存 markdown 是压缩后的。"""
+    store = _FakeStore()
+    engine, kb = _make_engine_only_kb(
+        tmp_path, store, extra_files={"scan.pdf": b"%PDF-1.4 fake"})
+    docling_md = (
+        "# 报告标题   \n"
+        "\n\n\n"
+        "<!-- image -->\n"
+        "\n\n"
+        "第一段正文。   \n"
+        "\n\n\n\n"
+        "第二段正文。\n"
+        "\n\n\n"
+    )
+    monkeypatch.setattr(
+        "agent.rag.engine._extract_with_pdf_engine",
+        lambda fp, pe="docling": (docling_md, True),
+    )
+    stats = engine.ingest(force=True)
+    assert stats["files_extracted"] == 1
+
+    md_files = [f for f in os.listdir(engine.markdown_dir) if f.endswith(".md")]
+    cached = open(os.path.join(engine.markdown_dir, md_files[0]), encoding="utf-8").read()
+    assert "\n\n\n" not in cached
+    assert "标题   " not in cached
+    assert "<!--" not in cached
+    assert cached == "# 报告标题\n\n第一段正文。\n\n第二段正文。"
+    assert all(
+        "\n\n\n" not in r.get("text", "")
+        for r in store.records
+    )

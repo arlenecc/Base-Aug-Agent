@@ -161,6 +161,81 @@ def strip_html_comments(text: str) -> str:
     return re.sub(r'<!--[\s\S]*?-->', ' ', text)
 
 
+# 围栏代码块起始（允许行首最多 3 空格，CommonMark 规范）。
+_FENCE_OPEN_RE = re.compile(r'^\s{0,3}(?:```|~~~)')
+# 缩进代码行（4 空格或 1 tab 起头）——内容是字面量，逐字保留。
+_INDENT_CODE_LINE_RE = re.compile(r'^(?: {4}|\t)')
+
+
+def compress_markdown_whitespace(markdown: str) -> str:
+    """压缩 Markdown 里不必要的空行与行尾空白——保留格式、提高切片密度。
+
+    引擎产出的「规范 Markdown」（docling/marker/pandoc）常带排版残留：剥掉
+    ``<!-- image -->`` 等注释后留下的空行、docling/pandoc 的行尾空格、连续
+    多空行。这些空白不改变 Markdown 渲染，却稀释切片与嵌入密度。
+
+    规则（只动「不必要」的，格式一律保留）：
+      * **行尾空格/tab 剥掉**——Markdown 行尾空格唯一作用是硬换行，而本管线
+        视硬断行为噪音（见 fix_hard_wraps）；围栏/缩进代码内除外（字面量）；
+      * **普通行行首 ≤3 空格剥掉**——Markdown 渲染忽略段首 ≤3 空格（再多的
+        就是缩进代码），这层空白只可能来自剥标签残留（``<div>正文`` → `` 正文``）
+        或排版缩进，属不必要的空格；结构行（标题/列表/引用/表格等）与缩进
+        代码行的行首一律不动，保住嵌套列表层级等格式；
+      * **连续 2+ 空行收敛为 1 个空行**——1 个空行即段落分隔，多余的不改变
+        渲染，只会降低密度；
+      * 文档首尾空行剥掉；
+      * **围栏代码块**（```/~~~）与**缩进代码行**（4 空格/tab 起头）逐字
+        不动——代码里的空行与行尾空白是字面量；
+      * HTML ``<table>`` 块整体掩码保护（内部行列结构不动）；
+      * 标题/列表/引用/表格等结构行的内容与行首缩进原样保留。
+
+    幂等：压缩一次后再跑零变化。
+    """
+    if not markdown:
+        return ""
+    masked, _restore = _mask_table_blocks(markdown)
+    out: List[str] = []
+    in_fence = False
+    fence_marker = ""
+    pending_blank = False  # 挂起的空行：连续空行只允许落一个
+
+    def _flush_blank() -> None:
+        nonlocal pending_blank
+        if pending_blank and out:
+            out.append('')
+        pending_blank = False
+
+    for line in masked.split('\n'):
+        stripped = line.strip()
+        if in_fence:
+            # 代码块内逐字保留（含空行与行尾空白，全是字面量）。
+            out.append(line)
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            continue
+        if _FENCE_OPEN_RE.match(line):
+            _flush_blank()
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line.rstrip())
+            continue
+        if not stripped:
+            pending_blank = True
+            continue
+        _flush_blank()
+        if _INDENT_CODE_LINE_RE.match(line):
+            out.append(line)           # 缩进代码行逐字保留
+            continue
+        if _MD_STRUCTURE_RE.match(line) or _MD_STRUCTURE_RE.match(stripped):
+            out.append(line.rstrip())  # 结构行：只剥行尾，行首缩进（嵌套层级）不动
+            continue
+        # 普通正文行：行首 ≤3 空格（渲染忽略，只可能是剥标签残留）+ 行尾空白
+        # 一并剥掉；4+ 行首空格上面已按缩进代码拦走，到不了这里。
+        out.append(stripped)
+    return _restore('\n'.join(out))
+
+
 def clean_markdown_document(markdown: str) -> str:
     """对 docling/marker/pandoc 输出的「规范 Markdown」做无损噪音清理。
 
@@ -185,6 +260,11 @@ def clean_markdown_document(markdown: str) -> str:
     代码块（围栏/缩进）与行内代码 span 受保护——里面的 ``< >`` / ``![](x)``
     是示例内容，不是噪音。顺序：注释 → raw HTML → 图片 → 内部链接。
 
+    **空白压缩**：最后再过一遍 :func:`compress_markdown_whitespace`——剥掉
+    注释/标签后残留的连续空行、行尾空格全部收敛（连续空行 → 1 个，行尾空白
+    剥掉），首尾空行去掉；围栏/缩进代码与 ``<table>`` 块逐字不动，标题/列表/
+    引用等结构行只剥行尾空白、保留行首缩进。提高切片密度，不改变渲染。
+
     **表格块保留**：复杂表格 markdown 无法无损表示，整段 ``<table>...</table>``
     会被原样保留（含 ``<tr>/<td>/<th>`` 行列结构，不剥标签），而不是被拆散成
     散落文字。docling/marker 默认把表格导成 markdown ``|`` 语法（本就保留）；
@@ -193,9 +273,10 @@ def clean_markdown_document(markdown: str) -> str:
     """
     if not markdown:
         return ""
-    md = strip_html_comments(markdown)   # <!-- image --> 等注释
-    md = strip_raw_html(md)              # <div>/<span>/<sup>/<a> 等标签（留正文）
-    md = strip_markdown_noise(md)        # ![...](...) 与 [文字](#...)
+    md = strip_html_comments(markdown)        # <!-- image --> 等注释
+    md = strip_raw_html(md)                   # <div>/<span>/<sup>/<a> 等标签（留正文）
+    md = strip_markdown_noise(md)             # ![...](...) 与 [文字](#...)
+    md = compress_markdown_whitespace(md)     # 收敛空行/行尾空白（保格式、提密度）
     return md
 
 
