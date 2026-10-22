@@ -698,6 +698,111 @@ class SyncKnowledgeWorker(QThread):
         self.sync_progress.emit(done, total, current)
 
 
+class VectorDedupWorker(QThread):
+    """Background worker for vector-store deduplication（UI「向量去重」按钮）.
+
+    只做向量库的扫描 + 删除（engine.dedupe_vectors），不解析文档、不嵌入，
+    因此不需要 embedding/rerank 等模型配置——只要 workspace + knowledge_base。
+
+    信号前缀 ``dedup_``：避开 QThread 内建 ``finished``（同名自定义信号会
+    遮蔽它，让挂在 finished 上的 deleteLater 在 run() 执行途中就销毁线程对象，
+    见 SyncKnowledgeWorker 的注释）。日志缓冲/临时 handler 模式与
+    SyncKnowledgeWorker 相同：engine 的 _log 走 log_callback，agent.rag 各
+    子模块的 logging 由临时 handler 收进 _log_buffer。
+    """
+    dedup_finished = pyqtSignal(dict)
+    dedup_failed = pyqtSignal(str)
+    dedup_progress = pyqtSignal(int, int, str)
+
+    def __init__(self, workspace: str, knowledge_base: str, parent=None):
+        super().__init__(parent)
+        self._workspace = workspace
+        self._knowledge_base = knowledge_base
+        self._engine: Optional[RAGEngine] = None
+        self._log_buffer: list = []
+        self._log_buffer_lock = threading.Lock()
+        self._log_buffer_max = 10000
+
+    def _emit_log(self, msg: str) -> None:
+        with self._log_buffer_lock:
+            self._log_buffer.append(msg)
+            if len(self._log_buffer) > self._log_buffer_max:
+                del self._log_buffer[: self._log_buffer_max // 2]
+
+    def run(self) -> None:  # type: ignore[override]
+        self._emit_log("[rag] ────────── 向量去重启动 ──────────")
+        logger.info("VectorDedupWorker start: workspace=%s kb=%s",
+                    self._workspace, self._knowledge_base)
+        _tmp_handler = logging.StreamHandler(io.StringIO())
+        _tmp_handler.setLevel(logging.INFO)
+        _tmp_handler.setFormatter(logging.Formatter("%(message)s"))
+
+        def _on_rag_log(record):
+            self._emit_log(_tmp_handler.format(record))
+
+        _tmp_handler.emit = _on_rag_log
+        _rag_loggers = [f"{_PKG_ROOT}.rag"]
+        _prev_levels = {}
+        self._dedup_tmp_handler = _tmp_handler
+        self._dedup_tmp_loggers = _rag_loggers
+        for _name in _rag_loggers:
+            _l = logging.getLogger(_name)
+            _prev_levels[_name] = _l.level
+            _l.setLevel(logging.INFO)
+            _l.addHandler(_tmp_handler)
+        emit_stats = None
+        emit_error = None
+        try:
+            self._engine = RAGEngine(
+                workspace=self._workspace,
+                knowledge_base=self._knowledge_base,
+            )
+            self._emit_log("[rag] 向量去重：开始扫描向量库…")
+            stats = self._engine.dedupe_vectors(
+                progress_callback=self._on_progress,
+                log_callback=self._emit_log,
+            )
+            self._emit_log(
+                f"[rag] 向量去重完成: 清理 {stats.get('removed', 0)} 条重复向量"
+                f"（{stats.get('groups', 0)} 组，{stats.get('sources_cleaned', 0)} 个来源整体去重）"
+            )
+            emit_stats = stats
+        except Exception as e:
+            self._emit_log(f"[rag] ❌ 向量去重失败: {e}")
+            logger.error("VectorDedupWorker failed: %s", e, exc_info=True)
+            emit_error = f"{type(e).__name__}: {e}"
+        finally:
+            for _name in _rag_loggers:
+                try:
+                    logging.getLogger(_name).removeHandler(_tmp_handler)
+                except Exception:
+                    pass
+            for _name, _lvl in _prev_levels.items():
+                try:
+                    logging.getLogger(_name).setLevel(_lvl)
+                except Exception:
+                    pass
+            # 释放 LanceDB 连接等资源（与 SyncKnowledgeWorker 同纪律：worker
+            # 侧的引擎必须在 finally 里关掉，否则每次去重泄漏一份连接）。
+            if self._engine is not None:
+                try:
+                    self._engine.close()
+                except Exception as e:
+                    logger.warning("VectorDedupWorker: engine close failed: %s", e)
+                self._engine = None
+            # 先清资源再发信号：主线程的 UI 复位 / reload_rag 跑在彻底释放
+            # 之后的 worker 侧引擎之上。
+            if emit_error is not None:
+                self.dedup_failed.emit(emit_error)
+            elif emit_stats is not None:
+                self.dedup_finished.emit(emit_stats)
+            else:
+                self.dedup_failed.emit("Unknown dedup error (no stats or error captured)")
+
+    def _on_progress(self, done: int, total: int, current: str) -> None:
+        self.dedup_progress.emit(done, total, current)
+
+
 class InstallDepsWorker(QThread):
     """Background worker for checking and installing missing RAG dependencies.
 
@@ -907,6 +1012,7 @@ class MainWindow(QMainWindow):
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
+        self._dedup_worker: Optional["VectorDedupWorker"] = None
         # 本地模型注册表（#140）：_llm 是 agent 正在用的主模型后端，_aux_llm
         # 是辅助模型后端。两者都由 UI 持有并负责 close()。签名记录「这个对象
         # 是用哪份配置建出来的」，配置变了才重建——否则每次应用配置都要重新
@@ -1437,6 +1543,16 @@ class MainWindow(QMainWindow):
         emb_row.addWidget(QLabel("本地路径"))
         emb_row.addWidget(self.embedding_model_path_edit, 3)
         emb_row.addWidget(self.embedding_model_path_btn)
+        # 向量去重按钮：放在「同步知识」前面——它是同步前的库维护操作，
+        # 扫描向量库按文本内容清理重复向量（保留入库最早的一份），降低
+        # 检索噪声。点击后需确认（删除不可逆）。
+        self.vector_dedup_btn = QPushButton("向量去重")
+        self.vector_dedup_btn.setToolTip(
+            "扫描向量库，按文本内容找出完全相同的重复向量\n"
+            "保留入库最早的一份，其余删除（不可恢复）\n"
+            "用于清理同一文档多次入库造成的检索噪声"
+        )
+        emb_row.addWidget(self.vector_dedup_btn)
         self.sync_knowledge_btn = QPushButton("同步知识")
         self.sync_knowledge_btn.setToolTip(
             "解析知识库文档、建立向量索引，支持 RAG 检索\n"
@@ -1617,6 +1733,7 @@ class MainWindow(QMainWindow):
         self.reranker_backend_combo.currentTextChanged.connect(self._on_reranker_backend_changed)
         self.model_combo.activated.connect(self._on_model_combo_activated)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
+        self.vector_dedup_btn.clicked.connect(self._on_vector_dedup)
         self.stop_sync_btn.clicked.connect(self._on_stop_sync)
         self.clear_btn.clicked.connect(self._on_clear_chat)
         self.log_clear_btn.clicked.connect(self.log_view.clear)
@@ -1987,10 +2104,11 @@ class MainWindow(QMainWindow):
         # OCR/docling 单例和 RAG 引擎，而同步线程可能正在用它们；同步结束后
         # 的 reload_rag() 也会作用到新 agent 上，结果不可预期。
         if (self._sync_busy or self._is_worker_running(self._sync_worker)
-                or self._is_worker_running(self._deps_worker)):
+                or self._is_worker_running(self._deps_worker)
+                or self._is_worker_running(self._dedup_worker)):
             QMessageBox.warning(
                 self, "正在同步",
-                "知识库同步/依赖安装进行中，请先停止或等待其完成，再应用配置。",
+                "知识库同步/依赖安装/向量去重进行中，请先停止或等待其完成，再应用配置。",
             )
             return
         self._gather_config_from_widgets()
@@ -2416,8 +2534,10 @@ class MainWindow(QMainWindow):
                 "Agent 正在运行，请先点击「终止对话」停止当前任务，再加载模型。",
             )
             return
-        if self._sync_busy or self._is_worker_running(self._sync_worker):
-            QMessageBox.warning(self, "正在同步", "知识库同步进行中，请先停止或等待完成。")
+        if (self._sync_busy or self._is_worker_running(self._sync_worker)
+                or self._is_worker_running(self._dedup_worker)):
+            QMessageBox.warning(
+                self, "正在同步", "知识库同步/向量去重进行中，请先停止或等待完成。")
             return
         # 先把控件里的值收进 config：加载必须用「用户刚填的」参数，而不是上
         # 一次应用配置留下的旧值——否则改了路径/采样参数却加载了旧模型。
@@ -2658,6 +2778,155 @@ class MainWindow(QMainWindow):
             return bool(worker.isRunning())
         except RuntimeError:
             return False
+
+    # ------------------------------------------------------------------
+    # 向量去重（「向量去重」按钮）
+    # ------------------------------------------------------------------
+
+    def _on_vector_dedup(self) -> None:
+        """扫描向量库清理重复向量：按文本内容分组，保留入库最早的一份。
+
+        与同步互斥（两者都开同一个 LanceDB 目录）；agent 在跑时也禁止
+        （检索会并发读库）。删除不可逆，先弹确认框。
+        """
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再做向量去重。",
+            )
+            return
+        if self._is_worker_running(self._sync_worker):
+            QMessageBox.warning(
+                self, "正在同步", "知识库同步正在进行，请先等待或停止同步。")
+            return
+        if self._is_worker_running(self._dedup_worker):
+            logger.warning("Vector dedup already running, ignoring duplicate request")
+            return
+        kb = self.knowledge_base_edit.text().strip()
+        ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
+        if not kb:
+            QMessageBox.warning(self, "缺少知识库", "请先选择知识库目录")
+            return
+        ret = QMessageBox.question(
+            self, "向量去重",
+            "将扫描向量库中的全部向量，按文本内容找出完全相同的重复项，\n"
+            "保留入库最早的一份，其余删除（不可恢复）。\n\n"
+            "重复向量不影响正确性，但会让同一内容在检索中重复命中（噪声）。\n"
+            "确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+        logger.info("Vector dedup triggered: kb=%s workspace=%s", kb, ws)
+        # 忙碌态：去重期间禁用同步/去重按钮与模型加载按钮（避免中途把 LLM
+        # 装进 GPU 与去重抢内存）。
+        self.vector_dedup_btn.setEnabled(False)
+        self.vector_dedup_btn.setText("去重中…")
+        self.sync_knowledge_btn.setEnabled(False)
+        self._refresh_model_buttons()
+        self.status_label.setText("正在扫描向量库…")
+        self.progress.setRange(0, 0)
+        self._append_log("[rag] ────────── 开始向量去重 ──────────")
+        # 与同步同纪律：临时禁用 QSignalLogHandler 的 RAG 日志过滤，避免并发
+        # 写 log_view；RAG 日志在去重期间由 _log_buffer + QTimer 处理。
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = True
+        self._dedup_worker = VectorDedupWorker(ws, kb)
+        self._dedup_worker.dedup_progress.connect(self._on_dedup_progress)
+        self._dedup_worker.dedup_finished.connect(self._on_dedup_finished)
+        self._dedup_worker.dedup_failed.connect(self._on_dedup_failed)
+        # deleteLater 必须挂内建 finished（run() 返回后触发），挂自定义信号会在
+        # run() 执行途中销毁线程对象（同 SyncKnowledgeWorker 的教训）。
+        self._dedup_worker.finished.connect(self._dedup_worker.deleteLater)
+        # 日志轮询定时器：100ms 消费 _log_buffer，实时显示去重日志。
+        self._log_poll_timer.start()
+        self._dedup_worker.start()
+
+    def _reset_dedup_ui(self) -> None:
+        """结束去重忙碌态：恢复按钮文案/可用性。"""
+        self.vector_dedup_btn.setText("向量去重")
+        # 不能无条件解锁：agent 在跑时（self._busy）必须保持禁用。
+        self.vector_dedup_btn.setEnabled(not self._busy)
+        self.sync_knowledge_btn.setEnabled(not self._busy)
+        self._refresh_model_buttons()
+
+    def _on_dedup_progress(self, done: int, total: int, current: str) -> None:
+        if done < 0:
+            # 纯日志/状态刷新信号（不更新进度条）
+            self.status_label.setText(current)
+            return
+        self.progress.setRange(0, max(total, 1))
+        self.progress.setValue(done)
+        self.status_label.setText(current)
+
+    def _on_dedup_finished(self, stats: dict) -> None:
+        logger.info("UI: _on_dedup_finished called")
+        self._log_poll_timer.stop()
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = False
+        self._poll_dedup_logs()
+        self._reset_dedup_ui()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._dedup_worker = None
+        # 刷新 agent 的 RAG 引擎表句柄：LanceDB 表对象打开时取版本快照，
+        # 去重删了行之后不重新打开，检索还会看到旧数据。
+        if self._agent is not None:
+            try:
+                self._agent.tools.reload_rag()
+            except Exception as e:
+                logger.warning("UI: reload_rag after dedup: %s", e)
+        if not isinstance(stats, dict):
+            stats = {}
+        removed = stats.get("removed", 0)
+        groups = stats.get("groups", 0)
+        cleaned = stats.get("sources_cleaned", 0)
+        errors = stats.get("errors", [])
+        if removed > 0:
+            summary = (
+                f"向量去重完成：清理 {removed} 条重复向量\n"
+                f"（{groups} 组重复，{cleaned} 个来源的内容已整体保留自其它来源）"
+            )
+        else:
+            summary = "向量库扫描完成：未发现重复向量，无需清理。"
+        if errors:
+            summary += f"\n\n⚠ {len(errors)} 个批次失败（详见日志）"
+        self.status_label.setText("向量去重完成")
+        self._append_log(f"[rag] {summary.splitlines()[0]}")
+        QMessageBox.information(self, "向量去重", summary)
+
+    def _on_dedup_failed(self, error: str) -> None:
+        logger.error("UI: _on_dedup_failed: %s", error)
+        self._log_poll_timer.stop()
+        if hasattr(self, '_log_handler') and self._log_handler is not None:
+            self._log_handler._sync_active = False
+        self._poll_dedup_logs()
+        self._reset_dedup_ui()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self._dedup_worker = None
+        self.status_label.setText("向量去重失败")
+        self._append_log(f"[rag] ❌ 向量去重失败: {error}")
+        QMessageBox.warning(self, "向量去重失败", f"向量去重失败：\n{error}")
+
+    def _poll_dedup_logs(self) -> None:
+        """去重结束时最后消费一次 _log_buffer，确保残余日志显示出来。"""
+        worker = self._dedup_worker
+        if worker is None:
+            return
+        try:
+            with worker._log_buffer_lock:
+                if not worker._log_buffer:
+                    return
+                buf = worker._log_buffer
+                worker._log_buffer = []
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText("\n" + "\n".join(buf))
+            self._scroll_to_bottom(self.log_view)
+        except Exception:
+            pass
 
     def _on_sync_knowledge(self, force: bool = False) -> None:
         # Agent 正在跑时不允许同步：同步线程与 agent 的 RAG 检索会并发读写
@@ -2985,6 +3254,10 @@ class MainWindow(QMainWindow):
         handler = getattr(worker, "_sync_tmp_handler", None)
         loggers = getattr(worker, "_sync_tmp_loggers", None)
         if handler is None or not loggers:
+            # 向量去重 worker 用另一组属性名（_dedup_tmp_*）
+            handler = getattr(worker, "_dedup_tmp_handler", None)
+            loggers = getattr(worker, "_dedup_tmp_loggers", None)
+        if handler is None or not loggers:
             return
         for name in loggers:
             try:
@@ -3240,9 +3513,10 @@ class MainWindow(QMainWindow):
         # 届时 worker 已回到等待态，发送是安全的。
         # 同步知识库时禁止对话：两个线程会并发读写同一个 LanceDB 目录，
         # 且同步结束的 reload_rag() 会把 agent 正在用的表句柄置空重开。
-        if self._sync_busy or self._is_worker_running(self._sync_worker):
+        if (self._sync_busy or self._is_worker_running(self._sync_worker)
+                or self._is_worker_running(self._dedup_worker)):
             QMessageBox.information(
-                self, "正在同步", "知识库同步进行中，请等待同步完成或先停止同步。"
+                self, "正在同步", "知识库同步/向量去重进行中，请等待完成或先停止。"
             )
             return
         text = self.send_editor.toPlainText().strip()
@@ -3330,7 +3604,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _poll_sync_logs(self) -> None:
-        """定时轮询 sync_worker._log_buffer，把新日志追加到 log_view。
+        """定时轮询 sync_worker / dedup_worker 的 _log_buffer，追加到 log_view。
 
         绕过 Qt queued signal 机制——ONNX Runtime 在 embedding 期间持有
         GIL，sync_progress 信号虽然是 queued 但主线程可能无法及时处理。
@@ -3341,7 +3615,8 @@ class MainWindow(QMainWindow):
         状态栏由 _on_sync_progress 根据进度回调单独更新，避免重复。
         """
         try:
-            worker = self._sync_worker
+            # 同步与向量去重共用轮询：谁在跑就消费谁的 _log_buffer。
+            worker = self._sync_worker or self._dedup_worker
             if worker is None:
                 return
             with worker._log_buffer_lock:
@@ -4026,6 +4301,18 @@ class MainWindow(QMainWindow):
         if self._shutdown_worker(self._deps_worker, "deps",
                                  wait_ms=2000, term_wait_ms=1000):
             self._deps_worker = None
+        # --- VectorDedupWorker: 去重无取消机制，等待/终止后兜底摘 handler +
+        # 关引擎（与 sync worker 同纪律）。
+        _dedup_engine = getattr(self._dedup_worker, "_engine", None)
+        if self._shutdown_worker(self._dedup_worker, "dedup",
+                                 wait_ms=2000, term_wait_ms=1000):
+            self._remove_sync_tmp_handler(self._dedup_worker)
+            self._dedup_worker = None
+        if _dedup_engine is not None:
+            try:
+                _dedup_engine.close()
+            except Exception as e:
+                logger.warning("UI: dedup worker engine 兜底关闭失败: %s", e)
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:
             try:

@@ -1897,6 +1897,129 @@ class RAGEngine:
         return set(removed)
 
     # ------------------------------------------------------------------
+    # 向量去重（UI「向量去重」按钮，独立于 ingest 的维护操作）
+    # ------------------------------------------------------------------
+
+    def dedupe_vectors(
+        self,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """向量库去重：按文本内容排查重复向量，保留入库最早的一份，其余删除。
+
+        UI「向量去重」按钮调它。与 ingest 收尾的 content_hash 清洗互补：那个按
+        manifest 的 content_hash 做**文件级**分组；本方法直接扫向量库全表按
+        text 精确分组（**chunk 级**，能找出 manifest 缺失/不一致的历史重复），
+        并按入库时间戳（ingested_at）保留最早的一份——「同一本书先后从两个
+        目录入库」这类场景，先入库的目录保留、后入库的副本向量被清掉，降低
+        检索噪声。
+
+        整来源被清空（它的所有切片都是别处的重复）时，连带清理 digest 行与
+        markdown 缓存，并把 manifest 条目标记为规范源的副本——下次同步不会
+        再把它的向量加回来。返回统计 dict（scanned/groups/removed/
+        sources_cleaned/errors）。
+        """
+        def _log(msg: str, *args) -> None:
+            if args:
+                msg = msg % args
+            if log_callback is not None:
+                log_callback(msg)
+            else:
+                logger.info(msg)
+
+        def _progress(done: int, total: int, hint: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(done, total, hint)
+            except Exception:
+                pass
+
+        stats: Dict[str, Any] = {
+            "scanned": 0, "groups": 0, "removed": 0,
+            "sources_cleaned": 0, "errors": [],
+        }
+        store = self._get_store()
+        total = store.count()
+        stats["scanned"] = total
+        if total == 0:
+            _log("  向量库为空，无需去重")
+            return stats
+        _log("━━━ 向量去重：扫描 %d 条向量（按文本内容分组） ━━━", total)
+        _progress(-1, 0, "正在扫描向量库…")
+        scan = store.scan_duplicate_texts()
+        groups = scan.get("groups") or []
+        source_counts = scan.get("source_counts") or {}
+        stats["groups"] = len(groups)
+        if not groups:
+            _log("  ✅ 未发现重复向量（%d 条全部唯一）", total)
+            _progress(-1, 0, "未发现重复向量")
+            return stats
+
+        drop_ids: List[str] = []
+        drop_by_source: Dict[str, int] = {}
+        dup_target: Dict[str, str] = {}   # 被清来源 -> 保留其内容的规范源
+        for g in groups:
+            keep_src = g["keep"]["source"]
+            for d in g["drop"]:
+                drop_ids.append(d["id"])
+                src = d["source"]
+                drop_by_source[src] = drop_by_source.get(src, 0) + 1
+                dup_target.setdefault(src, keep_src)
+        _log("  发现 %d 组重复向量，共 %d 条待清理（涉及 %d 个来源）",
+             len(groups), len(drop_ids), len(drop_by_source))
+
+        _BATCH = 500
+        done = 0
+        for i in range(0, len(drop_ids), _BATCH):
+            chunk = drop_ids[i:i + _BATCH]
+            try:
+                store.delete_by_ids(chunk)
+            except Exception as e:
+                stats["errors"].append(f"delete batch: {e}")
+                logger.warning("向量去重删除批次失败: %s", e)
+            done += len(chunk)
+            _progress(done, len(drop_ids), f"清理重复向量 {done}/{len(drop_ids)}")
+
+        new_total = store.count()
+        stats["removed"] = total - new_total
+        _log("  ✅ 已清理 %d 条重复向量（%d → %d）", stats["removed"], total, new_total)
+
+        # 整来源被清空的：清 digest/缓存 + manifest 标记副本，防止下次同步
+        # 把它的向量加回来（也防止 Step 7 按缓存重建它的 digest）。
+        fully = [s for s, n in drop_by_source.items()
+                 if n >= source_counts.get(s, 0)]
+        if fully:
+            _log("  %d 个来源的全部向量均为重复，连带清理目录概要并标记副本…",
+                 len(fully))
+            manifest = _load_manifest(self._rag_dir)
+            changed = False
+            for src in fully:
+                try:
+                    self._purge_source_vectors(store, src)
+                    entry = manifest.get(src)
+                    if entry is not None and not entry.get("duplicate_of"):
+                        entry = dict(entry)
+                        entry.pop("content_hash", None)
+                        entry.pop("chunk_count", None)
+                        entry["duplicate_of"] = dup_target.get(src, "")
+                        manifest[src] = entry
+                        changed = True
+                    stats["sources_cleaned"] += 1
+                    _log("    └─ %s（内容保留自 %s）",
+                         os.path.basename(src),
+                         os.path.basename(dup_target.get(src) or "?"))
+                except Exception as e:
+                    stats["errors"].append(f"{src}: {e}")
+                    logger.warning("向量去重后来源清理失败 %s: %s", src, e)
+            if changed:
+                try:
+                    _save_manifest(self._rag_dir, manifest)
+                except OSError as e:
+                    logger.warning("向量去重后 manifest 保存失败: %s", e)
+        return stats
+
+    # ------------------------------------------------------------------
     # retrieval
     # ------------------------------------------------------------------
 

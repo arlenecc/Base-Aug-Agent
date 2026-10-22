@@ -40,6 +40,11 @@ _QUERY_PREFIX = "search_query: "
 # tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
 _FTS_COLUMN = "text_fts"
 
+# 入库时间戳列（epoch 秒）：向量去重按它「保留入库最早的一份」。旧表没有
+# 这一列，schema 迁移时回填 0.0（视为最老——历史数据天然占先，不会被后来
+# 重新入库的副本顶掉）。
+_INGESTED_AT = "ingested_at"
+
 # jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
 _jieba = None
 _jieba_lock = threading.Lock()
@@ -770,23 +775,27 @@ class VectorStore:
         logger.info("  向量库初始化完成: 当前存储 %d 条向量记录", count)
 
     def _check_schema_migration(self) -> None:
-        """Migrate an existing table to include the ``text_fts`` column.
+        """Migrate an existing table to include ``text_fts`` / ``ingested_at``.
 
-        The BM25 full-text index lives on a pre-tokenized ``text_fts`` column.
-        Tables created before this feature lack the column; since LanceDB
-        schemas are immutable, we rebuild the table (data survives — it is
-        re-read from the old table and re-written with the new column).
+        The BM25 full-text index lives on a pre-tokenized ``text_fts`` column;
+        向量去重按 ``ingested_at`` 保留最早入库的一份。Tables created before
+        these features lack the columns; since LanceDB schemas are immutable,
+        we rebuild the table (data survives — it is re-read from the old table
+        and re-written with the new columns). 旧行没有 ingested_at，回填
+        0.0（视为「最老」——历史数据天然占先，不会被重新入库的副本顶掉）。
         """
         if self._table is None:
             return
         try:
             schema = self._table.schema
-            if _FTS_COLUMN in schema.names:
+            missing = [c for c in (_FTS_COLUMN, _INGESTED_AT)
+                       if c not in schema.names]
+            if not missing:
                 return
         except Exception:
             return
 
-        logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", _FTS_COLUMN)
+        logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", "/".join(missing))
         try:
             # Read all existing rows via PyArrow (无 pandas 依赖)。
             arrow_table = self._table.to_arrow()
@@ -799,7 +808,10 @@ class VectorStore:
                     "source": row["source"],
                     "chunk_index": row["chunk_index"],
                 }
-                rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                if _FTS_COLUMN in missing:
+                    rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                if _INGESTED_AT in missing:
+                    rec[_INGESTED_AT] = 0.0
                 records.append(rec)
 
             # LanceDB OSS 无 rename_table，只能 drop 后重建。数据已在内存
@@ -810,7 +822,8 @@ class VectorStore:
             if records:
                 self._table = self._db.create_table(_TABLE_NAME, records)
             self._table_checked = True
-            logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）", _FTS_COLUMN, len(records))
+            logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）",
+                        "/".join(missing), len(records))
         except Exception as e:
             logger.warning("  ⚠ 向量表迁移失败（BM25 索引将不可用）: %s", e)
             self._table = None
@@ -893,6 +906,7 @@ class VectorStore:
                     "source": source,
                     "chunk_index": chunk_idx,
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
+                    _INGESTED_AT: time.time(),
                 })
 
         table = self._ensure_table()
@@ -1240,6 +1254,8 @@ class VectorStore:
                 _last_yield = _time.monotonic()
         vectors = vectors_by_idx
         records: List[Dict[str, Any]] = []
+        # 批次级入库时间戳：向量去重按它保留最早入库的一份（见 _INGESTED_AT）。
+        _now = time.time()
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
         # 都重算一次 md5（写入侧纯浪费）。
         _hash_cache: Dict[str, str] = {}
@@ -1259,6 +1275,7 @@ class VectorStore:
                 "source": source,
                 "chunk_index": chunk_idx,
                 _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
+                _INGESTED_AT: _now,
             })
         return records
 
@@ -2012,6 +2029,85 @@ class VectorStore:
             return sorted({r.get("source", "") for r in all_data if r and r.get("source")})
         except Exception:
             return []
+
+    # ------------------------------------------------------------------
+    # 向量去重（UI「向量去重」按钮 / engine.dedupe_vectors 用）
+    # ------------------------------------------------------------------
+
+    @_store_op
+    def scan_duplicate_texts(self) -> Dict[str, Any]:
+        """全表按 ``text`` **精确**分组，找出重复向量组。
+
+        返回 ``{"total": 行数, "groups": [...], "source_counts": {source: n}}``；
+        每组 ``{"text": 样例, "keep": {...}, "drop": [{...}, ...]}``，条目含
+        ``id/source/ingested_at``。``keep`` = 组内 ``ingested_at`` 最早的一份
+        （缺失视为 0.0 = 最老，历史数据占先）；并列时取 source 字典序小者，
+        保证确定性。
+
+        text 完全一致才算重复——**不做归一化**，避免把「相似但不同」的文本误
+        并组。整表一次性读入（投影 id/text/source/ingested_at，不含向量），
+        大库（数十万行）内存与耗时都可接受；这是用户手动触发的维护操作，
+        不是同步热路径。
+        """
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None:
+            return {"total": 0, "groups": [], "source_counts": {}}
+        try:
+            arrow = table.to_arrow(columns=["id", "text", "source", _INGESTED_AT])
+        except Exception as e:
+            # 旧表没有 ingested_at 列（迁移未跑/失败）：退化为不按时间保留，
+            # 组内按 (source, id) 字典序取第一份——仍然确定，只是「最早」语义
+            # 退化为「字典序最早」。
+            logger.debug("scan_duplicate_texts: %s 列读取失败，退化分组: %s",
+                         _INGESTED_AT, e)
+            arrow = table.to_arrow(columns=["id", "text", "source"])
+        rows = arrow.to_pylist()
+        has_ts = _INGESTED_AT in arrow.schema.names
+        by_text: Dict[str, List[Dict[str, Any]]] = {}
+        source_counts: Dict[str, int] = {}
+        for r in rows:
+            src = r.get("source") or ""
+            source_counts[src] = source_counts.get(src, 0) + 1
+            ts = (r.get(_INGESTED_AT) if has_ts else None)
+            if ts is None:
+                ts = 0.0
+            by_text.setdefault(r.get("text") or "", []).append(
+                {"id": r.get("id"), "source": src, "ingested_at": ts})
+        groups = []
+        for text, items in by_text.items():
+            if len(items) < 2:
+                continue
+            items.sort(key=lambda x: (x["ingested_at"], x["source"], x["id"] or ""))
+            groups.append({"text": text, "keep": items[0], "drop": items[1:]})
+        # 可清理量大的组排前面：进度/报告更直观
+        groups.sort(key=lambda g: -len(g["drop"]))
+        return {"total": len(rows), "groups": groups, "source_counts": source_counts}
+
+    @_store_op
+    def delete_by_ids(self, ids: List[str], batch: int = 400) -> int:
+        """按 id 批量删除向量（去重用）。返回成功提交删除的条数。
+
+        id 形如 ``{md5hex}_{chunk_index}``（hex + 下划线 + 数字），无引号
+        注入面；仍做单引号转义防御。分批 IN 删除，避免单条 SQL 过长。
+        """
+        self._ensure_initialized()
+        table = self._ensure_table()
+        if table is None or not ids:
+            return 0
+        deleted = 0
+        id_list = [str(x) for x in ids]
+        for i in range(0, len(id_list), batch):
+            chunk = id_list[i:i + batch]
+            values = ", ".join("'" + x.replace("'", "''") + "'" for x in chunk)
+            try:
+                table.delete(f"id IN ({values})")
+                deleted += len(chunk)
+            except Exception as e:
+                logger.error("VectorStore: delete_by_ids batch %d/%d failed: %s",
+                             i // batch + 1,
+                             (len(id_list) + batch - 1) // batch, e)
+        return deleted
 
     # ------------------------------------------------------------------
     # documents metadata table (Meta-context + Targeted RAG)
