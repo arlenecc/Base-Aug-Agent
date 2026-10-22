@@ -503,6 +503,10 @@ class RAGEngine:
         ocr_backend: str = "mlx",
         ocr_model: str = "",
         ocr_model_path: str = "",
+        ocr_gguf_path: str = "",
+        ocr_mmproj_path: str = "",
+        ocr_vlm_handler: str = "",
+        ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
     ):
         self._workspace = workspace
@@ -537,7 +541,11 @@ class RAGEngine:
         # OvisOCR2 配置：ovis 主路与 PDF 兜底共用，惰性加载，同步结束释放。
         try:
             from .ovis_ocr import configure as _ovis_configure
-            _ovis_configure(ocr_backend, ocr_model, ocr_model_path)
+            _ovis_configure(
+                ocr_backend, ocr_model, ocr_model_path,
+                gguf_path=ocr_gguf_path, mmproj_path=ocr_mmproj_path,
+                vlm_handler=ocr_vlm_handler, chat_format=ocr_chat_format,
+            )
         except Exception as e:
             logger.debug("RAG: ovis configure error: %s", e)
         # docling 动态 OCR 倍率（默认关，全篇固定 scale=2.0；表格密集件

@@ -154,12 +154,24 @@ class AgentConfig:
     # 失败仍走轻量兜底，行为与 #133 之前一致。
     rag_pdf_engine: str = "docling"
     # OvisOCR2 模型配置（ovis 引擎 / PDF 兜底共用）：
-    #   - rag_ocr_backend：mlx | onnx | gguf（当前仅 mlx 有可用权重）
-    #   - rag_ocr_model：模型/目录名（展示与回退解析用）
-    #   - rag_ocr_model_path：本地模型目录（相对路径按应用根目录解析）
+    #   - rag_ocr_backend：mlx | onnx | gguf
+    #       · mlx  → MLX-VLM 权重（默认 OvisOCR2-0.8B-MLX-4bit）
+    #       · onnx → ONNX 多模态导出（含视觉+文本联合图），用 rag_ocr_model_path
+    #       · gguf → llama.cpp GGUF 多模态模型（需 mmproj 投影文件才能看图）
+    #   - rag_ocr_model / rag_ocr_model_path：MLX / ONNX 共用（目录或 .onnx 文件）
+    #   - rag_ocr_gguf_path：GGUF 模型文件（GGUF 后端专用）
+    #   - rag_ocr_mmproj_path：GGUF 多模态的 mmproj / clip 投影文件（必填才能读图）
+    #   - rag_ocr_vlm_handler：llama.cpp VLM handler（mtmd/llava15/llava16/
+    #     qwen25vl/minicpmv26/moondream/nanollava），默认 mtmd
+    #   - rag_ocr_chat_format：llama.cpp chat_format（如 qwen2-vl，模型需要的
+    #     话填；多数 mtmd handler 可留空）
     rag_ocr_backend: str = "mlx"
     rag_ocr_model: str = "OvisOCR2-0.8B-MLX-4bit"
     rag_ocr_model_path: str = "models/OvisOCR2-0.8B-MLX-4bit"
+    rag_ocr_gguf_path: str = ""
+    rag_ocr_mmproj_path: str = ""
+    rag_ocr_vlm_handler: str = "mtmd"
+    rag_ocr_chat_format: str = ""
     # docling 动态 OCR 倍率（逐页分析：表格页升 ocr_options.scale=2.5）。
     # 2026-10 实测（5 页中文扫描书，MPS + ocrmac，离线计时）：表格密集件
     # 耗时 +87%（20.0s vs 10.7s），而 char 级质量收益不稳定（输出字符数
@@ -204,6 +216,8 @@ class AgentConfig:
         "rag_rerank_mlx_model_path",
         "browser_endpoint", "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
+        "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
+        "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale",
@@ -220,6 +234,8 @@ class AgentConfig:
         "rag_rerank_mlx_model_path",
         "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
+        "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
+        "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
 
     @classmethod

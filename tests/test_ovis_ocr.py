@@ -267,37 +267,277 @@ def test_extract_markdown_pdf_image_page(monkeypatch, tmp_path):
 
 def test_configure_and_resolve(monkeypatch, tmp_path):
     monkeypatch.setattr(ovis_ocr, "_config",
-                        {"backend": "mlx", "model": "m", "path": ""})
-    ovis_ocr.configure(backend="onnx", model="m2")
+                        {"backend": "mlx", "model": "m", "path": "",
+                         "gguf_path": "", "mmproj_path": "",
+                         "vlm_handler": "mtmd", "chat_format": ""})
+    ovis_ocr.configure(backend="onnx", model="m2", gguf_path="/x.gguf")
     assert ovis_ocr._config["backend"] == "onnx"
     assert ovis_ocr._config["model"] == "m2"
+    assert ovis_ocr._config["gguf_path"] == "/x.gguf"
     # 空参数不覆盖
-    ovis_ocr.configure(backend="", model="")
+    ovis_ocr.configure(backend="", model="", gguf_path="")
     assert ovis_ocr._config["backend"] == "onnx"
 
 
-def test_is_ovis_available_backend_gate(monkeypatch):
-    monkeypatch.setattr(ovis_ocr, "_config",
-                        {"backend": "onnx", "model": "m", "path": "x"})
-    assert ovis_ocr.is_ovis_available() is False
-
-
-def test_is_ovis_available_model_dir(monkeypatch, tmp_path):
+def test_is_ovis_available_mlx(monkeypatch, tmp_path):
     monkeypatch.setattr(ovis_ocr, "_config",
                         {"backend": "mlx", "model": "m", "path": str(tmp_path)})
+    monkeypatch.setattr(ovis_ocr, "_importable", lambda n: n == "mlx_vlm")
     assert ovis_ocr.is_ovis_available() is True
     monkeypatch.setattr(ovis_ocr, "_config",
-                        {"backend": "mlx", "model": "m", "path": str(tmp_path / "nope")})
+                        {"backend": "mlx", "model": "m",
+                         "path": str(tmp_path / "nope")})
+    assert ovis_ocr.is_ovis_available() is False
+    # 缺依赖
+    monkeypatch.setattr(ovis_ocr, "_importable", lambda n: False)
     assert ovis_ocr.is_ovis_available() is False
 
 
-def test_engine_backend_not_implemented(monkeypatch):
-    """ONNX/GGUF 后端：明确错误而非静默失败。"""
+def test_is_ovis_available_onnx(monkeypatch, tmp_path):
+    monkeypatch.setattr(ovis_ocr, "_importable", lambda n: n == "onnxruntime")
     monkeypatch.setattr(ovis_ocr, "_config",
-                        {"backend": "gguf", "model": "m", "path": "x"})
+                        {"backend": "onnx", "model": "m", "path": str(tmp_path)})
+    assert ovis_ocr.is_ovis_available() is True
+    onnx_file = tmp_path / "x.onnx"
+    onnx_file.write_bytes(b"fake")
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "onnx", "model": "m", "path": str(onnx_file)})
+    assert ovis_ocr.is_ovis_available() is True
+    # 路径不存在
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "onnx", "model": "m", "path": str(tmp_path / "nope")})
+    assert ovis_ocr.is_ovis_available() is False
+
+
+def test_is_ovis_available_gguf(monkeypatch, tmp_path):
+    monkeypatch.setattr(ovis_ocr, "_importable", lambda n: n == "llama_cpp")
+    gguf_file = tmp_path / "m.gguf"
+    gguf_file.write_bytes(b"fake")
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "gguf", "model": "m",
+                         "path": "", "mmproj_path": "",
+                         "gguf_path": str(gguf_file)})
+    assert ovis_ocr.is_ovis_available() is True
+    # GGUF 文件不存在
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "gguf", "model": "m",
+                         "path": "", "mmproj_path": "",
+                         "gguf_path": str(tmp_path / "nope.gguf")})
+    assert ovis_ocr.is_ovis_available() is False
+    # 未配置 GGUF 路径
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "gguf", "model": "m",
+                         "path": "", "mmproj_path": "",
+                         "gguf_path": ""})
+    assert ovis_ocr.is_ovis_available() is False
+
+
+def test_get_engine_dispatch_mlx(monkeypatch):
+    """mlx 分支：走 _load_mlx（依赖 mlx_vlm），不可用时明确报错。"""
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "mlx", "model": "m", "path": "x"})
     monkeypatch.setattr(ovis_ocr, "_engine_failed", False)
-    with pytest.raises(OvisUnavailable, match="gguf"):
+    monkeypatch.setattr(ovis_ocr, "_load_mlx", lambda: (_ for _ in ()).throw(
+        OvisUnavailable("no mlx")))
+    with pytest.raises(OvisUnavailable):
         ovis_ocr._get_engine()
+
+
+def test_get_engine_gguf_missing_path(monkeypatch):
+    """gguf 分支未配置 GGUF 路径 → 明确错误（而非静默失败）。"""
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "gguf", "model": "",
+                         "path": "", "mmproj_path": "", "gguf_path": ""})
+    monkeypatch.setattr(ovis_ocr, "_engine_failed", False)
+    monkeypatch.setattr(ovis_ocr, "_importable", lambda n: True)
+    with pytest.raises(OvisUnavailable, match="GGUF OCR 未配置"):
+        ovis_ocr._get_engine()
+
+
+def test_get_engine_unsupported_backend(monkeypatch):
+    monkeypatch.setattr(ovis_ocr, "_config",
+                        {"backend": "tflite", "model": "m", "path": "x"})
+    monkeypatch.setattr(ovis_ocr, "_engine_failed", False)
+    with pytest.raises(OvisUnavailable, match="不支持的 OCR 后端"):
+        ovis_ocr._get_engine()
+
+
+# ---------- ONNX 推理路径（mock session，不加载真实权重） ----------
+
+class _FakeONNXTokenizer:
+    def __init__(self, vocab):
+        self.vocab = vocab
+        self.eos_token_id = vocab["</s>"]
+        self.id_to_tok = {v: k for k, v in vocab.items()}
+
+    def decode(self, ids, skip_special_tokens=True):
+        toks = [self.id_to_tok.get(i, "") for i in ids]
+        if skip_special_tokens:
+            toks = [t for t in toks if t != "</s>"]
+        return "".join(toks)
+
+
+class _FakeONNXProcessor:
+    def __init__(self, tok):
+        self._tok = tok
+
+    def __call__(self, text=None, images=None, return_tensors=None):
+        # 单 token 的 input_ids（形状 1x1），并补齐 attention_mask / position_ids
+        # / pixel_values——引擎的 _feeds 会按 session 输入名自动装配这些。
+        return {"input_ids": [[self._tok.vocab["<s>"]]],
+                "attention_mask": [[1]],
+                "position_ids": [[0]],
+                "pixel_values": [[[0.0]]]}
+
+
+class _FakeONNXSession:
+    def __init__(self, eos_id, emit):
+        self._eos_id = eos_id
+        self._emit = emit  # 每次 run 吐出的 token id 列表（顺序消费）
+        self._idx = 0
+        self._inputs = [
+            type("I", (), {"name": n})()
+            for n in ("input_ids", "attention_mask", "position_ids", "pixel_values")
+        ]
+
+    def get_inputs(self):
+        return self._inputs
+
+    def run(self, _, feeds):
+        assert "input_ids" in feeds and "pixel_values" in feeds
+        tok = self._emit[self._idx] if self._idx < len(self._emit) else self._eos_id
+        self._idx += 1
+        # logits 形状 1x1xV，仅首位（=tok）为 1
+        V = self._eos_id + 5
+        logits = [[[0.0] * V]]
+        logits[0][0][tok] = 1.0
+        return [logits]
+
+
+def test_onnx_engine_generate_decodes_tokens(monkeypatch, tmp_path):
+    """_ONNXOCREngine 跑自回归循环，遇 eos 停止，并把图像送入 processor。"""
+    vocab = {"<s>": 0, "H": 1, "i": 2, "</s>": 3}
+    tok = _FakeONNXTokenizer(vocab)
+    proc = _FakeONNXProcessor(tok)
+    # 依次生成 H, i, eos
+    session = _FakeONNXSession(eos_id=vocab["</s>"], emit=[vocab["H"], vocab["i"]])
+    eng = ovis_ocr._ONNXOCREngine(session, tok, proc, "<prompt>")
+    from PIL import Image
+    png = tmp_path / "x.png"
+    Image.new("RGB", (10, 10), 255).save(str(png))
+    text = eng.generate(str(png))
+    assert text == "Hi"
+
+
+def test_onnx_engine_stop_at_max_tokens_on_missing_eos(monkeypatch, tmp_path):
+    """eos 缺失时退化为 _MAX_TOKENS 上限，不无限空转。"""
+    vocab = {"<s>": 0, "A": 1, "</s>": 2}
+    tok = _FakeONNXTokenizer(vocab)
+    tok.eos_token_id = None  # 无 eos
+    proc = _FakeONNXProcessor(tok)
+    session = _FakeONNXSession(eos_id=2, emit=[1, 1, 1])
+    eng = ovis_ocr._ONNXOCREngine(session, tok, proc, "<prompt>")
+    from PIL import Image
+    png = tmp_path / "eos.png"
+    Image.new("RGB", (10, 10), 255).save(str(png))
+    text = eng.generate(str(png))
+    # 没有 eos：跑到 _MAX_TOKENS 步上限后停止，不无限空转，且 decode 不抛异常。
+    assert text is not None
+
+
+def test_onnx_engine_rejects_3d_position_requirement(monkeypatch, tmp_path):
+    """processor 未给 position_ids 且模型声明三维输入 → 明确报错。"""
+    vocab = {"<s>": 0, "x": 1, "</s>": 2}
+    tok = _FakeONNXTokenizer(vocab)
+
+    class _S3d:
+        def get_inputs(self):
+            ins = []
+            for n in ("input_ids", "attention_mask", "position_ids", "pixel_values"):
+                it = type("I", (), {"name": n})()
+                if n == "position_ids":
+                    it.shape = [1, 1, 1]  # 三维
+                ins.append(it)
+            return ins
+        def run(self, _, feeds):
+            return [[[0.0] * 10]]
+
+    class _P3d(_FakeONNXProcessor):
+        def __call__(self, **kw):
+            # 故意不返回 position_ids，迫使引擎按 session 声明形状判定 M-RoPE。
+            return {"input_ids": [[0]], "attention_mask": [[1]],
+                    "pixel_values": [[[0.0]]]}
+
+    eng = ovis_ocr._ONNXOCREngine(_S3d(), tok, _P3d(tok), "<prompt>")
+    from PIL import Image
+    png = tmp_path / "y.png"
+    Image.new("RGB", (10, 10), 255).save(str(png))
+    with pytest.raises(OvisUnavailable, match="M-RoPE"):
+        eng.generate(str(png))
+
+
+# ---------- GGUF 推理路径（mock backend，不加载 llama.cpp） ----------
+
+class _FakeStreamEvent:
+    def __init__(self, type, content=""):
+        self.type = type
+        self.content = content
+
+
+class _FakeGGUFBackend:
+    def __init__(self, chunks):
+        self._chunks = chunks  # list[str]
+
+    def chat_stream(self, messages, temperature=0.7):
+        # 验证图像以 [image:...] 标记传入
+        assert "image:" in messages[0]["content"]
+        for c in self._chunks:
+            yield _FakeStreamEvent("content", c)
+
+
+def test_gguf_engine_generate_joins_content(monkeypatch, tmp_path):
+    b = _FakeGGUFBackend(["# ", "标题", "\n\n", "内容"])
+    eng = ovis_ocr._GGUFOCREngine(b)
+    from PIL import Image
+    png = tmp_path / "z.png"
+    Image.new("RGB", (10, 10), 255).save(str(png))
+    text = eng.generate(str(png))
+    assert text == "# 标题\n\n内容"
+
+
+def test_gguf_engine_ignores_reasoning_events(monkeypatch, tmp_path):
+    class _B:
+        def chat_stream(self, messages, temperature=0.7):
+            yield _FakeStreamEvent("reasoning", "thinking")
+            yield _FakeStreamEvent("content", "done")
+    eng = ovis_ocr._GGUFOCREngine(_B())
+    from PIL import Image
+    png = tmp_path / "reason.png"
+    Image.new("RGB", (10, 10), 255).save(str(png))
+    text = eng.generate(str(png))
+    assert text == "done"
+
+
+# ---------- 分发入口（ocr_image_to_markdown 走 temp PNG + 引擎 generate） ----------
+
+def test_ocr_image_to_markdown_dispatches_to_engine(monkeypatch, tmp_path):
+    """ocr_image_to_markdown 落临时 PNG 并调用引擎 generate，且做 HTML→md。"""
+    calls = []
+    class _Eng:
+        kind = "mlx"
+        def generate(self, png_path):
+            calls.append(png_path)
+            return "<table><tr><td>a</td><td>b</td></tr></table>"
+
+    monkeypatch.setattr(ovis_ocr, "_get_engine", lambda: _Eng())
+    png = tmp_path / "doc.png"
+    import numpy as np
+    from PIL import Image
+    Image.new("L", (40, 20), 255).save(str(png))
+    md = ovis_ocr.ocr_image_to_markdown(np.full((20, 40), 255, dtype=np.uint8))
+    assert len(calls) == 1
+    assert "| a | b |" in md  # HTML 表格被归一为 markdown
+
 
 
 def test_engine_model_dir_missing(monkeypatch, tmp_path):

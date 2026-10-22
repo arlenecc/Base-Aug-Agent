@@ -13,8 +13,11 @@
 
 模型默认 ``models/OvisOCR2-0.8B-MLX-4bit``（Qwen3.5-VL 架构的 853M OCR
 微调模型，4bit MLX 量化，实测比 docling OCR 路径快 2-3 倍、内存 0.86GB）。
-后端下拉提供 MLX-VLM / ONNX / GGUF 三选，当前仅 MLX-VLM 有可用权重
-（ONNX/GGUF 变体不存在，选中会在加载时给出明确错误并回退文本直取）。
+后端下拉提供 MLX-VLM / ONNX / GGUF 三选：
+  * mlx   → MLX-VLM 权重（默认 OvisOCR2-0.8B-MLX-4bit）
+  * onnx  → ONNX 多模态导出（含视觉+文本联合图），用 rag_ocr_model_path
+  * gguf  → llama.cpp GGUF 多模态模型，必须配 mmproj 投影文件才能读图
+三者共用同一套 PDF/图像 → markdown 管线；缺权重时加载阶段给出明确错误。
 """
 from __future__ import annotations
 
@@ -54,22 +57,29 @@ _PROMPT = "Transcribe this document to markdown."
 # ---------------------------------------------------------------------------
 # 引擎单例（惰性加载 / 线程安全 / 可释放）
 # ---------------------------------------------------------------------------
-_engine = None            # (model, processor, prompt)
+_engine = None            # 已加载的 OCR 引擎 impl（含 .kind 与 .generate）
+_engine_kind = None
 _engine_lock = threading.RLock()
-_infer_lock = threading.RLock()   # mlx generate 非线程安全：4 worker 串行化
+_infer_lock = threading.RLock()   # mlx generate / llama 推理非线程安全：串行化
 _engine_failed = False    # 加载失败标记：避免每页重试刷屏
 _config = {
     "backend": DEFAULT_OCR_BACKEND,
     "model": DEFAULT_OCR_MODEL,
     "path": DEFAULT_OCR_MODEL_PATH,
+    "gguf_path": "",
+    "mmproj_path": "",
+    "vlm_handler": "mtmd",
+    "chat_format": "",
 }
 
 
 class OvisUnavailable(RuntimeError):
-    """引擎不可用（未安装 mlx-vlm / 模型缺失 / 后端未实现）。"""
+    """引擎不可用（未安装依赖 / 模型缺失 / 后端未实现）。"""
 
 
-def configure(backend: str = "", model: str = "", path: str = "") -> None:
+def configure(backend: str = "", model: str = "", path: str = "",
+              gguf_path: str = "", mmproj_path: str = "",
+              vlm_handler: str = "", chat_format: str = "") -> None:
     """RAGEngine.__init__ 调用：记录配置。已加载的引擎不受影响。"""
     with _engine_lock:
         if backend:
@@ -78,6 +88,14 @@ def configure(backend: str = "", model: str = "", path: str = "") -> None:
             _config["model"] = model
         if path:
             _config["path"] = path
+        if gguf_path:
+            _config["gguf_path"] = gguf_path
+        if mmproj_path:
+            _config["mmproj_path"] = mmproj_path
+        if vlm_handler:
+            _config["vlm_handler"] = vlm_handler
+        if chat_format is not None:
+            _config["chat_format"] = chat_format
 
 
 def _app_root() -> Path:
@@ -94,77 +112,301 @@ def _resolve_model_path() -> str:
     return str(path)
 
 
+def _importable(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 各后端的引擎 impl：统一接口 `generate(png_path) -> str`（返回 VLM 原始文本，
+# HTML→markdown 归一在 ocr_image_to_markdown 里统一做）。
+# ---------------------------------------------------------------------------
+class _MLXOCREngine:
+    kind = "mlx"
+
+    def __init__(self, model, processor, prompt):
+        self._model = model
+        self._processor = processor
+        self._prompt = prompt
+
+    def generate(self, png_path: str) -> str:
+        from mlx_vlm import generate
+
+        with _infer_lock:
+            out = generate(self._model, self._processor, self._prompt,
+                           image=png_path, max_tokens=_MAX_TOKENS, verbose=False)
+        return out.text if hasattr(out, "text") else str(out)
+
+
+class _ONNXOCREngine:
+    kind = "onnx"
+
+    def __init__(self, session, tokenizer, processor, prompt_text):
+        self._session = session
+        self._tokenizer = tokenizer
+        self._processor = processor
+        self._prompt_text = prompt_text
+
+    def _build_inputs(self, png_path):
+        import numpy as np
+        from PIL import Image
+
+        images = [Image.open(png_path).convert("RGB")]
+        if self._processor is not None:
+            batch = self._processor(text=self._prompt_text, images=images,
+                                    return_tensors="np")
+        else:
+            batch = self._tokenizer(self._prompt_text, return_tensors="np")
+        return {k: np.asarray(v) for k, v in dict(batch).items()}
+
+    def _feeds(self, encoded, input_ids):
+        import numpy as np
+
+        input_names = {it.name: it for it in self._session.get_inputs()}
+        feeds: dict = {}
+        for name, spec in input_names.items():
+            if name == "input_ids":
+                value = input_ids
+            elif name == "attention_mask":
+                value = np.ones_like(input_ids, dtype=np.int64)
+            elif name == "position_ids":
+                if name in encoded:
+                    base = np.asarray(encoded[name], dtype=np.int64)
+                    missing = input_ids.shape[1] - base.shape[-1]
+                    if missing > 0:
+                        tail = base[..., -1:] + np.arange(1, missing + 1, dtype=np.int64)
+                        base = np.concatenate((base, tail), axis=-1)
+                    value = base[..., :input_ids.shape[1]]
+                else:
+                    declared = list(spec.shape or [])
+                    if len(declared) == 3:
+                        raise OvisUnavailable(
+                            "该 ONNX VLM 需要显式三维 M-RoPE position_ids；"
+                            "processor 未生成此输入，不能用普通二维位置替代"
+                        )
+                    value = np.arange(input_ids.shape[1], dtype=np.int64)[None, :]
+            elif name == "token_type_ids":
+                value = np.zeros_like(input_ids, dtype=np.int64)
+            elif name in encoded:
+                value = encoded[name]
+            else:
+                raise OvisUnavailable(
+                    f"ONNX 模型需要未能自动构造的输入 '{name}' ({spec.shape})；"
+                    "请使用与导出图匹配的专用 processor"
+                )
+            feeds[name] = np.asarray(value)
+        return feeds
+
+    def generate(self, png_path: str) -> str:
+        import numpy as np
+
+        encoded = self._build_inputs(png_path)
+        if "input_ids" not in encoded:
+            raise OvisUnavailable("ONNX processor 未返回 input_ids")
+        input_ids = np.asarray(encoded["input_ids"], dtype=np.int64)
+        generated: list = []
+        eos = self._tokenizer.eos_token_id
+        eos_ids = (set(eos) if isinstance(eos, list)
+                   else {eos}) if eos is not None else set()
+        for _ in range(_MAX_TOKENS):
+            outputs = self._session.run(None, self._feeds(encoded, input_ids))
+            logits = np.asarray(outputs[0])
+            if logits.ndim < 3:
+                raise OvisUnavailable("ONNX 输出不是生成模型 logits")
+            nxt = int(np.argmax(logits[0, -1]))
+            if nxt in eos_ids:
+                break
+            generated.append(nxt)
+            input_ids = np.concatenate(
+                (input_ids, np.asarray([[nxt]], dtype=np.int64)), axis=1
+            )
+        return self._tokenizer.decode(generated, skip_special_tokens=True)
+
+
+class _GGUFOCREngine:
+    kind = "gguf"
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    def generate(self, png_path: str) -> str:
+        # 图像以 [image:path] 标记喂给多模态 GGUF（llama.cpp chat_handler 解析）。
+        messages = [{"role": "user", "content": f"[image:{png_path}] {_PROMPT}"}]
+        parts: list = []
+        with _infer_lock:
+            for ev in self._backend.chat_stream(messages, temperature=0.2):
+                if getattr(ev, "type", None) == "content":
+                    parts.append(ev.content or "")
+        return "".join(parts)
+
+
+class _GGUFConfig:
+    """把 OCR 的 GGUF/mmproj/handler/format 适配成 LlamaCppBackend 期望的
+    config 字段子集（llm_vision_projection_path / llm_vlm_handler /
+    llm_chat_format + 推理超参）。"""
+
+    def __init__(self):
+        self.llm_vision_projection_path = _config.get("mmproj_path") or ""
+        self.llm_vlm_handler = _config.get("vlm_handler") or "mtmd"
+        self.llm_chat_format = _config.get("chat_format") or ""
+        self.local_gpu_layers = -1
+        self.local_llm_n_ctx = 4096
+        self.max_context_tokens = 4096
+        self.local_model_batch_size = 512
+        self.local_model_threads = 4
+        self.top_p = 0.95
+        self.top_k = 20
+        self.min_p = 0.05
+        self.repetition_penalty = 1.0
+        self.max_tokens = _MAX_TOKENS
+
+
+def _build_onnx_prompt(tokenizer, processor) -> str:
+    """生成 ONNX VLM 的起始文本（带 generation prompt）。无模板则退化为原 prompt。"""
+    owner = processor or tokenizer
+    try:
+        return owner.apply_chat_template(
+            [{"role": "user", "content": _PROMPT}],
+            tokenize=False, add_generation_prompt=True,
+        )
+    except Exception:
+        return _PROMPT
+
+
+def _load_mlx():
+    try:
+        from mlx_vlm import load
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_config
+    except Exception as e:
+        raise OvisUnavailable(
+            f"mlx-vlm 未安装，OvisOCR2 不可用: {e}（pip install mlx-vlm）"
+        ) from e
+    model_path = _resolve_model_path()
+    if not Path(model_path).is_dir():
+        raise OvisUnavailable(
+            f"OvisOCR2 模型目录不存在: {model_path}"
+            f"（配置的 rag_ocr_model_path）"
+        )
+    model, processor = load(model_path)
+    prompt = apply_chat_template(
+        processor, load_config(model_path), _PROMPT, num_images=1
+    )
+    # MLX 内存上限：与嵌入/重排两个 MLX 入口一致，防止同步期 phys_footprint 暴涨。
+    from .model_backends import _cap_mlx_memory_limits
+    _cap_mlx_memory_limits()
+    logger.info("OvisOCR2 引擎加载完成: %s（MLX-VLM）", model_path)
+    return _MLXOCREngine(model, processor, prompt)
+
+
+def _load_onnx():
+    try:
+        import onnxruntime as ort
+        from transformers import AutoProcessor, AutoTokenizer
+    except ImportError as e:
+        raise OvisUnavailable(
+            f"ONNX OCR 需要 onnxruntime 与 transformers: {e}"
+        ) from e
+    model_path = _resolve_model_path()
+    if not (Path(model_path).is_file() or Path(model_path).is_dir()):
+        raise OvisUnavailable(f"ONNX OCR 模型路径不存在: {model_path}")
+    model_dir = Path(model_path) if Path(model_path).is_dir() else Path(model_path).parent
+    if Path(model_path).is_file():
+        model_file = Path(model_path)
+    else:
+        cands = sorted(Path(model_path).glob("*.onnx")) + \
+                sorted(Path(model_path).glob("onnx/*.onnx"))
+        if not cands:
+            raise OvisUnavailable(f"目录中未找到 ONNX 文件: {model_path}")
+        model_file = cands[0]
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = max(1, int(_config.get("onnx_threads") or 4))
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    session = ort.InferenceSession(
+        str(model_file), sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+    try:
+        processor = AutoProcessor.from_pretrained(
+            str(model_dir), local_files_only=True, trust_remote_code=False)
+    except Exception:
+        processor = None
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_dir), local_files_only=True, trust_remote_code=False)
+    logger.info("ONNX OCR 引擎加载完成: %s（CPU）", model_file)
+    return _ONNXOCREngine(session, tokenizer, processor,
+                          _build_onnx_prompt(tokenizer, processor))
+
+
+def _load_gguf():
+    try:
+        from ..model_backends import LlamaCppBackend
+    except ImportError as e:
+        raise OvisUnavailable(f"GGUF OCR 需要 agent.model_backends: {e}") from e
+    gguf_path = (_config.get("gguf_path") or _config.get("path")
+                 or _config.get("model"))
+    if not gguf_path:
+        raise OvisUnavailable("GGUF OCR 未配置 GGUF 模型路径 (rag_ocr_gguf_path)")
+    try:
+        backend = LlamaCppBackend(str(gguf_path), _GGUFConfig())
+    except Exception as e:
+        raise OvisUnavailable(f"GGUF OCR 模型加载失败: {gguf_path}: {e}") from e
+    logger.info("GGUF OCR 引擎加载完成: %s", gguf_path)
+    return _GGUFOCREngine(backend)
+
+
 def _get_engine():
-    """惰性加载 OvisOCR2；失败抛 OvisUnavailable（每个进程只记一次日志）。"""
-    global _engine, _engine_failed
+    """惰性加载 OCR 引擎（按 backend 分派 mlx/onnx/gguf）；失败抛 OvisUnavailable。"""
+    global _engine, _engine_failed, _engine_kind
     with _engine_lock:
         if _engine is not None:
             return _engine
         if _engine_failed:
-            raise OvisUnavailable("OvisOCR2 引擎此前加载失败，跳过（见上方日志）")
+            raise OvisUnavailable("OCR 引擎此前加载失败，跳过（见上方日志）")
         backend = _config["backend"]
-        if backend != "mlx":
-            raise OvisUnavailable(
-                f"OCR 后端 '{backend}' 尚未实现：OvisOCR2 目前只有 MLX 权重"
-                f"（MLX-VLM 后端可用）。请准备 MLX 权重后将后端切回 MLX-VLM。"
-            )
         try:
-            from mlx_vlm import load
-            from mlx_vlm.prompt_utils import apply_chat_template
-            from mlx_vlm.utils import load_config
+            if backend == "mlx":
+                impl = _load_mlx()
+            elif backend == "onnx":
+                impl = _load_onnx()
+            elif backend == "gguf":
+                impl = _load_gguf()
+            else:
+                raise OvisUnavailable(f"不支持的 OCR 后端: {backend}")
+        except OvisUnavailable:
+            raise
         except Exception as e:
             _engine_failed = True
-            raise OvisUnavailable(
-                f"mlx-vlm 未安装，OvisOCR2 不可用: {e}（pip install mlx-vlm）"
-            ) from e
-        model_path = _resolve_model_path()
-        if not Path(model_path).is_dir():
-            _engine_failed = True
-            raise OvisUnavailable(
-                f"OvisOCR2 模型目录不存在: {model_path}"
-                f"（配置的 rag_ocr_model_path）"
-            )
-        try:
-            model, processor = load(model_path)
-            prompt = apply_chat_template(
-                processor, load_config(model_path), _PROMPT, num_images=1
-            )
-            # MLX 内存上限（2026-10 审查修复）：此前只有嵌入/重排两个 MLX
-            # 入口调 _cap_mlx_memory_limits()，本引擎漏掉——当 embedding/
-            # rerank 都用非 MLX 后端时，进程里唯一的 MLX 使用者就是本 VLM，
-            # 其 Metal buffer cache 上限保持默认 recommendedMaxWorkingSetSize
-            # （16GB 机器 ≈ 15.2GB），正是同步期 phys_footprint 冲到 18-19GB
-            # 的根因。函数幂等，多处调用安全。
-            from .model_backends import _cap_mlx_memory_limits
-            _cap_mlx_memory_limits()
-        except Exception as e:
-            _engine_failed = True
-            raise OvisUnavailable(f"OvisOCR2 加载失败: {model_path}: {e}") from e
-        _engine = (model, processor, prompt)
-        logger.info("OvisOCR2 引擎加载完成: %s（MLX-VLM）", model_path)
+            raise OvisUnavailable(f"OCR 引擎加载失败 ({backend}): {e}") from e
+        _engine = impl
+        _engine_kind = backend
         return _engine
 
 
 def release_engine() -> None:
-    """释放 VLM 单例，归还其 ~0.9GB 统一内存。RAGEngine.close() 调用。"""
-    global _engine, _engine_failed
+    """释放引擎单例，归还显存/统一内存。RAGEngine.close() 调用。"""
+    global _engine, _engine_failed, _engine_kind
     # 非阻塞拿推理锁：有 worker 正在 generate 时不能释放——置 None 只是
     # 换掉单例引用，在途推理仍抱着旧模型，紧接着的 _get_engine() 会再造
-    # 一份 → 两代 ~0.9GB 并存（与 docling/marker 转换器两代并存的竞态同源）。
+    # 一份 → 两代内存并存（与 docling/marker 转换器两代并存的竞态同源）。
     # 拿不到锁就跳过本次释放；close() 在下次同步结束会再调，届时回收。
     if not _infer_lock.acquire(blocking=False):
-        logger.info("OvisOCR2 推理进行中，本次引擎释放跳过（留待下次回收）")
+        logger.info("OCR 推理进行中，本次引擎释放跳过（留待下次回收）")
         return
     try:
         with _engine_lock:
             if _engine is not None:
                 _engine = None
+                _engine_kind = None
                 try:
                     import mlx.core as mx
                     mx.clear_cache()
                 except Exception:
                     pass
-                logger.info("OvisOCR2 引擎已释放")
+                logger.info("OCR 引擎已释放")
             # 释放后允许下次重新尝试加载（用户可能刚修好模型目录）
             _engine_failed = False
     finally:
@@ -218,7 +460,11 @@ def _html_tables_to_markdown(text: str) -> str:
 # 图像 → markdown
 # ---------------------------------------------------------------------------
 def ocr_image_to_markdown(img) -> str:
-    """归一化后的灰度图（uint8 2D）→ markdown 文本。引擎不可用抛 OvisUnavailable。"""
+    """归一化后的灰度图（uint8 2D）→ markdown 文本。引擎不可用抛 OvisUnavailable。
+
+    落临时 PNG 交给后端引擎（mlx_vlm / onnxruntime / llama.cpp 都吃文件路径），
+    各后端的 generate 实现负责实际推理，这里统一做 HTML→markdown 归一。
+    """
     import tempfile
 
     import numpy as np
@@ -226,26 +472,20 @@ def ocr_image_to_markdown(img) -> str:
 
     from .parsers import _ocr_normalize
 
-    model, processor, prompt = _get_engine()
+    engine = _get_engine()
 
     arr = np.asarray(img)
     if arr.ndim == 3:  # 容错：调用方传入彩色图
         arr = arr.mean(axis=2).astype(np.uint8)
     arr = _ocr_normalize(arr)
 
-    from mlx_vlm import generate
-
-    # mlx_vlm.generate 只接受文件路径：落临时 PNG，用完即删。
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         Image.fromarray(arr).convert("RGB").save(tmp_path)
-        # generate 非线程安全（mlx 图执行），4 个 ingest worker 串行化；
-        # 模型本身就在一块 GPU 上，串行不损失吞吐。
-        with _infer_lock:
-            out = generate(model, processor, prompt, image=tmp_path,
-                           max_tokens=_MAX_TOKENS, verbose=False)
-        text = out.text if hasattr(out, "text") else str(out)
+        # 推理非线程安全（各后端都抱一块设备/GPU），4 个 ingest worker 串行化；
+        # 模型本身就在一块设备上，串行不损失吞吐。
+        text = engine.generate(tmp_path)
     finally:
         try:
             os.unlink(tmp_path)
@@ -606,11 +846,25 @@ def extract_markdown(filepath: str) -> Optional[str]:
 
 
 def is_ovis_available() -> bool:
-    """引擎是否可能可用（配置 + mlx-vlm + 模型目录三项快检，不加载模型）。"""
-    if _config["backend"] != "mlx":
-        return False
-    try:
-        import mlx_vlm  # noqa: F401
-    except Exception:
-        return False
-    return Path(_resolve_model_path()).is_dir()
+    """引擎是否可能可用（按 backend 快检依赖 + 权重，不加载模型）。
+
+    mlx  → 需要 mlx_vlm 且模型目录存在
+    onnx → 需要 onnxruntime 且模型文件/目录存在
+    gguf → 需要 llama_cpp 且 GGUF 模型文件存在
+    """
+    backend = _config["backend"]
+    if backend == "mlx":
+        if not _importable("mlx_vlm"):
+            return False
+        return Path(_resolve_model_path()).is_dir()
+    if backend == "onnx":
+        if not _importable("onnxruntime"):
+            return False
+        p = _resolve_model_path()
+        return Path(p).is_file() or Path(p).is_dir()
+    if backend == "gguf":
+        if not _importable("llama_cpp"):
+            return False
+        gp = _config.get("gguf_path") or _config.get("path") or _config.get("model")
+        return bool(gp) and Path(gp).is_file()
+    return False
