@@ -379,6 +379,51 @@ Markdown 文本
 2. 点击「同步知识」执行增量同步（只处理新增/修改的文件）；右键点击可强制全量重处理
 3. 右侧日志面板实时显示同步进度
 4. 同步完成后，对话中模型会自动调用 `rag_search` 检索相关知识
+5. 需要清理重复向量时，点击「同步知识」左侧的「向量去重」按钮（无需重解析文件）
+
+### 同步期进度可见性（心跳日志）
+
+大文件（尤其是上百页的扫描书）转换一次要几十秒到数分钟，期间日志面板会长时间不刷新。
+为此 `ingest()` 起一条**心跳线程**，默认每 60 秒输出一行进度：
+
+```
+  ⏱ 同步进行中 (已 128s): 已完成 37/120 个文件, 处理中 4 个 [算法导论.pdf(96s), 剑桥中国史.epub(88s) ...] 等4个
+```
+
+行内会列出**当前仍在处理**的文件及其已耗时，据此可以直观区分三种「卡住」：
+
+| 现象 | 含义 |
+|------|------|
+| 心跳持续出现、在办文件时间在涨 | 正常，只是这几本慢 |
+| 心跳出现但「处理中 0 个」 | 在向量化 / 收尾阶段，没有文件在解析 |
+| 心跳**不再出现** | 主线程卡死或进程已被系统杀掉 |
+
+可用环境变量 `RAG_HEARTBEAT_S` 调整间隔（设 `0` 关闭），`RAG_MEM_LOG=1` 额外开启内存采样。
+
+### 副本去重（三层，互不替代）
+
+同一本书常以多种形式重复出现（不同目录下的副本、重新保存的 PDF、`docx→pdf` 导出）。
+去重分三层，分别在不同时机生效：
+
+| 层 | 时机 | 判据 | 作用 |
+|----|------|------|------|
+| 解析前 | 同步 Step 2.5 | **文件指纹**（大小 + 头/中/尾各 64KB 采样 sha256） | 同内容文件只解析一次，其余在 manifest 标记 `duplicate_of`，省掉整段解析/切片/向量化 |
+| 入库后 | 同步 Step 5.5 | `content_hash`（解析产物） | 清掉新出现的副本向量与缓存，避免检索噪声 |
+| 存量清理 | 点「向量去重」按钮 | 向量库内同文本分组 + `ingested_at` 排序 | 清理历史遗留重复，**保留入库时间最早的一份** |
+
+「向量去重」是独立按钮而非同步的一部分：存量重复（本功能上线前已入库的副本）不会因新同步
+被动清理，需要显式跑一次。老库缺 `ingested_at` 列时会自动迁移补列（旧行填 `0.0`，即视为最早）。
+
+### PDF 转换的并发与内存护栏
+
+PDF 转换器（docling/marker）实例重、非线程安全，大文件并发会撑爆内存。按**文件大小**限流：
+
+- 小文件（< `rag_pdf_large_threshold_mb`，默认 20MB）：最多 `rag_pdf_small_concurrency`（默认 2）路并发
+- 大文件（≥ 阈值）：独占，且它排队时会阻止新的小文件入场（防大文件被源源不断的小文件饿死）
+
+转换器实例池按 OCR 渲染倍率分桶复用，每实例服满 50 篇主动退役重建，冲刷其原生缓存。
+闸门的 `acquire()` 返回许可令牌、`release(permit)` 凭据归还——不能按 size 重新判定分类
+（阈值热改会把读者计数减到写者分支，导致后续大文件永久阻塞，见问题表 #162）。
 
 ### Token 控制
 
@@ -802,6 +847,20 @@ pytest tests/ -k "not rag_e2e and not rag_full_pipeline" -v
 | 159 | #157 把 MLX buffer cache 压到 1GB 过激，prefill 长上下文时大注意力矩阵每步反复释放重分配 | 内存不爆了但每句话都卡半天、且历史越长越卡 | 抽出统一 `apply_mlx_memory_policy()`：cache 封顶 `min(40% RAM,6GB)`、总内存封顶 `min(当前,80% RAM)`；聊天/VLM/RAG 三处复用同一策略 |
 | 160 | RAG `list_sources()` 用 `to_arrow(columns=["source"])` 投影，本地 LanceDB 不支持该参数 → 兜底整表 `to_arrow().to_pylist()`（57 万行含向量） | `status()` 每轮调用，单次 200+ 秒 → 每句话卡几分钟、彩虹球 | 改用 `search().select(["source"])` 投影下推（~0.6s）；documents 表同款修正 |
 | 161 | `AgentWorker.run()` 每条消息返回、下次 `start()` 换新 OS 线程；MLX KV 缓存线程局部 → 每轮作废 | 每轮全量 prefill ~3500 token（~25s），第一句最慢 | 改常驻 worker（同一线程）；加载后 `prime_prefix_cache` 只 prefill 不生成预热 system+tools 前缀，首条命中缓存 |
+| 162 | 并发闸门 `release(size)` 按**当时的**阈值重新判定大/小文件 | 阈值在 acquire/release 之间被热改（引擎每次构造都会 configure）时，读者计数被减到写者分支 → `_readers` 只增不减 → **所有后续大文件转换永久阻塞**，同步卡死且无超时无日志 | `acquire()` 返回许可令牌固化分类，`release(permit)` 凭据归还；重复/多余归还记日志并忽略（防止 `_readers` 变负破坏大文件独占） |
+| 163 | OCR 预处理把 Otsu **二值化**后的纯黑白图统一喂给 ocrmac 与 RapidOCR | 二值化利于 RapidOCR 的 det/rec，却抹掉 Apple Vision 依赖的抗锯齿笔画与灰度过渡 → ocrmac 读不出字 → 大量页面逐页回退 RapidOCR（日志上看似「切到 RapidOCR」） | 预处理按引擎分流：**ocrmac 走灰度（不二值化）**，仅 RapidOCR 兜底通路二值化；上游只送灰度原图 |
+| 164 | ocrmac autorelease 补丁把**构造**也包进 `autorelease_pool`，且 `return inst` 位于 `with` 内 | 池在识别发生前就排空，构造期创建的 ObjC 对象被提前释放（悬垂引用），与「每页识别完再排空」的意图相反 | 只给 `recognize()` 套池，构造留在池外 |
+| 165 | RapidOCR 单例快路径无锁读取 + 引擎引用在信号量外取用 | 释放与取用之间竞态 → 两代 ~500MB 引擎并存（历史「内存涨到 16GB」的残形态）；极端下释放掉 worker 正握着的引擎 → 原生段错误 | 快路径纳入锁；`_ocr_image_cached` 改为**在信号量内取引擎**，`release_ocr_engine()` 先抢信号量再释放 |
+| 166 | `engine.ingest()` 的 Step 5~7（清理删除项/副本去重/保存 manifest/补刷目录）任一步抛异常 | 心跳与内存采样线程只在两条正常 return 停下 → 异常时线程带着闭包（`_inflight`/`stats`/`stats_lock`）活到进程结束，每 60s 向已结束的同步写日志 | 整段包进 `try/finally` 无条件停线程 |
+| 167 | 全部文件未修改（增量全跳过）时用户点「停止同步」 | 引用未初始化的 `kept_files` → `UnboundLocalError`，第 5/6 步整段跳过（删除项不清理、manifest 不保存） | `kept_files` 提到顶层初始化 |
+| 168 | docling/marker 构建转换器的**任何**异常都永久置 `_converter_unavailable` | 一次瞬时 MPS 显存抖动/surya SpawnError 就让引擎在整个进程生命周期内静默失效，全部 PDF 掉到轻量兜底且无法自愈 | 区分 `ImportError`（永久）与其它异常（60s 负缓存，之后自动重试恢复） |
+| 169 | 同步中点关闭窗口 | `RAGEngine.close()` 内部会 join ingest worker（默认 deadline **600s**），而 `QThread.terminate()` 杀不掉卡在 docling 原生线程池里的线程 → 主线程同步阻塞最多 10 分钟，窗口不消失、事件循环不转，表现为彻底卡死 | 仅当线程**确认停止**才 `close()`；否则跳过（宁可让引擎随进程回收，也不在主线程 join 第三方原生线程） |
+| 170 | 自定义信号槽（`deps_finished`/`sync_finished`/…）里把 worker 引用置 None + `finished→deleteLater` | 那些信号在 `run()` **内部** emit，emit 与线程真正结束之间有窗口；窗口内引用归零/DeferredDelete 被模态框的嵌套事件循环派发 → `QThread: Destroyed while thread is still running` qFatal → 进程 abort（无 Python traceback） | 新增 QThread 保活登记表 `_worker_refs` + `_retain_worker()`：创建即登记，仅线程确认结束后解除；业务槽照常置 None 但不再承担保活职责 |
+| 171 | `closeEvent` 完全没纳管 `LoadModelWorker`；`_bridge.blockSignals` 放在方法末尾；漏停 `_stream_flush_timer`/`_reason_flush_timer` | 启动后几十秒内关窗 → 仍在跑的加载线程被遗留（退出时可能 abort）；bridge 信号屏蔽晚于 agent/llm 释放 → 跨线程 UAF；漏停定时器在关窗后 fire 打到已释放控件 | 纳管 LoadModelWorker、bridge 屏蔽提到最前、补停两个定时器 |
+| 172 | 同步前 gc 扫描「孤儿 LLM 后端」的守卫只看 `_model_busy` 标志 | 该标志在 `load_done` 槽里就复位、而加载线程未必结束 → 扫描会关掉 worker 正在读取权重的后端（「加载模型」随机失败，重则原生层竞态） | 守卫加上「加载线程是否仍在 `isRunning()`」 |
+| 173 | 分段转换的 `fitz.open()` 子文档（`_extract_pdf_by_scale`）与 pandoc epub 图片的 `Image.open()` 无异常保护 | `insert_pdf`/`save`/`np.asarray` 抛异常时不关闭 → 每失败一个文件泄漏一个 fitz.Document / PIL 句柄与解码缓存 | 分别补 `try/finally: sub.close()` 与 `with Image.open(...)` |
+| 174 | `ovis_ocr.release_engine()` 的 `mx.clear_cache()` 写在 `if _engine is not None:` 内 | 该函数是每轮同步结束的收尾冲刷入口；第二轮以后（引擎已释放）直接跳过 → MLX 缓存单调增长，「同步跑一会就被系统杀」 | 移出 `if`，无条件冲刷 |
+| 175 | `vector_store` 判断共享 EmbeddingFunction 用 `self._ef in _EF_SINGLETONS.values()` | `in` 走 `==`，触发对象自定义 `__eq__`；一旦比较抛异常就把共享单例误判为私有 → `session.release()` 砸掉 graph_memory 正在用的模型 | 改用 identity：`any(v is self._ef for v in _EF_SINGLETONS.values())` |
 
 ## 部署
 
