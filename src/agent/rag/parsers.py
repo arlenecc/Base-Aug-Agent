@@ -843,9 +843,13 @@ def _extract_mobi(path: Path) -> str:
     # 返回 None —— 明明装了 calibre 却直接掉到下面的裸解析（正则扫二进制字节，
     # 效果很差，>100MB 还直接报错返回空）。这里复用 pandoc_parser 的探测
     # （which + 常见安装路径），与电子书主路径用同一个可执行文件。
-    from .pandoc_parser import find_ebook_convert
+    from .pandoc_parser import ebook_convert_failed_recently, find_ebook_convert
 
-    conv = find_ebook_convert()
+    # 本函数是 mobi/azw3 的**兜底**路径：主路径 pandoc_parser.convert_ebook()
+    # 已经用同一个 calibre 转过一次（输出 epub）。若那次已失败，这里再转一遍
+    # （输出 .txt）纯属重复付费——最坏 600s + 120s 才落到裸解析，KB 里 6585 个
+    # mobi/azw3 时这段叠加就是「同步长时间不动」。故跳过，直接进裸解析。
+    conv = None if ebook_convert_failed_recently(path) else find_ebook_convert()
     if conv:
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             txt_path = tmp.name

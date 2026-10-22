@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
@@ -49,6 +50,52 @@ _PANDOC_FROM = {
 # pandoc 单次转换超时（秒）。整本 epub 实测 < 5s，取宽裕值防大书卡死。
 _PANDOC_TIMEOUT = 300
 _EBOOK_CONVERT_TIMEOUT = 600
+
+# 扫描版 epub 的**整本 OCR 时间预算**（秒）。
+#
+# 为什么需要：mobi/azw3 转出的 epub 与原文件等大（实测 86MB→85MB、
+# 75MB→71MB），图多的书（漫画/绘本/扫描件）文字层为 0 字符 → 判定扫描版 →
+# 全部正文只能逐张 OCR。实测 75MB 漫画 = 202 张图 ≈ 2~7 分钟；KB 里最大的
+# 半小时漫画套装 417MB（16 册）会到上千张 ≈ 9~37 分钟。而这段既没有超时
+# 也没有进度输出，一个文件就能把 worker 占满数十分钟且界面零输出 —— 正是
+# 「同步卡住了」的直接观感。给一个宽裕但有界的预算，超了就带着已识别的部分
+# 收尾，绝不无限期占住 worker。
+_EPUB_OCR_TIME_BUDGET_S = 900
+
+# mobi/azw3 转换失败的路径负缓存：path -> 失败时刻（monotonic）。
+#
+# 为什么需要：engine 对 mobi/azw3 先走本模块的 convert_ebook()（calibre
+# 转临时 epub，超时 600s），失败后回退 parsers._extract_mobi()——后者又会用
+# **同一个 calibre** 把同一个文件再转一次（输出 .txt，超时 120s）。于是每个
+# 转换失败的文件要付两次完整的 calibre 转换：最坏 720s 才走到裸解析。KB 里
+# mobi/azw3 有 6585 个，DRM/损坏文件一多，这两段叠加就是「同步长时间不动」。
+# 记下本模块已判失败的路径，让兜底跳过它自己的那次 calibre 尝试。
+_EBOOK_CONVERT_FAILED: dict = {}
+_EBOOK_CONVERT_FAILED_TTL_S = 3600.0
+
+
+def mark_ebook_convert_failed(filepath: str) -> None:
+    """记录「本模块的 calibre 转换已失败」，供兜底路径跳过重复转换。"""
+    try:
+        _EBOOK_CONVERT_FAILED[str(filepath)] = time.monotonic()
+        # 顺手清理过期条目，避免长期运行的进程里这张表无限增长。
+        now = time.monotonic()
+        for k in [k for k, t in _EBOOK_CONVERT_FAILED.items()
+                  if now - t > _EBOOK_CONVERT_FAILED_TTL_S]:
+            _EBOOK_CONVERT_FAILED.pop(k, None)
+    except Exception:
+        pass
+
+
+def ebook_convert_failed_recently(filepath: str) -> bool:
+    """该文件是否刚在本模块转换失败过（兜底路径据此跳过重复的 calibre 调用）。"""
+    t = _EBOOK_CONVERT_FAILED.get(str(filepath))
+    if t is None:
+        return False
+    if time.monotonic() - t > _EBOOK_CONVERT_FAILED_TTL_S:
+        _EBOOK_CONVERT_FAILED.pop(str(filepath), None)
+        return False
+    return True
 
 # pandoc 常见安装位置（macOS Homebrew / Linux / Intel brew）。
 _PANDOC_CANDIDATES = (
@@ -88,6 +135,36 @@ def is_pandoc_available() -> bool:
     return find_pandoc() is not None
 
 
+def _kill_proc_tree(proc) -> None:
+    """回收超时子进程及其整棵子树（进程组 kill，见 _run 的注释）。"""
+    if proc is None:
+        return
+    try:
+        import signal
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        # 必须再 communicate 一次回收僵尸，否则子进程变 <defunct> 常驻。
+        proc.communicate(timeout=10)
+    except Exception:
+        pass
+
+
+class _CompletedProc:
+    """把 Popen.communicate() 的结果包装成 subprocess.run() 的返回形态。"""
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, stdout, stderr, returncode) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
 def find_ebook_convert() -> Optional[str]:
     global _EBOOK_CONVERT_EXE
     if _EBOOK_CONVERT_EXE is None:
@@ -102,20 +179,30 @@ def find_ebook_convert() -> Optional[str]:
 
 def _run(cmd: List[str], timeout: int) -> Optional[str]:
     """执行子进程，stdout 为 UTF-8 文本；失败返回 None（不抛异常）。"""
+    proc = None
     try:
-        res = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            # 自成进程组：ebook-convert/pandoc 超时时要能**整组**回收。
+            # subprocess.run(timeout=) 只 kill 顶层进程，派生的子进程会成为
+            # 孤儿继续占 CPU/内存（本项目在 shell_run / MCP 已用同一纪律，见
+            # 设计文档 6.4.1），这里补齐。
+            start_new_session=True,
         )
+        # returncode **必须在 communicate() 之后**读取（那时进程才退出、码才有效）。
+        stdout, stderr = proc.communicate(timeout=timeout)
+        res = _CompletedProc(stdout, stderr, proc.returncode)
     except FileNotFoundError:
         logger.warning("%s 不存在或不可执行", cmd[0])
         return None
     except subprocess.TimeoutExpired:
         logger.warning("%s 超时 (> %ds): %s", cmd[0], timeout, cmd[-1] if len(cmd) > 1 else "")
+        _kill_proc_tree(proc)
         return None
     except OSError as e:
         logger.warning("%s 执行失败: %s", cmd[0], e)
@@ -630,6 +717,7 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
 
     parts: List[str] = []
     done = 0
+    _t_start = time.time()
     for idx, item in enumerate(imgs):
         try:
             raw = item.get_content() or b""
@@ -657,8 +745,29 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
             logger.debug("epub 图片 OCR 失败 %s 第 %d 张: %s",
                          os.path.basename(filepath), idx, e)
             continue
-        if log and done and done % 20 == 0:
-            log("    ├─ 扫描版 OCR 进度: %d/%d 张", done, len(imgs))
+        # 进度**无条件输出**：旧实现写成 `if log and ...`，而主调用点
+        # convert_ebook() 调用本函数时不传 log → 条件恒不满足 → 图多的书在
+        # 这段（实测 202 张 ≈ 2~7 分钟，最大套装可达 30+ 分钟）全程零输出，
+        # 观感就是「同步卡死了」。这里改为本函数自己 logger.info，log 回调
+        # 只是额外的一路（调用方想打到 UI 面板时再传）。
+        if done and done % 20 == 0:
+            elapsed = time.time() - _t_start
+            logger.info("  扫描版 OCR 进度: %s %d/%d 张（已 %.0fs）",
+                        os.path.basename(filepath), done, len(imgs), elapsed)
+            if log:
+                log("    ├─ 扫描版 OCR 进度: %d/%d 张", done, len(imgs))
+        # 时间预算：图极多的套装书（实测 417MB/16 册 ≈ 上千张）不该无限期
+        # 占住 worker。超时就带着已识别的部分收尾并告警，剩余部分下一轮
+        # 同步不会重试（该文件已入库，只是正文不完整）—— 但至少同步能继续走。
+        if time.time() - _t_start > _EPUB_OCR_TIME_BUDGET_S:
+            logger.warning(
+                "%s: 扫描版 OCR 超过时间预算 %.0fs（%d/%d 张已完成），"
+                "提前结束本次 OCR——已识别部分仍会入库，剩余内容本次不处理",
+                os.path.basename(filepath), _EPUB_OCR_TIME_BUDGET_S, done, len(imgs))
+            if log:
+                log("    ├─ 扫描版 OCR 超时预算 %.0fs，已处理 %d/%d 张",
+                    _EPUB_OCR_TIME_BUDGET_S, done, len(imgs))
+            break
 
     if not parts:
         return None
@@ -697,6 +806,10 @@ def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[
             if res is None or not os.path.isfile(tmp_epub):
                 _cleanup(tmp_epub)
                 tmp_epub = None
+                # 打标记：让兜底路径 parsers._extract_mobi 跳过它自己的那次
+                # calibre 调用——同一个文件、同一个工具，没必要再付一次完整
+                # 转换（最坏 600s + 120s 才走到裸解析）。
+                mark_ebook_convert_failed(filepath)
                 return None
             src = tmp_epub
 

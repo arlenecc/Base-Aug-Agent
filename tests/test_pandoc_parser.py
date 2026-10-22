@@ -431,3 +431,60 @@ def test_ingest_docx_via_pandoc(tmp_path, fake_ef):
     outline = eng.get_document_outline("doc.docx")
     assert outline is not None
     assert "Pandoc 标题" in outline["digest"]
+
+
+def test_run_returns_none_on_nonzero_exit(monkeypatch):
+    """_run 在子进程非零返回时必须返回 None。
+
+    回归：_run 从 subprocess.run 改成 Popen 后，若 returncode 取错（如在
+    communicate 之前读、或包装类恒返回 0），失败会被误判成成功 → 损坏文件
+    被当成已转换、后续读到空/残缺内容。
+    """
+    from agent.rag.pandoc_parser import _run
+
+    assert _run(["/bin/sh", "-c", "echo boom >&2; exit 3"], timeout=10) is None
+    assert _run(["/bin/echo", "ok"], timeout=10) == "ok\n"
+
+
+def test_run_kills_process_group_on_timeout():
+    """超时必须回收整棵进程树，不能只杀顶层进程留孤儿。"""
+    import os
+    import subprocess
+
+    import agent.rag.pandoc_parser as pp
+
+    p = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 300 & sleep 300"],
+        start_new_session=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    pgid = os.getpgid(p.pid)
+    try:
+        p.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        pp._kill_proc_tree(p)
+    import time
+
+    time.sleep(0.5)
+    try:
+        os.killpg(pgid, 0)
+        raise AssertionError("进程组仍然存在 → 超时留下了孤儿进程")
+    except ProcessLookupError:
+        pass  # 预期：整组已回收
+
+
+def test_ebook_convert_failure_marks_negative_cache():
+    """转换失败打标记，兜底路径据此跳过重复的 calibre 调用。
+
+    mobi/azw3 主路径失败后 parsers._extract_mobi 会用同一 calibre 再转一次
+    （600s + 120s 双重付费），负缓存用于消除重复。
+    """
+    from agent.rag.pandoc_parser import (
+        ebook_convert_failed_recently,
+        mark_ebook_convert_failed,
+    )
+
+    assert ebook_convert_failed_recently("/nonexistent/x.mobi") is False
+    mark_ebook_convert_failed("/nonexistent/x.mobi")
+    assert ebook_convert_failed_recently("/nonexistent/x.mobi") is True
+    assert ebook_convert_failed_recently("/nonexistent/other.mobi") is False
