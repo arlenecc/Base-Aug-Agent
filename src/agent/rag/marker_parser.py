@@ -60,6 +60,13 @@ _converters: list = []
 _pool_lock = threading.Lock()
 _converter_unavailable = False
 
+# 与永久闩锁（上面的 _converter_unavailable，仅 ImportError）互补的**瞬时失败
+# 负缓存**：marker 拉起 surya 服务端子进程时的 SpawnError / 资源紧张大多是瞬时
+# 的，旧实现却把它们打成永久闩锁，一次抖动就让 marker 在整个进程生命周期内
+# 静默失效。见 docling_parser 里同名变量的说明。
+_converter_failed_until = 0.0
+_CONV_FAIL_COOLDOWN_S = 60.0
+
 # 按文件大小限流的并发闸门参数（与 docling_parser 同语义）。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
 _SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
@@ -148,11 +155,13 @@ def _get_converter():
     空闲池的取/还在 _pool_lock 下完成；构建较重（拉起 surya 客户端），放到
     锁外，避免持池锁时阻塞其它 worker 取还实例。
     """
-    global _converter_unavailable
+    global _converter_unavailable, _converter_failed_until
     with _pool_lock:
         if _converters:
             return _converters.pop()
         if _converter_unavailable:
+            return None
+        if _converter_failed_until > time.monotonic():
             return None
     # 锁外构建（拉起 surya 客户端，较重）。
     try:
@@ -162,9 +171,13 @@ def _get_converter():
         _converter_unavailable = True
         return None
     except Exception as e:
-        logger.warning("failed to init marker converter: %s", e)
-        _converter_unavailable = True
+        # 瞬时失败（surya SpawnError / 资源紧张）：只冷却，不永久闩锁。
+        _converter_failed_until = time.monotonic() + _CONV_FAIL_COOLDOWN_S
+        logger.warning(
+            "failed to init marker converter: %s（%.0fs 内不再重试，之后自动恢复）",
+            e, _CONV_FAIL_COOLDOWN_S)
         return None
+    _converter_failed_until = 0.0
     logger.info("marker PdfConverter initialized (pooled)")
     return converter
 
@@ -229,7 +242,7 @@ def extract_markdown(filepath: str) -> Optional[str]:
         except OSError:
             size = 0
         t_wait = time.monotonic()
-        _conv_gate.acquire(size)
+        permit = _conv_gate.acquire(size)
         waited = time.monotonic() - t_wait
         if waited >= _GATE_WAIT_LOG_S:
             # 诊断「很久没输出」：卡在等闸门（大文件独占/并发已满）会打本日志，
@@ -250,7 +263,7 @@ def extract_markdown(filepath: str) -> Optional[str]:
             del rendered
         finally:
             _release_pooled_converter(converter)
-            _conv_gate.release(size)
+            _conv_gate.release(permit)
         if not markdown or not markdown.strip():
             logger.warning("marker extracted empty markdown from %s", path.name)
             return None

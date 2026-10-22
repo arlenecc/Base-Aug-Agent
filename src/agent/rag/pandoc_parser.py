@@ -638,10 +638,11 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
         if len(raw) < _EPUB_OCR_MIN_IMAGE_BYTES:
             continue  # 装饰图，跳过
         try:
-            pil = Image.open(io.BytesIO(raw))
-            pil.load()
-            gray = pil.convert("L")
-            del pil
+            # with 保证解码器/文件句柄一定释放：np.asarray 或后续任一步抛异常时，
+            # 旧实现的 del pil / del gray 都会被跳过（与 ovis_ocr 的写法对齐）。
+            with Image.open(io.BytesIO(raw)) as pil:
+                pil.load()
+                gray = pil.convert("L")
             arr = np.asarray(gray, dtype=np.uint8)
             del gray
             # 仅送灰度原图：完整预处理（缩放/归一化/锐化/二值化）由

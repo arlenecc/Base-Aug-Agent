@@ -619,8 +619,10 @@ def _get_ocr_engine():
     **不可用时的兜底**，走稳不求快，CPU EP 足够。
     """
     global _OCR_ENGINE
-    if _OCR_ENGINE is not None:
-        return _OCR_ENGINE
+    # 快路径同样要持锁：无锁读取会在 release 把单例置 None 的瞬间读到撕裂状态
+    # （worker A 拿到旧引擎引用 → release → worker C 建新引擎），两代并存的窗口
+    # 正是旧注释里「最多 4 代引擎并存」的残形态。OCR 调用本身已被信号量串行化，
+    # 这里多一次锁竞争的代价可以忽略。
     with _OCR_ENGINE_LOCK:
         if _OCR_ENGINE is not None:
             return _OCR_ENGINE
@@ -724,10 +726,7 @@ def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
     # 本页 ocrmac 未装/异常/无文字 → 用 RapidOCR 补充。RapidOCR 的 det/rec 在
     # 纯黑白样本上训练，二值化更利检测，故这条兜底通路单独做二值化。
     binimg = _ocr_preprocess_array(img, binarize=True)
-    ocr_engine = _get_ocr_engine()
-    if ocr_engine is None:
-        return ""
-    return _ocr_image_cached(ocr_engine, binimg, page_num, filename)
+    return _ocr_image_cached(binimg, page_num, filename)
 
 
 def _ocr_backend_available() -> bool:
@@ -754,21 +753,35 @@ def release_ocr_engine() -> None:
     lazily re-created on the next OCR-requiring ingestion.
     """
     global _OCR_ENGINE
-    with _OCR_ENGINE_LOCK:
-        if _OCR_ENGINE is not None:
-            # RapidOCR wraps an onnxruntime InferenceSession.  Drop the
-            # reference so the session's C++ heap is freed on GC.
-            _OCR_ENGINE = None
-            logger.info("RapidOCR engine released (memory reclaimed)")
+    # **先抢 OCR 信号量**：持有它 == 没有任何线程正卡在 engine(img) 里。
+    # 释放前后若不同步这一步，就会撞上两类事故（详见 _ocr_image_cached 的注释）：
+    # ① 释放掉 worker 正握着的引擎（use-after-free → 原生段错误）；
+    # ② 旧引擎仍在使用时下一个 worker 又建一份（两代 ~500MB 并存）。
+    # 取锁顺序：信号量 → _OCR_ENGINE_LOCK，与 _ocr_image_cached 完全一致，
+    # 不会出现 AB-BA 死锁。
+    with _OCR_SEMAPHORE:
+        with _OCR_ENGINE_LOCK:
+            if _OCR_ENGINE is not None:
+                # RapidOCR wraps an onnxruntime InferenceSession.  Drop the
+                # reference so the session's C++ heap is freed on GC.
+                _OCR_ENGINE = None
+                logger.info("RapidOCR engine released (memory reclaimed)")
 
 
-def _ocr_image_cached(engine, img, page_num: int, filename: str) -> str:
-    """Run OCR using a pre-loaded engine instance.
+def _ocr_image_cached(img, page_num: int, filename: str) -> str:
+    """用全局单例引擎识别**已预处理**的灰度 ndarray。
 
     ``img`` 是归一化后的灰度 ndarray（见 _ocr_preprocess）；RapidOCR 的
     LoadImage 对 ndarray 直接走 cv2 转换，无需再编码/解码。
     兼容两代 API 的返回：3.x 返回 RapidOCROutput（行文本在 .txts）；
     1.x 返回 (result, elapse)，result 是 [box, text, score] 列表。
+
+    **引擎必须在信号量内取**（而不是由调用方取好再传进来）：
+    ``release_ocr_engine()`` 会先抢到同一把信号量再释放单例，据此保证「释放时
+    没有任何线程正在用旧引擎」。旧实现的取用顺序相反——调用方先在信号量外握住
+    引擎引用，于是留下两个窗口：① release 释放了 worker 正握着的引擎的 ORT
+    会话（use-after-free，原生层直接段错误）；② 下一个 worker 在旧引擎仍被使用
+    时新建一份（~500MB×2 两代并存，正是历史上「内存涨到 16GB」的残形态）。
     """
     try:
         # RapidOCR 可能非线程安全：串行化 engine(img) 调用（2026-10 审查
@@ -776,6 +789,9 @@ def _ocr_image_cached(engine, img, page_num: int, filename: str) -> str:
         # RapidOCR，ocrmac/Apple Vision 通路恢复并发，4 worker 的并行度
         # 不再被一把全进程锁归零）。
         with _OCR_SEMAPHORE:
+            engine = _get_ocr_engine()
+            if engine is None:
+                return ""
             out = engine(img)
         if isinstance(out, tuple):
             out = out[0]
@@ -1028,17 +1044,20 @@ def _install_ocrmac_autorelease_patch() -> None:
         return
 
     def _pooled_OCR(*args, **kwargs):
-        # 构造与识别都在同一个 autorelease pool 内，识别完立刻排空。
-        with objc.autorelease_pool():
-            inst = _orig(*args, **kwargs)
-            _orig_recognize = inst.recognize
+        # **只给 recognize 套 autorelease pool，构造必须留在池外**：
+        # 若把 `inst = _orig(...)` 也放进 with，`return inst` 位于 with 块内，
+        # 池的 __exit__ 会在值真正返回之前执行——构造过程中创建的 ObjC 对象
+        # （NSImage 等）还没参与识别就被排空，inst 里留下的就是悬垂引用，与该
+        # 补丁「每页识别完立刻排空、避免跨页堆积」的意图正好相反。
+        inst = _orig(*args, **kwargs)
+        _orig_recognize = inst.recognize
 
-            def _pooled_recognize(*rargs, **rkwargs):
-                with objc.autorelease_pool():
-                    return _orig_recognize(*rargs, **rkwargs)
+        def _pooled_recognize(*rargs, **rkwargs):
+            with objc.autorelease_pool():
+                return _orig_recognize(*rargs, **rkwargs)
 
-            inst.recognize = _pooled_recognize
-            return inst
+        inst.recognize = _pooled_recognize
+        return inst
 
     _pooled_OCR._autorelease_patched = True
     _ocrmac_mod.OCR = _pooled_OCR

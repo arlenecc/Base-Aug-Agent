@@ -969,6 +969,11 @@ class RAGEngine:
         # 只有 files_to_process 才进入 worker 池——跳过的文件不解析不 chunk
         # 本次实际写入的切片数（取消/失败分支要用它，而不是全库总数）。
         added = 0
+        # 取消/写失败时「已完整入库」的文件数。**必须在 if files_to_process 之外
+        # 初始化**：全部文件都未修改（走 over 的 skip 分支）时里面那行赋值不会执行，
+        # 而第 4 步末尾的 cancelled 分支仍会引用它 → UnboundLocalError 会让整个
+        # ingest 崩在第 5/6 步之前（清理删除文件、保存 manifest 全部跳过）。
+        kept_files = 0
         if files_to_process:
             _log("━━━ Step 3/6: 解析文档 + 清洗 + 切片（%d 个文件，%d 个并行 Worker） ━━━",
                         len(files_to_process), self._parallel_workers)
@@ -1545,44 +1550,58 @@ class RAGEngine:
                  kept_files)
 
         # Step 5: 清理已删除文件
-        _log("━━━ Step 5/6: 清理已删除文件 ━━━")
-        removed_sources = self._cleanup_deleted_files(
-            all_files, stats, stats_lock, manifest, new_manifest)
-        if stats["files_deleted"] > 0:
-            _log("  已清理 %d 个已删除文件的旧向量", stats["files_deleted"])
-        else:
-            _log("  无已删除文件需要清理")
-
-        # Step 5.5: 按 content_hash 清洗副本向量（同步收尾，manifest 保存前）
-        # 两类「同一内容多来源」：① 历史遗留——本功能前已入库的副本，manifest
-        # 里多条同 content_hash 且都带向量；② 指纹漏网——同内容不同字节（重新
-        # 保存的 PDF、docx→pdf 导出），解析时指纹不同都入了库。每组只保留一个
-        # 规范源，其余来源的向量/digest/缓存一并清掉，manifest 标记副本；
-        # 规范源没能入库的副本标记 dup_retry，下轮改由它优先。
-        self._cleanup_duplicate_content(
-            new_manifest, manifest, stats, stats_lock, _log)
-
-        # Step 6: 保存 manifest
-        _log("━━━ Step 6/6: 保存同步记录 ━━━")
         try:
-            # 读改写合并 + 跨进程锁：并存的另一个 RAGEngine（agent 侧自动
-            # ingest）刚写入的条目不能被这份旧快照抹掉。
-            _save_manifest(self._rag_dir, new_manifest, removed=removed_sources)
-            _log("  同步记录已保存: %d 个文件条目 → %s",
-                        len(new_manifest), _manifest_path(self._rag_dir))
-        except OSError as e:
-            logger.warning("  同步记录保存失败: %s", e)
+            _log("━━━ Step 5/6: 清理已删除文件 ━━━")
+            removed_sources = self._cleanup_deleted_files(
+                all_files, stats, stats_lock, manifest, new_manifest)
+            if stats["files_deleted"] > 0:
+                _log("  已清理 %d 个已删除文件的旧向量", stats["files_deleted"])
+            else:
+                _log("  无已删除文件需要清理")
 
-        # Step 7: 补做/重刷文档目录结构（缩略版本）。
-        # 这一步不依赖「文件是否修改」——即使所有文件都被增量跳过（未修改），
-        # 也要扫描 markdown 缓存，为缺记录或旧格式（含废弃的「章节摘要」段、
-        # 空目录）的文档重刷为纯目录结构，确保 rag_outline 始终返回正确结果。
-        try:
-            refreshed = self.ensure_digests_for_cached_documents(refresh_stale=True)
-            if refreshed:
-                _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
-        except Exception as e:
-            logger.warning("  目录结构补做/重刷失败: %s", e)
+            # Step 5.5: 按 content_hash 清洗副本向量（同步收尾，manifest 保存前）
+            # 两类「同一内容多来源」：① 历史遗留——本功能前已入库的副本，manifest
+            # 里多条同 content_hash 且都带向量；② 指纹漏网——同内容不同字节（重新
+            # 保存的 PDF、docx→pdf 导出），解析时指纹不同都入了库。每组只保留一个
+            # 规范源，其余来源的向量/digest/缓存一并清掉，manifest 标记副本；
+            # 规范源没能入库的副本标记 dup_retry，下轮改由它优先。
+            self._cleanup_duplicate_content(
+                new_manifest, manifest, stats, stats_lock, _log)
+
+            # Step 6: 保存 manifest
+            _log("━━━ Step 6/6: 保存同步记录 ━━━")
+            try:
+                # 读改写合并 + 跨进程锁：并存的另一个 RAGEngine（agent 侧自动
+                # ingest）刚写入的条目不能被这份旧快照抹掉。
+                _save_manifest(self._rag_dir, new_manifest, removed=removed_sources)
+                _log("  同步记录已保存: %d 个文件条目 → %s",
+                            len(new_manifest), _manifest_path(self._rag_dir))
+            except OSError as e:
+                logger.warning("  同步记录保存失败: %s", e)
+
+            # Step 7: 补做/重刷文档目录结构（缩略版本）。
+            # 这一步不依赖「文件是否修改」——即使所有文件都被增量跳过（未修改），
+            # 也要扫描 markdown 缓存，为缺记录或旧格式（含废弃的「章节摘要」段、
+            # 空目录）的文档重刷为纯目录结构，确保 rag_outline 始终返回正确结果。
+            try:
+                refreshed = self.ensure_digests_for_cached_documents(refresh_stale=True)
+                if refreshed:
+                    _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
+            except Exception as e:
+                logger.warning("  目录结构补做/重刷失败: %s", e)
+        finally:
+            # 后台观测线程必须**无条件**停：Step 5~7（清理删除项 / 副本去重 /
+            # 保存 manifest / 补刷目录）任何一步抛异常，旧实现都只从两条正常
+            # return 路径回到这里，异常路径会让心跳与内存采样线程带着闭包
+            # （_inflight / stats / stats_lock）继续活满进程余生——每 60s 向一个
+            # 早已结束的同步写日志，且持续持有整份 manifest 与统计结构。
+            if mem_thread is not None and _mem_stop is not None:
+                _mem_stop.set()
+                try:
+                    mem_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+            _hb_stop.set()
 
         if cancelled:
             t_total = time.monotonic() - t_start
@@ -1592,10 +1611,6 @@ class RAGEngine:
                 stats["files_skipped"], stats["chunks"],
             )
             _log("══════════════════════════════════════════")
-            if mem_thread is not None and _mem_stop is not None:
-                _mem_stop.set()
-                mem_thread.join(timeout=2.0)
-            _hb_stop.set()
             return stats
 
         t_total = time.monotonic() - t_start
@@ -1616,10 +1631,6 @@ class RAGEngine:
             if len(stats["errors"]) > 10:
                 _log("     ... (还有 %d 个错误)", len(stats["errors"]) - 10)
         _log("══════════════════════════════════════════")
-        if mem_thread is not None and _mem_stop is not None:
-            _mem_stop.set()
-            mem_thread.join(timeout=2.0)
-        _hb_stop.set()
         return stats
 
     def _dedupe_by_fingerprint(

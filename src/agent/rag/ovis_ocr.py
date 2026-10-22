@@ -401,14 +401,21 @@ def release_engine() -> None:
             if _engine is not None:
                 _engine = None
                 _engine_kind = None
-                try:
-                    import mlx.core as mx
-                    mx.clear_cache()
-                except Exception:
-                    pass
                 logger.info("OCR 引擎已释放")
             # 释放后允许下次重新尝试加载（用户可能刚修好模型目录）
             _engine_failed = False
+            # MLX 缓存冲刷**必须无条件执行**：本函数是 RAGEngine.close() 每轮
+            # 同步结束的收尾入口。旧实现把 mx.clear_cache() 放在上面的 if 里，
+            # 于是「上一轮已释放 / 从未加载成功」时直接跳过 —— 第二轮以后的同步
+            # 结束就再也冲刷不到 MLX 缓存，分配器按形状单调增长，表现为
+            # 「同步跑一会就被系统杀掉」（与 vector_store 里 mx.clear_cache 的
+            # 长注释是同一类问题）。
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
     finally:
         _infer_lock.release()
 

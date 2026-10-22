@@ -669,6 +669,11 @@ class SyncKnowledgeWorker(QThread):
                     logger.info("SyncKnowledgeWorker: RAG engine closed")
                 except Exception as e:
                     logger.warning("SyncKnowledgeWorker: engine close failed: %s", e)
+                # 置 None 与 VectorDedupWorker 保持一致：否则关窗路径
+                # `getattr(self._sync_worker, "_engine", None)` 会拿到一个**已经
+                # close 过**的引擎再关一次（并发/重复 close 会在原生层与仍在用它的
+                # 线程竞态 → use-after-free 段错误）。
+                self._engine = None
             # Emit the signal only after cleanup is complete so the main
             # thread's UI reset / reload_rag() runs against a fully released
             # worker-side engine.
@@ -1013,6 +1018,21 @@ class MainWindow(QMainWindow):
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._dedup_worker: Optional["VectorDedupWorker"] = None
+        # --- QThread 保活登记表（消除「Destroyed while thread is still running」）
+        #
+        # 背景：项目历史里踩过多次 Qt 的 `QThread: Destroyed while thread '' is
+        # still running` qFatal → 进程直接 abort（没有 Python traceback）。根因是
+        # 「自定义信号（xxx_finished）的槽里把最后一个强引用置 None」——那个信号
+        # 是在 run() **内部** emit 的，emit 与线程真正结束之间还有一段窗口；窗口内
+        # 引用归零 → Py 端包装器析构 → C++ QThread 被删 → Qt 看到 isRunning() →
+        # qFatal。少数路径再叠加 `finished → deleteLater` 与模态框（嵌套事件循环
+        # 会立刻派发 DeferredDelete）就会稳定命中。
+        #
+        # 对策：每个 worker 创建后立刻登记进这里，**只有确认线程真的结束后**才
+        # 解除登记。业务槽继续照常置 None（那是 UI 状态语义），但不再承担「保持
+        # 对象存活」的职责 —— 两者解耦后上述窗口彻底消失。
+        self._worker_refs: List[Any] = []
+        self._worker_refs_lock = threading.Lock()
         # 本地模型注册表（#140）：_llm 是 agent 正在用的主模型后端，_aux_llm
         # 是辅助模型后端。两者都由 UI 持有并负责 close()。签名记录「这个对象
         # 是用哪份配置建出来的」，配置变了才重建——否则每次应用配置都要重新
@@ -2559,7 +2579,7 @@ class MainWindow(QMainWindow):
         self._model_workers[role] = worker
         worker.load_done.connect(self._on_model_loaded)
         worker.load_failed.connect(self._on_model_load_failed)
-        worker.finished.connect(worker.deleteLater)
+        self._retain_worker(worker)
         worker.start()
 
     def _unload_role(self, role: str) -> bool:
@@ -2838,7 +2858,7 @@ class MainWindow(QMainWindow):
         self._dedup_worker.dedup_failed.connect(self._on_dedup_failed)
         # deleteLater 必须挂内建 finished（run() 返回后触发），挂自定义信号会在
         # run() 执行途中销毁线程对象（同 SyncKnowledgeWorker 的教训）。
-        self._dedup_worker.finished.connect(self._dedup_worker.deleteLater)
+        self._retain_worker(self._dedup_worker)
         # 日志轮询定时器：100ms 消费 _log_buffer，实时显示去重日志。
         self._log_poll_timer.start()
         self._dedup_worker.start()
@@ -2970,7 +2990,7 @@ class MainWindow(QMainWindow):
         self._deps_worker.deps_finished.connect(self._on_deps_finished)
         # deleteLater 必须挂到 QThread 内建的 finished（run() 返回后触发），
         # 挂在自定义信号上会在 run() 执行途中销毁线程对象。
-        self._deps_worker.finished.connect(self._deps_worker.deleteLater)
+        self._retain_worker(self._deps_worker)
         self._deps_worker.start()
 
     def _reset_sync_ui(self) -> None:
@@ -3078,7 +3098,18 @@ class MainWindow(QMainWindow):
             # 正在读权重的后端，此刻 close() 会把在途加载的资源收掉（表现为
             # 「加载模型」随机失败）。此时新建的后端被 worker 引用着，不是孤儿，
             # 也不会被扫描误杀的对象逻辑覆盖。
-            _gc_scan_safe = not any(self._model_busy.values())
+            # 守卫不能只看 _model_busy 标志：它在 _on_model_loaded（自定义信号
+            # load_done 的槽）里就被复位，而那时 LoadModelWorker 的线程**还没跑完**
+            # —— 标志已 False、线程仍在读权重，扫描就会把 worker 手里刚建好的后端
+            # 当成「孤儿」close() 掉，表现为「加载模型随机失败」，重则在原生层
+            # 与正在 mmap 读权重的线程竞态。故必须同时确认线程真的空闲。
+            _gc_scan_safe = (
+                not any(self._model_busy.values())
+                and not any(
+                    _w is not None and _w.isRunning()
+                    for _w in self._model_workers.values()
+                )
+            )
             for _o in _gc.get_objects() if _gc_scan_safe else ():
                 if isinstance(_o, (MLXLanguageBackend, MLXVLMBackend,
                                    ONNXLanguageBackend, LlamaCppBackend)):
@@ -3158,7 +3189,7 @@ class MainWindow(QMainWindow):
         # 在 connect 时快照引用，保证兜底槽拿到真正的 worker。
         self._sync_worker.finished.connect(
             lambda w=self._sync_worker: self._on_sync_thread_finished(w))
-        self._sync_worker.finished.connect(self._sync_worker.deleteLater)
+        self._retain_worker(self._sync_worker)
         self._sync_worker.start()
         # 启动日志轮询定时器：每 100ms 消费 _log_buffer，实时显示同步日志
         self._log_poll_timer.start()
@@ -3359,7 +3390,7 @@ class MainWindow(QMainWindow):
         self._fetch_worker = FetchModelsWorker(base_url, api_key)
         self._fetch_worker.fetched.connect(self._on_models_fetched)
         self._fetch_worker.failed.connect(self._on_fetch_failed)
-        self._fetch_worker.finished.connect(self._fetch_worker.deleteLater)
+        self._retain_worker(self._fetch_worker)
         self._fetch_worker.start()
 
     def _on_models_fetched(self, models: list) -> None:
@@ -3434,6 +3465,9 @@ class MainWindow(QMainWindow):
             # 显式失效，与后端 _kv_thread_ident 检查构成双保险。
             self._invalidate_llm_kv_caches()
             worker.warmup_done.connect(self._on_warmup_done)
+            # 常驻线程同样登记保活：它跑满应用生命周期，是最可能在退出时仍在运行
+            # 的那个线程（见 _worker_refs 的注释）。
+            self._retain_worker(worker)
             worker.start()
             return worker
         # agent 可能已被 _rebuild_agent 换掉（改配置 / 换模型）：必须换上新的，
@@ -3887,6 +3921,40 @@ class MainWindow(QMainWindow):
         except Exception as e:  # pragma: no cover - 清理失败不影响对话
             logger.debug("UI: mx.clear_cache() 失败（忽略）: %s", e)
 
+    def _retain_worker(self, worker) -> None:
+        """登记 worker 保活，并在其线程**确认结束**后自动解除登记。
+
+        这是消除 `QThread: Destroyed while thread '' is still running` qFatal 的
+        统一入口（原理见 ``self._worker_refs`` 的注释）。用法：每个 worker
+        ``start()`` 之前调一次，并把原先的 ``finished.connect(worker.deleteLater)``
+        换成由本方法连接的兜底槽。
+        """
+        if worker is None:
+            return
+        with self._worker_refs_lock:
+            if worker not in self._worker_refs:
+                self._worker_refs.append(worker)
+
+        def _on_finished():
+            # finished 已发 == run() 已返回；但 OS 线程要再走几步才真正终止，
+            # 这里再等一小会儿，确保 isRunning() 归 False 后才解除保活。
+            try:
+                if not worker.wait(2000) and worker.isRunning():
+                    logger.warning(
+                        "UI: worker %s 在 finished 后仍未终止，继续保活引用（"
+                        "宁可泄漏也不能让 Qt 销毁运行中的 QThread）",
+                        type(worker).__name__)
+                    return
+            except RuntimeError:
+                pass
+            with self._worker_refs_lock:
+                try:
+                    self._worker_refs.remove(worker)
+                except ValueError:
+                    pass
+
+        worker.finished.connect(_on_finished)
+
     def _shutdown_worker(self, worker, label: str, cancel: bool = False,
                          wait_ms: int = 3000, term_wait_ms: int = 2000) -> bool:
         """关窗时回收一个 worker 线程。返回 True 表示已确认结束。
@@ -4250,8 +4318,20 @@ class MainWindow(QMainWindow):
         # 本方法末尾会清空模块级 _LOG_HANDLER（见那里的注释）。
         global _LOG_HANDLER
         self._closed = True
-        # --- 停止日志轮询定时器与任务计划轮询定时器
-        for timer_name in ("_log_poll_timer", "_plan_poll_timer"):
+        # --- 第一时间屏蔽 bridge 信号：AgentWorker.run() 是**直接**调
+        # self._callbacks.bridge.*.emit()，sender 是 Bridge 不是 worker —— 后面
+        # _shutdown_worker() 里的 worker.blockSignals(True) 挡不住它们。若到释放
+        # agent/llm 时才屏蔽（旧实现放在方法末尾），跨线程把正在被 worker 使用的
+        # 对象 close 掉会引发 RuntimeError/段错误。
+        try:
+            self._bridge.blockSignals(True)
+        except Exception:
+            pass
+        # --- 停止所有定时器。旧实现只停了下面两个，_stream_flush_timer /
+        # _reason_flush_timer（流式刷 UI，singleShot 100ms）漏停：关窗后它们仍会
+        # fire 并打到已释放的 chat_view / think_view → RuntimeError → abort。
+        for timer_name in ("_log_poll_timer", "_plan_poll_timer",
+                           "_stream_flush_timer", "_reason_flush_timer"):
             try:
                 getattr(self, timer_name).stop()
             except Exception:
@@ -4267,6 +4347,21 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             setattr(self, window_name, None)
+        # --- LoadModelWorker（模型权重加载线程，读数 GB 权重要几十秒）：
+        # 旧实现完全没纳管它——self._model_workers 只写不清理，关窗时既不 wait
+        # 也不 terminate。于是「启动后几十秒内点关闭」会让一个仍在跑的 QThread
+        # 一直活到解释器 teardown（那一刻 sip 析构它 → 可能撞上 Qt 的
+        # "Destroyed while thread is still running" qFatal）；且 load_done 是
+        # queued 信号，若它晚于本方法末尾的 self._llm.close() 才被处理，
+        # _on_model_loaded 会把一个刚 close 的后端重新装回去。
+        for _role in list(self._model_workers.keys()):
+            _mw = self._model_workers.get(_role)
+            if _mw is None:
+                continue
+            if self._shutdown_worker(_mw, f"model-{_role}",
+                                     wait_ms=2000, term_wait_ms=1000):
+                self._model_workers.pop(_role, None)
+            # 停不下来就保住引用（_shutdown_worker 的既定纪律），绝不能丢。
         # --- AgentWorker: cancel the agent run and join the thread.
         # Without this, closing the window during an agent run leaves the
         # worker thread alive; its bridge.finished/error/content signals
@@ -4281,7 +4376,8 @@ class MainWindow(QMainWindow):
             self._fetch_worker = None
         # --- SyncKnowledgeWorker: cooperative cancel (finishes current file).
         _sync_engine = getattr(self._sync_worker, "_engine", None)
-        if self._shutdown_worker(self._sync_worker, "sync"):
+        _sync_stopped = self._shutdown_worker(self._sync_worker, "sync")
+        if _sync_stopped:
             # terminate 路径下 finished 信号被 blockSignals 吞掉，
             # _on_sync_thread_finished 兜底不会触发——这里显式再摘一次
             # 临时 handler（闭包强引用整个 worker 与 RAG 引擎，不摘会
@@ -4292,11 +4388,22 @@ class MainWindow(QMainWindow):
         # （LanceDB 连接 / FastEmbed / reranker / OCR，共 ~600MB+）残留。
         # 这里兜底关闭；close() 幂等（等价于重复 drop 缓存），正常结束
         # 路径多调一次是无害的 no-op。
-        if _sync_engine is not None:
+        #
+        # **但只在线程已确认结束时才关**：RAGEngine.close() 会先 join 内部那批
+        # ingest worker 线程（默认 deadline 600s），而 QThread.terminate() 杀不
+        # 掉它们——它们卡在 docling 的原生线程池里没有取消点。旧实现无条件调用，
+        # 于是「同步中点关闭窗口」会在这行**同步阻塞最多 10 分钟**：窗口不消失、
+        # 事件循环不转，表现为彻底卡死。线程没停就干脆不关，宁可让引擎随进程
+        # 退出回收，也不能在主线程 join 第三方原生线程。
+        if _sync_engine is not None and _sync_stopped:
             try:
                 _sync_engine.close()
             except Exception as e:
                 logger.warning("UI: sync worker engine 兜底关闭失败: %s", e)
+        elif _sync_engine is not None:
+            logger.warning(
+                "UI: 同步线程未能停止，跳过 RAGEngine.close()"
+                "（避免在主线程 join 原生转换线程导致关窗卡死）")
         # --- InstallDepsWorker: no cancel mechanism, just wait.
         if self._shutdown_worker(self._deps_worker, "deps",
                                  wait_ms=2000, term_wait_ms=1000):
@@ -4304,15 +4411,20 @@ class MainWindow(QMainWindow):
         # --- VectorDedupWorker: 去重无取消机制，等待/终止后兜底摘 handler +
         # 关引擎（与 sync worker 同纪律）。
         _dedup_engine = getattr(self._dedup_worker, "_engine", None)
-        if self._shutdown_worker(self._dedup_worker, "dedup",
-                                 wait_ms=2000, term_wait_ms=1000):
+        _dedup_stopped = self._shutdown_worker(self._dedup_worker, "dedup",
+                                               wait_ms=2000, term_wait_ms=1000)
+        if _dedup_stopped:
             self._remove_sync_tmp_handler(self._dedup_worker)
             self._dedup_worker = None
-        if _dedup_engine is not None:
+        # 与 sync worker 同纪律：线程未确认停止时跳过 close()（否则会阻塞在
+        # RAGEngine.close() 内部的 ingest worker join 上）。
+        if _dedup_engine is not None and _dedup_stopped:
             try:
                 _dedup_engine.close()
             except Exception as e:
                 logger.warning("UI: dedup worker engine 兜底关闭失败: %s", e)
+        elif _dedup_engine is not None:
+            logger.warning("UI: 去重线程未能停止，跳过 RAGEngine.close()")
         # --- Release agent resources: MCP subprocesses, httpx client, RAG.
         if self._agent is not None:
             try:

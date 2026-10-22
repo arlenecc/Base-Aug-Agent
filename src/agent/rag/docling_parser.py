@@ -60,6 +60,15 @@ _checked_out: list = []
 _pool_lock = threading.Lock()     # 保护 _converters / _checked_out 的取还/构建
 _converter_unavailable = False
 
+# 与永久闩锁（上面的 _converter_unavailable，仅用于 ImportError）互补的
+# **瞬时失败负缓存**：构建转换器时的失败大多是瞬时的——MPS 显存瞬时不足、
+# 模型权重正在被另一路加载、磁盘 I/O 抖动。旧实现把任何异常都打成永久闩锁，
+# 一次抖动就让 docling 在整个进程生命周期内静默失效（全部 PDF 掉到轻量兜底，
+# 用户只会觉得「这批同步质量变差了」却找不到原因）。
+# 这里改为：瞬时失败只冷却 _CONV_FAIL_COOLDOWN_S 秒，之后允许重试自愈。
+_converter_failed_until = 0.0
+_CONV_FAIL_COOLDOWN_S = 60.0
+
 # 按文件大小限流的并发闸门参数。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
 _SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
@@ -112,7 +121,7 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
     except OSError:
         size = 0
     t_wait = time.monotonic()
-    _conv_gate.acquire(size)
+    permit = _conv_gate.acquire(size)
     waited = time.monotonic() - t_wait
     if waited >= _GATE_WAIT_LOG_S:
         # 同步期「很久没输出」时，这条日志直接区分：卡在等闸门（大文件独占中 /
@@ -134,7 +143,7 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
         return md
     finally:
         _release_pooled_converter(scale, converter)
-        _conv_gate.release(size)
+        _conv_gate.release(permit)
 
 
 def _maybe_recycle_converter() -> None:
@@ -305,7 +314,7 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
     刻意放到锁外，避免持池锁时阻塞其它 worker 取还实例。取到的实例同时登记
     进 _checked_out（携带 uses 计数），归还时按这份计数决定退役还是回池。
     """
-    global _converter_unavailable
+    global _converter_unavailable, _converter_failed_until
     key = round(float(scale), 3)
     with _pool_lock:
         pool = _converters.get(key)
@@ -315,6 +324,9 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
             return entry[0]
         if _converter_unavailable:
             return None
+        if _converter_failed_until > time.monotonic():
+            # 瞬时失败冷却期内直接返回 None，不再反复触发重量级构建。
+            return None
     # 锁外构建（耗时、且可能 import torch，不应持池锁）。
     try:
         converter = _build_converter(scale)
@@ -323,9 +335,14 @@ def _get_converter(scale: float = _OCR_SCALE_DEFAULT):
         _converter_unavailable = True
         return None
     except Exception as e:
-        logger.warning("failed to init docling converter: %s", e)
-        _converter_unavailable = True
+        # 瞬时失败：只做负缓存，不永久闩锁（理由见 _converter_failed_until 注释）。
+        _converter_failed_until = time.monotonic() + _CONV_FAIL_COOLDOWN_S
+        logger.warning(
+            "failed to init docling converter: %s（%.0fs 内不再重试，之后自动恢复）",
+            e, _CONV_FAIL_COOLDOWN_S)
         return None
+    # 构建成功：清掉任何残留的负缓存，让后续文件立刻可用。
+    _converter_failed_until = 0.0
     with _pool_lock:
         _checked_out.append([converter, 0])
     logger.info("docling DocumentConverter initialized (pooled, scale=%.2f)", scale)
@@ -706,11 +723,17 @@ def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
                 for scale in sorted({s for s, _ in runs}, reverse=True):
                     for s, idxs in [r for r in runs if r[0] == scale]:
                         sub = fitz.open()
-                        sub.insert_pdf(src, from_page=idxs[0], to_page=idxs[-1])
-                        tmp = os.path.join(
-                            tmpdir, f"seg_{scale:.2f}_{idxs[0]}_{idxs[-1]}.pdf")
-                        sub.save(tmp)
-                        sub.close()
+                        try:
+                            sub.insert_pdf(src, from_page=idxs[0], to_page=idxs[-1])
+                            tmp = os.path.join(
+                                tmpdir, f"seg_{scale:.2f}_{idxs[0]}_{idxs[-1]}.pdf")
+                            sub.save(tmp)
+                        finally:
+                            # 必须 try/finally：insert_pdf / save 在加密、损坏或
+                            # 超大 PDF 上会直接抛，旧实现把 sub.close() 放在
+                            # 正常路径末尾 → 每个失败文件都泄漏一个 fitz.Document
+                            # （文件句柄 + 整段子文档的解码缓存）。
+                            sub.close()
                         md = _convert_with_scale(tmp, scale)
                         if md and md.strip():
                             parts[idxs[0]] = md

@@ -981,6 +981,9 @@ def test_scratch_cache_released_when_idle(qtbot, tmp_path, monkeypatch):
     win = _make_window(tmp_path, monkeypatch)
     qtbot.addWidget(win)
 
+    # 只统计 _release_mlx_scratch_cache 自己产生的调用：建窗口/RAG 引擎收尾
+    # 也会走 mx.clear_cache()（ovis_ocr.release_engine 的收尾冲刷），先清零隔离。
+    calls.clear()
     win._sync_busy = False
     win._release_mlx_scratch_cache()
     assert calls == [1]

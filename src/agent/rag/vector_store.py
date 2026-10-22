@@ -1905,7 +1905,11 @@ class VectorStore:
             # process-wide singleton (get_or_create_embedding_function),
             # the session may still be in use by graph_memory or another
             # VectorStore — releasing it would crash those callers.
-            is_shared = self._ef in _EF_SINGLETONS.values()
+            # **必须用 identity 判断**：`in` 走 `==`，会调用 EF 对象自定义的
+            # __eq__（pydantic/自定义后端可能又重又会抛）。一旦比较抛异常，
+            # 共享单例会被误判成「私有」→ 走到下面 session.release()，把
+            # graph_memory / 其它 VectorStore 正在使用的模型砸掉。
+            is_shared = any(v is self._ef for v in _EF_SINGLETONS.values())
             if not is_shared:
                 try:
                     inner = getattr(self._ef, "model", None) or getattr(self._ef, "_model", None)

@@ -75,11 +75,11 @@ def test_gate_small_files_capped_at_two():
     rec = _Concurrency()
 
     def work():
-        gate.acquire(1 * MB)
+        _permit = gate.acquire(1 * MB)
         rec.enter(False)
         time.sleep(0.05)
         rec.exit()
-        gate.release(1 * MB)
+        gate.release(_permit)
 
     _run_parallel([work] * 4)
     assert rec.max == 2
@@ -93,18 +93,18 @@ def test_gate_large_file_is_exclusive():
     rec = _Concurrency()
 
     def large():
-        gate.acquire(LARGE)
+        _permit = gate.acquire(LARGE)
         rec.enter(True)
         time.sleep(0.1)
         rec.exit()
-        gate.release(LARGE)
+        gate.release(_permit)
 
     def small():
-        gate.acquire(1 * MB)
+        _permit = gate.acquire(1 * MB)
         rec.enter(False)
         time.sleep(0.05)
         rec.exit()
-        gate.release(1 * MB)
+        gate.release(_permit)
 
     # 大文件先拿到闸门，小文件随后到达必须等它跑完
     large_started = threading.Event()
@@ -132,11 +132,11 @@ def test_gate_boundary_is_large():
     rec = _Concurrency()
 
     def work():
-        gate.acquire(LARGE)  # 恰好 20MB
+        _permit = gate.acquire(LARGE)  # 恰好 20MB
         rec.enter(True)
         time.sleep(0.05)
         rec.exit()
-        gate.release(LARGE)
+        gate.release(_permit)
 
     _run_parallel([work] * 3)
     assert rec.max == 1
@@ -161,18 +161,18 @@ def test_gate_large_file_not_starved_by_small():
     def small(idx, delay=0.0):
         if delay:
             time.sleep(delay)
-        gate.acquire(1 * MB)
+        _permit = gate.acquire(1 * MB)
         _mark(f"small{idx}-in")
         time.sleep(0.15)
         _mark(f"small{idx}-out")
-        gate.release(1 * MB)
+        gate.release(_permit)
 
     def large():
         time.sleep(0.03)  # 等两个小文件先入场
         _mark("large-wait")
-        gate.acquire(LARGE)
+        _permit = gate.acquire(LARGE)
         _mark("large-in")
-        gate.release(LARGE)
+        gate.release(_permit)
         _mark("large-out")
 
     def small_late():  # 大文件排队后才到的小文件：必须被挡住
@@ -519,14 +519,69 @@ def test_gate_configure_updates_in_place():
     rec = _Concurrency()
 
     def work():
-        gate.acquire(15 * MB)
+        _permit = gate.acquire(15 * MB)
         rec.enter(True)
         time.sleep(0.05)
         rec.exit()
-        gate.release(15 * MB)
+        gate.release(_permit)
 
     _run_parallel([work] * 3)
     assert rec.max == 1
+
+
+def test_gate_release_after_threshold_reconfigure_does_not_leak_readers():
+    """回归：acquire 与 release 之间热改阈值，不得把读者计数算错。
+
+    旧实现 ``release(size)`` 用**当时的** threshold 重新判断 size 属于大/小，
+    于是「按小文件入场、期间阈值被调小」的请求会在 release 时走进写者分支：
+    ``_writing = False``（空操作）而 ``_readers`` 永不减回来。_readers 只增不减
+    后，写者的等待条件 ``while self._readers > 0`` 永远不成立 ⇒ **所有后续大
+    文件转换永久阻塞**（表现为同步卡住且无超时、无日志）。
+
+    本用例构造该时序并断言：所有读者退场后大文件仍能拿到闸门（不阻塞）。
+    """
+    from agent.rag.concurrency_gate import SizeAwareConversionGate
+
+    gate = SizeAwareConversionGate(LARGE, small_capacity=2)   # 阈值 20MB
+    p_small = gate.acquire(1 * MB)      # 1MB → 按**旧**阈值判定为读者
+    assert gate.active() == 1
+
+    # 同步进行中重建 RAGEngine（改配置同理）→ 阈值热改成 1KB
+    gate.configure(threshold=1024, small_capacity=2)
+
+    gate.release(p_small)               # 归还必须按 acquire 时的分类走读者分支
+    assert gate.active() == 0, "读者计数错位：release 把归属算到了写者分支"
+
+    # 若计数泄漏，这里会永久阻塞（_run_parallel 有超时，不会挂死测试）
+    _acquired = threading.Event()
+
+    def wait_large():
+        _permit = gate.acquire(50 * MB)
+        _acquired.set()
+        gate.release(_permit)
+
+    t = threading.Thread(target=wait_large, daemon=True)
+    t.start()
+    assert _acquired.wait(timeout=5), "大文件未被放行：上游发生了永久阻塞"
+    t.join(timeout=5)
+
+
+def test_gate_double_release_is_ignored():
+    """重复归还同一个 permit 不得把 _readers 减成负数。
+
+    变负会直接破坏「大文件独占」：写者条件 ``_readers > 0`` 在仍有真实读者时也
+    会通过 ⇒ 大文件与小文件真的并发 → 内存被撑爆。
+    """
+    from agent.rag.concurrency_gate import _Permit, SizeAwareConversionGate
+
+    gate = SizeAwareConversionGate(LARGE, small_capacity=2)
+    p = gate.acquire(1 * MB)
+    gate.release(p)                              # 正常归还一次
+    assert gate.active() == 0
+    gate.release(p)                              # 同一个 permit 重复归还：必须忽略
+    assert gate.active() == 0
+    gate.release(_Permit(is_writer=False))        # 凭空归还：同样必须忽略
+    assert gate.active() == 0
 
 
 def test_gate_active_counts_inflight():
@@ -534,13 +589,13 @@ def test_gate_active_counts_inflight():
 
     gate = SizeAwareConversionGate(LARGE, small_capacity=2)
     assert gate.active() == 0
-    gate.acquire(1 * MB)
+    p1 = gate.acquire(1 * MB)
     assert gate.active() == 1
-    gate.acquire(1 * MB)
+    p2 = gate.acquire(1 * MB)
     assert gate.active() == 2
-    gate.release(1 * MB)
+    gate.release(p2)
     assert gate.active() == 1
-    gate.release(1 * MB)
+    gate.release(p1)
     assert gate.active() == 0
 
 

@@ -16,7 +16,26 @@ PDF 转换（docling/marker）的转换器不是线程安全的，且大文件�
 """
 from __future__ import annotations
 
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
+
+
+class _Permit:
+    """一次 ``acquire`` 的入场许可，固化「读者 / 写者」分类。
+
+    见 :class:`SizeAwareConversionGate` 的注释：release 必须凭据归还，不能按
+    size 重新推断分类。
+    """
+
+    __slots__ = ("is_writer",)
+
+    def __init__(self, is_writer: bool) -> None:
+        self.is_writer = is_writer
+
+    def __repr__(self) -> str:  # 便于排查：日志/栈里能直接看出分类
+        return f"_Permit({'writer' if self.is_writer else 'reader'})"
 
 
 class SizeAwareConversionGate:
@@ -25,13 +44,13 @@ class SizeAwareConversionGate:
     典型用法（docling/marker 各持一个模块级单例）：:
 
         gate = SizeAwareConversionGate(threshold=20 * 1024 * 1024, small_capacity=2)
-        gate.acquire(file_size)          # 阻塞直到拿到入场许可
+        permit = gate.acquire(file_size)   # 阻塞直到拿到入场许可
         try:
-            converter = pool.acquire()    # 取一个转换器实例
+            converter = pool.acquire()      # 取一个转换器实例
             ...
         finally:
             pool.release(converter)
-            gate.release(file_size)       # 归还入场许可
+            gate.release(permit)            # 归还入场许可（传 acquire 的返回值）
     """
 
     def __init__(self, threshold: int, small_capacity: int = 2) -> None:
@@ -43,6 +62,18 @@ class SizeAwareConversionGate:
         self._lock = threading.Lock()
         self._read_cv = threading.Condition(self._lock)
         self._write_cv = threading.Condition(self._lock)
+
+    # -- acquire 返回的许可令牌 -----------------------------------------
+    #
+    # **为什么必须由 acquire 固化「读者/写者」分类，release 不能按 size 重判**：
+    # 旧实现 release(size) 用「当时的 threshold」重新算 size >= threshold。若
+    # 本次 acquire 与 release 之间阈值被 configure() 改小（RAGEngine.__init__
+    # 每次构造都会 configure，同步期间重建引擎/改配置都会命中），原本按读者入场
+    # 的请求就会在 release 时走写者分支 —— `_writing = False`（本来就是 False，
+    # 空操作），而 `_readers` 永远不会被减回来。_readers 单调增长后，写者的等待
+    # 条件 `while self._readers > 0` 永不满足 ⇒ **所有后续大文件转换永久阻塞**，
+    # 且没有任何超时/日志（表现为「同步莫名卡住」）。反向错位同理。
+    # 故这里在 acquire 时就把分类写进 permit，release 只认 permit。
 
     def configure(self, threshold: int, small_capacity: int) -> None:
         """热更新参数（引擎初始化时调用）。
@@ -65,8 +96,8 @@ class SizeAwareConversionGate:
         with self._lock:
             return self._readers + (1 if self._writing else 0)
 
-    def acquire(self, size: int) -> None:
-        """申请入场许可；必要时阻塞。
+    def acquire(self, size: int) -> _Permit:
+        """申请入场许可；必要时阻塞。返回许可令牌，**必须**交给 :meth:`release`。
 
         ``size`` 是文件字节数。小文件走「读者」（最多 small_capacity 个并发），
         大文件走「写者」（独占，且优先于新入场的小文件）。
@@ -79,22 +110,36 @@ class SizeAwareConversionGate:
                     self._write_cv.wait()
                 self._writer_waiting -= 1
                 self._writing = True
-            else:
-                # 读者：无写者、读者未满、且无大文件在排队
-                while (
-                    self._writing
-                    or self._readers >= self.small_capacity
-                    or self._writer_waiting > 0
-                ):
-                    self._read_cv.wait()
-                self._readers += 1
+                return _Permit(is_writer=True)
+            # 读者：无写者、读者未满、且无大文件在排队
+            while (
+                self._writing
+                or self._readers >= self.small_capacity
+                or self._writer_waiting > 0
+            ):
+                self._read_cv.wait()
+            self._readers += 1
+            return _Permit(is_writer=False)
 
-    def release(self, size: int) -> None:
-        """归还入场许可，唤醒等待方。"""
+    def release(self, permit: _Permit) -> None:
+        """归还入场许可，唤醒等待方。
+
+        ``permit`` 是 :meth:`acquire` 返回的令牌。切勿改成按 size 重新判定
+        分类（原因见 __init__ 下方的长注释）。重复/多余的 release 会被记日志
+        并忽略——否则 _readers 会变负，写者的保护条件形同失效。
+        """
+        is_writer = permit.is_writer
         with self._lock:
-            if size >= self.threshold:
+            if is_writer:
+                if not self._writing:
+                    # 双重 release：再减一次会把状态搅乱，宁可报错也不要错减。
+                    logger.error("SizeAwareConversionGate: 重复的写者 release，已忽略")
+                    return
                 self._writing = False
             else:
+                if self._readers <= 0:
+                    logger.error("SizeAwareConversionGate: 多余的读者 release，已忽略")
+                    return
                 self._readers -= 1
             self._write_cv.notify_all()
             self._read_cv.notify_all()
