@@ -147,21 +147,287 @@ def _find_headings(markdown: str) -> List[Tuple[int, str, int, int]]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Markdown 标题净化（docling 等提取器常把正文句子误判为标题）
+# ---------------------------------------------------------------------------
+
+# 章节锚点：命中即视为「真正的章节 / 前言 / 目录」，用于 (a) 作为内容起点、
+# 剔除其前的书名页/版权页噪声；(b) 豁免句子式过滤（如「序二鉴往知来，学习
+# 佛陀的人间关怀…」含逗号但确为标题）。
+_ANCHOR_KEYWORDS = (
+    "章", "卷", "节", "部", "篇", "附录", "后记", "译后记", "跋",
+    "序言", "原序", "中译本序", "译者序", "前言", "引言", "引论", "导言",
+    "绪论", "目录", "目次", "序", "contents", "table of contents",
+)
+_ANCHOR_KEYWORD_SET = {k.lower() for k in _ANCHOR_KEYWORDS}
+
+# 「第X章 / 卷一 / X部 / 章三」两种语序，以及纯数字编号起步。
+_ANCHOR_RE = re.compile(
+    r"^(?:"
+    r"(?:第\s*)?(?:[0-9]+|[一二三四五六七八九十百千零〇]+)\s*[章卷节部篇]"
+    r"|"
+    r"[章卷节部篇]\s*(?:之\s*)?(?:[0-9]+|[一二三四五六七八九十百千零〇]+)"
+    r")"
+)
+# 中文序号起步（「一 个人和宇宙的关系」「二、灵魂意识」「三、心智回归」）。
+# 序号后接 `、`/`.`/`．` 或空格分隔符（不要求再后有空格）。
+_CN_ORDINAL_RE = re.compile(r"^[一二三四五六七八九十百零〇]+\s*(?:[、.．]|\s)")
+# 「目录」类标记标题（保留为锚点用于裁剪，但最终从章节列表中丢弃）。
+_TOC_MARKER_SET = {
+    "目录", "目 录", "目錄", "目 錄", "目次", "contents", "table of contents",
+}
+# 中文句末/句中标点：标题几乎不会包含这些，命中多为被误判的正文句子。
+_SENT_PUNCT = "。！？；，、"
+
+
+def _is_anchor(title: str) -> bool:
+    """True if ``title`` is a real chapter/section/preface/TOC anchor."""
+    t = title.strip()
+    if not t:
+        return False
+    if _ANCHOR_RE.match(t):
+        return True
+    if _CN_ORDINAL_RE.match(t):
+        return True
+    if _NUMBERED_RE.match(t):
+        return True
+    low = t.lower()
+    if low in _ANCHOR_KEYWORD_SET:
+        return True
+    return any(low.startswith(k) for k in _ANCHOR_KEYWORDS)
+
+
+def _is_sentence_like(title: str) -> bool:
+    """True if a (non-anchor) heading looks like a body sentence, not a title.
+
+    Real chapter titles are short noun phrases; docling frequently promotes full
+    sentences (ending in 。/！/？ or riddled with ，/；) to headings.  Strip
+    surrounding quotes/brackets first so a quoted title (``"因为生命是无限"``)
+    is not mistaken for a sentence.  A title that *ends* with a colon/ellipsis is
+    almost always a mis-detected clause (``我努力找尋幸福源頭：``).
+    """
+    t = title.strip().strip("\"'「」『』“”‘’（）()[]【】")
+    if any(p in t for p in _SENT_PUNCT):
+        return True
+    if re.search(r"[!?;,]{1,}", t):
+        return True
+    if re.search(r"[：:]\s*$|[.．・…]{2,}\s*$", t):
+        return True
+    if len(t) > 40:
+        return True
+    return False
+
+
+# 版权页 / 勒口 / 读者回函卡等「后 matter」噪声关键词（命中即丢弃）。
+_COLOPHON_KEYWORDS = (
+    "定價", "定価", "美術設計", "裝幀", "裝訂", "責任編輯", "封面", "封底",
+    "讀者回函", "讀者服務", "ISBN", "版權", "印製", "印刷", "印次", "印張",
+    "發行", "發行人", "出版者", "出版日期", "初版", "二版", "三版", "四版",
+    "五版", "六版", "七版", "八版", "九版", "郵政", "劃撥", "帳號", "電話",
+    "傳真", "網址", "部落格", "臉書", "地址", "台北", "台灣", "號", "出版社",
+    "總經銷", "排版", "經銷", "劃撥", "公司", "國家圖書館", "出版品預行編目",
+    "預行編目", "編目資料", "版權所有", "翻印必究", "印次",
+)
+_DECORATIVE_DOTS = "·・．•∙"
+
+
+def _is_decorative_like(title: str) -> bool:
+    """True if a title is a decorative dotted rendition (``哲·學·釣・感・森``)."""
+    t = title.strip()
+    if len(t) <= 1:
+        return False
+    return sum(1 for c in t if c in _DECORATIVE_DOTS) >= 2
+
+
+def _is_colophon_like(title: str) -> bool:
+    """True if a title looks like copyright/colophon back-matter.
+
+    Catches price/date/phone lines, ISBN/CIP metadata, and Latin-only
+    back-matter (English titles, ``My Daily Bread``) or Dewey-style call
+    numbers (``IV.B502.44``) — none of which are real chapter titles.
+    """
+    t = title.strip()
+    if any(k in t for k in _COLOPHON_KEYWORDS):
+        return True
+    if re.search(r"\d{2,4}\s*元", t):
+        return True
+    if re.search(r"^\d{3,4}\s*年", t):
+        return True
+    if re.search(r"20\d{2}\s*[)）]", t):
+        return True
+    if re.search(r"\d{2,3}\s*[-－]\d{2,3}[-－]\d{2,3}", t):
+        return True
+    # 杜威分类号 / 索书号（如 IV.B502.44、B502.44）。
+    if re.search(r"^[IVXLC]+\.?\s*[A-Za-z]?\d{2,}", t):
+        return True
+    if re.search(r"图书在版编目|（CIP）|CIP数据", t):
+        return True
+    # 纯拉丁（无中文）且较长 → 多为英文书名 / 版权行，非章节标题。
+    if len(t) >= 8 and not any("\u4e00" <= c <= "\u9fff" for c in t):
+        return True
+    return False
+
+
+def _is_garbage_like(title: str) -> bool:
+    """True if a title is pure garbage (``..`` / ``tld~`` / ``2004)`` …).
+
+    Also flags OCR-spaced sentences where every character is isolated by spaces
+    (``天 父 啊 請 幫 助 …``) — these are body sentences, not titles.
+    """
+    t = title.strip()
+    if not t:
+        return True
+    if len(t) <= 5 and not any("\u4e00" <= c <= "\u9fff" for c in t):
+        return True
+    # 空格隔开的单字过多 → 逐字空格化的正文句子。
+    tokens = [tok for tok in re.split(r"\s+", t) if tok]
+    single = sum(1 for tok in tokens if len(tok) == 1)
+    if len(tokens) >= 5 and single >= 4:
+        return True
+    return False
+
+
+def _norm_title(t: str) -> str:
+    """Normalise a title for *near*-duplicate detection.
+
+    Drops whitespace, punctuation, decorative dots, and the function word
+    ``的/旳`` (which OCR routinely drops or inserts) so OCR-corrupted variants of
+    the same running-header chapter (``安頓心靈的七個步驟`` / ``安頓心靈七個步驟``)
+    collapse to one entry.
+    """
+    t = re.sub(
+        r'[\s，。、；：！？·・．…—\-_/\\()（）\[\]【】""\'\'「」『』<>~]',
+        "", t,
+    )
+    t = t.replace("的", "").replace("旳", "")
+    return t.lower()
+
+
+def _cjk_only(t: str) -> str:
+    """Keep only CJK ideographs (for fuzzy near-duplicate comparison)."""
+    return re.sub(r"[^\u4e00-\u9fff]", "", t)
+
+
+def _lcs_ratio(a: str, b: str) -> float:
+    """Ratio of the longest common subsequence length to ``min(len(a), len(b))``."""
+    if not a or not b:
+        return 0.0
+    # 经典 O(n*m) LCS，标题均很短，成本可忽略。
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ca = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ca == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+            else:
+                cur[j] = max(prev[j], cur[j - 1])
+        prev = cur
+    return prev[len(b)] / min(len(a), len(b))
+
+
+def _is_near_duplicate(t: str, seen_cjk: List[str]) -> bool:
+    """True if ``t`` (CJK-normalised) is a near-duplicate of an already-seen title.
+
+    Collapses OCR-corrupted repetitions of the same running-header chapter
+    (``安頓心靈七個步驟`` vs ``安頓心靈钓七個步驟`` …) without merging genuinely
+    distinct sections: requires a long shared core (≥5 CJK chars) and a high
+    LCS ratio (≥0.75).
+    """
+    cjk = _cjk_only(t)
+    if len(cjk) < 5:
+        return False
+    for s in seen_cjk:
+        if len(s) < 5:
+            continue
+        if _lcs_ratio(cjk, s) >= 0.75:
+            return True
+    return False
+
+
 def extract_chapters(markdown: str) -> List[Chapter]:
-    """Split Markdown into chapters at ``#`` heading boundaries."""
+    """Split Markdown into chapters at ``#`` heading boundaries.
+
+    In addition to splitting on headings, this *cleans* docling-style noise:
+
+      * A heading whose text looks like a body sentence (contains sentence
+        punctuation, or is very long) is dropped — unless it is a genuine
+        chapter anchor (``第X章`` / ``卷一`` / numbered / 序言 / 目录 …).
+      * Leading front-matter (title page, copyright, publisher, ISBN) is
+        discarded: everything before the first real chapter anchor is noise.
+      * Duplicate titles (running-header boilerplate, e.g. a repeated section
+        name) are collapsed to their first occurrence.
+      * ``目录``/``Contents`` markers are dropped from the final list (but still
+        act as the front-matter anchor).
+    """
     if not markdown or not markdown.strip():
         return []
 
     headings = _find_headings(markdown)
-    chapters: List[Chapter] = []
+    if not headings:
+        return []
 
-    if headings:
-        prefix = markdown[: headings[0][2]].strip()
+    # 1) 过滤明显非标题：正文句子 / 过长段落 / 装饰性圆点标题 / 版权页勒口 /
+    #    无意义乱码；「锚点标题」豁免句子过滤，但仍可能被版权页/装饰规则丢弃。
+    filtered = []
+    for level, title, start, end in headings:
+        t = title.strip()
+        if not t:
+            continue
+        if _is_garbage_like(t):
+            continue
+        if _is_decorative_like(t):
+            continue
+        if _is_colophon_like(t):
+            continue
+        if not _is_anchor(t) and _is_sentence_like(t):
+            continue
+        filtered.append((level, t, start, end))
+
+    # 2) 以首个「锚点标题」为内容起点，丢弃其前的书名页/版权页噪声。
+    first_anchor_idx = next(
+        (i for i, (lv, t, s, e) in enumerate(filtered) if _is_anchor(t)), None
+    )
+    if first_anchor_idx is not None:
+        kept = filtered[first_anchor_idx:]
+    else:
+        # 没有任何锚点（如全文只有一个无结构标题）：退回不过滤、保留前言包裹。
+        kept = filtered
+
+    # 3) 去重（保留首次出现，含 OCR 近重合并），并丢弃「目录」类标记标题。
+    seen: set = set()
+    seen_cjk: List[str] = []
+    dedup = []
+    for lv, t, s, e in kept:
+        if t.lower() in _TOC_MARKER_SET:
+            continue
+        key = _norm_title(t)
+        if key in seen:
+            continue
+        # OCR 近重合并：同一标题被识别成多个错字变体时只保留首个。
+        # 「锚点标题」（第X章/卷/序/编号…）带有权威章节号，绝不参与近重合并，
+        # 以免把「第六十章」「第六十一章」这类仅差一字的相邻章节误并成一条。
+        if not _is_anchor(t) and _is_near_duplicate(t, seen_cjk):
+            continue
+        seen.add(key)
+        seen_cjk.append(_cjk_only(t))
+        dedup.append((lv, t, s, e))
+
+    if not dedup:
+        return []
+
+    chapters: List[Chapter] = []
+    # 把首个保留标题之前的文本作为「前言」包裹 —— 但仅当没有「被裁掉的书名页/
+    # 版权页噪声」（first_anchor_idx > 0 表示我们确实丢弃了前导标题，其前的文本
+    # 是标题页垃圾，不应包装成前言）。若首个标题本身就是真正的章（idx==0）或全文
+    # 无锚点（None），则保留前言包裹（兼容既有的前缀测试与无结构文档）。
+    if first_anchor_idx is None or first_anchor_idx == 0:
+        prefix = markdown[: dedup[0][2]].strip()
         if prefix:
             chapters.append(Chapter(0, "前言", prefix))
 
-    for i, (level, title, _start, end) in enumerate(headings):
-        next_start = headings[i + 1][2] if i + 1 < len(headings) else len(markdown)
+    for i, (level, title, _start, end) in enumerate(dedup):
+        next_start = dedup[i + 1][2] if i + 1 < len(dedup) else len(markdown)
         body = markdown[end:next_start].strip()
         if body or title:
             chapters.append(Chapter(level, title, body))

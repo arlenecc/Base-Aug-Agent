@@ -236,6 +236,117 @@ def compress_markdown_whitespace(markdown: str) -> str:
     return _restore('\n'.join(out))
 
 
+# ---------------------------------------------------------------------------
+# Markdown 排版噪音行（页码 / 页眉页脚 / 脚注标记 / 装饰线 / 目录点线引导）
+# ---------------------------------------------------------------------------
+
+# 独立页码行：`23` / `- 23 -` / `第 23 页` / `Page 23` / `p. 23`
+_MD_PAGE_ONLY_RE = re.compile(
+    r'^\s*(?:\d{1,4}|第\s*\d{1,4}\s*页|[-–—]\s*\d{1,4}\s*[-–—]'
+    r'|Page\s+\d{1,4}|p\.\s*\d{1,4})\s*$', re.IGNORECASE)
+# 脚注标记行：`[12]` / `[]` / `*` / `†` / `‡`
+_MD_FOOTNOTE_MARK_RE = re.compile(r'^\s*(?:\[\d{1,3}\]|\[\s*\]|[*†‡§¶])\s*$')
+# 页眉/页脚：短前缀(不含句读) + 分隔符 + 页码（`第二章 → 23`、`第三章 ／ 45`）
+_MD_HEADER_PAGENO_RE = re.compile(
+    r'^\s*[^。！？，,.!?]{1,18}\s*[／/|·•→>»›—–]\s*\d{1,4}\s*$')
+# 章节名 + 空格 + 页码（无标题）：`第六章 767`
+_MD_CHAPTER_PAGENO_RE = re.compile(r'^\s*第.{0,12}?[章部节回篇卷]\s+\d{1,4}\s*$')
+# 装饰分隔线：框线/点线/省略号串（排除 Markdown 水平线 ---/***/___ 与围栏 ~~~```）
+_MD_DECOR_SEP_RE = re.compile(r'^[\s·•…—–─━═。.]{3,}$')
+# 目录点线引导 + 页码：行尾 / 表格单元格尾。引导字符可为单个 `…`/`·`/`•`
+# （这些永不是小数点），但 ASCII `.` 需 ≥2 个连续，避免误伤小数点/版本号
+# （`3.14` 只有单个 `.`，不匹配）。
+_LEADER_HEAD = r'(?:[…·•]|[.…·•]{2,})'
+_MD_TRAILING_LEADER_RE = re.compile(r'%s[.…·•\s]*\d{1,4}\s*$' % _LEADER_HEAD)
+_MD_TRAILING_LEADER_CELL_RE = re.compile(r'%s[.…·•\s]*\d{1,4}\s*(?=\|)' % _LEADER_HEAD)
+# 被 _mask_table_blocks 掩码的 HTML <table> 块占位符（私用区字符），须原样保留。
+_TABLE_PLACEHOLDER_RE = re.compile(r'^\uE000\d+\uE000$')
+
+
+def _md_line_is_noise(line: str) -> bool:
+    """True if a non-structure, non-code line is pure page/footer/footnote/
+    separator/乱码 noise (safe to drop entirely)."""
+    s = line.strip()
+    if _MD_PAGE_ONLY_RE.match(s):
+        return True
+    if _MD_FOOTNOTE_MARK_RE.match(s):
+        return True
+    if _MD_HEADER_PAGENO_RE.match(s):
+        return True
+    if _MD_CHAPTER_PAGENO_RE.match(s):
+        return True
+    if _MD_DECOR_SEP_RE.match(s):
+        return True
+    # 纯符号/罕见字符乱码行：无中文、无 ≥2 连续字母数字、长度 ≥3
+    if len(s) >= 3 and not any('\u4e00' <= c <= '\u9fff' for c in s) \
+            and not re.search(r'[A-Za-z0-9]{2,}', s):
+        return True
+    return False
+
+
+def strip_markdown_noise_lines(markdown: str) -> str:
+    """逐行剥离 PDF/OCR 排版噪音，保留 Markdown 结构与代码块，提高信息密度。
+
+    针对 docling/pandoc/OCR 产出的「规范 Markdown」里混入的排版垃圾：
+
+      * **独立页码行** ``23`` / ``- 23 -`` / ``第 23 页`` / ``Page 23`` → 删整行；
+      * **页眉/页脚**：短前缀 + 分隔符 + 页码（``第二章 → 23``、``第三章 ／ 45``）、
+        章节名 + 空格 + 页码（``第六章 767``）→ 删整行；
+      * **脚注标记行** ``[12]`` / ``*`` / ``†`` → 删整行；
+      * **装饰分隔线**：框线/点线串（``────`` / ``…………``）→ 删整行（但不碰
+        Markdown 水平线 ``---``/``***``/``___`` 与代码围栏 `` ``` ``/``~~~``）；
+      * **纯符号乱码行**：无中文、无连续字母数字的短符号串 → 删整行；
+      * **目录点线引导 + 页码**：任何非代码行尾（含表格单元格）的 ``…… 23``
+        → 只删点线与页码、保留条目标题与表格结构。
+
+    格式一律保留：围栏/缩进代码块逐字不动；标题/列表/引用/水平线/表格等结构行
+    绝不整行删除（仅清单元格尾部点线页码）。幂等。
+    """
+    if not markdown:
+        return ""
+    masked, _restore = _mask_table_blocks(markdown)
+    out: List[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in masked.split('\n'):
+        stripped = line.strip()
+        if in_fence:
+            out.append(line)                       # 代码块内逐字保留
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+            continue
+        if _FENCE_OPEN_RE.match(line):
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append(line.rstrip())
+            continue
+        if _INDENT_CODE_LINE_RE.match(line):
+            out.append(line)                       # 缩进代码逐字保留
+            continue
+        if not stripped:
+            out.append('')
+            continue
+        # 被掩码的 HTML <table> 块占位符：原样保留，待 _restore 还原，绝不当作
+        # 乱码行删掉（占位符是私用区字符、无中文/字母数字，会误触噪音判定）。
+        if _TABLE_PLACEHOLDER_RE.match(stripped):
+            out.append(stripped)
+            continue
+        # 清尾部点线页码（所有非代码行：正文、标题、表格单元格均受益）。
+        cleaned = _MD_TRAILING_LEADER_RE.sub('', stripped)
+        cleaned = _MD_TRAILING_LEADER_CELL_RE.sub('', cleaned).rstrip()
+        # 结构行（标题/列表/引用/水平线/表格）：保留（已清点线），绝不整行删。
+        if _MD_STRUCTURE_RE.match(line) or _MD_STRUCTURE_RE.match(stripped) \
+                or _PIPE_LINE_RE.search(stripped):
+            out.append(cleaned)
+            continue
+        # 普通正文行：整行是排版噪音则丢弃，否则保留（已清点线）。
+        if _md_line_is_noise(line):
+            continue
+        out.append(cleaned)
+    return _restore('\n'.join(out))
+
+
 def clean_markdown_document(markdown: str) -> str:
     """对 docling/marker/pandoc 输出的「规范 Markdown」做无损噪音清理。
 
@@ -276,6 +387,7 @@ def clean_markdown_document(markdown: str) -> str:
     md = strip_html_comments(markdown)        # <!-- image --> 等注释
     md = strip_raw_html(md)                   # <div>/<span>/<sup>/<a> 等标签（留正文）
     md = strip_markdown_noise(md)             # ![...](...) 与 [文字](#...)
+    md = strip_markdown_noise_lines(md)       # 页码/页眉页脚/脚注/装饰线/目录点线
     md = compress_markdown_whitespace(md)     # 收敛空行/行尾空白（保格式、提密度）
     return md
 
@@ -354,6 +466,17 @@ def clean_text(text: str) -> str:
         if re.match(r'^第\s*\d{1,4}\s*页$', stripped):
             continue
         if re.match(r'^Page\s+\d{1,4}$', stripped, re.IGNORECASE):
+            continue
+        # Skip centered page numbers / footers: `- 23 -`, `— 23 —`
+        if re.match(r'^[-–—]\s*\d{1,4}\s*[-–—]$', stripped):
+            continue
+        # Skip running headers carrying a page number (PDF 页眉):
+        # `第二章 → 23`、`第三章 ／ 45`、`第六章 767`。纯文本路径无 Markdown
+        # 结构要保护，且这些若漏掉会被 convert_plain_text_to_markdown 误判成标题。
+        if _MD_HEADER_PAGENO_RE.match(stripped) or _MD_CHAPTER_PAGENO_RE.match(stripped):
+            continue
+        # Skip footnote marker lines: `[12]`, `*`, `†`
+        if _MD_FOOTNOTE_MARK_RE.match(stripped):
             continue
         # Skip separator lines (long runs of the same character)
         if re.match(r'^([\-=_*#~]{3,})\s*$', stripped):

@@ -325,3 +325,118 @@ def test_plain_toc_marker_not_title():
     assert "~1~ 不可置信之书" in titles
     assert "~2~ 史上最重要的问题" in titles
     assert "目 录" not in titles
+
+
+# ---------------------------------------------------------------------------
+# Markdown 标题净化（docling 把正文句子误判为标题）
+# ---------------------------------------------------------------------------
+
+def test_md_drops_sentence_headings_but_keeps_anchors():
+    """docling 常把正文句子标成 ## 标题；句子应丢弃，真正的章（锚点）应保留。"""
+    md = """# 作者的话
+
+## 但是，完全不是这么回事。
+
+# 第一章 引言
+
+## 便说：「若瑟的回答是正确的，因为他不知道。」
+
+## 第二章 方法
+
+正文。
+"""
+    chapters = extract_chapters(md)
+    titles = {c.title for c in chapters}
+    assert "第一章 引言" in titles
+    assert "第二章 方法" in titles
+    # 句子式误判标题应被丢弃
+    assert "但是，完全不是这么回事。" not in titles
+    assert "便说：「若瑟的回答是正确的，因为他不知道。」" not in titles
+
+
+def test_md_strips_front_matter_title_page():
+    """书名页/版权页噪声（在首个真实章节之前）应被丢弃，真实章节保留。"""
+    md = """## 人生的亲证
+
+## Rabindranath Tagore SADHANA
+
+## 目录
+
+## 作者序言
+
+## 一 个人和宇宙的关系
+
+正文。
+"""
+    chapters = extract_chapters(md)
+    titles = {c.title for c in chapters}
+    # 书名页噪声被丢弃
+    assert "人生的亲证" not in titles
+    assert "Rabindranath Tagore SADHANA" not in titles
+    assert "目录" not in titles
+    # 真实章节保留
+    assert "作者序言" in titles
+    assert "一 个人和宇宙的关系" in titles
+
+
+def test_md_drops_colophon_back_matter():
+    """版权页 / 勒口 / 地址等后 matter 噪声标题应被丢弃。"""
+    md = """# 第一章 引言
+
+正文。
+
+## 定價220元
+
+## 美術設計／朱陳毅
+
+## 104 台北市民生東路二段141號
+
+## 第二章 方法
+
+正文。
+"""
+    chapters = extract_chapters(md)
+    titles = {c.title for c in chapters}
+    assert "第一章 引言" in titles
+    assert "第二章 方法" in titles
+    assert "定價220元" not in titles
+    assert "美術設計／朱陳毅" not in titles
+    assert "104 台北市民生東路二段141號" not in titles
+
+
+def test_md_merges_ocr_variant_running_header():
+    """同一章节被 OCR 识别成多个错字变体时（如「安顿心灵的七个步骤」），应合并为一条。"""
+    md = """# 第二部
+
+## 安頓心靈七個步驟
+
+## 安頓心靈的七個步驟
+
+## 安頓心靈钓七個步驟
+
+## 安頓心蟹七個步驟
+
+# 第三部
+
+正文。
+"""
+    chapters = extract_chapters(md)
+    titles = [c.title for c in chapters]
+    variants = [t for t in titles if "安頓心靈" in t and "步驟" in t]
+    assert len(variants) == 1, variants
+
+
+def test_md_keeps_consecutive_numbered_chapters():
+    """相邻编号章节（仅差编号一字）不应被 OCR 近重合并误并成一条。"""
+    md = """# 第一百章 總論
+
+正文。
+
+# 第一百零一章 分論
+
+正文。
+"""
+    chapters = extract_chapters(md)
+    titles = [c.title for c in chapters]
+    assert "第一百章 總論" in titles
+    assert "第一百零一章 分論" in titles
