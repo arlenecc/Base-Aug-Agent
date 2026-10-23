@@ -295,7 +295,7 @@ class ToolRegistry:
                 # PDF 大小限流并发（小文件并发路数 / 大文件阈值 MB）。内存吃紧
                 # 时 rag_pdf_small_concurrency=1 可退回全串行。
                 pdf_small_concurrency=getattr(
-                    self.config, "rag_pdf_small_concurrency", 2),
+                    self.config, "rag_pdf_small_concurrency", 1),
                 pdf_large_threshold_mb=getattr(
                     self.config, "rag_pdf_large_threshold_mb", 20.0),
             )

@@ -71,7 +71,15 @@ _CONV_FAIL_COOLDOWN_S = 60.0
 
 # 按文件大小限流的并发闸门参数。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
-_SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
+# **默认 1 = 单实例串行**（2026-10 由 2 改回）。
+#
+# 每个 DocumentConverter 实例 = 一整套布局 + TableFormer 模型（两套并存实测
+# ~1.9GB 统一内存，见 _extract_pdf_by_scale 的注释）。2 实例对小 PDF 的吞吐
+# 收益，换不来整机内存压力：同步期还要同时常驻 RapidOCR 实例池（2×~500MB）、
+# MLX 聊天/VLM 权重与 KV 缓存。用户实测（M1/统一内存）并发两份转换器时明显
+# 吃紧，故回退到单实例串行；需要吞吐的用户把 rag_pdf_small_concurrency 调回
+# 2 即可（闸门与实例池都支持，代码未删）。
+_SMALL_FILE_CONCURRENCY = 1                # 小文件最多 1 路并发（单实例串行）
 _conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
 
 # 闸门等待超过该秒数就打 INFO 日志——同步期「很久没输出」时，这条日志能直接

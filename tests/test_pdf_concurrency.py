@@ -360,7 +360,7 @@ def test_docling_pool_reuses_instances(monkeypatch):
     assert len(built) == 1
 
 
-def test_docling_pool_caps_at_two_and_release_clears(monkeypatch):
+def test_docling_pool_caps_at_small_concurrency_and_release_clears(monkeypatch):
     from agent.rag import docling_parser as dp
 
     built = []
@@ -372,20 +372,20 @@ def test_docling_pool_caps_at_two_and_release_clears(monkeypatch):
     monkeypatch.setattr(dp, "_build_converter", _fake_build)
     monkeypatch.setattr(dp, "_converter_unavailable", False)
 
-    c1 = dp._get_converter(2.0)
-    c2 = dp._get_converter(2.0)
-    c3 = dp._get_converter(2.0)
-    assert len(built) == 3     # 三次都在用，池空，各建一个
+    # 默认 _SMALL_FILE_CONCURRENCY == 1（单实例串行，省内存）。这里不写死数字，
+    # 直接对照该常量，配置调整时本测试仍成立。
+    cap = dp._SMALL_FILE_CONCURRENCY
+    convs = [dp._get_converter(2.0) for _ in range(cap + 2)]
+    assert len(built) == cap + 2   # 前 cap+2 次都在用，池空，各建一个
 
-    dp._release_pooled_converter(2.0, c1)
-    dp._release_pooled_converter(2.0, c2)
-    dp._release_pooled_converter(2.0, c3)
-    assert len(dp._converters[2.0]) == 2   # 空闲池封顶 2 个
+    for c in convs:
+        dp._release_pooled_converter(2.0, c)
+    assert len(dp._converters[2.0]) == cap   # 空闲池封顶 = 小文件并发数
 
     dp.release_converter()
     assert dp._converters == {}
     c4 = dp._get_converter(2.0)
-    assert c4 == "conv-4"     # 释放后惰性重建
+    assert c4 == f"conv-{cap + 3}"     # 释放后惰性重建
 
 
 def test_marker_pool_reuses_and_release_clears(monkeypatch):

@@ -69,7 +69,7 @@ _CONV_FAIL_COOLDOWN_S = 60.0
 
 # 按文件大小限流的并发闸门参数（与 docling_parser 同语义）。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
-_SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
+_SMALL_FILE_CONCURRENCY = 1                # 小文件最多 1 路并发（单实例串行）
 _conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
 
 # 闸门等待超过该秒数就打 INFO 日志（诊断「很久没输出」：区分等闸门 vs convert）。

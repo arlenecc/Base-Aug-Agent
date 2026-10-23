@@ -20,7 +20,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
@@ -61,6 +64,54 @@ _EBOOK_CONVERT_TIMEOUT = 600
 # 「同步卡住了」的直接观感。给一个宽裕但有界的预算，超了就带着已识别的部分
 # 收尾，绝不无限期占住 worker。
 _EPUB_OCR_TIME_BUDGET_S = 900
+
+# ---------------------------------------------------------------------------
+# 扫描版 epub 的并发闸门：**同一时刻只允许 1 本扫描书在做图片 OCR**
+# ---------------------------------------------------------------------------
+# 为什么只拦扫描版、不拦整本 epub：扫描版的峰值内存不比 PDF 小——`epub.read_epub`
+# 把整本书（含所有图片字节）载入进程，还要逐张解码图片送 RapidOCR（2 实例常驻
+# ~1GB）。若 2 个 worker 同时各扛一本大扫描书就是数 GB 瞬时占用，在统一内存的
+# Apple Silicon 上会卡顿 / 被系统杀进程。
+#
+# 而**文字版 epub**（pandoc 直抽正文，轻量）保持 2 路并行、不进这道闸——按用户
+# 要求「扫描版串行、文字版 2 并行」：判定「可能是扫描版」的便宜门槛是清洗后
+# 正文极短（< ``_EPUB_SCAN_MD_MIN_CHARS``），只有这种书才进入扫描闸去读全本 +
+# OCR；正文够长的书根本不读 profile、不进闸，全程 2 并行。
+_SCANNED_EPUB_SEM = threading.Semaphore(1)   # 1 = 扫描版 OCR 严格串行
+# 闸门等待超过该秒数就打 INFO：同步期「很久没输出」时，这条日志能直接区分
+# 「卡在等扫描闸（另一本扫描书独占中）」与「卡在 OCR 本身」。
+_SCANNED_EPUB_GATE_WAIT_LOG_S = 5.0
+# 单本扫描书内部并行 OCR 的线程数。= 2 才能让 RapidOCR 的 2 实例真正同时开工
+# （扫描版整体串行，所以这本内部并行不会突破「1 本在 OCR」的内存上限）。
+_EPUB_OCR_MAX_WORKERS = 2
+
+
+@contextmanager
+def _scanned_epub_gate(filepath: str):
+    """进入/退出扫描版 OCR 串行闸；等待过久打 INFO（区分卡顿与串行排队）。"""
+    name = os.path.basename(filepath)
+    logged = False
+    start = time.time()
+    acquired = False
+    try:
+        while True:
+            if _SCANNED_EPUB_SEM.acquire(blocking=False):
+                acquired = True
+                if logged:
+                    logger.info("%s: 扫描版 OCR 闸门已获取，继续处理", name)
+                break
+            if (not logged
+                    and time.time() - start > _SCANNED_EPUB_GATE_WAIT_LOG_S):
+                logger.info(
+                    "%s: 等待扫描版 OCR 闸门——当前已有另一本扫描书在 OCR"
+                    "（为防内存峰值刻意串行），稍候…", name)
+                logged = True
+            time.sleep(0.5)
+        yield
+    finally:
+        if acquired:
+            _SCANNED_EPUB_SEM.release()
+
 
 # mobi/azw3 转换失败的路径负缓存：path -> 失败时刻（monotonic）。
 #
@@ -663,6 +714,16 @@ def _epub_images_in_reading_order(book, docs, imgs):
     return result
 
 
+def _is_scanned_profile(prof) -> bool:
+    """给定扫描特征，判定是否为扫描图片版 epub（双条件说明见 _is_scanned_epub）。"""
+    if prof is None:
+        return False
+    img_bytes, text_chars, _imgs = prof
+    return (img_bytes >= _EPUB_SCAN_MIN_IMAGE_BYTES
+            and text_chars * _EPUB_SCAN_TEXT_WEIGHT < img_bytes
+            and text_chars < _EPUB_SCAN_TEXT_FLOOR)
+
+
 def _is_scanned_epub(filepath: str) -> bool:
     """是否为扫描图片版 epub（正文全是图，文字层只有目录/页眉）。
 
@@ -672,13 +733,7 @@ def _is_scanned_epub(filepath: str) -> bool:
        图文并茂的漫画/绘本正文字符数十万，会被条件 1 误伤，但它们有可读
        文字层，走 pandoc/docling 直接抽正文即可，不该去 OCR 几千张图。
     """
-    prof = _epub_scan_profile(filepath)
-    if prof is None:
-        return False
-    img_bytes, text_chars, _imgs = prof
-    return (img_bytes >= _EPUB_SCAN_MIN_IMAGE_BYTES
-            and text_chars * _EPUB_SCAN_TEXT_WEIGHT < img_bytes
-            and text_chars < _EPUB_SCAN_TEXT_FLOOR)
+    return _is_scanned_profile(_epub_scan_profile(filepath))
 
 
 def _ocr_image_array(img, stats: Optional[dict] = None) -> str:
@@ -693,34 +748,52 @@ def _ocr_image_array(img, stats: Optional[dict] = None) -> str:
     return ocr_recognize_array(img, 0, "epub-page", stats=stats)
 
 
-def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
-    """对扫描版 epub 的图片逐张 OCR，返回拼接正文（无可识别内容返回 None）。
+def _ocr_one_image(raw: bytes, stats: dict) -> Optional[str]:
+    """单张图片解码 + OCR（供线程池调用）。返回识别文本或 None。"""
+    import io
+    import numpy as np
+    from PIL import Image
+    try:
+        # with 保证解码器/文件句柄一定释放：np.asarray 或后续任一步抛异常时，
+        # 旧的 del pil / del gray 都会被跳过（与 ovis_ocr 的写法对齐）。
+        with Image.open(io.BytesIO(raw)) as pil:
+            pil.load()
+            gray = pil.convert("L")
+        arr = np.asarray(gray, dtype=np.uint8)
+        del gray
+        # 仅送灰度原图：完整预处理（缩放/归一化/锐化/二值化）由
+        # parsers.ocr_recognize_array 内部按引擎分别施加——ocrmac 走灰度、
+        # RapidOCR 兜底走二值化。这里若先做二值化会把 ocrmac 的输入污染掉。
+        return _ocr_image_array(arr, stats=stats)
+    except Exception as e:
+        logger.debug("epub 图片 OCR 解码/识别失败: %s", e)
+        return None
+
+
+def ocr_epub_images(filepath: str, log=None, profile=None) -> Optional[str]:
+    """对扫描版 epub 的图片**并行** OCR，返回拼接正文（无可识别内容返回 None）。
 
     预处理（长边 Lanczos ≤1500px、灰度、USM 锐化、可选 Otsu 二值化）由
     ``parsers.ocr_recognize_array`` 统一施加——与 PDF 图片页**完全一致**，且按引擎
     分流：ocrmac 走灰度（不二值化，避免 Vision 读不出字）、RapidOCR 兜底走二值化。
-    这里只把图片解码成灰度 ndarray 交给它。
 
-    内存：逐张读取、识别后立即释放，不会把整本书的图片（可达数百 MB）常驻。
+    并发（两层）：
+    * **跨书**：由 ``convert_ebook`` 的扫描版串行闸保证同一时刻只 1 本在 OCR，
+      所以这本内部再怎么并行也不会突破「1 本在 OCR」的内存上限；
+    * **单书内**：用 ``_EPUB_OCR_MAX_WORKERS``(=2) 线程池并行 OCR 图片，让
+      RapidOCR 的 2 实例真正同时开工（这是把 RapidOCR 实例池从 1 调到 2 的意义）。
+    内存：逐张读取、识别后立即释放，不会把整本书的图片（可达数百 MB）常驻；
+    线程池用信号量限制「预取」图片数，避免一次性把上千张图全排队进内存。
     """
-    prof = _epub_scan_profile(filepath)
+    prof = profile if profile is not None else _epub_scan_profile(filepath)
     if prof is None:
         return None
     _img_bytes, _text_chars, imgs = prof
     if not imgs:
         return None
 
-    import io
-
-    import numpy as np
-    from PIL import Image
-
-    parts: List[str] = []
-    done = 0
-    # 逐页回退原因的聚合统计（由 parsers.ocr_recognize_array 累加），收尾时
-    # 汇总成一条可读日志——日志区因此能看到「这本为什么大量走了 RapidOCR」。
-    _stats: dict = {}
-    _t_start = time.time()
+    # 过滤装饰图（太小），并记录（idx, raw）以便按原顺序拼接。
+    tasks: List[Tuple[int, bytes]] = []
     for idx, item in enumerate(imgs):
         try:
             raw = item.get_content() or b""
@@ -728,49 +801,59 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
             continue
         if len(raw) < _EPUB_OCR_MIN_IMAGE_BYTES:
             continue  # 装饰图，跳过
-        try:
-            # with 保证解码器/文件句柄一定释放：np.asarray 或后续任一步抛异常时，
-            # 旧实现的 del pil / del gray 都会被跳过（与 ovis_ocr 的写法对齐）。
-            with Image.open(io.BytesIO(raw)) as pil:
-                pil.load()
-                gray = pil.convert("L")
-            arr = np.asarray(gray, dtype=np.uint8)
-            del gray
-            # 仅送灰度原图：完整预处理（缩放/归一化/锐化/二值化）由
-            # parsers.ocr_recognize_array 内部按引擎分别施加——ocrmac 走灰度、
-            # RapidOCR 兜底走二值化。这里若先做二值化会把 ocrmac 的输入污染掉。
-            text = _ocr_image_array(arr, stats=_stats)
-            del arr
-            if text and text.strip():
-                parts.append(text.strip())
-                done += 1
-        except Exception as e:
-            logger.debug("epub 图片 OCR 失败 %s 第 %d 张: %s",
-                         os.path.basename(filepath), idx, e)
-            continue
-        # 进度**无条件输出**：旧实现写成 `if log and ...`，而主调用点
-        # convert_ebook() 调用本函数时不传 log → 条件恒不满足 → 图多的书在
-        # 这段（实测 202 张 ≈ 2~7 分钟，最大套装可达 30+ 分钟）全程零输出，
-        # 观感就是「同步卡死了」。这里改为本函数自己 logger.info，log 回调
-        # 只是额外的一路（调用方想打到 UI 面板时再传）。
-        if done and done % 20 == 0:
+        tasks.append((idx, raw))
+    if not tasks:
+        return None
+
+    parts_map: dict = {}
+    done = 0
+    _stats: dict = {}
+    _t_start = time.time()
+    name = os.path.basename(filepath)
+    # 背压：最多允许 max_workers*3 张图「已提交未回收」，限制常驻字节。
+    _prefetch = threading.Semaphore(_EPUB_OCR_MAX_WORKERS * 3)
+
+    def _progress() -> None:
+        nonlocal done
+        done += 1
+        if done % 20 == 0:
             elapsed = time.time() - _t_start
             logger.info("  扫描版 OCR 进度: %s %d/%d 张（已 %.0fs）",
-                        os.path.basename(filepath), done, len(imgs), elapsed)
+                        name, done, len(tasks), elapsed)
             if log:
-                log("    ├─ 扫描版 OCR 进度: %d/%d 张", done, len(imgs))
-        # 时间预算：图极多的套装书（实测 417MB/16 册 ≈ 上千张）不该无限期
-        # 占住 worker。超时就带着已识别的部分收尾并告警，剩余部分下一轮
-        # 同步不会重试（该文件已入库，只是正文不完整）—— 但至少同步能继续走。
-        if time.time() - _t_start > _EPUB_OCR_TIME_BUDGET_S:
-            logger.warning(
-                "%s: 扫描版 OCR 超过时间预算 %.0fs（%d/%d 张已完成），"
-                "提前结束本次 OCR——已识别部分仍会入库，剩余内容本次不处理",
-                os.path.basename(filepath), _EPUB_OCR_TIME_BUDGET_S, done, len(imgs))
-            if log:
-                log("    ├─ 扫描版 OCR 超时预算 %.0fs，已处理 %d/%d 张",
-                    _EPUB_OCR_TIME_BUDGET_S, done, len(imgs))
-            break
+                log("    ├─ 扫描版 OCR 进度: %d/%d 张", done, len(tasks))
+
+    with ThreadPoolExecutor(max_workers=_EPUB_OCR_MAX_WORKERS) as ex:
+        futures = []
+        for idx, raw in tasks:
+            _prefetch.acquire()
+            fut = ex.submit(_ocr_one_image, raw, _stats)
+            fut.add_done_callback(lambda f: _prefetch.release())
+            futures.append((idx, fut))
+        timed_out = False
+        for idx, fut in futures:
+            if timed_out:
+                fut.cancel()
+                continue
+            try:
+                text = fut.result()
+            except Exception:
+                text = None
+            if text and text.strip():
+                parts_map[idx] = text.strip()
+            _progress()
+            # 时间预算：图极多的套装书不该无限期占住扫描闸。超时就带着已识别的
+            # 部分收尾并告警；剩余部分下一轮同步不会重试（该文件已入库，只是
+            # 正文不完整）—— 但至少同步能继续走。
+            if time.time() - _t_start > _EPUB_OCR_TIME_BUDGET_S:
+                logger.warning(
+                    "%s: 扫描版 OCR 超过时间预算 %.0fs（%d/%d 张已完成），"
+                    "提前结束本次 OCR——已识别部分仍会入库，剩余内容本次不处理",
+                    name, _EPUB_OCR_TIME_BUDGET_S, done, len(tasks))
+                if log:
+                    log("    ├─ 扫描版 OCR 超时预算 %.0fs，已处理 %d/%d 张",
+                        _EPUB_OCR_TIME_BUDGET_S, done, len(tasks))
+                timed_out = True
 
     # 汇总一次「引擎命中/回退」情况：这是日志区判断「ocrmac 是否真在生效」
     # 的唯一依据。旧实现里回退完全无声（异常只记 debug、空结果干脆不记），
@@ -786,10 +869,10 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
             "%s: 扫描版 OCR 引擎统计 —— ocrmac 直接采信 %d 张，"
             "补充/改用 RapidOCR %d 张（其中 RapidOCR 产出更完整 %d 张）；"
             "回退原因: %s",
-            os.path.basename(filepath), _mac, _fb, _rapid_won, _detail)
-    if not parts:
+            name, _mac, _fb, _rapid_won, _detail)
+    if not parts_map:
         return None
-    return "\n\n".join(parts)
+    return "\n\n".join(parts_map[i] for i in sorted(parts_map))
 
 
 def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[List[str]]]]:
@@ -844,15 +927,22 @@ def convert_ebook(filepath: str) -> Optional[Tuple[str, List[Chapter], Optional[
         # 判定必须用**清洗后**的正文量，不能拿原始 md：扫描版的原始 md 里塞满
         # <img>/<svg> 标记（实测 82266 字符，剥完只剩 9986），拿原始值判断会
         # 被误判成「内容很足」而跳过 OCR。
-        if (len(_WS_RE.sub("", body_md)) < _EPUB_SCAN_MD_MIN_CHARS
-                and _is_scanned_epub(src)):
-            logger.info("%s: 判定为扫描图片版 epub，改用图片 OCR 取正文",
+        # 正文极短 → 可能是扫描版：进入「扫描版 OCR 串行闸」后再读全本判定。
+        # 闸门保证同一时刻只有 1 本扫描书在 read_epub + OCR（峰值内存数 GB），
+        # 文字版（正文够长）根本不进闸，保持 2 路并行（用户要求：扫描版串行、
+        # 文字版 2 并行）。profile 只算一次，OCR 段直接复用，避免重复读整本。
+        if len(_WS_RE.sub("", body_md)) < _EPUB_SCAN_MD_MIN_CHARS:
+            with _scanned_epub_gate(filepath):
+                prof = _epub_scan_profile(src)
+                if _is_scanned_profile(prof):
+                    logger.info("%s: 判定为扫描图片版 epub，改用图片 OCR 取正文",
+                                os.path.basename(filepath))
+                    ocr_md = ocr_epub_images(src, profile=prof)
+                    if ocr_md:
+                        return ocr_md, toc, None
+                    logger.warning(
+                        "%s: 扫描版图片 OCR 未取到内容，回退 pandoc 结果",
                         os.path.basename(filepath))
-            ocr_md = ocr_epub_images(src)
-            if ocr_md:
-                return ocr_md, toc, None
-            logger.warning("%s: 扫描版图片 OCR 未取到内容，回退 pandoc 结果",
-                           os.path.basename(filepath))
         chapter_texts = split_chapters_by_anchors(md, toc)
         md = body_md
         if chapter_texts:

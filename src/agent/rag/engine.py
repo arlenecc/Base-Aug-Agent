@@ -109,7 +109,7 @@ def _is_stale_digest(old_digest: str) -> bool:
 # local-disk + CPU-bound parsing workloads (PDF OCR, docx parsing, etc.).
 # Embedding/vector-store writes stay serial because LanceDB's table lock is
 # not thread-safe and the embedding model instance can't be shared across threads.
-DEFAULT_PARALLEL_WORKERS = 4
+DEFAULT_PARALLEL_WORKERS = 2
 
 # worker→主线程队列容量：限制 worker 最多超前产出多少文件的 chunks，
 # 超过后 worker 阻塞（背压），避免大知识库时 chunks 在内存堆积。

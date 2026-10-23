@@ -187,7 +187,7 @@ class AgentConfig:
     #   - rag_pdf_large_threshold_mb：大于等于该大小的文件视为「大文件」，
     #     独占单实例串行转换——大文件（扫描书）单册峰值内存就很高，并发
     #     两份会把统一内存撑爆。
-    rag_pdf_small_concurrency: int = 2
+    rag_pdf_small_concurrency: int = 1
     rag_pdf_large_threshold_mb: float = 20.0
 
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.

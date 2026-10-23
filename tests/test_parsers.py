@@ -32,8 +32,16 @@ class _FakeRapidOCR:
 
 
 def _reset_ocr_state():
-    """Reset the module-level OCR singleton so tests start clean."""
+    """Reset the module-level OCR state so tests start clean.
+
+    注意：除了旧的全局单例 ``_OCR_ENGINE``，还要清空**引擎池**
+    ``_OCR_ENGINES`` / ``_OCR_ENGINE_BUSY``——否则上一个测试留下的池实例
+    （或它装过的 fake）会被 ``_acquire_ocr_slot`` 复用，污染本测试的 RapidOCR
+    行为（顺序相关、难以排查）。
+    """
     parsers._OCR_ENGINE = None
+    parsers._OCR_ENGINES = [None] * parsers._OCR_ENGINE_POOL_SIZE
+    parsers._OCR_ENGINE_BUSY = [False] * parsers._OCR_ENGINE_POOL_SIZE
     _FakeRapidOCR.instances = 0
 
 

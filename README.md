@@ -15,7 +15,7 @@
 - **依赖自动管理** — 同步知识库前自动扫描文件类型、检查并安装缺失的解析依赖
 - **全链路日志** — 知识同步的每个关键节点（文件解析 → 清洗 → Markdown 转换 → 切片 → 向量化 → 入库 → 清理 → Manifest 保存）都通过 QTimer 轮询 + 线程安全日志缓冲区实时显示在右侧日志面板中；知识检索时展示向量检索候选数、BGE Reranker 精排过程和最终结果排名
 - **协作式取消** — 同步过程中可随时停止，worker 在文件/批处理边界安全退出；已入库数据不丢失，Manifest 保持一致性。`code_run` 走独立子进程组，超时时 **SIGTERM → SIGKILL killpg** 真正杀掉整棵进程树（线程版只能等进程退出），同时立起取消标志文件供 `_cancelled()` 协作退出
-- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；OCR 引擎与 docling/marker/ovis 转换器全局单例且同步结束后显式释放，转换器「取+用」在同一把锁内原子完成、释放前非阻塞抢推理锁（避免两代模型并存，#141/#144）；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker、logger handler、主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎；`VectorStore` 用**在途操作计数 + 条件变量**保证 `clear()`/`close()`/`reload()` 不与在途检索/写入并发；「应用配置」的重资源释放移到后台线程，不冻结界面
+- **内存管理** — Embedding 模型进程级单例共享（RAG + 知识图谱共用同一 FastEmbed 实例，~137MB 而非 ~274MB）；LongTermMemory 单例缓存避免重复加载；`ToolRegistry.shutdown()` 统一释放 RAG 引擎 + 知识图谱 LanceDB 连接 + ONNX 模型 + BGE reranker；ONNX Runtime InferenceSession 共享时不 release（避免破坏其他调用方）；RapidOCR 为**实例池（最多 2 份）**、docling/marker/ovis 转换器全局单例且同步结束后显式释放（docling 小文件并发数默认 1 = 单实例串行，为省 ~1.9GB 统一内存；需吞吐可把 `rag_pdf_small_concurrency` 调回 2）；转换器「取+用」在同一把锁内原子完成、释放前非阻塞抢推理锁（避免两代模型并存，#141/#144）；`_JsonStore` 用单一全局 atexit 回调 + WeakSet 统一 flush（避免每实例注册一条永不注销的回调）；窗口关闭时统一清理 QThread worker、logger handler、主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎；`VectorStore` 用**在途操作计数 + 条件变量**保证 `clear()`/`close()`/`reload()` 不与在途检索/写入并发；「应用配置」的重资源释放移到后台线程，不冻结界面
 - **健壮性** — 子进程统一 `start_new_session` 独立进程组，超时/停止时用 `killpg` 回收整棵树（`shell_run` 不留孤儿、MCP 不留僵尸）；`code_run` 在**受限子进程**中执行且写路径防护覆盖 `builtins.open` / `io.open` / `os.*` 写类操作 / `pathlib.Path` / `shutil`，`rename`/`link`/`symlink` 的**目标路径**同样校验；确认弹窗默认拒绝（超时不会自动放行高风险操作）；`skill_load` 拒绝绝对路径/`..` 入口；`config.json` 原子写入 + 损坏自动回退默认配置；`web_scan` 限制 http/https、拦截云元数据地址（SSRF）并限制响应体大小
 - **Prompt 优化** — SYSTEM_PROMPT 精简至 ~200 tok（去掉模型已知的协议说明与冗余反例，补充「语义检索 query 用原始语言、勿翻译/音译」与「工具报错后改参数重试、两次失败即换方法」两条高价值约束）；Knowledge base 状态条件注入（无 KB 时省 tok）；`webexec_js` 条件注册（无浏览器时省 146 tok/轮）；Tool descriptions 精简（`rag_search`/`rag_outline` 去除冗长重复解释）；Work memory 注入用 compact JSON；长期记忆不注入 prompt 而靠 `memory_search` 按需检索；记忆抽取 prompt 精简并加条数/语言约束
 - **MCP 协议** — 对接通用 MCP Server，自动注册远程工具
@@ -231,7 +231,7 @@ MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：
 
 ```
 ══════════════════════════════════════════
-▶ 知识库同步开始: 目录=/data/kb 模式=增量同步 并发数=4
+▶ 知识库同步开始: 目录=/data/kb 模式=增量同步 并发数=2
 ══════════════════════════════════════════
 ━━━ Step 1/6: 扫描知识库目录 ━━━
   扫描完成: 共发现 12 个文件 [.pdf(5), .docx(3), .md(4)]
@@ -316,11 +316,11 @@ MLX 仅在 Apple Silicon macOS 可用，因此默认路径带**自动回退**：
 - **增量重刷**：同步时无论文件是否修改，都会扫描 Markdown 缓存，对缺记录或旧格式（含已废弃的「章节摘要」段/空目录）的文档重刷为纯目录结构。
 
 - **增量同步**：`manifest.json` 记录每个文件的签名（mtime + size + content_hash），未修改文件完全跳过（不解析、不切片、不嵌入、不写入），已删除文件自动清理对应向量和 manifest 条目。`force=True` 可强制全量重处理。取消同步后仍会保存 Manifest 以确保下次同步的增量准确性。
-- **流式 ingest**：worker 池（默认 4 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 引擎全局单例（多 worker 不重复加载模型）；并发限流仅包 RapidOCR 的推理调用（ocrmac/ANE 路径可并发），docling/marker/ovis 转换器「取+用」在同一把锁内原子完成，避免周期回收时两代模型并存（#141/#142/#144）。
+- **流式 ingest**：worker 池（默认 2 线程）并行解析+切片，主线程通过有界队列（容量 = 2×workers）消费并增量写入向量库，背压机制避免内存堆积。OCR 引擎为**实例池（最多 2 份）**——并发限流仅包 RapidOCR 的推理调用（ocrmac/ANE 路径可并发），扫描版 epub 单书内以 2 线程并行 OCR 图片让 2 份实例同时开工；docling/marker/ovis 转换器「取+用」在同一把锁内原子完成，避免周期回收时两代模型并存（#141/#142/#144）。**扫描版 epub 串行**：同一时刻只 1 本扫描书在做 OCR（峰值内存数 GB），文字版 epub 保持 2 路并行。
 - **Markdown 缓存**：解析结果缓存为 Markdown，基于源文件 mtime 判断是否需要重新解析，避免重复处理。
 - **批量嵌入**：嵌入按批次进行（默认 200 条/批），避免大知识库一次性嵌入导致 OOM。每批次内按文本长度降序分桶后再拆子批，子批大小由自适应控制器实测吞吐动态调整（2-64，初始 16、步长 2：更快则继续上调、变慢回退；持续劣化自动降档避让，环境变快重新爬升；超长文本另由形状预算钳制条数，RSS 软墙 8GB 兜底），累计持 GIL 达到阈值才主动让出（不逐个 sleep），让 UI 保持响应。每批次嵌入前检查取消标志，及时响应停止请求。
 - **协作式取消**：取消后 worker 在文件/批处理边界退出，已写入的向量数据保持完整；`_chunk_iter` 使用 0.5s 短超时确保取消后快速响应；`add_streaming` 在每批处理前检查取消标志避免无效计算。
-- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 引擎（~500MB）、docling/marker 转换器（各 ~1.9GB）、OvisOCR2 VLM（~0.9GB）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时补关主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎，并移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
+- **资源释放**：同步完成后 `RAGEngine.close()` 显式释放 LanceDB 连接、FastEmbed ONNX 模型、BGE reranker、RapidOCR 实例池（2×~500MB≈1GB）、docling/marker 转换器（各 ~1.9GB）、OvisOCR2 VLM（~0.9GB）；`VectorStore.close()` 显式调用 ONNX `InferenceSession.release()` 立即回收 C++ 堆内存；窗口关闭时补关主/辅助 LLM 后端与 terminate 路径残留的 RAG 引擎，并移除 logger handler 防止悬空引用；`_JsonStore` 采用 0.5s 节流写盘避免高频 I/O。
 - **文档元数据缓存**：`VectorStore` 对 documents 表内容做内存缓存，`get_document_digest` / `list_documents` 不再每次全表 `to_pylist()`；写入（upsert/delete/clear）时失效缓存。documents 表写入用 `_documents_lock` 串行化，避免多 worker 并发 ingest 时 delete+add 交错。
 - **不存全文 Markdown**：documents 表只存「缩略版本 + 章节列表 + Markdown 缓存路径」，**不存全文**（全文已有 `rag/documents/*.md` 缓存，表内再存是第三份冗余，且会被缓存全量载入内存；该字段实际零消费者）。缓存按列读取并显式剔除 `markdown`，兼容旧数据。
 - **删除即清理**：源文件从知识库移除后，同步时一并清理向量、documents 元数据行与 manifest 条目。
