@@ -1210,7 +1210,12 @@ class MLXVLMBackend(_LazyLocalBackend):
             self._model_obj = None
             self._processor = None
             try:
+                import gc
                 import mlx.core as mx
+
+                # 与 MLXLLMBackend.close 保持一致：先断开权重引用再清分配器缓存，
+                # 否则 _model_obj 置空后底层 MLX 缓存池仍占着 GPU 统一内存。
+                gc.collect()
                 mx.clear_cache()
             except Exception:
                 pass
