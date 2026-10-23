@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set
 
 from .parsers import extract_text, SUPPORTED_EXTENSIONS
-from .cleaner import clean_text, fix_hard_wraps, normalize_markdown, clean_markdown_document
+from .cleaner import clean_text, fix_hard_wraps, clean_markdown_document
 from .chunker import chunk_documents
-from .document_outline import build_digest, build_toc
+from .document_outline import build_digest, build_toc, convert_plain_text_to_markdown
 from .pandoc_parser import (
     PANDOC_EBOOK_EXTS,
     PANDOC_SUPPORTED_EXTENSIONS,
@@ -1137,9 +1137,15 @@ class RAGEngine:
                                     t_clean_end = time.monotonic()
                                     _log("    ├─ 清洗完成: %s → %d 字符 (耗时 %.2fs)", fname, len(cleaned), t_clean_end - t_clean)
                                     # ---- 3. 转换为 Markdown ----
+                                    # 非结构化纯文本（txt / OCR 兜底提取等）：先用
+                                    # 纯文本启发式还原章节目录结构，再据此把标题行
+                                    # 注入成真实 Markdown ``#`` 标题，使后续切片能
+                                    # 按章节切分（hybrid_chunker 按 ``#`` 边界）。
+                                    # 检测不到标题时等价于原 normalize_markdown（仅
+                                    # 做空白归一），不会破坏普通文本。
                                     _log("    ├─ 转换 Markdown: %s", fname)
                                     _flush_logs(f"Markdown: {fname}")
-                                    cleaned = normalize_markdown(cleaned)
+                                    cleaned, _ = convert_plain_text_to_markdown(cleaned)
                                     _log("    ├─ Markdown 完成: %s (%d 字符)", fname, len(cleaned))
                                     _flush_logs(f"Markdown完成: {fname}")
                                 try:

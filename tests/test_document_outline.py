@@ -4,6 +4,7 @@ from __future__ import annotations
 from agent.rag.document_outline import (
     build_digest,
     build_toc,
+    convert_plain_text_to_markdown,
     extract_chapters,
     extract_chapters_plain,
     find_chapters_by_title,
@@ -209,6 +210,89 @@ def test_plain_pdf_header_chapter_pageno_noise():
     assert "第五章" in titles
     assert "第七章" in titles
     assert "第六章 767" not in titles
+
+
+# ---------------------------------------------------------------------------
+# 纯文本 → Markdown（注入 # 标题）
+# ---------------------------------------------------------------------------
+
+def test_convert_plain_cn_chapters_to_markdown():
+    """正文含「第X章」标题的纯文本，应被注入成 # 标题，且正文保留。"""
+    text = """内容提要
+这是一段前言介绍。
+
+第一章 人际关系的构成
+假若黄金周这样度过，是不是很美妙。
+
+第二章 研究方法
+本章介绍研究亲密关系的方法。
+"""
+    md, chapters = convert_plain_text_to_markdown(text)
+    assert "# 第一章 人际关系的构成" in md
+    assert "# 第二章 研究方法" in md
+    # 正文段落应保留
+    assert "假若黄金周这样度过" in md
+    assert "本章介绍研究亲密关系的方法。" in md
+    # 标题层级
+    assert {c.title: c.level for c in chapters} == {
+        "第一章 人际关系的构成": 1,
+        "第二章 研究方法": 1,
+    }
+
+
+def test_convert_plain_toc_block_dropped_when_body_has_headings():
+    """正文自带标题时，前导「目录」块应被丢弃，不重复生成标题。"""
+    text = """目 录
+第一章 引言
+第二章 方法
+
+第一章 引言
+引言正文。
+
+第二章 方法
+方法正文。
+"""
+    md, chapters = convert_plain_text_to_markdown(text)
+    # 「目录」标记与 TOC 块条目都应在 markdown 中消失
+    assert "目 录" not in md
+    assert "# 第一章 引言" in md
+    assert "# 第二章 方法" in md
+    # 不应出现重复标题（TOC 块里的那一份已被丢弃）
+    assert md.count("# 第一章 引言") == 1
+
+
+def test_convert_plain_toc_block_becomes_headings():
+    """正文无标题、只有「目录」块时，目录条目应转为 # 标题。"""
+    text = """人生的活法
+
+目 录
+1卷 我的财产告白
+2卷 我的人生活法
+
+他，设计了明治神宫的森林。
+"""
+    md, chapters = convert_plain_text_to_markdown(text)
+    assert "# 1卷 我的财产告白" in md
+    assert "# 2卷 我的人生活法" in md
+    # 「目录」标记本身被丢弃
+    assert "目 录" not in md
+    assert {c.title for c in chapters} == {
+        "1卷 我的财产告白",
+        "2卷 我的人生活法",
+    }
+
+
+def test_convert_plain_no_headings_is_noop():
+    """没有可识别标题的普通纯文本，应保持原样（不误造标题）。"""
+    text = """这是一段普通叙述文字，没有任何章节标题。
+它包含多个句子。第二句话也平淡无奇。
+
+第三段也是一样的内容。
+"""
+    md, chapters = convert_plain_text_to_markdown(text)
+    assert chapters == []
+    assert "#" not in md
+    assert "这是一段普通叙述文字" in md
 
 
 def test_plain_year_prefix_noise():

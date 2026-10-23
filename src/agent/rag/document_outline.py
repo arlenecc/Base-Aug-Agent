@@ -347,6 +347,177 @@ def extract_chapters_plain(text: str) -> List[Chapter]:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text → Markdown (inject headings with the same heuristics)
+# ---------------------------------------------------------------------------
+
+def _classify_toc_entry(line: str) -> Optional[Tuple[int, str]]:
+    """Classify a line *inside a TOC block* as a title.
+
+    The TOC block is a curated list, so any line that survives ``_looks_like_title``
+    is treated as a title (matching the acceptance used by
+    :func:`_extract_from_toc_block`).  Level: ``第X节`` → 2, ``第X章/卷/篇/部``
+    or numbered → its natural level, plain short title / ALL-CAPS → 1.
+    """
+    if not line or not _looks_like_title(line):
+        return None
+    title = _normalize_title(line)
+    hit = (_cn_section_match(title) or _cn_chapter_match(title)
+           or _numbered_match(title))
+    if hit is not None:
+        return hit
+    return (1, title)
+
+
+def _classify_title_line(lines: List[str], idx: int) -> Optional[Tuple[int, str]]:
+    """Classify the line at ``idx`` as a *body* chapter title, or ``None``.
+
+    Uses exactly the same matching rules as :func:`_extract_from_body_headings`:
+    strong patterns (``第X章/节``, numbered) are accepted outright; the weak
+    ALL-CAPS pattern additionally requires surrounding blank lines (so ordinary
+    prose in ALL-CAPS is not mistaken for a heading).
+    """
+    line = lines[idx]
+    if not line or not _looks_like_title(line):
+        return None
+    title = _normalize_title(line)
+    hit = (_cn_section_match(title) or _cn_chapter_match(title)
+           or _numbered_match(title))
+    if hit is not None:
+        return hit
+    if _ALLCAPS_RE.match(title):
+        prev_blank = idx == 0 or lines[idx - 1] == ""
+        nxt_blank = idx + 1 >= len(lines) or lines[idx + 1] == ""
+        if prev_blank and nxt_blank:
+            return (1, title)
+    return None
+
+
+def _toc_block_span(lines: List[str]) -> Tuple[int, int]:
+    """Return ``(marker_index, end_index)`` of a leading TOC block, else ``(-1, -1)``.
+
+    The block runs from just after the "目录/Contents" marker up to (but not
+    including) the first body line.  It terminates at:
+      * a blank-line-separated **repeat** of a TOC entry (the body re-states a
+        chapter already listed — the common "TOC → Chapter 1" transition); or
+      * the first line that is neither a TOC entry nor blank (real body prose).
+
+    This avoids over-extending the block into the first body heading.
+    """
+    for i, ln in enumerate(lines):
+        if ln.lower() in _TOC_MARKERS:
+            break
+    else:
+        return (-1, -1)
+    seen_in_toc: set = set()
+    end = len(lines)
+    j = i + 1
+    while j < len(lines):
+        ln = lines[j]
+        if not ln:
+            j += 1
+            continue
+        entry = _classify_toc_entry(ln)
+        if entry is not None:
+            title = entry[1]
+            if title in seen_in_toc:
+                # body re-states a listed chapter → block ends here
+                end = j
+                break
+            seen_in_toc.add(title)
+            j += 1
+            continue
+        # non-title, non-blank line → real body prose begins
+        end = j
+        break
+    return (i, end)
+
+
+def convert_plain_text_to_markdown(text: str) -> Tuple[str, List[Chapter]]:
+    """Convert unstructured plain text into markdown by injecting ``#`` headings
+    at detected chapter-title lines.
+
+    Reuses the *same* heuristics as :func:`extract_chapters_plain` (the existing
+    plain-text chapter-structure recovery), but works positionally so each
+    detected title can be turned into a real Markdown heading **in place** —
+    turning an otherwise flat document into a structure-aware one that
+    :mod:`hybrid_chunker` can split on (``#`` … ``######`` boundaries).
+
+    Strategy:
+      * Locate a leading "目录/Contents" block.  A TOC entry whose title also
+        appears later in the body is treated as a duplicate copy and dropped
+        (the body copy becomes the real heading).  TOC entries with **no** body
+        counterpart become headings themselves — so a document that is *only* a
+        TOC still gains structure.
+      * Scan line-by-line; each detected title becomes ``"#" * level + " " +
+        title``.  Body titles use the stricter :func:`_classify_title_line`
+        rules (avoiding false positives in prose); TOC-block lines use the more
+        permissive :func:`_classify_toc_entry` (a curated list is all titles).
+        All other lines (and blank-line paragraph grouping) are preserved.
+
+    Returns ``(markdown, chapters)`` where ``chapters`` mirrors the injected
+    heading structure (titles only, empty body) — useful for the digest, though
+    the canonical output is the markdown string fed to chunking/RAG.
+    """
+    if not text or not text.strip():
+        return "", []
+    lines = _split_lines(text)
+    if not lines:
+        return "", []
+
+    toc_marker, toc_end = _toc_block_span(lines)
+
+    # Titles that genuinely appear as body headings (so TOC copies can be dropped).
+    body_title_texts: set = set()
+    if toc_marker >= 0:
+        for j in range(toc_end, len(lines)):
+            hit = _classify_title_line(lines, j)
+            if hit is not None:
+                body_title_texts.add(hit[1])
+
+    out: List[str] = []
+    chapters: List[Chapter] = []
+    seen: set = set()
+    prev_blank = False
+
+    for idx, line in enumerate(lines):
+        # Always drop the TOC marker line itself.
+        if toc_marker >= 0 and idx == toc_marker:
+            continue
+
+        in_toc = toc_marker >= 0 and toc_marker < idx < toc_end
+        hit = (_classify_toc_entry(line) if in_toc
+               else _classify_title_line(lines, idx))
+        if hit is not None:
+            level, title = hit
+            if in_toc and title in body_title_texts:
+                # TOC copy of a real body heading → drop (body copy is injected)
+                continue
+            if title in seen:
+                # Duplicate title → keep as plain text, don't double the heading.
+                if line:
+                    out.append(line)
+                    prev_blank = False
+                continue
+            seen.add(title)
+            chapters.append(Chapter(level, title, ""))
+            out.append("#" * level + " " + title)
+            prev_blank = False
+            continue
+
+        # Normal line — preserve, normalising consecutive blank lines.
+        if not line:
+            if not prev_blank and out:
+                out.append("")
+            prev_blank = True
+        else:
+            out.append(line)
+            prev_blank = False
+
+    markdown = "\n".join(out).strip()
+    return markdown, chapters
+
+
+# ---------------------------------------------------------------------------
 # Digest assembly
 # ---------------------------------------------------------------------------
 
