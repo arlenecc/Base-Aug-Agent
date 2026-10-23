@@ -51,19 +51,11 @@ _EPUB_LINK_RE = re.compile(r"^\[(.+)\]\(#[^)]*\)$")
 # HTML 注释 / 图片占位噪声。
 _HTML_NOISE_RE = re.compile(r"^\s*<!--.*?-->\s*$")
 
-# 「目录」标记行（用于识别目录列表段）。
-_TOC_MARKERS = (
-    "目录", "目 录", "目錄", "contents", "table of contents",
-)
-
 # 明显非标题的噪声行（作者、版权、出版社等）。
 _NOISE_TITLES = {
     "copyright", "all rights reserved", "all right reserved", "isbn",
     "references", "references and citations", "img",
 }
-
-# 「目录」标记本身（含带空格的变体），无论在哪个阶段都应跳过。
-_TOC_TITLE_NOISE = {"目录", "目 录", "目錄", "目 錄"}
 
 # PDF 页眉模式：「章节名 + 分隔符 + 纯数字页码」，如「第二章 → 23」、
 # 「第十章 ／ 147」、「第六章 ～65」。这是书籍左/右页页眉（章节名+页码），
@@ -92,6 +84,46 @@ _TRUNCATED_CN_CHAPTER_RE = re.compile(
 # 年份开头的正文行：如「1947）。《薄伽梵歌》是…」「2007 年12月」。
 # 标题不会以 4 位年份开头（除非恰是年份书名，罕见），视为正文噪声。
 _YEAR_PREFIX_RE = re.compile(r"^(?:19|20)\d{2}\s*[年）).、]")
+
+# 强章节标记前缀：行以「第X章/节/卷/篇/部」开头。这类前缀是权威的章节号，
+# 即使行内因并入了引文/正文而含句读，也交由 _normalize_title 清尾，不整体拒绝。
+_CN_CHAPTER_PREFIX_RE = re.compile(
+    r"^第\s*[0-9%s]+\s*[章卷篇部节]" % _CJK_NUM
+)
+
+# 「目录」标记归一化：去掉 Markdown 强调/标题符号与空白后比对，兼容
+# 「**总目录**」「## 目 录」「目次」「Contents」等写法。
+_TOC_MARKER_CANON = {
+    "目录", "目錄", "目次", "总目录", "總目錄", "總目次", "全书目录",
+    "全書目錄", "contents", "tableofcontents",
+}
+
+
+def _is_toc_marker(line: str) -> bool:
+    """True if ``line`` is a TOC marker (目录/总目录/Contents …).
+
+    Normalises away Markdown emphasis/heading symbols and whitespace so bold
+    or heading-wrapped markers (``**总目录**``, ``## 目 录``) are recognised.
+    """
+    s = re.sub(r"[*_#`>\s]+", "", line or "").lower()
+    return s in _TOC_MARKER_CANON
+
+
+# 有效字符：中文 / 字母数字 / 常见中英文标点。用于判定 OCR 乱码行。
+_MEANINGFUL_EXTRA = set(
+    "，。！？、；：""''（）《》【】—…·.,;:!?()'\"-–—"
+)
+
+
+def _meaningful_ratio(line: str) -> float:
+    """Fraction of characters that are meaningful text (CJK/alnum/punct)."""
+    if not line:
+        return 0.0
+    good = sum(
+        1 for c in line
+        if c.isalnum() or "\u4e00" <= c <= "\u9fff" or c in _MEANINGFUL_EXTRA
+    )
+    return good / len(line)
 
 
 class Chapter:
@@ -454,11 +486,18 @@ def _looks_like_title(line: str) -> bool:
     # 不以句末标点结尾（标题一般无句号/逗号/分号）。
     if line[-1] in "。，；：！？.,;:!?":
         return False
+    # 行内含句读（。！？；，）→ 正文句子或被并入正文的标题行，非干净标题。但以强
+    # 章节标记（第X章/节/卷/篇/部）开头的行，其「第X章」前缀权威，交由
+    # _normalize_title 去掉尾部引文/页码，不在此整体拒绝（否则会丢掉
+    # 「第3章 标题 "引文"」这类真实章节）。
+    if any(p in line for p in "。！？；，"):
+        if not _CN_CHAPTER_PREFIX_RE.match(line):
+            return False
     # 明显噪声。
     if line.lower() in _NOISE_TITLES:
         return False
-    # 「目录」标记本身（含带空格变体）不是标题。
-    if line in _TOC_TITLE_NOISE:
+    # 「目录」标记本身（含带空格/强调变体）不是标题。
+    if _is_toc_marker(line):
         return False
     # 年份开头的正文行（如「1947）。《薄伽梵歌》…」「2007 年12月」）。
     if _YEAR_PREFIX_RE.match(line):
@@ -474,21 +513,30 @@ def _looks_like_title(line: str) -> bool:
     # 被截断的章节名（「三章」「一章」）不是标题。
     if _TRUNCATED_CN_CHAPTER_RE.match(line):
         return False
+    # OCR 乱码行：有效字符（中文/字母数字/常见标点）占比过低（大量 ①•⋯ 等）。
+    if n >= 8 and _meaningful_ratio(line) < 0.5:
+        return False
     return True
 
 
 def _normalize_title(line: str) -> str:
     """Normalise a raw title line into a clean title.
 
-    Strips EPUB link wrappers (``[TITLE](#anchor)`` → ``TITLE``) and other
-    obvious wrappers, then collapses internal whitespace.
+    Strips EPUB link wrappers (``[TITLE](#anchor)`` → ``TITLE``), a trailing
+    pull-quote merged onto the heading (``第9章 界面 ｜ 223 "…"``), a trailing
+    page number (``第2章 优泰｜：61`` → ``第2章 优泰``), then collapses internal
+    whitespace.
     """
     line = line.strip()
     m = _EPUB_LINK_RE.match(line)
     if m:
         line = m.group(1).strip()
+    # 尾部 pull-quote（被并入标题的引文）："…" / "…"。
+    line = re.sub(r'\s*["“][^"”]*["”]\s*$', "", line)
+    # 尾部页码（章节名 ｜ 223 / 第2章 优泰|：61）。
+    line = re.sub(r'[\s｜|/／→—\-~～:：]+\s*\d{1,4}\s*$', "", line)
     line = re.sub(r"\s+", " ", line)
-    return line
+    return line.strip()
 
 
 def _cn_section_match(line: str) -> Optional[Tuple[int, str]]:
@@ -521,6 +569,15 @@ def _numbered_match(line: str) -> Optional[Tuple[int, str]]:
     # 纯数字行（如页码）不算标题。
     if not rest:
         return None
+    # rest 仅标点/符号（如页码碎片 "| "）→ 非标题。
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", rest):
+        return None
+    # rest 是长句子（含句读或过长）→ 正文编号列表/习题，非标题。单级编号
+    # （"1."）在正文里常是列表项/习题句，标题通常很短；多级编号（"1.1"）
+    # 几乎总是真标题，放宽长度上限。
+    max_rest = 16 if "." not in num else 30
+    if any(p in rest for p in "。！？；，") or len(rest) > max_rest:
+        return None
     return (level, line)
 
 
@@ -533,7 +590,7 @@ def _extract_from_toc_block(lines: List[str]) -> List[Chapter]:
     short titles → 1.
     """
     for i, ln in enumerate(lines):
-        if ln.lower() in _TOC_MARKERS:
+        if _is_toc_marker(ln):
             break
     else:
         return []
@@ -670,7 +727,7 @@ def _toc_block_span(lines: List[str]) -> Tuple[int, int]:
     This avoids over-extending the block into the first body heading.
     """
     for i, ln in enumerate(lines):
-        if ln.lower() in _TOC_MARKERS:
+        if _is_toc_marker(ln):
             break
     else:
         return (-1, -1)

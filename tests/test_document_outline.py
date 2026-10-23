@@ -440,3 +440,101 @@ def test_md_keeps_consecutive_numbered_chapters():
     titles = [c.title for c in chapters]
     assert "第一百章 總論" in titles
     assert "第一百零一章 分論" in titles
+
+
+# ---------------------------------------------------------------------------
+# 纯文本路径的噪声抑制（句读行 / OCR 乱码 / 编号习题句 / 加粗目录标记 / 标题去页码）
+# ---------------------------------------------------------------------------
+
+def test_plain_bold_toc_marker():
+    """加粗/变体目录标记（**总目录**）应被识别，提取其后的条目。"""
+    text = """某套装总集
+
+**总目录**
+
+傲慢与偏见
+
+呼啸山庄
+
+基督山伯爵
+
+正文开始了，这是一段很长很长的正文内容用来终止目录块的读取，需要超过八十个字符才会触发终止条件。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = [c.title for c in chapters]
+    assert "傲慢与偏见" in titles
+    assert "呼啸山庄" in titles
+    assert "基督山伯爵" in titles
+    assert "某套装总集" not in titles  # 目录标记之前的内容不收入
+
+
+def test_plain_rejects_numbered_sentence_item():
+    """单级编号的长句（正文列表项/习题，非章节）不应被当作标题。"""
+    text = """2. 不是每一项旨在保留一个早已存在帝国的外交政策都是帝国主
+
+第1章 国际政治现实主义理论
+
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert not any("不是每一项" in t for t in titles)
+    assert "第1章 国际政治现实主义理论" in titles
+
+
+def test_plain_rejects_ocr_garbage_line():
+    """有效字符占比过低的 OCR 乱码行（大量 ①•⋯）不应被当作标题。"""
+    text = """第一章 引言
+
+1. ①体••11.①西⋯•②秦⋯11. ①游戏-软件设计 N. ①TP311.5
+
+第二章 方法
+
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert "第一章 引言" in titles
+    assert "第二章 方法" in titles
+    assert not any("①" in t for t in titles)
+
+
+def test_plain_rejects_sentence_with_midline_punct():
+    """行中含句读（。，；！）的合并正文行不应被当作标题。"""
+    text = """第三章 数据与统计，这是一段被并入标题行的正文说明。
+
+第四章 抽样与抽样分布
+
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = {c.title for c in chapters}
+    assert not any("这是一段被并入" in t for t in titles)
+    assert "第四章 抽样与抽样分布" in titles
+
+
+def test_normalize_title_strips_trailing_page_and_quote():
+    """标题行尾部的页码与并入的引文应被清掉。"""
+    from agent.rag.document_outline import _normalize_title
+    assert _normalize_title("第2章 优泰|：61") == "第2章 优泰"
+    assert _normalize_title("第9章 界面 ｜ 223 “很不幸，看来…”") == "第9章 界面"
+    assert _normalize_title("第一章 引言") == "第一章 引言"
+
+
+def test_plain_keeps_chapter_merged_with_quote():
+    """真实「第X章 标题」即使并入了含句读的引文，也应保留（引文被剥掉）。"""
+    text = """第3章 重商主义、重农主义及古典经济思想的其他先驱 “值得注意的是，发明家们并不具备被称为‘科学态度’的客观性。”
+
+正文段落。
+
+第5章 李嘉图与马尔萨斯 “李嘉图在思维上的吸引力，过去和现在都体现为他运用英雄式抽象概念的非凡才能。”
+
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = [c.title for c in chapters]
+    assert any(t.startswith("第3章") and "先驱" in t for t in titles)
+    assert any(t.startswith("第5章") and "李嘉图" in t for t in titles)
+    # 并入的引文应被剥掉
+    assert not any("值得注意的是" in t for t in titles)
+    assert not any("英雄式抽象" in t for t in titles)
