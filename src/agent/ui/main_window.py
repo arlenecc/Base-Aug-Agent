@@ -1016,6 +1016,10 @@ class MainWindow(QMainWindow):
         self._finish_handled = False
         self._fetch_worker: Optional[FetchModelsWorker] = None
         self._sync_worker: Optional[SyncKnowledgeWorker] = None
+        # 同步起点卸载的主/辅助 LLM 角色中「确实已加载」的集合；供同步结束后只
+        # 重载这些角色（用户事先手动卸载的角色不擅自重新加载）。见 _on_sync_knowledge
+        # 与 _reload_models_after_sync。
+        self._sync_preloaded_roles: set = set()
         self._deps_worker: Optional[InstallDepsWorker] = None
         self._dedup_worker: Optional["VectorDedupWorker"] = None
         # --- QThread 保活登记表（消除「Destroyed while thread is still running」）
@@ -3078,9 +3082,14 @@ class MainWindow(QMainWindow):
         # 会把内存推到 13GB+。Embedding 模型同步必需（vectorize 要用）则保留。
         # 卸载后 agent 换回惰性后端，下次对话时自动重载，无需在此恢复。
         _unloaded = []
+        _unloaded_roles = []
         for _role in ("main", "aux"):
             if self._unload_role(_role):
                 _unloaded.append("主" if _role == "main" else "辅助")
+                _unloaded_roles.append(_role)
+        # 记录「同步前确实已加载」的角色：同步结束后只重载这些，避免把用户事先
+        # 手动卸载的模型在同步后擅自重新加载回来（见 _reload_models_after_sync）。
+        self._sync_preloaded_roles = set(_unloaded_roles)
         if _unloaded:
             self._append_log(f"[rag] 同步前已卸载{'/'.join(_unloaded)}对话模型，释放 GPU 显存")
             self.status_label.setText("已卸载对话模型，正在同步知识库…")
@@ -3194,6 +3203,48 @@ class MainWindow(QMainWindow):
         # 启动日志轮询定时器：每 100ms 消费 _log_buffer，实时显示同步日志
         self._log_poll_timer.start()
 
+    def _reload_models_after_sync(self) -> None:
+        """同步结束后在后台重新加载对话模型，并预热主模型。
+
+        同步起点（_on_sync_knowledge）已把主/辅助 LLM 卸载以释放统一内存；同步
+        资源（docling / reranker / RapidOCR / OCR VLM 等）在 SyncKnowledgeWorker
+        的 finally 里已彻底释放，此刻重载 LLM 不会与任何重资源叠加（避免资源冲突）。
+
+        只重载「同步前确实已加载」的角色（self._sync_preloaded_roles）：若用户事先
+        手动卸载了某角色，不应在同步后擅自把它重新加载回来。
+        主模型加载完成后由 _on_model_loaded 自动预热 system+tools 前缀，使同步后
+        第一次对话直接命中 KV 缓存、无需再付数十秒加载 + prefill。
+
+        走后台线程（LoadModelWorker），不阻塞 UI；已在加载 / 已加载的角色跳过。
+        """
+        roles = getattr(self, "_sync_preloaded_roles", set())
+        if not roles:
+            return
+        for role in roles:
+            if self._model_busy.get(role, False):
+                continue  # 用户正在手动加载/卸载该角色，别抢
+            # 同步起点卸载后该角色应是惰性后端；若已加载（异常）则不重复加载。
+            existing = self._loaded_model(role)
+            if existing is not None and not getattr(existing, "_closed", False):
+                continue
+            signature = self._model_signature(role)
+            # OpenAI 接口模式没有「本地权重」可加载（仅主模型）。
+            if role == "main" and self.config.llm_mode == "openai":
+                continue
+            label = "主模型" if role == "main" else "辅助模型"
+            self._model_busy[role] = True
+            self._refresh_model_buttons()
+            self.status_label.setText(f"正在重新加载{label}…")
+            self._append_log(
+                f"[model] 同步结束，重新加载{label}: {signature[2] or '(未填路径)'}")
+            worker = LoadModelWorker(
+                role=role, signature=signature, config=self.config)
+            self._model_workers[role] = worker
+            worker.load_done.connect(self._on_model_loaded)
+            worker.load_failed.connect(self._on_model_load_failed)
+            self._retain_worker(worker)
+            worker.start()
+
     def _on_sync_finished(self, stats: dict) -> None:
         logger.info("UI: _on_sync_finished called")
         self._log_poll_timer.stop()
@@ -3222,6 +3273,10 @@ class MainWindow(QMainWindow):
                     self._agent.tools.reload_rag()
                 except Exception as e:
                     logger.warning("UI: reload_rag after sync: %s", e)
+            # 同步资源已释放：在后台重新加载对话模型并预热主模型（释放的统一内存
+            # 此刻可回收给 LLM，不会与任何重资源叠加）。只重载「同步前已加载」的
+            # 角色；用户中途手动卸载的角色不会被动重新加载。
+            self._reload_models_after_sync()
             # 防御：stats 可能不是 dict（极端情况下为 None）
             if not isinstance(stats, dict):
                 stats = {}
@@ -3329,6 +3384,8 @@ class MainWindow(QMainWindow):
                 self.progress.setRange(0, 1)
                 self.progress.setValue(0)
                 self.status_label.setText("知识库同步完成（状态已自动恢复）")
+                # 信号丢失说明正常结束回调没跑：这里补一次对话模型重载 + 预热。
+                self._reload_models_after_sync()
             except Exception:
                 pass
         # 清理 worker 引用，防止后续误判
@@ -3350,6 +3407,8 @@ class MainWindow(QMainWindow):
             self.progress.setValue(0)
             self.status_label.setText("知识库同步失败")
             self._sync_worker = None
+            # 同步起点卸载的对话模型，失败也要恢复（只重载同步前已加载的角色）。
+            self._reload_models_after_sync()
             QMessageBox.critical(self, "同步失败", f"知识库同步失败：\n{error}")
         except Exception as e:
             logger.error("UI: _on_sync_failed error: %s", e, exc_info=True)
