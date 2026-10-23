@@ -114,10 +114,14 @@ def test_ocr_recognize_prefers_ocrmac_and_skips_rapidocr(monkeypatch):
     """ocrmac(Apple Vision) 命中时**不加载** RapidOCR 单例（省 ~500MB）。"""
     _reset_ocr_state()
     fake = _install_fake_rapidocr(monkeypatch)
-    monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "视觉识别结果")
+    # 文本需 >= _OCRMAC_MIN_USEFUL_CHARS 才算「命中」：低于它说明 Vision 只
+    # 抓到页眉/碎片，会再补一次 RapidOCR（见该常量与 test_..._thin 用例）。
+    _hit = "视觉识别结果" * 12
+    monkeypatch.setattr(parsers, "_ocrmac_recognize",
+                        lambda img, err_out=None: _hit)
 
     out = parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
-    assert out == "视觉识别结果"
+    assert out == _hit
     assert fake.instances == 0  # RapidOCR 压根没被构造
 
 
@@ -125,7 +129,7 @@ def test_ocr_recognize_falls_back_to_rapidocr(monkeypatch):
     """ocrmac 本页识别不到（返回空/异常）时按页回退 RapidOCR。"""
     _reset_ocr_state()
     fake = _install_fake_rapidocr(monkeypatch)
-    monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img: "")
+    monkeypatch.setattr(parsers, "_ocrmac_recognize", lambda img, err_out=None: "")
 
     parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf")
     assert fake.instances == 1  # 仅这一页回退，拉起 RapidOCR
@@ -137,10 +141,10 @@ def test_ocr_recognize_fallback_is_per_page_not_global(monkeypatch):
     fake = _install_fake_rapidocr(monkeypatch)
     seq = {"n": 0}
 
-    def _mock(img):
+    def _mock(img, err_out=None):
         seq["n"] += 1
         # 第 1、3 页 ocrmac 命中，第 2 页识别不到
-        return "" if seq["n"] == 2 else f"第{seq['n']}页文字"
+        return "" if seq["n"] == 2 else f"第{seq['n']}页文字" * 12
 
     monkeypatch.setattr(parsers, "_ocrmac_recognize", _mock)
 
@@ -148,7 +152,7 @@ def test_ocr_recognize_fallback_is_per_page_not_global(monkeypatch):
     r2 = parsers.ocr_recognize_array(_blank_page(), 2, "x.pdf")
     r3 = parsers.ocr_recognize_array(_blank_page(), 3, "x.pdf")
 
-    assert r1 == "第1页文字" and r2 == "" and r3 == "第3页文字"
+    assert r1 == "第1页文字" * 12 and r2 == "" and r3 == "第3页文字" * 12
     assert fake.instances == 1  # 只有第 2 页触发回退，引擎只构造一次
 
 
@@ -196,3 +200,36 @@ def test_is_scanned_epub_illustrated_book_not_scanned(monkeypatch):
     monkeypatch.setattr(pandoc_parser, "_epub_scan_profile",
                         lambda p: (415 * 1024 * 1024, 483_230, []))
     assert pandoc_parser._is_scanned_epub("x.epub") is False
+
+
+def test_ocr_recognize_supplements_thin_ocrmac_result(monkeypatch):
+    """ocrmac 只抓到碎片（< _OCRMAC_MIN_USEFUL_CHARS）时补 RapidOCR 取更完整的那份。
+
+    实测依据（KB 里的漫画类扫描页，同一批 8 张）：ocrmac 只出页眉几十字符，
+    RapidOCR 出正文上千字符 —— 旧逻辑「ocrmac 有结果就直接采用」等于把整页
+    正文丢掉，且日志上毫无痕迹。修后 8 张总字符 40 → 1314。
+    """
+    _reset_ocr_state()
+
+    class _Rich:
+        txts = ["这是被 RapidOCR 取回的正文，长度远超 ocrmac 抓到的页眉碎片"]
+
+    class _RichRapidOCR(_FakeRapidOCR):
+        def __call__(self, *args, **kwargs):
+            return _Rich()
+
+    for name in _RAPIDOCR_IMPORT_NAMES:
+        mod = types.ModuleType(name)
+        mod.RapidOCR = _RichRapidOCR
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    # 只有 2 个字符 —— 典型的「只抓到页眉」
+    monkeypatch.setattr(parsers, "_ocrmac_recognize",
+                        lambda img, err_out=None: "页眉")
+
+    stats = {}
+    out = parsers.ocr_recognize_array(_blank_page(), 1, "x.pdf", stats=stats)
+    assert out == "这是被 RapidOCR 取回的正文，长度远超 ocrmac 抓到的页眉碎片"
+    assert stats.get("fallback") == 1
+    assert stats.get("reasons", {}).get("thin") == 1
+    assert stats.get("rapid_won") == 1

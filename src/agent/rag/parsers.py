@@ -56,6 +56,16 @@ _OCR_RECYCLE_ENABLED = False
 _OCR_DPI = 150
 _OCR_MAX_LONG_EDGE = 1500
 
+# ocrmac 结果「够用」的字符下限。
+#
+# 低于它说明 Apple Vision 只抓到页眉/零散碎片，此时必须再用 RapidOCR 补一次
+# 并取更完整的那份。实测依据（KB 里的漫画类扫描页，同一批 4 张）：
+#   ocrmac 原图 24 字符 / 预处理灰度 22 字符  vs  RapidOCR 二值 302 字符
+# —— 碎片几乎全是页眉的英文书名，正文一个字都没有。旧逻辑「ocrmac 有结果就
+# 直接采用」会把整页正文丢掉，且日志上毫无痕迹。
+# 取 32：正文段落（哪怕一句）远大于此，而页眉/页码/装饰文字基本在此之下。
+_OCRMAC_MIN_USEFUL_CHARS = 32
+
 # 锐化 / 二值化开关（默认全开）。放在这里是为了留退路：二值化会丢掉反锯齿
 # 灰边，个别印刷质量差的扫描件若识别率反而下降，把 _OCR_BINARIZE 置 False
 # 即可退回灰度管线，不必改代码结构。
@@ -663,8 +673,12 @@ def _get_ocr_engine():
             return None
 
 
-def _ocrmac_recognize(img) -> str:
+def _ocrmac_recognize(img, err_out: Optional[list] = None) -> str:
     """用 ocrmac（Apple Vision）识别**已预处理**的灰度 ndarray。
+
+    ``err_out`` 是可选出参：调用方传一个 list，本函数把异常原因 append 进去，
+    供上层聚合统计并在日志里说明「为什么这一页改用 RapidOCR」。返回类型保持
+    为 str（既有调用方与测试都按 str 使用）。
 
     返回空串表示「本页没识别到文字」**或**「ocrmac 不可用/异常」——这两种
     情况都交给 :func:`ocr_recognize_array` 用 RapidOCR 补充**这一页**。
@@ -690,6 +704,11 @@ def _ocrmac_recognize(img) -> str:
             detail=False,
         ).recognize()
     except Exception as e:
+        # 交给出参供上层聚合「回退原因」，日志区才看得到为什么走 RapidOCR。
+        # 这里仍只记 debug：异常可能每张图都发生（如 ocrmac 未安装），逐张
+        # warning 会淹没日志面板；统计与结论由调用方汇总后一次性输出。
+        if err_out is not None:
+            err_out.append(f"{type(e).__name__}: {e}")
         logger.debug("ocrmac 不可用/识别失败，本页改由 rapidocr 补充: %s", e)
         return ""
 
@@ -702,7 +721,8 @@ def _ocrmac_recognize(img) -> str:
     return "\n".join(parts)
 
 
-def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
+def ocr_recognize_array(img, page_num: int = 0, filename: str = "",
+                        stats: Optional[dict] = None) -> str:
     """识别**已归一化**的灰度 ndarray：ocrmac(Apple Vision) 优先，回退 RapidOCR。
 
     全项目唯一的「图 → 文字」入口：PyMuPDF 兜底 PDF 页（:func:`_extract_pdf`）
@@ -710,23 +730,66 @@ def ocr_recognize_array(img, page_num: int = 0, filename: str = "") -> str:
     通路的预处理（:func:`_ocr_preprocess_array`）与引擎选择策略完全一致。
 
     **按页回退（非全局）**：本页先走 ocrmac(Apple Vision)；若 ocrmac 未装/
-    运行期异常/本页没识别到文字，则该页改用 RapidOCR 补充。下一页依旧优先
-    ocrmac，不会因某一页失败就整体切到 RapidOCR（繁体竖排、线装版画等个别
-    页 ocrmac 读不出的场景，用 rapidocr 补这几页即可）。RapidOCR 单例按需
-    懒加载，仅在真正有页回退时才构造、之后复用。
+    运行期异常/本页没识别到文字/**只识别到碎片**，则该页再用 RapidOCR 补充，
+    取两者中更完整的那份。下一页依旧优先 ocrmac，不会因某一页失败就整体切到
+    RapidOCR。RapidOCR 单例按需懒加载，仅在真正有页回退时才构造、之后复用。
+
+    **为什么「碎片」也要补一次**（实测修的根因）：漫画/繁体扫描页上 ocrmac
+    常常只抓到页眉那十几个字符（实测 22 字符）就返回，而 RapidOCR 能取出正
+    文 302 字符。旧逻辑「ocrmac 有结果就直接用」等于把整页正文丢掉，且日志
+    上完全看不出发生了什么。这里对低于 ``_OCRMAC_MIN_USEFUL_CHARS`` 的结果
+    再补一次 RapidOCR，取更长的那份。
+
+    ``stats`` 是可选出参（dict）：调用方传一个空 dict，本函数累加
+    ``mac_hit``（ocrmac 直接采信的页数）、``fallback``（回退页数）与
+    ``reasons``（按原因分类计数：exception/empty/thin），供调用方在日志里
+    汇总说明「为什么这本大量走了 RapidOCR」。
 
     ``page_num`` / ``filename`` 仅用于 RapidOCR 失败时的日志定位。
     """
     # ocrmac(Apple Vision) 优先：走**灰度**（不二值化）——Otsu 二值化会让
     # Vision 读不出字（见 _ocr_preprocess_array 的 binarize 参数说明）。
     gray = _ocr_preprocess_array(img, binarize=False)
-    text = _ocrmac_recognize(gray)
-    if text:
-        return text
-    # 本页 ocrmac 未装/异常/无文字 → 用 RapidOCR 补充。RapidOCR 的 det/rec 在
-    # 纯黑白样本上训练，二值化更利检测，故这条兜底通路单独做二值化。
+    err_out: list = []
+    text_mac = _ocrmac_recognize(gray, err_out=err_out)
+
+    def _bump(key: str, reason_key: Optional[str] = None) -> None:
+        if stats is None:
+            return
+        stats[key] = stats.get(key, 0) + 1
+        if reason_key is not None:
+            reasons = stats.setdefault("reasons", {})
+            reasons[reason_key] = reasons.get(reason_key, 0) + 1
+
+    reason = None
+    reason_key = None
+    if err_out:
+        reason_key = "exception"
+        reason = f"ocrmac 调用异常（{err_out[0]}）"
+    elif not text_mac:
+        reason_key = "empty"
+        reason = "ocrmac 未识别到任何文字"
+    elif len(text_mac) < _OCRMAC_MIN_USEFUL_CHARS:
+        reason_key = "thin"
+        reason = (f"ocrmac 仅识别到 {len(text_mac)} 字符"
+                  f"（< {_OCRMAC_MIN_USEFUL_CHARS}，疑似只抓到页眉/碎片）")
+
+    if reason is None:
+        _bump("mac_hit")
+        return text_mac
+
+    _bump("fallback", reason_key)
+    logger.debug("第 %d 张改用 RapidOCR 补充：%s（%s）", page_num, reason, filename)
+    # RapidOCR 的 det/rec 在纯黑白样本上训练，二值化更利检测，故兜底通路单独
+    # 做二值化（与 ocrmac 的灰度通路区分，见 _ocr_preprocess_array）。
     binimg = _ocr_preprocess_array(img, binarize=True)
-    return _ocr_image_cached(binimg, page_num, filename)
+    text_rapid = _ocr_image_cached(binimg, page_num, filename)
+    # 取更完整的那份：ocrmac 的页眉碎片不应覆盖 RapidOCR 取到的正文。
+    if len(text_rapid) > len(text_mac):
+        if stats is not None:
+            stats["rapid_won"] = stats.get("rapid_won", 0) + 1
+        return text_rapid
+    return text_mac
 
 
 def _ocr_backend_available() -> bool:

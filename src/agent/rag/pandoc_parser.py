@@ -681,7 +681,7 @@ def _is_scanned_epub(filepath: str) -> bool:
             and text_chars < _EPUB_SCAN_TEXT_FLOOR)
 
 
-def _ocr_image_array(img) -> str:
+def _ocr_image_array(img, stats: Optional[dict] = None) -> str:
     """对单张**已预处理**的灰度 ndarray 做识别。
 
     直接委托 :func:`agent.rag.parsers.ocr_recognize_array`——ocrmac(Apple
@@ -690,7 +690,7 @@ def _ocr_image_array(img) -> str:
     """
     from .parsers import ocr_recognize_array
 
-    return ocr_recognize_array(img, 0, "epub-page")
+    return ocr_recognize_array(img, 0, "epub-page", stats=stats)
 
 
 def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
@@ -717,6 +717,9 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
 
     parts: List[str] = []
     done = 0
+    # 逐页回退原因的聚合统计（由 parsers.ocr_recognize_array 累加），收尾时
+    # 汇总成一条可读日志——日志区因此能看到「这本为什么大量走了 RapidOCR」。
+    _stats: dict = {}
     _t_start = time.time()
     for idx, item in enumerate(imgs):
         try:
@@ -736,7 +739,7 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
             # 仅送灰度原图：完整预处理（缩放/归一化/锐化/二值化）由
             # parsers.ocr_recognize_array 内部按引擎分别施加——ocrmac 走灰度、
             # RapidOCR 兜底走二值化。这里若先做二值化会把 ocrmac 的输入污染掉。
-            text = _ocr_image_array(arr)
+            text = _ocr_image_array(arr, stats=_stats)
             del arr
             if text and text.strip():
                 parts.append(text.strip())
@@ -769,6 +772,21 @@ def ocr_epub_images(filepath: str, log=None) -> Optional[str]:
                     _EPUB_OCR_TIME_BUDGET_S, done, len(imgs))
             break
 
+    # 汇总一次「引擎命中/回退」情况：这是日志区判断「ocrmac 是否真在生效」
+    # 的唯一依据。旧实现里回退完全无声（异常只记 debug、空结果干脆不记），
+    # 于是整本走 RapidOCR 也看不出原因。
+    _mac = _stats.get("mac_hit", 0)
+    _fb = _stats.get("fallback", 0)
+    _reasons = _stats.get("reasons", {})
+    _rapid_won = _stats.get("rapid_won", 0)
+    if _mac or _fb:
+        _detail = ", ".join(
+            f"{k}={v}" for k, v in sorted(_reasons.items())) or "无"
+        logger.info(
+            "%s: 扫描版 OCR 引擎统计 —— ocrmac 直接采信 %d 张，"
+            "补充/改用 RapidOCR %d 张（其中 RapidOCR 产出更完整 %d 张）；"
+            "回退原因: %s",
+            os.path.basename(filepath), _mac, _fb, _rapid_won, _detail)
     if not parts:
         return None
     return "\n\n".join(parts)
