@@ -78,6 +78,115 @@ def test_llamacpp_n_ctx_bounded_by_local_llm_n_ctx(monkeypatch):
     assert backend3._n_ctx >= 512
 
 
+def _install_fake_llama_cpp(monkeypatch):
+    """注入假 llama_cpp 模块（Llama + LlamaCache），返回 (Llama, LlamaCache)。
+
+    Llama.created 记录每次构造出的实例；set_cache 写到的缓存可从实例 .cache 读。
+    """
+    pkg = type(sys)("llama_cpp")
+
+    class LlamaCache:
+        def __init__(self, capacity_bytes: int = 0):
+            self.capacity_bytes = capacity_bytes
+
+    class Llama:
+        created: list = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.cache = None
+            self.closed = False
+            Llama.created.append(self)
+
+        def set_cache(self, cache):
+            self.cache = cache
+
+        def reset(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    pkg.Llama = Llama
+    pkg.LlamaCache = LlamaCache
+    monkeypatch.setitem(sys.modules, "llama_cpp", pkg)
+    return Llama, LlamaCache
+
+
+def _make_llamacpp(monkeypatch, **cfg_over):
+    from agent.model_backends import LlamaCppBackend
+    monkeypatch.setattr(
+        "agent.model_backends.resolve_model_path", lambda p, *a, **k: "/tmp/fake.gguf"
+    )
+    Llama, LlamaCache = _install_fake_llama_cpp(monkeypatch)
+    cfg = AgentConfig()
+    cfg.llm_backend = "llama_cpp"
+    cfg.llm_model_path = "/tmp/fake.gguf"
+    for k, v in cfg_over.items():
+        setattr(cfg, k, v)
+    backend = LlamaCppBackend(cfg.llm_model_path, cfg)
+    backend._ensure_loaded()
+    return backend, Llama.created[-1], LlamaCache
+
+
+def test_llamacpp_kv_cache_attached_on_load(monkeypatch):
+    """默认开启时，GGUF 后端加载后应给 Llama 挂上 LlamaCache（跨轮前缀复用）。"""
+    backend, llama, LlamaCache = _make_llamacpp(
+        monkeypatch, llama_cpp_kv_cache=True, llama_cpp_kv_cache_mb=256)
+    try:
+        assert llama.cache is not None
+        assert isinstance(llama.cache, LlamaCache)
+        assert llama.cache.capacity_bytes == 256 * 1024 * 1024
+        assert backend._kv_cache is llama.cache
+    finally:
+        backend.close()
+    assert llama.closed
+
+
+def test_llamacpp_kv_cache_disabled_attaches_nothing(monkeypatch):
+    """关闭开关时不应挂任何缓存。"""
+    backend, llama, _ = _make_llamacpp(monkeypatch, llama_cpp_kv_cache=False)
+    try:
+        assert llama.cache is None
+        assert backend._kv_cache is None
+    finally:
+        backend.close()
+
+
+def test_llamacpp_kv_cache_capacity_floor(monkeypatch):
+    """容量有 16MB 下限，防止设成 0/负数导致缓存永远放不下一条状态。"""
+    backend, llama, _ = _make_llamacpp(
+        monkeypatch, llama_cpp_kv_cache=True, llama_cpp_kv_cache_mb=1)
+    try:
+        assert llama.cache.capacity_bytes >= 16 * 1024 * 1024
+    finally:
+        backend.close()
+
+
+def test_llamacpp_kv_cache_invalidate_swaps_fresh(monkeypatch):
+    """invalidate_kv_cache 应换成全新的空缓存，旧状态作废（避免前缀错位命中）。"""
+    backend, llama, _ = _make_llamacpp(monkeypatch, llama_cpp_kv_cache=True)
+    try:
+        first = llama.cache
+        assert first is not None
+        backend.invalidate_kv_cache()
+        assert llama.cache is not None and llama.cache is not first
+        assert backend._kv_cache is llama.cache
+    finally:
+        backend.close()
+
+
+def test_llamacpp_kv_cache_invalidate_noop_when_disabled(monkeypatch):
+    """关闭时 invalidate 是空操作，不会凭空挂上缓存。"""
+    backend, llama, _ = _make_llamacpp(monkeypatch, llama_cpp_kv_cache=False)
+    try:
+        backend.invalidate_kv_cache()
+        assert llama.cache is None
+        assert backend._kv_cache is None
+    finally:
+        backend.close()
+
+
 def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
     """#159：统一 MLX 内存策略必须把 buffer cache 从默认 95% RAM 封顶到 ~6GB
     （避免 prefill 长上下文时大注意力矩阵每步反复释放重分配 → 生成抖动卡顿），

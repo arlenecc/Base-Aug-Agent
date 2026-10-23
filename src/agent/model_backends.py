@@ -1507,6 +1507,15 @@ class LlamaCppBackend(_LazyLocalBackend):
                 int(getattr(config, "local_llm_n_ctx", 16384)),
             ),
         )
+        # 跨轮 KV / 前缀复用（对齐 MLX 后端的 _kv_cache 行为）：用 llama.cpp 的
+        # LlamaCache 在不随时间变化的 system prompt + 对话前缀上复用 KV，每轮只
+        # prefill 增量。默认开；内存吃紧可关或调小容量（见 config.llama_cpp_kv_cache）。
+        self._kv_cache_enabled = bool(getattr(config, "llama_cpp_kv_cache", True))
+        self._kv_cache_bytes = max(
+            16 * 1024 * 1024,
+            int(getattr(config, "llama_cpp_kv_cache_mb", 512)) * 1024 * 1024,
+        )
+        self._kv_cache = None  # 当前挂到 Llama 上的 LlamaCache（失效时换新的）
 
     @property
     def context_window(self) -> int:
@@ -1563,7 +1572,48 @@ class LlamaCppBackend(_LazyLocalBackend):
                 chat_handler=self._chat_handler(),
                 verbose=False,
             )
+            if self._kv_cache_enabled:
+                self._attach_kv_cache()
             logger.info("GGUF 模型加载完成: %s", self.model_path)
+
+    def _attach_kv_cache(self) -> None:
+        """给 Llama 挂一个（全新空的）LlamaCache，启用跨轮 KV / 前缀复用。
+
+        llama.cpp 在每次生成时自动做「最长 token 前缀命中 → load_state 复用 KV
+        → 只 eval 后缀」，生成完再把整段序列状态存回缓存；不变的 system prompt
+         ／对话前缀因此每轮只 prefill 一次。
+        """
+        if self._llama is None:
+            return
+        try:
+            from llama_cpp import LlamaCache
+        except ImportError as e:
+            logger.warning("llama-cpp-python 无 LlamaCache，GGUF 前缀复用不可用: %s", e)
+            self._kv_cache = None
+            return
+        cache = LlamaCache(capacity_bytes=self._kv_cache_bytes)
+        self._llama.set_cache(cache)
+        self._kv_cache = cache
+        logger.info("GGUF 跨轮 KV 前缀复用已启用 (容量 %d MB)",
+                    self._kv_cache_bytes // (1024 * 1024))
+
+    def invalidate_kv_cache(self) -> None:
+        """丢弃跨轮 KV / 前缀缓存（历史被改写、用户取消、切换会话时由 agent 调用）。
+
+        对齐 MLXLanguageBackend.invalidate_kv_cache：换一个全新的空 LlamaCache，
+        旧状态全部作废——下一轮无前缀可命中 → 全量 prefill（结果正确，只是没了
+        加速），杜绝前缀错位命中到过期内容。刻意不在生成中调用 reset()，避免与
+        流式生成争抢 llama.cpp 上下文。
+        """
+        if not self._kv_cache_enabled:
+            return
+        if self._llama is not None:
+            try:
+                self._attach_kv_cache()
+            except Exception as e:  # noqa: BLE001 - 失效失败不应炸掉主流程
+                logger.warning("GGUF KV 缓存失效失败: %s", e)
+        else:
+            self._kv_cache = None
 
     @staticmethod
     def _multimodal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1650,6 +1700,7 @@ class LlamaCppBackend(_LazyLocalBackend):
             self._closed = True
             llama = self._llama
             self._llama = None
+            self._kv_cache = None
             if llama is not None:
                 try:
                     llama.close()

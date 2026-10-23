@@ -68,6 +68,20 @@ class AgentConfig:
     # 不受影响），只约束 llama.cpp 的预分配上限。16384 对 7B 约 8.6GB、13B 约
     # 13GB，16G 机器可承受；内存更小的机器可调到 8192，显存更大的可调大。
     local_llm_n_ctx: int = 16384
+    # llama.cpp (GGUF) 专用：跨轮 KV / 前缀复用开关。对齐 MLX 后端的跨轮 KV 缓存
+    # 行为——用 llama.cpp 的 LlamaCache 在「不随时间变化的 system prompt + 对话
+    # 前缀」上复用 KV，每轮只 prefill 增量 token，省掉重复计算不变部分（长 system
+    # prompt / 固定工具 schema 收益明显）。默认开；内存吃紧可关，或调小容量。
+    #
+    # 实现：LlamaCppBackend 加载后 set_cache(LlamaCache(...))，llama.cpp 在每次
+    # 生成时自动做「最长 token 前缀命中 → load_state 复用 KV → 只 eval 后缀」，
+    # 生成完再把整段序列状态存回缓存。历史被改写/取消/切会话时 agent 调
+    # invalidate_kv_cache() 换一个空缓存，避免前缀错位。
+    llama_cpp_kv_cache: bool = True
+    # LlamaCache 容量上限（MB）：存放「前缀 token 序列 → KV 状态」的字节预算，超出
+    # 按最旧优先淘汰。单条 KV 状态大小 ≈ n_ctx×层数×KV头×头维×2(K,V)×精度，长上
+    # 下文可达数百 MB~GB；容量放不下一条时会反复淘汰、等于不命中，可调大。
+    llama_cpp_kv_cache_mb: int = 512
     # MLX 专用：prefill 分块大小（一次前向喂多少 token）。越大越快（少几次
     # kernel 启动与同步），峰值内存越高；太小则长 prompt 的 prefill 被切成很多
     # 块、白白多付同步开销。2861 token 的预热前缀一次喂完完全没问题。
@@ -206,6 +220,7 @@ class AgentConfig:
         "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
         "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
+        "llama_cpp_kv_cache_mb",
         "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
         "rag_pdf_small_concurrency",
@@ -235,7 +250,7 @@ class AgentConfig:
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
-                    "llm_speculative")
+                    "llm_speculative", "llama_cpp_kv_cache")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (

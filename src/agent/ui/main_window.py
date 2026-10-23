@@ -1426,6 +1426,16 @@ class MainWindow(QMainWindow):
             placeholder="本地主模型目录或 .onnx/.gguf 文件",
             path_value=self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH,
         )
+        # GGUF 专用：跨轮 KV / 前缀复用开关（对齐 MLX 后端行为）。仅主后端选
+        # GGUF 时可见，显隐由 _update_model_controls 控制。
+        self.llama_kv_cache_check = QCheckBox(
+            "GGUF 跨轮 KV 复用（复用不变的 system prompt 前缀，加快响应）")
+        self.llama_kv_cache_check.setToolTip(
+            "用 llama.cpp 的 KV 前缀缓存，在不随时间变化的 system prompt + 对话前缀上"
+            "复用 KV，每轮只 prefill 增量 token，省掉重复计算不变部分（长 system prompt"
+            "收益明显）。内存吃紧可关闭，或在配置里调小容量 llama_cpp_kv_cache_mb。"
+        )
+        local_lay.addWidget(self.llama_kv_cache_check)
         self._add_sampling_row(
             local_lay, "", self._main_sampling_defaults(),
             buttons=(
@@ -1808,6 +1818,8 @@ class MainWindow(QMainWindow):
         self.llm_model_path_edit.setText(
             self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH
         )
+        self.llama_kv_cache_check.setChecked(
+            bool(getattr(self.config, "llama_cpp_kv_cache", True)))
         self.aux_llm_model_path_edit.setText(
             getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH
         )
@@ -1885,6 +1897,7 @@ class MainWindow(QMainWindow):
         self.config.llm_model_path = (
             self.llm_model_path_edit.text().strip() or DEFAULT_MAIN_MODEL_PATH
         )
+        self.config.llama_cpp_kv_cache = self.llama_kv_cache_check.isChecked()
         self.config.aux_llm_backend = _combo_backend_value(self.aux_llm_backend_combo)
         self.config.aux_llm_model_path = (
             self.aux_llm_model_path_edit.text().strip() or DEFAULT_AUX_MODEL_PATH
@@ -2178,6 +2191,8 @@ class MainWindow(QMainWindow):
         # 多模态后端才能附加图片；mlx_lm 是纯文本。
         multimodal = local_mode and backend in ("mlx_vlm", "onnx", "llama_cpp")
         self.attach_image_btn.setEnabled(multimodal)
+        # GGUF 跨轮 KV 复用开关：仅本地模式 + GGUF 后端时可见。
+        self.llama_kv_cache_check.setVisible(local_mode and backend == "llama_cpp")
         # 切到不支持视觉的后端时必须丢弃待发图片：否则 [image:...] 标记会以
         # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
         if not multimodal and self._pending_image_path:
