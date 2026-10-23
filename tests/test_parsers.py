@@ -17,13 +17,14 @@ _RAPIDOCR_IMPORT_NAMES = ("rapidocr", "rapidocr_onnxruntime")
 class _FakeRapidOCR:
     """Fake RapidOCR used for both candidate import names.
 
-    ``__init__`` 仍接受可选的 ``params``（签名兼容）：_get_ocr_engine() 现在
-    一律不传参走默认 CPU EP，但旧签名保留以便将来再启用 EP。
+    ``__init__`` 接受 ``params`` / ``providers`` 等关键字（签名兼容）：生产侧
+    rapidocr 3.x 走 ``params={...}``、rapidocr_onnxruntime 1.x 走
+    ``providers=[...]``，fake 都要能接住才能计数。
     用**同一个类**注册到两个模块名，实例计数才与实际构造次数一致。
     """
     instances = 0
 
-    def __init__(self, params=None):
+    def __init__(self, params=None, **kwargs):
         _FakeRapidOCR.instances += 1
         self.params = params
 

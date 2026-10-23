@@ -547,7 +547,7 @@ class RAGEngine:
         ocr_vlm_handler: str = "",
         ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
-        pdf_small_concurrency: int = 2,
+        pdf_small_concurrency: int = 1,
         pdf_large_threshold_mb: float = 20.0,
     ):
         self._workspace = workspace

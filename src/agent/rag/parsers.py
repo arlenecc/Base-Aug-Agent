@@ -633,33 +633,44 @@ def _build_ocr_engine():
     引擎选择：优先 rapidocr 3.x（模型目录与 docling 共享、懒加载省内存），
     未安装再回退旧版 rapidocr-onnxruntime 1.x。
 
-    **一律使用默认 CPU EP**，不再启用 CoreML EP：实测 Apple Silicon 上
-    CoreML EP 反而比纯 CPU 更慢、且额外占用 ANE/GPU 与内存（与同进程里跑
-    MLX/Metal 的推理相互抢资源）。RapidOCR 现在只作为 ocrmac(Apple Vision)
-    **不可用时的兜底**，走稳不求快，CPU EP 足够。
+    **一律纯 CPU EP，禁用 CoreML EP（显式强制）**：Apple Silicon 上 RapidOCR
+    若走 CoreML EP 会抢 Apple Neural Engine(ANE)，而同进程里 ocrmac(Apple Vision)
+    也跑在 ANE 上——两者争抢 ANE 反而更慢、且额外吃 GPU/统一内存。RapidOCR 现在
+    只作为 ocrmac 不可用时的兜底，走稳不求快，纯 CPU EP 足够。
+
+    rapidocr 3.x 默认 use_coreml=false（即 CPU），但这里仍显式用 params 关掉，
+    以防默认配置被改；rapidocr_onnxruntime 1.x 则直接传 providers=['CPUExecutionProvider']。
+    两个实例（池内槽位）都走本函数，故都受同一约束。
     """
     global _OCR_RECYCLE_ENABLED
     try:
         try:
             from rapidocr import RapidOCR  # 3.x
+            engine = RapidOCR(
+                params={"EngineConfig.onnxruntime.use_coreml": False}
+            )
         except ImportError:
             from rapidocr_onnxruntime import RapidOCR  # 1.x 回退
-        # 不传 params → onnxruntime 默认 CPU EP。
-        engine = RapidOCR()
+            engine = RapidOCR(providers=["CPUExecutionProvider"])
         # 预热一次（空图）：提前加载模型并探测实际生效的 EP。
         # 模型本来马上就会被用到，预热同时消除首页 OCR 的加载延迟。
         try:
             import numpy as np
 
             engine(np.full((64, 64), 255, dtype=np.uint8))
+            # 三个子模型(det/rec/cls)共用同一份 EngineConfig，检查 det 即可代表全部。
             inner = getattr(getattr(engine, "text_det", None), "session", None)
             inner = getattr(inner, "session", inner)
-            logger.info("RapidOCR engine loaded, EP: %s", inner.get_providers())
+            provs = inner.get_providers()
+            logger.info("RapidOCR engine loaded, EP: %s", provs)
+            if any("CoreML" in str(p) for p in provs):
+                # 防御：理论上不应发生（已显式关闭），一旦发生会抢 ANE 与 ocrmac 冲突。
+                logger.error(
+                    "RapidOCR 意外启用了 CoreML EP（应为纯 CPU）：%s；"
+                    "CoreML 会抢 ANE、与 ocrmac 冲突，请检查 provider 配置", provs)
             # 周期重建仅对 CoreML EP 有意义（CPU EP 原生缓存不积累，见
             # _OCR_RECYCLE_PAGES 注释）。按实际生效 EP 打开开关。
-            _OCR_RECYCLE_ENABLED = any(
-                "CoreML" in str(p) for p in inner.get_providers()
-            )
+            _OCR_RECYCLE_ENABLED = any("CoreML" in str(p) for p in provs)
         except Exception:
             logger.info("RapidOCR engine loaded")
         return engine

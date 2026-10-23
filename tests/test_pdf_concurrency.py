@@ -1,7 +1,8 @@
 """PDF 转换按文件大小限流的并发测试（docling / marker / 闸门原语）。
 
 策略：
-  * 小文件（< 20MB）：最多 2 路并发转换，加快小文件吞吐；
+  * 小文件（< 20MB）：最多 ``_SMALL_FILE_CONCURRENCY`` 路并发（默认 1 = 单实例串行，省
+    ~1.9GB 统一内存；可在配置里把 ``rag_pdf_small_concurrency`` 调回 2 提速）；
   * 大文件（>= 20MB）：独占（1 路），防止大文件并发把内存撑爆。
 
 覆盖三层：``SizeAwareConversionGate`` 原语语义（含大文件优先、防饿死）、
@@ -222,7 +223,7 @@ def _sparse_pdf(path, size: int):
         f.truncate(size)  # 稀疏文件，秒建不占实际磁盘块
 
 
-def test_docling_small_files_run_two_concurrently(monkeypatch, tmp_path):
+def test_docling_small_files_run_up_to_small_concurrency(monkeypatch, tmp_path):
     from agent.rag import docling_parser as dp
 
     rec = _Concurrency()
@@ -237,7 +238,8 @@ def test_docling_small_files_run_two_concurrently(monkeypatch, tmp_path):
         files.append(str(p))
 
     _run_parallel([lambda f=f: dp._convert_with_scale(f, 2.0) for f in files])
-    assert rec.max == 2
+    # 小文件并发数 = _SMALL_FILE_CONCURRENCY（默认 1 = 单实例串行；可配置调回 2）。
+    assert rec.max == dp._SMALL_FILE_CONCURRENCY
 
 
 def test_docling_large_files_run_exclusively(monkeypatch, tmp_path):
@@ -281,7 +283,8 @@ def test_docling_large_file_excludes_concurrent_smalls(monkeypatch, tmp_path):
         [lambda: dp._convert_with_scale(str(big), 2.0)]
         + [lambda f=f: dp._convert_with_scale(f, 2.0) for f in smalls]
     )
-    assert rec.max == 2          # 大文件跑完后小文件仍可 2 路并发
+    # 大文件跑完后，小文件仍按小文件并发数并发（默认 1 = 单实例串行）。
+    assert rec.max == dp._SMALL_FILE_CONCURRENCY
     assert not rec.large_overlapped
 
 
@@ -303,7 +306,7 @@ def _marker_fake(rec: _Concurrency, sleep: float = 0.05):
     return _Conv()
 
 
-def test_marker_small_files_run_two_concurrently(monkeypatch, tmp_path):
+def test_marker_small_files_run_up_to_small_concurrency(monkeypatch, tmp_path):
     from agent.rag import marker_parser as mp
 
     rec = _Concurrency()
@@ -317,7 +320,8 @@ def test_marker_small_files_run_two_concurrently(monkeypatch, tmp_path):
         files.append(str(p))
 
     _run_parallel([lambda f=f: mp.extract_markdown(f) for f in files])
-    assert rec.max == 2
+    # 小文件并发数 = _SMALL_FILE_CONCURRENCY（默认 1；可配置调回 2）。
+    assert rec.max == mp._SMALL_FILE_CONCURRENCY
 
 
 def test_marker_large_files_run_exclusively(monkeypatch, tmp_path):
