@@ -187,6 +187,128 @@ def test_llamacpp_kv_cache_invalidate_noop_when_disabled(monkeypatch):
         backend.close()
 
 
+def _make_fake_onnx_llm(inputs=None, **cfg_over):
+    """构造注入了假 session/tokenizer 的 ONNXLanguageBackend，跑生成回路。
+
+    本地没有 decoder ONNX 权重、无法真正加载；这里绕过 _ensure_loaded，直接注入
+    假 InferenceSession（get_inputs/run）与假 tokenizer，验证 chat_stream 的
+    prompt→feeds→run→sample→eos→增量 decode→流式→done 全链路与报错路径。
+    ``inputs`` 为 ``[(name, shape), ...]``，用于模拟不同的 ONNX 图输入。
+    """
+    import threading
+
+    import numpy as np
+
+    from agent.model_backends import ONNXLanguageBackend
+
+    class _FakeInput:
+        def __init__(self, name, shape):
+            self.name, self.shape = name, shape
+
+    class _FakeSession:
+        # 当前序列长 L -> 下一 token：5->10,6->11,7->12,8->99(eos)
+        _NEXT = {5: 10, 6: 11, 7: 12, 8: 99}
+
+        def __init__(self, inputs):
+            self._inputs = inputs
+
+        def get_inputs(self):
+            return self._inputs
+
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+        def run(self, outputs, feeds):
+            ids = np.asarray(feeds["input_ids"])
+            length = ids.shape[1]
+            logits = np.zeros((1, length, 100), dtype=np.float32)
+            logits[0, -1, self._NEXT.get(length, 99)] = 100.0
+            return [logits]
+
+    class _FakeTok:
+        eos_token_id = 99
+
+        def apply_chat_template(self, messages, **kw):
+            return "PROMPT"
+
+        def __call__(self, text, return_tensors="np", **kw):
+            return {"input_ids": np.array([[1, 2, 3, 4, 5]], dtype=np.int64),
+                    "attention_mask": np.ones((1, 5), dtype=np.int64)}
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join({10: "A", 11: "B", 12: "C"}.get(int(i), "?") for i in ids)
+
+    cfg = AgentConfig()
+    cfg.temperature = 0.0
+    cfg.max_tokens = 64
+    for k, v in cfg_over.items():
+        setattr(cfg, k, v)
+
+    be = ONNXLanguageBackend.__new__(ONNXLanguageBackend)
+    be.config = cfg
+    be.model = "fake.onnx"
+    be.model_path = "/tmp/fake.onnx"
+    be._closed = False
+    be._load_lock = threading.RLock()
+    be._generation_lock = threading.RLock()
+    be._session = _FakeSession([_FakeInput(n, s) for n, s in (
+        inputs if inputs is not None
+        else [("input_ids", [1, -1]), ("attention_mask", [1, -1])])])
+    be._tokenizer = _FakeTok()
+    be._processor = None
+    be._model_file = "/tmp/fake.onnx"
+    return be
+
+
+def test_onnx_llm_chat_stream_generates_and_stops_on_eos():
+    """ONNXLanguageBackend 生成回路：贪心解码出 ABC、命中 eos 停止、上报用量。"""
+    be = _make_fake_onnx_llm()
+    events = list(be.chat_stream(
+        [{"role": "user", "content": "hi"}], tools=None, temperature=0.0))
+    content = "".join(e.content for e in events if e.type == "content")
+    done = [e for e in events if e.type == "done"]
+    assert content == "ABC", repr(content)
+    assert len(done) == 1
+    assert done[0].usage["prompt_tokens"] == 5
+    assert done[0].usage["completion_tokens"] == 3
+    assert done[0].finish_reason == "stop"
+
+
+def test_onnx_llm_feeds_unknown_input_raises_actionable_error():
+    """ONNX 图含无法自动构造的必需输入时，应抛出点名该输入的可操作错误。"""
+    from agent.llm_client import LLMError
+
+    be = _make_fake_onnx_llm(inputs=[
+        ("input_ids", [1, -1]), ("attention_mask", [1, -1]), ("weird_input", [1, -1])])
+    with pytest.raises(LLMError) as ei:
+        list(be.chat_stream([{"role": "user", "content": "hi"}], temperature=0.0))
+    assert "weird_input" in str(ei.value)
+
+
+def test_onnx_llm_rejects_non_generation_logits():
+    """输出不是 [batch, seq, vocab] logits（如分类/Embedding 模型）应明确报错。"""
+    import numpy as np
+
+    from agent.llm_client import LLMError
+
+    be = _make_fake_onnx_llm()
+
+    class _FlatSession:
+        def get_inputs(self):
+            return [type("I", (), {"name": "input_ids", "shape": [1, -1]})(),
+                    type("I", (), {"name": "attention_mask", "shape": [1, -1]})()]
+
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+        def run(self, outputs, feeds):
+            return [np.zeros((1, 100), dtype=np.float32)]  # 2D，非 logits
+
+    be._session = _FlatSession()
+    with pytest.raises(LLMError):
+        list(be.chat_stream([{"role": "user", "content": "hi"}], temperature=0.0))
+
+
 def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
     """#159：统一 MLX 内存策略必须把 buffer cache 从默认 95% RAM 封顶到 ~6GB
     （避免 prefill 长上下文时大注意力矩阵每步反复释放重分配 → 生成抖动卡顿），
