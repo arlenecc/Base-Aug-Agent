@@ -1402,12 +1402,12 @@ class RAGEngine:
                         "  [消费 %d] 向量化排队: %s (%d 个切片等待嵌入)",
                         consumer_file_no, fname, n_chunks,
                     )
-                    # Update manifest for this processed file.
-                    # 先记到 pending，等 add_streaming 整体成功后才并入
-                    # new_manifest（见下方 except/cancel 分支）：旧实现在产出
-                    # chunks 的同时就写 manifest，一旦后续 embedding/写库失败
-                    # 或用户中途取消，文件只入库了一部分，manifest 却已记录
-                    # 完成——下次同步因 mtime/size 未变被跳过，内容永久缺失。
+                    # 先把这份待入库记录记到 pending（含签名/content_hash/切片数）。
+                    # 它何时「算完成」并入 new_manifest 并落盘，取决于切片是否真的
+                    # 全部提交：既有下方 except/cancel 分支的「整体成功/已完整入库」
+                    # 兜底，也有 _on_batch 里的「逐文件增量落盘」——只要该文件累计
+                    # 切片数 <= 已提交数就立即写 manifest，进程被直接杀掉也不会让
+                    # 已完成的文件下次重做（半截文件不会触发、幂等重做）。
                     try:
                         pending_manifest[filepath] = {
                             **_file_signature(filepath),
@@ -1433,6 +1433,23 @@ class RAGEngine:
             def _on_batch(batch_added: int, total_added: int) -> None:
                 # 记录已提交切片数：取消/失败时据此判断哪些文件已完整入库。
                 committed_chunks["n"] = total_added
+                # 增量落盘：某个文件的所有切片都已提交（cum <= total_added）即视为
+                # 该文件「全流程完成」（解析/清洗/切片/向量化/入库），立刻把它写进
+                # manifest。这样即使进程被直接杀掉（非点「停止同步」），已完成的文件
+                # 下次同步也会因 mtime/size 未变被跳过，不会从头重做；只写了一半的
+                # 文件不会触发此处、下次幂等重做（add_streaming 先按 source 删旧再插）。
+                for _fp, _n, _cum in written_files:
+                    if _cum <= total_added and _fp not in new_manifest:
+                        _entry = pending_manifest.get(_fp)
+                        if _entry is not None:
+                            new_manifest[_fp] = _entry
+                            try:
+                                _save_manifest(self._rag_dir, {_fp: _entry})
+                                _log("  ├─ 已完整入库，增量保存同步记录: %s",
+                                     os.path.basename(_fp))
+                            except OSError as e:
+                                logger.warning(
+                                    "RAG: 增量保存同步记录失败（不影响本次同步）: %s", e)
                 _mem_mark(f"向量化批次 +{batch_added} (累计 {total_added})")
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:

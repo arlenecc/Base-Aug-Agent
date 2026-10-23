@@ -526,6 +526,67 @@ def test_cancelled_sync_keeps_completed_files_and_resumes(tmp_path):
     assert len(_load_manifest(engine._rag_dir)) == 2
 
 
+def test_completed_file_checkpointed_to_manifest_per_file(tmp_path, monkeypatch):
+    """每个文件全流程（解析/切片/向量化/入库）完成后立即写入 manifest，而不必等
+    收尾的整批保存；这样进程被直接杀掉（非点「停止同步」）时，已完成的文件也已
+    落盘，下次同步会因 mtime/size 未变被跳过，不会从头重做。
+
+    用「逐文件调用 on_batch（累计数）」的假 store 模拟真实写入节奏，并 spy 每次
+    _save_manifest 的入参，断言存在「只保存单个文件」的增量落盘调用。
+    """
+
+    class _FakeStorePerFile(_FakeStore):
+        def add_streaming(self, chunk_iter, batch_size=100, on_batch=None, is_cancelled=None):
+            added = 0
+            cur_src = None
+            buf = []
+            for chunk in chunk_iter:
+                src = chunk.get("source", "")
+                if src != cur_src:
+                    if buf:
+                        added += len(buf)
+                        self.records.extend(buf)
+                        buf = []
+                        if on_batch:
+                            on_batch(len(self.records[-added:]), added)
+                    cur_src = src
+                buf.append(chunk)
+            if buf:
+                added += len(buf)
+                self.records.extend(buf)
+                if on_batch:
+                    on_batch(len(buf), added)
+            self._count += added
+            return added
+
+    import agent.rag.engine as engine_mod
+
+    saved_calls: list = []
+    orig_save = engine_mod._save_manifest
+
+    def _spy_save(rag_dir, files, removed=None):
+        saved_calls.append(set(files.keys()))
+        return orig_save(rag_dir, files, removed)
+
+    monkeypatch.setattr(engine_mod, "_save_manifest", _spy_save)
+
+    store = _FakeStorePerFile()
+    engine, kb = _make_engine(tmp_path, store)
+    _make_two_file_kb(engine)
+
+    stats = engine.ingest(force=False)
+    assert stats["files_extracted"] == 2
+
+    # 至少存在「只保存单个文件」的增量落盘调用（证明逐文件 checkpoint）
+    single_file_saves = [s for s in saved_calls if len(s) == 1]
+    assert single_file_saves, "应存在逐文件增量保存 manifest 的调用"
+    saved_names = {os.path.basename(n) for s in single_file_saves for n in s}
+    assert saved_names == {"a.txt", "b.txt"}, saved_names
+
+    # 最终 manifest 仍含两个文件
+    assert len(_load_manifest(engine._rag_dir)) == 2
+
+
 def test_cancelled_mid_file_keeps_nothing(tmp_path):
     """取消发生在第一个文件内部（只写了一半）时，不写任何记录。"""
     engine, kb = _make_engine(tmp_path, _FakeStore())
