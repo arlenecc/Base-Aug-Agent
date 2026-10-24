@@ -941,6 +941,13 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 gen_kwargs["prefill_step_size"] = max(
                     512, int(getattr(self.config, "local_llm_prompt_batch_size", 4096))
                 )
+                # KV cache int8 量化（省显存）：MLX 默认不量化。整段量化
+                # （quantized_kv_start=0）——agent 上下文常 <5000 token，用默认
+                # 起点(5000)会完全不量化而达不到省内存目的。仅对支持量化的缓存层
+                # 生效，不支持的架构由 mlx_lm 自动跳过，不会报错。
+                gen_kwargs["kv_bits"] = 8
+                gen_kwargs["kv_group_size"] = 64
+                gen_kwargs["quantized_kv_start"] = 0
                 # 投机解码：草稿模型 = 已加载的辅助模型（同词表，无需额外加载）。
                 # 注意：mlx_lm 要求 prompt cache 可裁剪才允许投机解码，而 qwen3.5
                 # 的 ArraysCache 不可裁剪 → 传 prompt_cache 时必须关掉，否则
@@ -1173,6 +1180,10 @@ class MLXVLMBackend(_LazyLocalBackend):
                     "max_tokens": int(getattr(self.config, "max_tokens", 32768)),
                     "sampler": sampler,
                     "verbose": False,
+                    # KV cache int8 量化（省显存），同 MLX 文本后端：整段量化。
+                    "kv_bits": 8,
+                    "kv_group_size": 64,
+                    "quantized_kv_start": 0,
                 }
                 for response in stream_generate(
                     self._model_obj,
@@ -1557,6 +1568,7 @@ class LlamaCppBackend(_LazyLocalBackend):
             if self._llama is not None:
                 return
             try:
+                import llama_cpp
                 from llama_cpp import Llama
             except ImportError as e:
                 raise LLMError(
@@ -1571,6 +1583,9 @@ class LlamaCppBackend(_LazyLocalBackend):
                 chat_format=getattr(self.config, "llm_chat_format", "") or None,
                 chat_handler=self._chat_handler(),
                 verbose=False,
+                # KV cache int8 量化（省显存）：默认 f16 → q8_0，KV 显存减半。
+                type_k=llama_cpp.GGML_TYPE_Q8_0,
+                type_v=llama_cpp.GGML_TYPE_Q8_0,
             )
             if self._kv_cache_enabled:
                 self._attach_kv_cache()
