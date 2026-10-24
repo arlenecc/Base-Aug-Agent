@@ -34,19 +34,25 @@ def _get_skill_index(config: AgentConfig, registry: ToolRegistry) -> SkillIndex:
 
     构造 SkillIndex 会全目录扫描并可能落盘 —— 无锁时并发首次调用会产生两个
     实例（后写者覆盖缓存，前者泄漏一份扫描结果）。
+
+    索引同时覆盖两个技能根：``<ws>/.agent/skills``（skill.json + prompt.md）与
+    ``<ws>/skills``（SKILL.md）——否则新体系的技能只能被语义检索命中，关键词
+    检索和自动注入都拿不到。
     """
     skills_dir = os.path.join(config.workspace, ".agent", "skills")
+    extra_dir = os.path.join(config.workspace, "skills")
+    cache_key = skills_dir + "\n" + extra_dir
     with _skill_index_lock:
         cache = getattr(registry, "_skill_index_cache", None)
         if isinstance(cache, dict):
-            idx = cache.get(skills_dir)
+            idx = cache.get(cache_key)
             if idx is not None:
                 return idx
         else:
             cache = {}
             setattr(registry, "_skill_index_cache", cache)
-        idx = SkillIndex(skills_dir)
-        cache[skills_dir] = idx
+        idx = SkillIndex(skills_dir, extra_dirs=[extra_dir])
+        cache[cache_key] = idx
         # Keep the legacy attribute in sync so shutdown()/other callers still see it.
         setattr(registry, "_skill_index", idx)
         return idx

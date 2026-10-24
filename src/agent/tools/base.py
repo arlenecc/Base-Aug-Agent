@@ -332,27 +332,34 @@ class ToolRegistry:
     def get_skill_retriever(self):
         """Return the shared SkillRetriever (hybrid skill search), lazily built.
 
-        The retriever scans ``<workspace>/skills`` for SKILL.md files and builds
-        a LanceDB table (embeddings + BM25).  Building is lazy: the first call
-        triggers scanning + indexing (can be slow for thousands of skills), so
-        it is cached on the registry and rebuilt on subsequent calls only if
-        the skills directory changed.
+        The retriever scans the workspace's skill roots for skills and builds a
+        LanceDB table (embeddings + BM25).  **Both layouts are indexed together** —
+        ``<workspace>/skills/*/SKILL.md`` (new) and ``<workspace>/.agent/skills/*``
+        (legacy skill.json + prompt.md) — so a skill is findable no matter which
+        directory it lives in.  Building is lazy: the first call triggers scanning
+        + indexing (can be slow for thousands of skills), so it is cached on the
+        registry and rebuilt on subsequent calls only if the skills directories
+        changed.
         """
-        # 缓存按 skills_dir 区分：「应用配置」切换 workspace 后，复用旧目录的
-        # retriever 会检索到错误工作区的技能。
-        skills_dir = os.path.join(self.config.workspace, "skills")
+        # 缓存按根集合区分：「应用配置」切换 workspace 后，复用旧目录的 retriever
+        # 会检索到错误工作区的技能。
+        skills_dirs = [
+            os.path.join(self.config.workspace, "skills"),
+            os.path.join(self.config.workspace, ".agent", "skills"),
+        ]
+        cache_key = "\n".join(skills_dirs)
         cache = getattr(self, "_skill_retriever_cache", None)
         if not isinstance(cache, dict):
             cache = {}
             setattr(self, "_skill_retriever_cache", cache)
-        retriever = cache.get(skills_dir)
+        retriever = cache.get(cache_key)
         if retriever is not None:
             return retriever
         # 首次构建是重活（扫描 + LanceDB 建表 + embedding），且 agent 线程与
         # UI 线程可能并发首次调用：不加锁会各建一个 SkillRetriever，后写者
         # 覆盖属性，先建的 LanceDB 连接泄漏（shutdown 只回收缓存里的那个）。
         with self._retriever_lock:
-            retriever = cache.get(skills_dir)
+            retriever = cache.get(cache_key)
             if retriever is not None:
                 return retriever
             # 创建后复查关闭标志（与 _get_long_memory 同源竞态）：若 shutdown() 已
@@ -372,7 +379,7 @@ class ToolRegistry:
             )
             from ..skill_retriever import SkillRetriever
             retriever = SkillRetriever(
-                skills_dir=skills_dir,
+                skills_dir=skills_dirs,
                 db_path=db_path,
                 embedding_function=embedding_function,
             )
@@ -382,7 +389,7 @@ class ToolRegistry:
                 except Exception:
                     pass
                 return None
-            cache[skills_dir] = retriever
+            cache[cache_key] = retriever
             setattr(self, "_skill_retriever", retriever)
             return retriever
 

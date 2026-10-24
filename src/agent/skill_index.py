@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 _INDEX_FILENAME = "_index.json"
 _SKILL_META_FILENAME = "skill.json"
+_SKILL_MD_FILENAME = "SKILL.md"
 _DEFAULT_ENTRY = "prompt.md"
 _SCAN_INTERVAL = 300  # seconds between automatic scans (5 min)
 # entry 文件读取上限（字符）：内容会原样进入模型上下文。
@@ -75,8 +76,17 @@ class SkillIndex:
     _SCAN_INTERVAL seconds and no files have changed, it's a no-op.
     """
 
-    def __init__(self, skills_dir: str):
+    def __init__(self, skills_dir: str, extra_dirs=()):
         self._dir = skills_dir
+        # 额外技能根（如 <ws>/skills）。两套目录布局用同一个关键词索引覆盖，
+        # 否则新体系的技能只能被语义检索命中、关键词检索和自动注入都拿不到。
+        self._extra_dirs = [
+            d for d in extra_dirs
+            if d and os.path.realpath(d) != os.path.realpath(skills_dir)
+        ]
+        self._roots = [skills_dir] + self._extra_dirs
+        # workspace 根：用于把额外根里的技能映射成跨根唯一的 path。
+        self._ws = os.path.dirname(os.path.dirname(os.path.abspath(skills_dir)))
         self._index_path = os.path.join(skills_dir, _INDEX_FILENAME)
         self._lock = threading.Lock()
         self._index: List[Dict[str, Any]] = []
@@ -169,34 +179,29 @@ class SkillIndex:
         return False
 
     def _dir_mtime(self) -> float:
-        """Get the most recent mtime among skill subdirectories *and* their
-        ``skill.json`` metadata files.
-
-        Stat-ing only the subdirectories (the old behaviour) misses the common
-        edit case: rewriting ``skill.json``/``prompt.md`` does not change the
-        parent directory's mtime, so the index stayed stale for up to
-        ``_SCAN_INTERVAL`` seconds after a skill was edited.
-        """
+        """Most recent mtime of any skill entry file across all roots."""
+        entry_names = {_SKILL_META_FILENAME, _SKILL_MD_FILENAME, "prompt.md"}
         max_mtime = 0.0
-        if not os.path.isdir(self._dir):
-            return 0.0
-        try:
-            mtime = os.stat(self._dir).st_mtime
-            if mtime > max_mtime:
-                max_mtime = mtime
-        except OSError:
-            pass
-        for entry in os.scandir(self._dir):
-            if not entry.is_dir() or entry.name.startswith("_"):
+        for root in self._roots:
+            if not os.path.isdir(root):
                 continue
             try:
-                mtime = entry.stat(follow_symlinks=False).st_mtime
-                if mtime > max_mtime:
-                    max_mtime = mtime
-                meta = os.path.join(entry.path, _SKILL_META_FILENAME)
-                mtime = os.stat(meta).st_mtime
-                if mtime > max_mtime:
-                    max_mtime = mtime
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames
+                                   if not d.startswith(("_", "."))]
+                    try:
+                        mtime = os.stat(dirpath).st_mtime
+                        if mtime > max_mtime:
+                            max_mtime = mtime
+                    except OSError:
+                        pass
+                    for name in entry_names & set(filenames):
+                        try:
+                            mtime = os.stat(os.path.join(dirpath, name)).st_mtime
+                            if mtime > max_mtime:
+                                max_mtime = mtime
+                        except OSError:
+                            pass
             except OSError:
                 pass
         return max_mtime
@@ -210,37 +215,105 @@ class SkillIndex:
             if not force and not self._should_scan():
                 return len(self._index)
 
-            if not os.path.isdir(self._dir):
-                # 目录不存在时同样要更新 _last_scan/_last_dir_mtime，否则
-                # _should_scan() 永远为真：每次 search() 都会 makedirs +
-                # 重写一遍 _index.json（无谓的磁盘写入，且目录被外部创建后
-                # 也感知不到）。
-                self._index = []
-                self._last_scan = time.time()
-                self._last_dir_mtime = 0.0
-                return 0
-
             new_index: List[Dict[str, Any]] = []
-            for entry in os.scandir(self._dir):
-                if not entry.is_dir():
+            seen_paths: set = set()
+            for root in self._roots:
+                if not os.path.isdir(root):
                     continue
-                if entry.name.startswith("_") or entry.name.startswith("."):
+                try:
+                    entries = list(os.scandir(root))
+                except OSError:
                     continue
-                skill_dir = entry.path
-                meta_path = os.path.join(skill_dir, _SKILL_META_FILENAME)
-                if not os.path.isfile(meta_path):
-                    # Not a skill directory (no skill.json)
-                    continue
-                record = self._read_skill_meta(entry.name, skill_dir, meta_path)
-                if record:
-                    new_index.append(record)
+                for entry in entries:
+                    if not entry.is_dir():
+                        continue
+                    if entry.name.startswith(("_", ".")):
+                        continue
+                    record = self._read_dir_meta(root, entry.name, entry.path)
+                    if record and record["path"] not in seen_paths:
+                        seen_paths.add(record["path"])
+                        new_index.append(record)
 
             self._index = new_index
             self._last_scan = time.time()
             self._last_dir_mtime = self._dir_mtime()
             self._save()
-            logger.info("skill_index: indexed %d skills from %s", len(new_index), self._dir)
+            logger.info("skill_index: indexed %d skills from %s",
+                        len(new_index), self._roots)
             return len(new_index)
+
+    def _read_dir_meta(self, root: str, dirname: str,
+                       skill_dir: str) -> Optional[Dict[str, Any]]:
+        """Read one skill directory, supporting both on-disk layouts.
+
+        * legacy — ``skill.json`` (+ ``prompt.md``);
+        * new — ``SKILL.md`` with YAML frontmatter.
+
+        ``path`` is the bare directory name inside the primary root (backwards
+        compatible) and workspace-relative inside extra roots (``skills/x``),
+        so ids stay unique across roots.
+        """
+        meta_path = os.path.join(skill_dir, _SKILL_META_FILENAME)
+        if os.path.isfile(meta_path):
+            record = self._read_skill_meta(dirname, skill_dir, meta_path)
+            if record is None:
+                return None
+            if os.path.realpath(root) != os.path.realpath(self._dir):
+                record["path"] = self._ws_rel(skill_dir)
+            return record
+        md_path = os.path.join(skill_dir, _SKILL_MD_FILENAME)
+        if os.path.isfile(md_path):
+            return self._read_skill_md(skill_dir, md_path)
+        return None
+
+    def _ws_rel(self, skill_dir: str) -> str:
+        """Workspace-relative id for a skill dir (falls back to abs path)."""
+        try:
+            rel = os.path.relpath(skill_dir, self._ws)
+        except ValueError:
+            return skill_dir
+        return rel if not rel.startswith("..") else skill_dir
+
+    def _read_skill_md(self, skill_dir: str, md_path: str) -> Optional[Dict[str, Any]]:
+        """Build an index record from a SKILL.md's YAML frontmatter."""
+        try:
+            with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            logger.warning("skill_index: failed to read %s: %s", md_path, e)
+            return None
+        m = re.match(r"\A---\s*\n(.*?)\n---\s*\n?", text, re.DOTALL)
+        meta: Dict[str, Any] = {}
+        if m:
+            for line in m.group(1).splitlines():
+                if ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                key = key.strip().lower()
+                value = value.strip().strip('"').strip("'")
+                if key == "name":
+                    meta["name"] = value
+                elif key == "description":
+                    meta["description"] = value
+                elif key in ("tags", "keywords"):
+                    inner = value.strip().lstrip("[").rstrip("]")
+                    meta["tags"] = [t.strip().strip('"').strip("'")
+                                    for t in inner.split(",") if t.strip()]
+        name = str(meta.get("name") or "").strip()
+        if not name:
+            return None
+        keywords = [str(k).lower() for k in (meta.get("keywords") or [])]
+        tags = [str(t).lower() for t in (meta.get("tags") or [])]
+        desc = str(meta.get("description") or "").strip()
+        return {
+            "name": name,
+            "description": desc,
+            "keywords": keywords or tags,
+            "tags": tags or keywords,
+            "path": self._ws_rel(skill_dir),
+            "entry": _SKILL_MD_FILENAME,
+            "updated_at": _now_iso(),
+        }
 
     def _read_skill_meta(
         self, dirname: str, skill_dir: str, meta_path: str
@@ -353,17 +426,50 @@ class SkillIndex:
         return [s for _, s in scored[:top_k]]
 
     def _resolve_within(self, *parts: str) -> Optional[str]:
-        """Resolve parts under the skills dir, rejecting path traversal.
+        """Resolve parts under a skill root, rejecting path traversal.
 
-        Returns the absolute path if it stays inside self._dir, else None.
-        The LLM supplies `path`/`entry` strings, so we must defend against
-        e.g. path="../../../../etc" or entry="../../../secret".
+        Accepts the several ``path`` spellings the index and its callers use:
+        the bare directory name inside the primary root (``docx-convert``), a
+        workspace-relative id (``skills/pdf-x`` / ``.agent/skills/docx-c``), or
+        an absolute path.  Returns the absolute path only when it lands inside
+        one of the registered roots — the LLM supplies these strings, so
+        ``path="../../../../etc"`` and ``entry="../../../secret"`` must not
+        resolve.
         """
-        base = os.path.realpath(self._dir)
-        resolved = os.path.realpath(os.path.join(base, *parts))
-        if resolved == base or not resolved.startswith(base + os.sep):
+        cleaned = [str(p) for p in parts if p]
+        if not cleaned:
             return None
-        return resolved
+        head = cleaned[0].replace("\\", "/")
+        # 只去掉开头的 "./" 段：lstrip("./") 会把 ".agent/..." 的点一起吞掉，
+        # 使 workspace 相对 id 解析成错误的路径。
+        rel = re.sub(r"^(?:\./)+", "", head)
+        bases: List[str] = []
+        if os.path.isabs(rel):
+            bases.append(os.path.realpath(rel))
+        else:
+            for root in self._roots:
+                bases.append(os.path.realpath(os.path.join(root, rel)))
+            if self._ws:
+                bases.append(os.path.realpath(os.path.join(self._ws, rel)))
+        contained: List[str] = []
+        for base in bases:
+            resolved = os.path.realpath(os.path.join(base, *cleaned[1:]))
+            # 必须严格位于某个技能根之内（等于根本身视为越界）。
+            for root in self._roots:
+                root_real = os.path.realpath(root)
+                if resolved.startswith(root_real + os.sep):
+                    contained.append(resolved)
+                    break
+        if not contained:
+            return None
+        # 同一 id 在多个根下都"合法"时，优先返回真实存在的那个（例如
+        # "skills/pdf-x" 在 <ws>/.agent/skills 下也有个合法的拼接口径，但那里
+        # 并没有这个目录）。都不存在时返回第一个，让调用方的 open() 走它
+        # 原有的"读取失败"分支，而不是被误判成路径穿越。
+        for resolved in contained:
+            if os.path.exists(resolved):
+                return resolved
+        return contained[0]
 
     def get_skill_path(self, skill_path: str) -> Optional[str]:
         """Return the absolute path to a skill directory by its relative path."""
@@ -412,17 +518,22 @@ class SkillIndex:
 
 import re
 
-_TOKEN_RE = re.compile(r"\w+")
-# 中文没有空格，\w+ 会把连续中文当成一个整体 token，与 name/keywords 的
-# token 集合做交集恒为空——未空格的中文查询（"提取pdf表格"）检索不到任何
-# 技能。与 skills.py 的 _keywords_of 对齐：CJK 连续段额外产出整段与二元组。
+_TO_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z]+|[0-9]+")
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 
 
 def _tokenize(text: str) -> List[str]:
-    toks = [w.lower() for w in _TOKEN_RE.findall(text)]
-    for run in _CJK_RUN_RE.findall(text):
-        toks.append(run)
-        for i in range(len(run) - 1):
-            toks.append(run[i:i + 2])
+    """按字script切分：CJK 串、拉丁词、数字串各自独立成 token。
+
+    ``\\w+`` 会把「帮我提取pdf里的表格」整个当成一个 token（CJK 与拉丁都是
+    ``\\w``），于是技能关键词里的 ``pdf`` / ``docx`` / ``api`` 永远匹配不上——
+    而真实意图几乎全是中文夹英文术语，关键词检索会静默失效。CJK 串额外产出
+    整段与二元组，让「提取」能命中「提取pdf表格」。
+    """
+    toks: List[str] = []
+    for run in _TO_TOKEN_RE.findall(text):
+        toks.append(run.lower())
+        if _CJK_RUN_RE.fullmatch(run):
+            for i in range(len(run) - 1):
+                toks.append(run[i:i + 2])
     return toks

@@ -21,6 +21,7 @@ function (nomic-embed-text-v1.5).
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -42,7 +43,12 @@ _SKILL_TABLE_NAME = "skills"
 _DESC_WEIGHT = 0.6
 _EXAMPLES_WEIGHT = 0.4
 # Minimum similarity for a candidate to survive filtering.
-_MIN_SIMILARITY = 0.5
+# 0.5 太松：单个 nomic 嵌入模型下 0.5–0.65 是「什么都沾一点」的区间，实测会把
+# 不相关的技能以 0.51/0.64 混进候选（把文档转成docx → 语义返回 pdf-table-extract
+# 0.513 排第一），全靠 LLM 二次裁决。提到 0.7 后只剩高置信匹配，代价是跨语种的
+# 边缘正确匹配（中文短意图常见 0.6 左右）会被滤掉——此时应让调用方改关键词或
+# 走关键词检索，而不是把噪声塞给模型。
+_MIN_SIMILARITY = 0.7
 # Number of candidates from each channel (vector / BM25).
 _VECTOR_TOP_K = 3
 _BM25_TOP_K = 3
@@ -267,49 +273,73 @@ def parse_skill_md(text: str, dir: str) -> Optional[SkillMetadata]:
 # ---------------------------------------------------------------------------
 
 class SkillScanner:
-    """Recursively scan a skills directory for SKILL.md files.
+    """Recursively scan one or more skill roots for skills.
 
-    Thread-safe; debounced like SkillIndex — a rescan is triggered when the
-    directory mtime changes or the interval elapses.
+    Two on-disk layouts are supported so a single retrieval surface covers both:
+
+    * **new layout** — ``<root>/<name>/SKILL.md`` (YAML frontmatter + body);
+    * **legacy layout** — ``<root>/<name>/skill.json`` + ``prompt.md``.  The
+      metadata is read from ``skill.json`` and the body from ``prompt.md``, then
+      synthesised into the same shape the SKILL.md parser produces.
+
+    ``dir`` values are relative to ``base`` (the workspace), so a skill's id is
+    unambiguous across roots (``skills/pdf-x`` vs ``.agent/skills/docx``) and
+    :meth:`SkillRetriever.read_skill_dir` can resolve either one.
+
+    Thread-safe; debounced like SkillIndex — a rescan is triggered when any
+    root's mtime changes or the interval elapses.
     """
 
-    def __init__(self, skills_dir: str, scan_interval: float = 300.0):
-        self._dir = skills_dir
+    def __init__(self, skills_dirs, base: str = "", scan_interval: float = 300.0):
+        if isinstance(skills_dirs, str):
+            skills_dirs = [skills_dirs]
+        self._dirs = [os.path.realpath(d) for d in skills_dirs if d]
+        self._base = os.path.realpath(base) if base else (
+            os.path.dirname(self._dirs[0]) if self._dirs else "")
         self._scan_interval = scan_interval
         self._lock = threading.Lock()
         self._skills: List[SkillMetadata] = []
         self._last_scan = 0.0
         self._last_mtime = 0.0
 
-    def _dir_mtime(self) -> float:
-        """Most recent mtime of any SKILL.md (plus its parent dirs).
+    @property
+    def _dir(self) -> str:
+        """Primary root (kept for backwards compatibility)."""
+        return self._dirs[0] if self._dirs else ""
 
-        We deliberately stat only directories and ``SKILL.md`` files: walking
-        and stat-ing *every* file (the old behaviour) is O(files) syscalls, and
-        ``_should_scan()`` + ``scan()`` each called it — two full tree walks per
-        query on a skills tree that can hold thousands of directories.
+    def _dir_mtime(self) -> float:
+        """Most recent mtime of any skill entry file (plus their parent dirs).
+
+        We deliberately stat only directories and the known entry filenames:
+        walking and stat-ing *every* file (the old behaviour) is O(files)
+        syscalls, and ``_should_scan()`` + ``scan()`` each called it — two full
+        tree walks per query on a skills tree that can hold thousands of
+        directories.
         """
         max_mtime = 0.0
-        if not os.path.isdir(self._dir):
-            return 0.0
-        try:
-            for root, dirs, files in os.walk(self._dir):
-                dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
-                try:
-                    mtime = os.stat(root).st_mtime
-                    if mtime > max_mtime:
-                        max_mtime = mtime
-                except OSError:
-                    pass
-                if _SKILL_FILENAME in files:
+        entry_names = {_SKILL_FILENAME, "skill.json", "prompt.md"}
+        for base_dir in self._dirs:
+            if not os.path.isdir(base_dir):
+                continue
+            try:
+                for root, dirs, files in os.walk(base_dir):
+                    dirs[:] = [d for d in dirs
+                               if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
                     try:
-                        mtime = os.stat(os.path.join(root, _SKILL_FILENAME)).st_mtime
+                        mtime = os.stat(root).st_mtime
                         if mtime > max_mtime:
                             max_mtime = mtime
                     except OSError:
                         pass
-        except OSError:
-            pass
+                    for name in entry_names & set(files):
+                        try:
+                            mtime = os.stat(os.path.join(root, name)).st_mtime
+                            if mtime > max_mtime:
+                                max_mtime = mtime
+                        except OSError:
+                            pass
+            except OSError:
+                pass
         return max_mtime
 
     def _should_scan(self) -> bool:
@@ -324,33 +354,97 @@ class SkillScanner:
             pass
         return False
 
+    def _rel_dir(self, root: str) -> str:
+        """Compute the ``dir`` id for a skill directory.
+
+        * 主根（roots[0]，通常是 ``<ws>/skills``）下的技能 → 相对主根的目录名，
+          与旧的单根语义一致（``finance/invoice``），避免破坏既有调用与测试。
+        * 其它根（如 ``<ws>/.agent/skills``）下的技能 → 相对 workspace 的 id
+          （``.agent/skills/docx``），保证跨根唯一；``read_skill_dir`` 两种写法
+          都能解析。
+        """
+        primary = self._dirs[0] if self._dirs else ""
+        if primary and (root == primary or root.startswith(primary + os.sep)):
+            rel = os.path.relpath(root, primary)
+            return "" if rel == "." else rel
+        if self._base and (root == self._base or root.startswith(self._base + os.sep)):
+            rel = os.path.relpath(root, self._base)
+            return "" if rel == "." else rel
+        return root
+
+    def _read_text(self, path: str) -> Optional[str]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("skill_retriever: failed to read %s: %s", path, e)
+            return None
+
+    def _legacy_skill_md(self, root: str) -> Optional[str]:
+        """Synthesise a SKILL.md-equivalent text from a legacy skill.json + prompt.md."""
+        meta_path = os.path.join(root, "skill.json")
+        if not os.path.isfile(meta_path):
+            return None
+        raw = self._read_text(meta_path)
+        if raw is None:
+            return None
+        try:
+            meta = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(meta, dict) or not meta.get("name"):
+            return None
+        prompt = ""
+        for entry in ("prompt.md", meta.get("entry") or ""):
+            if entry and os.path.isfile(os.path.join(root, entry)):
+                prompt = self._read_text(os.path.join(root, entry)) or ""
+                break
+        tags = meta.get("tags") or meta.get("keywords") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        front = [
+            "---",
+            "name: %s" % meta.get("name", ""),
+            "description: %s" % (meta.get("description") or ""),
+            "tags: [%s]" % ", ".join(str(t) for t in tags),
+            "---",
+            "",
+        ]
+        return "\n".join(front) + (prompt or "")
+
     def scan(self, force: bool = False) -> List[SkillMetadata]:
-        """Scan the skills directory and return the current skill list."""
+        """Scan all skill roots and return the current skill list."""
         with self._lock:
             if not force and not self._should_scan():
                 return list(self._skills)
             skills: List[SkillMetadata] = []
-            if os.path.isdir(self._dir):
-                for root, dirs, files in os.walk(self._dir):
-                    dirs[:] = [d for d in dirs if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
-                    if _SKILL_FILENAME not in files:
+            seen_dirs: set = set()
+            for base_dir in self._dirs:
+                if not os.path.isdir(base_dir):
+                    continue
+                for root, dirs, files in os.walk(base_dir):
+                    dirs[:] = [d for d in dirs
+                               if d not in _SKIP_DIR_NAMES and not d.startswith(".")]
+                    if root in seen_dirs:
                         continue
-                    path = os.path.join(root, _SKILL_FILENAME)
-                    try:
-                        with open(path, "r", encoding="utf-8") as f:
-                            content = f.read()
-                    except (OSError, UnicodeDecodeError) as e:
-                        logger.warning("skill_retriever: failed to read %s: %s", path, e)
+                    rel = self._rel_dir(root)
+                    content: Optional[str] = None
+                    if _SKILL_FILENAME in files:
+                        content = self._read_text(os.path.join(root, _SKILL_FILENAME))
+                    elif "skill.json" in files:
+                        # 旧体系：没有 SKILL.md，用 skill.json + prompt.md 合成。
+                        content = self._legacy_skill_md(root)
+                    if not content:
                         continue
-                    # dir is relative to the skills root, or absolute if not under it.
-                    rel = os.path.relpath(root, self._dir) if root.startswith(self._dir) else root
                     meta = parse_skill_md(content, rel)
                     if meta:
+                        seen_dirs.add(root)
                         skills.append(meta)
             self._skills = skills
             self._last_scan = time.time()
             self._last_mtime = self._dir_mtime()
-            logger.info("skill_retriever: scanned %d skills from %s", len(skills), self._dir)
+            logger.info("skill_retriever: scanned %d skills from %s",
+                        len(skills), self._dirs)
             return list(self._skills)
 
     def list_skills(self) -> List[SkillMetadata]:
@@ -770,10 +864,18 @@ class SkillRetriever:
     and (optionally) an LLM final pick among candidates.
     """
 
-    def __init__(self, skills_dir: str, db_path: str, embedding_function=None):
-        self._scanner = SkillScanner(skills_dir)
+    def __init__(self, skills_dir, db_path: str, embedding_function=None):
+        # skills_dir 可以是单个目录或目录列表（新体系 <ws>/skills 与旧体系
+        # <ws>/.agent/skills 都纳入同一检索面）。base 取第一个目录的父目录
+        # （即 workspace），dir id 相对它计算，跨根唯一。
+        dirs = [skills_dir] if isinstance(skills_dir, str) else list(skills_dir)
+        dirs = [d for d in dirs if d]
+        base = os.path.dirname(os.path.realpath(dirs[0])) if dirs else ""
+        self._scanner = SkillScanner(dirs, base=base)
         self._store = SkillVectorStore(db_path, embedding_function=embedding_function)
-        self._skills_dir = skills_dir
+        self._skills_dir = dirs[0] if dirs else ""
+        self._skills_dirs = [os.path.realpath(d) for d in dirs]
+        self._base = base
 
     def ensure_indexed(self) -> None:
         """Sync the vector table against the skills directory (incremental).
@@ -955,13 +1057,33 @@ class SkillRetriever:
         return None
 
     def read_skill_dir(self, dir: str) -> Optional[str]:
-        """Return the absolute path to a skill's directory (for reading support files)."""
-        base = os.path.realpath(self._skills_dir)
-        resolved = os.path.realpath(os.path.join(base, dir))
-        if resolved == base or not resolved.startswith(base + os.sep):
+        """Return the absolute path to a skill's directory (for reading support files).
+
+        ``dir`` 是相对 workspace 的 id（``skills/x`` / ``.agent/skills/y``），也
+        兼容只传技能目录名（``y``）——后者会在所有已注册根里查找，让按旧习惯传
+        单个名字的调用（和历史索引记录）仍然能解析。
+        """
+        if not dir:
             return None
-        if os.path.isdir(resolved):
-            return resolved
+        head = dir.replace("\\", "/")
+        # 只去开头的 "./"：lstrip("./") 会吞掉 ".agent/..." 的点，令 workspace
+        # 相对 id 解析到错误路径。
+        rel = re.sub(r"^(?:\./)+", "", head)
+        candidates = []
+        if os.path.isabs(rel):
+            candidates.append(os.path.realpath(rel))
+        else:
+            if self._base:
+                candidates.append(os.path.realpath(os.path.join(self._base, rel)))
+            for root in self._skills_dirs:
+                candidates.append(os.path.realpath(os.path.join(root, rel)))
+        for resolved in candidates:
+            if not os.path.isdir(resolved):
+                continue
+            # 必须落在某个已注册根之内。
+            for root in self._skills_dirs:
+                if resolved.startswith(root + os.sep):
+                    return resolved
         return None
 
     def close(self) -> None:

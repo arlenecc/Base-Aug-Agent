@@ -15,7 +15,7 @@ import os
 import re
 import threading
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from .memory import _JsonStore
 
@@ -24,6 +24,10 @@ _TOKEN_RE = re.compile(r"\w+")
 # {"提取pdf表格"}），导致 "pdf"/"提取" 这类关键词永远匹配不上，中文技能
 # 检索彻底失效。因此额外切出 CJK 子串及其二元组（bigram）用于匹配。
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+# 按「字script」切出极大运行段：CJK 串、拉丁词、数字串各自独立。\w+ 会把
+# 「帮我提取pdf里的表格」整个当成一个 token（CJK 与拉丁都是 \w），于是关键词
+# "pdf"/"docx"/"api" 永远匹配不上——而真实意图几乎全是中文夹英文术语。
+_SCRIPT_RUN_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z]+|[0-9]+")
 
 # 停用词表提到模块级：_request_key() 每轮对话都会调用，旧实现在函数体内重建
 # 这个集合，白白重复分配。
@@ -40,18 +44,23 @@ _MAX_TRACKED_REQUESTS = 500
 
 
 def _keywords_of(text: str) -> List[str]:
-    """Tokenize for keyword matching, with CJK support.
+    """Tokenize for keyword matching, with CJK + Latin support.
 
-    Latin words are taken whole; CJK runs are additionally emitted as the full
-    run plus its character bigrams, so a keyword like "提取" matches inside
-    "提取pdf表格" (without this, ``\\w+`` yields one giant token and Chinese
-    skill matching silently never hits).
+    Text is split into maximal runs by script (CJK / Latin / digits) so a mixed
+    phrase like ``帮我提取pdf里的表格`` yields ``pdf`` as its own token — without
+    this, ``\\w+`` treats the whole thing as one token and English keywords
+    (``pdf`` / ``docx`` / ``api``) can never match, silently disabling skill
+    matching for the most common real-world phrasing.  CJK runs additionally
+    emit their character bigrams so a keyword like ``提取`` matches inside
+    ``提取pdf表格``.
     """
-    toks = [w.lower() for w in _TOKEN_RE.findall(text)]
-    for run in _CJK_RUN_RE.findall(text):
-        toks.append(run)
-        for i in range(len(run) - 1):
-            toks.append(run[i:i + 2])
+    toks: List[str] = []
+    for run in _SCRIPT_RUN_RE.findall(text):
+        low = run.lower()
+        toks.append(low)
+        if _CJK_RUN_RE.fullmatch(run):
+            for i in range(len(run) - 1):
+                toks.append(run[i:i + 2])
     return toks
 
 
@@ -100,8 +109,8 @@ class SkillManager:
             if not isinstance(self._store.get("requests"), dict):
                 self._store.set("requests", {})
 
-    def _load_skills(self) -> List[Skill]:
-        """Read persisted skill records, tolerating corrupted entries.
+    def _load_persisted(self) -> List[Skill]:
+        """Read persisted flat skill records (skills.json) only.
 
         A single malformed record (hand-edited skills.json, an aborted write,
         a record from an older schema) used to raise TypeError/KeyError inside
@@ -110,7 +119,7 @@ class SkillManager:
         """
         raw = self._store.get("skills") or []
         if not isinstance(raw, list):
-            return []
+            raw = []
         out: List[Skill] = []
         for s in raw:
             if not isinstance(s, dict):
@@ -125,6 +134,139 @@ class SkillManager:
             except (TypeError, ValueError):
                 continue
         return [s for s in out if s.name]
+
+    def _load_skills(self) -> List[Skill]:
+        """合并持久化记录与磁盘目录技能。
+
+        目录技能（``.agent/skills/*`` 与 ``<workspace>/skills/*``）也一并并入：
+        它们是用户直接放在磁盘上的，只读 skills.json 会让这些技能永远拿不到
+        自动注入（``# Active skill``）——检索工具能命中、自动应用却失效。
+
+        同名去重时**持久化记录优先**：``create_dir_skill`` 会在 skills.json 里
+        注册一条 flat 记录，其 prompt 引导模型走 ``skill_load`` 读完整指令；若
+        目录技能反客为主，自动注入时就会把原始 prompt.md 直接塞进系统提示，
+        违背「保持 prompt 精简」的设计。
+        """
+        # 先持久化记录，再目录技能：去重保留前者。
+        out: List[Skill] = []
+        out.extend(self._load_persisted())
+        out.extend(self._load_dir_skills())
+        seen: set = set()
+        unique: List[Skill] = []
+        for s in out:
+            if not s.name or s.name in seen:
+                continue
+            seen.add(s.name)
+            unique.append(s)
+        return unique
+
+    # ------------------------------------------------------------------
+    # 目录技能（磁盘上的 skill.json / SKILL.md）
+    # ------------------------------------------------------------------
+
+    def _skill_roots(self) -> List[str]:
+        """All directories that may hold on-disk skills."""
+        roots: List[str] = []
+        if self._skills_dir:
+            roots.append(self._skills_dir)
+        # skills.json 位于 <ws>/.agent/skills.json → 同级 skills/ 是新体系根。
+        try:
+            ws = os.path.dirname(os.path.dirname(os.path.abspath(self._store.path)))
+        except Exception:
+            ws = ""
+        if ws:
+            roots.append(os.path.join(ws, "skills"))
+        return [r for r in roots if r and os.path.isdir(r)]
+
+    def _load_dir_skills(self) -> List[Skill]:
+        """Scan on-disk skill directories into flat Skill records.
+
+        纯关键词打分用（自动注入每轮都跑，不能碰 embedding），所以只取
+        name / keywords / tags / description 做关键词源，prompt 取正文前
+        一段（完整内容仍由 skill_load 读）。
+        """
+        out: List[Skill] = []
+        for root in self._skill_roots():
+            try:
+                entries = sorted(os.listdir(root))
+            except OSError:
+                continue
+            for name in entries:
+                if name.startswith((".", "_")) or name in ("tests", "test"):
+                    continue
+                d = os.path.join(root, name)
+                if not os.path.isdir(d):
+                    continue
+                rec = self._read_dir_skill(d)
+                if rec is not None:
+                    out.append(rec)
+        return out
+
+    def _read_dir_skill(self, skill_dir: str) -> Optional[Skill]:
+        """Read one skill directory (skill.json+prompt.md or SKILL.md)."""
+        meta: Dict[str, Any] = {}
+        prompt = ""
+        sj = os.path.join(skill_dir, "skill.json")
+        if os.path.isfile(sj):
+            try:
+                with open(sj, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except (OSError, ValueError):
+                meta = {}
+            for entry in (meta.get("entry") or "prompt.md", "prompt.md"):
+                p = os.path.join(skill_dir, entry)
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            prompt = f.read(4000)
+                    except (OSError, UnicodeDecodeError):
+                        prompt = ""
+                    break
+        else:
+            sk = os.path.join(skill_dir, "SKILL.md")
+            if not os.path.isfile(sk):
+                return None
+            try:
+                with open(sk, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                return None
+            meta, prompt = self._split_frontmatter(text)
+        name = str(meta.get("name") or "").strip()
+        if not name:
+            return None
+        keywords = meta.get("keywords") or meta.get("tags") or []
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        desc = str(meta.get("description") or "").strip()
+        kw = [str(k).lower() for k in keywords]
+        if desc:
+            kw.append(desc.lower())
+        return Skill(name=name, keywords=kw, prompt=prompt[:1500])
+
+    @staticmethod
+    def _split_frontmatter(text: str):
+        """Minimal YAML-frontmatter split for SKILL.md (no yaml dependency)."""
+        meta: Dict[str, Any] = {}
+        body = text
+        m = re.match(r"\A---\s*\n(.*?)\n---\s*\n?", text, re.DOTALL)
+        if m:
+            body = text[m.end():]
+            for line in m.group(1).splitlines():
+                if ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                key = key.strip().lower()
+                value = value.strip().strip('"').strip("'")
+                if key in ("name", "description"):
+                    meta[key] = value
+                elif key in ("tags", "keywords"):
+                    inner = value.strip().lstrip("[").rstrip("]")
+                    meta["tags"] = [t.strip().strip('"').strip("'")
+                                    for t in inner.split(",") if t.strip()]
+        return meta, body
 
     def list(self) -> List[Skill]:
         with self._lock:
@@ -197,7 +339,9 @@ class SkillManager:
         # system prompt (keeps prompts lean).
         dir_name = os.path.basename(skill_dir)
         with self._lock:
-            skills = self._load_skills()
+            # _load_persisted（不是 _load_skills，后者会把磁盘目录技能也读进来，
+            # 写回 skills.json 后会让「目录技能」在去重时优先于本条 flat 记录）。
+            skills = self._load_persisted()
             if not any(s.name == name for s in skills):
                 skills.append(Skill(
                     name=name,
