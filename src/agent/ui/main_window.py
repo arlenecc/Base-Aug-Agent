@@ -1339,7 +1339,10 @@ class MainWindow(QMainWindow):
         # --- RAG ---
         self.embedding_backend_combo = QComboBox()
         _fill_backend_combo(self.embedding_backend_combo, RAG_BACKENDS)
-        self.embedding_model_edit = QLineEdit()
+        # 模型名：仅 fastembed 后端用（HuggingFace id 下载），本地后端无意义；
+        # 本地后端用「本地路径」。两个字段按后端显隐（见 _update_rag_model_controls）。
+        self.embedding_model_edit = QLineEdit(
+            placeholderText="HuggingFace 模型名（如 nomic-ai/nomic-embed-text-v1.5-Q）")
         self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
         self.embedding_model_path_btn = QPushButton("选择")
         # --- PDF 解析引擎（三选一横排单选）+ 自定义 OCR 模型 ---
@@ -1378,7 +1381,8 @@ class MainWindow(QMainWindow):
         # rag_rerank_enabled=false（会退化为向量距离排序）。
         self.reranker_backend_combo = QComboBox()
         _fill_backend_combo(self.reranker_backend_combo, RAG_BACKENDS[:3])
-        self.reranker_model_edit = QLineEdit()
+        self.reranker_model_edit = QLineEdit(
+            placeholderText="HuggingFace 模型名（如 BAAI/bge-reranker-v2-m3-int8）")
         self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
         self.reranker_model_path_btn = QPushButton("选择")
         # --- 目录 / 动作 ---
@@ -1567,14 +1571,16 @@ class MainWindow(QMainWindow):
         ocr_gguf_row.addWidget(self.ocr_chat_format_edit, 1)
         kb_lay.addLayout(ocr_gguf_row)
 
-        # Row 2: Embedding 后端 | 模型名 | 本地路径 | 同步知识
+        # Row 2: Embedding 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 同步知识
         emb_row = QHBoxLayout()
         emb_row.setSpacing(8)
         emb_row.addWidget(QLabel("Embedding"))
         emb_row.addWidget(self.embedding_backend_combo)
-        emb_row.addWidget(QLabel("模型/目录名"))
+        self.embedding_name_label = QLabel("模型名")
+        emb_row.addWidget(self.embedding_name_label)
         emb_row.addWidget(self.embedding_model_edit, 2)
-        emb_row.addWidget(QLabel("本地路径"))
+        self.embedding_path_label = QLabel("本地路径")
+        emb_row.addWidget(self.embedding_path_label)
         emb_row.addWidget(self.embedding_model_path_edit, 3)
         emb_row.addWidget(self.embedding_model_path_btn)
         # 向量去重按钮：放在「同步知识」前面——它是同步前的库维护操作，
@@ -1600,14 +1606,16 @@ class MainWindow(QMainWindow):
         emb_row.addWidget(self.sync_knowledge_btn)
         kb_lay.addLayout(emb_row)
 
-        # Row 3: Reranker 后端 | 模型名 | 本地路径 | 停止同步
+        # Row 3: Reranker 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 停止同步
         rerank_row = QHBoxLayout()
         rerank_row.setSpacing(8)
         rerank_row.addWidget(QLabel("Reranker"))
         rerank_row.addWidget(self.reranker_backend_combo)
-        rerank_row.addWidget(QLabel("模型/目录名"))
+        self.reranker_name_label = QLabel("模型名")
+        rerank_row.addWidget(self.reranker_name_label)
         rerank_row.addWidget(self.reranker_model_edit, 2)
-        rerank_row.addWidget(QLabel("本地路径"))
+        self.reranker_path_label = QLabel("本地路径")
+        rerank_row.addWidget(self.reranker_path_label)
         rerank_row.addWidget(self.reranker_model_path_edit, 3)
         rerank_row.addWidget(self.reranker_model_path_btn)
         # Stop-sync button: enabled only while a sync is running. Cancels
@@ -1763,8 +1771,10 @@ class MainWindow(QMainWindow):
         self.llm_mode_openai_radio.toggled.connect(self._on_mode_changed)
         self.llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.aux_llm_backend_combo.currentTextChanged.connect(self._update_model_controls)
+        self.embedding_backend_combo.currentTextChanged.connect(self._update_rag_model_controls)
         self.reranker_backend_combo.currentTextChanged.connect(self._update_model_controls)
         self.reranker_backend_combo.currentTextChanged.connect(self._on_reranker_backend_changed)
+        self.reranker_backend_combo.currentTextChanged.connect(self._update_rag_model_controls)
         self.model_combo.activated.connect(self._on_model_combo_activated)
         self.sync_knowledge_btn.clicked.connect(self._on_sync_knowledge)
         self.vector_dedup_btn.clicked.connect(self._on_vector_dedup)
@@ -2197,7 +2207,32 @@ class MainWindow(QMainWindow):
         # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
         if not multimodal and self._pending_image_path:
             self._set_attached_image("")
+        self._update_rag_model_controls()
         self._refresh_model_buttons()
+
+    def _update_rag_model_controls(self, *_args) -> None:
+        """按后端显隐 Embedding/Reranker 的「模型名」与「本地路径」字段。
+
+        语义：fastembed 后端用 HuggingFace 模型名下载，无本地路径；mlx/onnx/
+        llama_cpp 本地后端用本地路径，模型名只是兜底标签、对用户无意义。两套
+        字段互斥显隐，用户看到的恰好是「选后端 + 填那一个标识符」，不再出现
+        一个填了也不生效的死字段（用户反馈：名字到底能不能改、改了干嘛）。
+        """
+        emb_fastembed = _combo_backend_value(self.embedding_backend_combo) == "fastembed"
+        rk_fastembed = _combo_backend_value(self.reranker_backend_combo) == "fastembed"
+        for name_lbl, name_edit, path_lbl, path_edit, path_btn, is_fastembed in (
+            (self.embedding_name_label, self.embedding_model_edit,
+             self.embedding_path_label, self.embedding_model_path_edit,
+             self.embedding_model_path_btn, emb_fastembed),
+            (self.reranker_name_label, self.reranker_model_edit,
+             self.reranker_path_label, self.reranker_model_path_edit,
+             self.reranker_model_path_btn, rk_fastembed),
+        ):
+            name_lbl.setVisible(is_fastembed)
+            name_edit.setVisible(is_fastembed)
+            path_lbl.setVisible(not is_fastembed)
+            path_edit.setVisible(not is_fastembed)
+            path_btn.setVisible(not is_fastembed)
 
     def _on_mode_changed(self, checked: bool) -> None:
         # 初始化阶段 _apply_config_to_widgets 的 setChecked 也会触发本函数，
