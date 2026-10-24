@@ -349,6 +349,132 @@ def test_web_scan_falls_back_to_get_when_stream_unsupported(monkeypatch, config)
 
 
 # ---------------------------------------------------------------------------
+# web_scan 增强：API 数据源 / 动态页 / iframe / 内嵌数据 / 不返空
+# ---------------------------------------------------------------------------
+
+class _WSResp:
+    """假 HTTP 响应：stream（上下文管理器 + iter_bytes）与 get（.content/.text）通用。"""
+
+    def __init__(self, body, ctype, status=200):
+        self._b = body.encode("utf-8") if isinstance(body, str) else body
+        self.status_code = status
+        self.encoding = "utf-8"
+        self.headers = {"Content-Type": ctype}
+        self.content = self._b
+        self.text = body if isinstance(body, str) else self._b.decode("utf-8", "replace")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_bytes(self, chunk_size=65536):
+        return iter([self._b])
+
+    def close(self):
+        pass
+
+
+def _install_ws_routes(monkeypatch, routes):
+    """按 URL 子串分发假响应，打桩 httpx.Client 的 stream/get（无真实网络）。"""
+    def _match(url):
+        for k, v in routes.items():
+            if k in url:
+                return v
+        return ("<html><body></body></html>", "text/html")
+
+    def _stream(self, method, url, **kw):
+        body, ctype = _match(url)
+        return _WSResp(body, ctype)
+
+    def _get(self, url, **kw):
+        body, ctype = _match(url)
+        return _WSResp(body, ctype)
+
+    monkeypatch.setattr(httpx.Client, "stream", _stream)
+    monkeypatch.setattr(httpx.Client, "get", _get)
+
+
+def test_web_scan_json_api_source(config, monkeypatch):
+    """API/JSON 数据源：按 JSON 美化返回，而不是被当 HTML 抽成一团。"""
+    import json as _json
+    _install_ws_routes(monkeypatch, {
+        "api.example.com": (_json.dumps({"users": [{"name": "Ann"}]}), "application/json")})
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://api.example.com/users"})
+    assert res.success
+    assert '"name": "Ann"' in res.output  # 美化后的 JSON
+
+
+def test_web_scan_extracts_embedded_json(config, monkeypatch):
+    """SPA 空壳 + 内嵌 __NEXT_DATA__：应抽出内嵌结构化数据，避免看着空。"""
+    spa = ('<html><head><title>商品</title></head><body><div id="__next"></div>'
+           '<script id="__NEXT_DATA__" type="application/json">'
+           '{"product":{"name":"widget","price":9.9}}</script></body></html>')
+    _install_ws_routes(monkeypatch, {"spa.example.com": (spa, "text/html")})
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://spa.example.com/p/1"})
+    assert res.success
+    assert "商品" in res.output
+    assert "widget" in res.output and "9.9" in res.output
+    assert "内嵌数据" in res.output
+
+
+def test_web_scan_recurses_iframes(config, monkeypatch):
+    """iframe 嵌套页：无 bridge 时静态抓取 iframe src，拼进结果。"""
+    page = ('<html><body><p>主页面文字</p>'
+            '<iframe src="https://frame.example.com/embed"></iframe></body></html>')
+    routes = {"main.example.com": (page, "text/html"),
+              "frame.example.com": ("<html><body><p>iframe正文内容</p></body></html>", "text/html")}
+    _install_ws_routes(monkeypatch, routes)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://main.example.com"})
+    assert res.success
+    assert "主页面文字" in res.output
+    assert "iframe正文内容" in res.output
+    assert "[iframe:" in res.output
+
+
+def test_web_scan_never_returns_empty(config, monkeypatch):
+    """真·空壳页：绝不返回空，给标题/Content-Type/诊断等可操作信息。"""
+    shell = '<html><head><title>空壳页</title></head><body><div id="root"></div></body></html>'
+    _install_ws_routes(monkeypatch, {"empty.example.com": (shell, "text/html")})
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://empty.example.com"})
+    assert res.success
+    assert res.output.strip()  # 非空
+    assert "空壳页" in res.output  # 至少给出标题
+
+
+def test_web_scan_bridge_renders_dynamic_page(config, monkeypatch):
+    """配了 browser_endpoint：动态页走 bridge 渲染，拿正文 + iframe 文本。"""
+    import json as _json
+    config.browser_endpoint = "http://localhost:9222"
+    shell = '<html><head><title>动态</title></head><body><div id="root">加载中</div></body></html>'
+    _install_ws_routes(monkeypatch, {"dyn.example.com": (shell, "text/html")})
+    rendered = {"title": "动态", "text": "JS渲染出的正文" + "x" * 300,
+                "iframes": [{"src": "https://x/f", "text": "iframe文本"}]}
+
+    class _FakePost:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"result": _json.dumps(rendered)}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(httpx.Client, "post", lambda self, url, **kw: _FakePost())
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://dyn.example.com"})
+    assert res.success
+    assert "JS渲染出的正文" in res.output
+    assert "iframe文本" in res.output
+
+
+# ---------------------------------------------------------------------------
 # ask_user
 # ---------------------------------------------------------------------------
 

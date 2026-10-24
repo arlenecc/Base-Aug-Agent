@@ -5,8 +5,8 @@ import ipaddress
 import json
 import os
 import re
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -86,8 +86,14 @@ def _block_ssrf_redirect(response):
         )
 
 
-def _read_capped(client, url: str) -> str:
-    """GET ``url`` and return the body text, capped at ``_MAX_FETCH_BYTES``.
+def _resp_ct(resp) -> str:
+    """取响应 Content-Type（兼容大小写：真实 httpx 大小写不敏感，测试替身是普通 dict）。"""
+    h = getattr(resp, "headers", None) or {}
+    return h.get("content-type") or h.get("Content-Type") or ""
+
+
+def _read_capped(client, url: str) -> Tuple[str, str]:
+    """GET ``url`` → ``(body_text, content_type)``，body 上限 ``_MAX_FETCH_BYTES``。
 
     优先走流式读取：``client.get()`` 是非流式的——整个响应体会先完整读进内存，
     才轮到我们截断，对一个 2GB 的直链内存峰值仍然是 2GB。``client.stream()``
@@ -98,10 +104,11 @@ def _read_capped(client, url: str) -> str:
         chunks: list = []
         total = 0
         truncated = False
+        ctype = ""
         try:
             with client.stream("GET", url) as resp:
                 if resp.status_code >= 400:
-                    return f"__HTTP_ERROR__{resp.status_code}"
+                    return f"__HTTP_ERROR__{resp.status_code}", _resp_ct(resp)
                 for block in resp.iter_bytes(chunk_size=65536):
                     if not block:
                         continue
@@ -117,11 +124,12 @@ def _read_capped(client, url: str) -> str:
                     chunks.append(block)
                     total += len(block)
                 encoding = getattr(resp, "encoding", None) or "utf-8"
+                ctype = _resp_ct(resp)
             text = b"".join(chunks).decode(encoding, errors="replace")
             del chunks
             if truncated:
                 text += f"\n… [响应超过 {_MAX_FETCH_BYTES // (1024 * 1024)} MB，已截断]"
-            return text
+            return text, ctype
         except AttributeError:
             # 仅当 client 没有真正的 stream 实现（测试替身/残缺实现）才回退。
             pass
@@ -133,7 +141,7 @@ def _read_capped(client, url: str) -> str:
     resp = client.get(url)
     try:
         if resp.status_code >= 400:
-            return f"__HTTP_ERROR__{resp.status_code}"
+            return f"__HTTP_ERROR__{resp.status_code}", _resp_ct(resp)
         # 优先按字节裁剪（真实 httpx 的 .content），拿不到字节时退化为
         # .text（更轻量的响应/测试替身只实现 text）。
         raw = getattr(resp, "content", None)
@@ -151,7 +159,162 @@ def _read_capped(client, url: str) -> str:
 
     if truncated:
         text += f"\n… [响应超过 {_MAX_FETCH_BYTES // (1024 * 1024)} MB，已截断]"
-    return text
+    return text, _resp_ct(resp)
+
+
+# ---------------------------------------------------------------------------
+# web_scan 内容路由 / 抽取 / 渲染辅助
+# ---------------------------------------------------------------------------
+
+# 输出上限（字符）。抓取上限是 _MAX_FETCH_BYTES（8MB），这里限制最终回给模型的文本。
+_MAX_OUTPUT = 20000
+# 静态递归 iframe 的最大个数（防一个页面挂几十个 iframe 拖垮同步）。
+_MAX_IFRAMES = 6
+# 抽到的可见文本少于此阈值 → 判定「可能是 JS 动态渲染页（SPA 空壳）」，触发渲染。
+_MIN_TEXT_TO_RENDER = 200
+
+# <script type="application/json"> / ld+json / __NEXT_DATA__：SSR/水合用内嵌数据。
+_JSON_SCRIPT_RE = re.compile(
+    r"<script[^>]*type=[\"']application/(?:ld\+)?json[\"'][^>]*>(.*?)</script>",
+    re.S | re.I,
+)
+_NEXT_DATA_RE = re.compile(
+    r"<script[^>]*id=[\"']__NEXT_DATA__[\"'][^>]*>(.*?)</script>", re.S | re.I,
+)
+# window.__X__ = {...} / self.FOO = [...]：把状态对象挂到全局（SPA 常见）。
+_WINDOW_ASSIGN_RE = re.compile(
+    r"(?:window|self|globalThis)\s*\.\s*([A-Za-z_$][\w$]*)\s*=\s*"
+)
+
+
+def _collapse(text: str) -> str:
+    """去每行首尾空白、丢空行，压成紧凑文本。"""
+    return "\n".join(ln.strip() for ln in text.splitlines() if ln.strip())
+
+
+def _sniff_kind(text: str, content_type: str) -> str:
+    """判断响应是 json / html / xml / text，用于路由（API 数据源 vs 网页）。"""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if "json" in ct:
+        return "json"
+    if "html" in ct:
+        return "html"
+    if "xml" in ct:
+        return "xml"
+    head = text.lstrip()[:512]
+    if head[:1] in "{[":
+        try:
+            json.loads(text)
+            return "json"
+        except Exception:
+            pass
+    if head.startswith("<?xml"):
+        return "xml"
+    if head.startswith("<"):
+        if re.search(r"<(?:!doctype\s+html|html|head|body)\b", head, re.I):
+            return "html"
+        return "xml"
+    return "text"
+
+
+def _format_json(text: str, limit: int = _MAX_OUTPUT) -> str:
+    """尽量把 JSON 美化输出；解析失败原样返回（都截断到 limit）。"""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return text[:limit]
+    s = json.dumps(obj, ensure_ascii=False, indent=2)
+    if len(s) > limit:
+        s = s[:limit] + f"\n… [JSON 超过 {limit} 字符，已截断]"
+    return s
+
+
+def _balanced(s: str, i: int) -> Optional[str]:
+    """从 ``s[i]``（``{`` 或 ``[``）取到配对的闭合括号，正确处理字符串与转义。"""
+    open_c = s[i]
+    close_c = "}" if open_c == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(i, len(s)):
+        c = s[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return s[i:j + 1]
+    return None
+
+
+def _extract_embedded_json(html: str) -> List[Tuple[str, Any]]:
+    """从 HTML 抽取内嵌结构化数据（API/SSR 状态），返回 ``[(label, obj)]``。
+
+    覆盖：``<script type=application/json>``（含 ld+json）、``__NEXT_DATA__``、
+    ``window.__X__={...}`` 全局状态——这些是 SPA「看着空」时真正的数据来源。
+    """
+    blobs: List[Tuple[str, Any]] = []
+
+    def _try(label: str, raw: str) -> None:
+        raw = raw.strip()
+        if not raw or len(blobs) >= 4:
+            return
+        try:
+            blobs.append((label, json.loads(raw)))
+        except Exception:
+            pass
+
+    for m in _JSON_SCRIPT_RE.finditer(html):
+        _try("application/json", m.group(1))
+    for m in _NEXT_DATA_RE.finditer(html):
+        _try("__NEXT_DATA__", m.group(1))
+    for m in _WINDOW_ASSIGN_RE.finditer(html):
+        j = m.end()
+        while j < len(html) and html[j] in " \t":
+            j += 1
+        if j < len(html) and html[j] in "{[":
+            raw = _balanced(html, j)
+            if raw:
+                _try(m.group(1), raw)
+    return blobs
+
+
+def _extract_html(html: str) -> Dict[str, Any]:
+    """从 HTML 抽取可见文本 + 标题/描述 + 内嵌 JSON + iframe src。"""
+    if BeautifulSoup is None:
+        return {"title": "", "desc": "", "iframes": [], "json_blobs": [],
+                "text": _collapse(re.sub(r"<[^>]+>", " ", html))}
+    soup = BeautifulSoup(html, "html.parser")
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    desc = ""
+    meta = (soup.find("meta", attrs={"name": "description"})
+            or soup.find("meta", attrs={"property": "og:description"}))
+    if meta and meta.get("content"):
+        desc = meta["content"].strip()
+    iframes: List[str] = []
+    for tag in soup.find_all("iframe"):
+        src = (tag.get("src") or "").strip()
+        if src and src not in ("about:blank",):
+            iframes.append(src)
+    # 先抽内嵌 JSON（脚本还在），再删脚本/style 取可见文本。
+    json_blobs = _extract_embedded_json(html)
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    return {"title": title, "desc": desc, "iframes": iframes,
+            "json_blobs": json_blobs, "text": text}
 
 
 class WebScanTool(Tool):
@@ -193,27 +356,172 @@ class WebScanTool(Tool):
                 error=f"Refusing to fetch link-local/metadata address: {url[:80]}",
             )
         try:
-            text = _read_capped(self._http, url)
+            text, ctype = _read_capped(self._http, url)
         except Exception as e:
             return ToolResult(False, error=f"Request failed: {e}")
         if text.startswith("__HTTP_ERROR__"):
             return ToolResult(False, error=f"HTTP {text[len('__HTTP_ERROR__'):]}")
         if raw:
-            return ToolResult(True, output=text[:20000])
-        if BeautifulSoup is not None:
-            soup = BeautifulSoup(text, "html.parser")
-            for tag in soup(["script", "style", "noscript"]):
-                tag.decompose()
-            content = soup.get_text(separator="\n")
-        else:
-            # very rough fallback
-            import re
+            return ToolResult(True, output=text[:_MAX_OUTPUT])
 
-            content = re.sub(r"<script.*?</script>", "", text, flags=re.S | re.I)
-            content = re.sub(r"<style.*?</style>", "", content, flags=re.S | re.I)
-            content = re.sub(r"<[^>]+>", " ", content)
-        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-        return ToolResult(True, output="\n".join(lines)[:20000])
+        kind = _sniff_kind(text, ctype)
+        # API / JSON / XML / 纯文本数据源：不走 HTML 抽取，直接给数据（美化 JSON）。
+        if kind == "json":
+            return ToolResult(True, output=_format_json(text)[:_MAX_OUTPUT])
+        if kind in ("xml", "text"):
+            body = _collapse(text)
+            label = "XML" if kind == "xml" else "文本"
+            return ToolResult(True, output=f"[{label} 响应]\n{body[:_MAX_OUTPUT]}")
+
+        # ---- HTML：抽可见文本 + 标题/描述 + 内嵌 JSON + iframe ----
+        info = _extract_html(text)
+        visible = _collapse(info["text"])
+        rendered: Optional[Dict[str, Any]] = None
+        # 可见文本太少 → 疑似 JS 动态渲染的空壳页：用 browser bridge 渲染
+        # （能跑 JS、也能读到 iframe 内容）。无 bridge 则退回静态 iframe 递归。
+        if len(visible) < _MIN_TEXT_TO_RENDER:
+            rendered = self._render_via_bridge(url)
+
+        sections: List[str] = []
+        head_bits: List[str] = []
+        eff_title = info["title"]
+        if rendered and rendered.get("title"):
+            eff_title = eff_title or str(rendered["title"])
+        if eff_title:
+            head_bits.append(f"# {eff_title}")
+        if info["desc"]:
+            head_bits.append(f"> {info['desc']}")
+
+        if rendered is not None:
+            rtext = _collapse(str(rendered.get("text", "")))
+            if len(rtext) > len(visible):
+                visible = rtext
+            # 渲染后直接读各 iframe 的文本（跨域 iframe 读不到时文本为空，跳过）。
+            for fr in rendered.get("iframes", []) or []:
+                if not isinstance(fr, dict):
+                    continue
+                ft = _collapse(str(fr.get("text", "")))
+                if ft:
+                    sections.append(f"[iframe: {fr.get('src', '')}]\n{ft}")
+        elif info["iframes"]:
+            # 无 bridge：静态抓取 iframe src（同源/相对路径已 urljoin 归一）。
+            for src, body in self._fetch_iframes(info["iframes"], base=url):
+                sections.append(f"[iframe: {src}]\n{body}")
+
+        # 内嵌 JSON（SPA 的 SSR/水合数据、API 内联响应）——「看着空」时真正的信息。
+        for label, obj in info["json_blobs"]:
+            s = json.dumps(obj, ensure_ascii=False, indent=2)
+            if len(s) > 4000:
+                s = s[:4000] + "\n… [截断]"
+            sections.append(f"[内嵌数据: {label}]\n{s}")
+
+        out_parts: List[str] = []
+        if head_bits:
+            out_parts.append("\n".join(head_bits))
+        if visible.strip():
+            out_parts.append(visible)
+        out_parts.extend(sections)
+        result = "\n\n".join(out_parts).strip()
+
+        if not result:
+            # 绝不返回空：给出可操作的诊断，说明为什么没抓到、下一步怎么办。
+            diag = [f"未能从该页面抽取到正文文本：{url[:80]}"]
+            if eff_title:
+                diag.append(f"标题: {eff_title}")
+            diag.append(f"Content-Type: {ctype or '未知'}")
+            if info["iframes"]:
+                diag.append(f"检测到 {len(info['iframes'])} 个 iframe: "
+                            + ", ".join(info["iframes"][:5]))
+            if len(visible) < _MIN_TEXT_TO_RENDER and not rendered:
+                diag.append("页面疑似 JS 动态渲染且静态文本极少；已尝试内嵌数据与 iframe。"
+                            "配置 browser_endpoint（Playwright bridge）可渲染动态页与 iframe。")
+            else:
+                diag.append("页面本身可见文本极少（可能确为空壳或需登录）。")
+            result = "\n".join(diag)
+
+        return ToolResult(True, output=result[:_MAX_OUTPUT])
+
+    def _render_via_bridge(self, url: str) -> Optional[Dict[str, Any]]:
+        """用 browser_endpoint 的 Playwright bridge 渲染页面，返回结构化结果或 None。
+
+        返回 ``{"title", "text", "iframes": [{"src","text"}...]}``。桥未配置或不可用
+        时返回 None（调用方退回静态策略）。不新增依赖、不新增工具——复用 webexec_js
+        已有的 bridge 端点。
+        """
+        endpoint = getattr(self.config, "browser_endpoint", "") or ""
+        if not endpoint:
+            return None
+        script = (
+            "(() => { try {"
+            " const fr = Array.from(document.querySelectorAll('iframe')).map(f => ({"
+            "   src: f.src || '',"
+            "   text: (() => { try {"
+            "     const d = f.contentDocument || (f.contentWindow && f.contentWindow.document);"
+            "     return d && d.body ? d.body.innerText : '';"
+            "   } catch (e) { return ''; } })()"
+            " }));"
+            " return JSON.stringify({"
+            "   title: document.title || '',"
+            "   text: document.body ? document.body.innerText : '',"
+            "   iframes: fr"
+            " });"
+            "} catch (e) { return JSON.stringify({ error: String(e) }); } })()"
+        )
+        try:
+            resp = self._http.post(
+                endpoint.rstrip("/") + "/exec",
+                json={"url": url, "script": script, "action": "",
+                      "selector": "", "value": ""},
+                timeout=60.0,
+            )
+        except Exception:
+            return None
+        try:
+            if resp.status_code >= 400:
+                return None
+            ct = resp.headers.get("content-type", "") if hasattr(resp, "headers") else ""
+            data = resp.json() if "json" in ct.lower() else {"result": resp.text}
+        except Exception:
+            return None
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        result = data
+        for key in ("result", "value", "output", "data"):
+            if isinstance(data, dict) and key in data:
+                result = data[key]
+                break
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                return {"title": "", "text": _collapse(result), "iframes": []}
+        return result if isinstance(result, dict) else None
+
+    def _fetch_iframes(self, srcs: List[str], base: str) -> List[Tuple[str, str]]:
+        """静态抓取 iframe（urljoin 归一 + 协议/SSRF 校验 + 抽取文本），有界。"""
+        out: List[Tuple[str, str]] = []
+        for src in srcs[:_MAX_IFRAMES]:
+            abs_src = urljoin(base, src)
+            if not abs_src.lower().startswith(("http://", "https://")):
+                continue
+            if _is_ssrf_target(abs_src):
+                continue
+            try:
+                t, ct = _read_capped(self._http, abs_src)
+            except Exception:
+                continue
+            if t.startswith("__HTTP_ERROR__"):
+                continue
+            if _sniff_kind(t, ct) == "html":
+                body = _collapse(_extract_html(t)["text"])
+            else:
+                body = _collapse(t)
+            if body.strip():
+                out.append((abs_src, body))
+        return out
 
 
 class WebExecJsTool(Tool):
