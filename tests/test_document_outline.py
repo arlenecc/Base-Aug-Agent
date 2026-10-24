@@ -1,6 +1,8 @@
 """Tests for document outline extraction + digest (Meta-context RAG)."""
 from __future__ import annotations
 
+import re
+
 from agent.rag.document_outline import (
     build_digest,
     build_toc,
@@ -404,6 +406,32 @@ def test_md_drops_colophon_back_matter():
     assert "104 台北市民生東路二段141號" not in titles
 
 
+def test_md_colophon_rules_are_format_based_not_keyword_based():
+    """版权页判定必须是通用格式规则：跨语种/地区的出版式样都能识别，且不误伤
+    真标题——不依赖任何针对某几本书堆出来的关键词表。"""
+    from agent.rag.document_outline import _is_colophon_like
+
+    for noise in [
+        "定價220元",                                  # 定价/货币
+        "美術設計／朱陳毅",                            # 全角斜杠署名行
+        "104 台北市民生東路二段141號",                 # 多个数字段（地址）
+        "國家圖書館出版品預行編目（CIP）資料",          # CIP 标准标识
+        "Copyright © 2020 by Example Press",          # 版权符号
+        "ISBN 978-0-306-40615-7",                     # ISBN
+        "www.example.com/press",                      # 网址
+        "contact@example.com",                        # 邮箱
+        "IV.B502.44",                                 # 分类号/索书号
+        "Printed and bound in the United States of America",  # 拉丁长句
+    ]:
+        assert _is_colophon_like(noise), noise
+
+    for title in [
+        "第一章 引言", "第七章 2024年展望", "21天学会编程",
+        "安顿心灵的七个步骤", "TIME AND THE GODS", "附录三 参考文献",
+    ]:
+        assert not _is_colophon_like(title), title
+
+
 def test_md_merges_ocr_variant_running_header():
     """同一章节被 OCR 识别成多个错字变体时（如「安顿心灵的七个步骤」），应合并为一条。"""
     md = """# 第二部
@@ -440,6 +468,75 @@ def test_md_keeps_consecutive_numbered_chapters():
     titles = [c.title for c in chapters]
     assert "第一百章 總論" in titles
     assert "第一百零一章 分論" in titles
+
+
+# ---------------------------------------------------------------------------
+# 纯文本路径：OCR 目录标记 + 合并成一行的目录条目
+# ---------------------------------------------------------------------------
+
+def test_plain_toc_marker_tolerates_ocr_mangled_char():
+    """OCR 把「目錄」识别成「目東/目彔」时，目录块仍应被找到。"""
+    from agent.rag.document_outline import _is_toc_marker
+    assert _is_toc_marker("目東")
+    assert _is_toc_marker("目彔")
+    assert _is_toc_marker("目 祿")
+    # 真标题不得误判
+    assert not _is_toc_marker("目标")
+    assert not _is_toc_marker("目前")
+    assert not _is_toc_marker("目錄學")
+
+
+def test_plain_extracts_chapters_from_merged_toc_lines():
+    """目录条目与页码/外文名/正文挤在一行时，应抽出「第X章 标题」前缀。"""
+    text = """《药物简史》
+目東
+第一章 药物与人类 1 ARZNEI UND MENSCH 3 自古以来
+第二章 柏林的微生物猎手 2 DIE MIKROBENJAGER VON BERLIN 45 世
+第四章 保尔·埃尔利希和维纳斯的疾病 217 维尔
+第十章 有病的心脏和有病的胃 217 心脏的
+正文从此开始，这是真正的正文内容，不再是目录条目。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = [c.title for c in chapters]
+    assert "第一章 药物与人类" in titles
+    assert "第二章 柏林的微生物猎手" in titles
+    assert "第四章 保尔·埃尔利希和维纳斯的疾病" in titles
+    assert "第十章 有病的心脏和有病的胃" in titles
+    # 页码 / 外文名 / 正文不得残留在标题里
+    for t in titles:
+        assert "ARZNEI" not in t and "MIKROBENJAGER" not in t
+        assert not re.search(r"\s\d{1,4}\s", t)
+
+
+def test_plain_extracts_chinese_ordinal_merged_toc_lines():
+    """「一、标题 + 正文」挤成一行的目录条目（无第X章的教材/专著）也要能抽取。"""
+    text = """银行管理与IT架构
+目录
+一、银行成本管理内容 成本信息对于银行分部门核算的意义在于能够揭示
+二、银行成本的主要方法 作业成本法在银行领域的应用始于20世纪90年代
+三、银行成本核算体系设计 体系设计需要遵循一致性原则
+正文开始。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = [c.title for c in chapters]
+    assert "一、银行成本管理内容" in titles
+    assert "二、银行成本的主要方法" in titles
+    assert "三、银行成本核算体系设计" in titles
+
+
+def test_plain_merged_toc_rejects_body_sentence():
+    """以「第X章/一、」开头的正文句子不得被当成目录条目（动词开头守卫）。"""
+    text = """总目录
+第2章增加了包括复合条形图和结构条形图的新资料以及数据可视化和创建有效图形显示的最佳实践这一新的小节。
+一、增加了很多新的内容来说明这个问题的重要性以及它对于整体结构的影响很大
+第一章 真正的章节
+正文。
+"""
+    chapters = extract_chapters_plain(text)
+    titles = [c.title for c in chapters]
+    assert "第一章 真正的章节" in titles
+    assert not any("增加了" in t for t in titles)
+    assert not any("增加了很多" in t for t in titles)
 
 
 # ---------------------------------------------------------------------------

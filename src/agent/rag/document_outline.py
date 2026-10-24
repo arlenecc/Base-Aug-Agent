@@ -85,12 +85,6 @@ _TRUNCATED_CN_CHAPTER_RE = re.compile(
 # 标题不会以 4 位年份开头（除非恰是年份书名，罕见），视为正文噪声。
 _YEAR_PREFIX_RE = re.compile(r"^(?:19|20)\d{2}\s*[年）).、]")
 
-# 强章节标记前缀：行以「第X章/节/卷/篇/部」开头。这类前缀是权威的章节号，
-# 即使行内因并入了引文/正文而含句读，也交由 _normalize_title 清尾，不整体拒绝。
-_CN_CHAPTER_PREFIX_RE = re.compile(
-    r"^第\s*[0-9%s]+\s*[章卷篇部节]" % _CJK_NUM
-)
-
 # 「目录」标记归一化：去掉 Markdown 强调/标题符号与空白后比对，兼容
 # 「**总目录**」「## 目 录」「目次」「Contents」等写法。
 _TOC_MARKER_CANON = {
@@ -104,9 +98,23 @@ def _is_toc_marker(line: str) -> bool:
 
     Normalises away Markdown emphasis/heading symbols and whitespace so bold
     or heading-wrapped markers (``**总目录**``, ``## 目 录``) are recognised.
+    OCR-scanned books frequently mangle the second character (``目東``/``目彔``
+    instead of ``目錄``), so a short ``目``-led line whose tail is made only of
+    visually-confusable characters is also accepted — bounded to ≤4 chars so
+    real titles (``目标``/``目前``/``目錄學``) are never matched.
     """
     s = re.sub(r"[*_#`>\s]+", "", line or "").lower()
-    return s in _TOC_MARKER_CANON
+    if s in _TOC_MARKER_CANON:
+        return True
+    if 2 <= len(s) <= 4 and s.startswith("目") and all(
+        c in _TOC_OCR_TAIL_CHARS for c in s[1:]
+    ):
+        return True
+    return False
+
+
+# OCR 把「錄」识别成的形近字（目錄 → 目東 / 目彔 / 目禄 …）。
+_TOC_OCR_TAIL_CHARS = set("錄彔東次录録禄祿彖")
 
 
 # 有效字符：中文 / 字母数字 / 常见中英文标点。用于判定 OCR 乱码行。
@@ -251,16 +259,58 @@ def _is_sentence_like(title: str) -> bool:
 
 
 # 版权页 / 勒口 / 读者回函卡等「后 matter」噪声关键词（命中即丢弃）。
-_COLOPHON_KEYWORDS = (
-    "定價", "定価", "美術設計", "裝幀", "裝訂", "責任編輯", "封面", "封底",
-    "讀者回函", "讀者服務", "ISBN", "版權", "印製", "印刷", "印次", "印張",
-    "發行", "發行人", "出版者", "出版日期", "初版", "二版", "三版", "四版",
-    "五版", "六版", "七版", "八版", "九版", "郵政", "劃撥", "帳號", "電話",
-    "傳真", "網址", "部落格", "臉書", "地址", "台北", "台灣", "號", "出版社",
-    "總經銷", "排版", "經銷", "劃撥", "公司", "國家圖書館", "出版品預行編目",
-    "預行編目", "編目資料", "版權所有", "翻印必究", "印次",
+# 版权页 / 勒口 / 读者回函卡等「后 matter」噪声：**只用通用格式信号判定**，
+# 绝不堆具体出版用语的关键词——那会对某几本书过拟合，换一批书就失效。
+# 依据是一个通用事实：真正的章节标题是简短名词短语，不会长成「书目记录」
+# （电话/账号/书号/定价/网址/署名行/分类号）的样子。
+_COLOPHON_PATTERNS = (
+    re.compile(r"\d[\d\-－\s]{5,}\d"),                    # 电话/传真/账号/邮编等长数字组
+    re.compile(r"\b\d{9}[\dXx]\b|\b\d{13}\b"),            # ISBN-10 / ISBN-13
+    re.compile(r"(?i)\bisbn\b|图书在版编目|\bCIP\b"),      # 标准书号 / 在版编目标识
+    re.compile(r"[©℗]"),                                  # 版权符号
+    re.compile(r"(?i)https?://|www\.|@[\w.\-]+\.|\.(?:com|net|org|tw|cn|io|edu)\b"),
+    re.compile(r"\d+\s*[元圓圆¥￥]|(?:NT|US|RMB|HK)\$"),   # 定价 / 货币
+    re.compile(r"[(（【\[]\s*(?:19|20)\d{2}\s*[)）】\]]"),  # 括注年份（版次）
+    re.compile(r"^[IVXLC]{1,5}\.?\s*[A-Za-z]?\d{2,}"),    # 杜威分类号 / 索书号
 )
 _DECORATIVE_DOTS = "·・．•∙"
+
+
+def _is_colophon_like(title: str) -> bool:
+    """True if a title looks like copyright/colophon back-matter.
+
+    判定只用**通用格式信号**，不含任何针对具体出版方/地区的用语：
+
+      * 长数字组（电话 / 传真 / 划拨账号 / 邮编）、ISBN、版权符号、网址/邮箱、
+        定价货币、括注年份、杜威分类号；
+      * 数字密度异常（≥2 个 ≥2 位的数字段且整行 ≥10 字）——印次/开本/定价/
+        地址混在一行的典型形态；
+      * 全角斜杠 ``／``/``｜`` 分隔的署名行（美術設計／朱陳毅、總經銷／某某
+        書局）——中文书名极少用全角斜杠，署名行几乎必用；
+      * 纯拉丁（无中文）且 ≥5 个词的长句 —— 外文版权行 / 出版说明（书名通常
+        ≤4 词，故 ``TIME AND THE GODS`` 这类短外文书名不会被误伤）。
+
+    这些规则与语种、地区、出版方无关，换任何一本书都同样成立。
+    """
+    t = title.strip()
+    if not t:
+        return False
+    if any(p.search(t) for p in _COLOPHON_PATTERNS):
+        return True
+    if len(t) >= 10:
+        # ≥2 个长度 ≥2 的数字段 → 书目记录（单一数字段可能是标题里的年份/编号）。
+        if len(re.findall(r"\d{2,}", t)) >= 2:
+            return True
+    # 全角斜杠分隔的署名/版权行（书名极少含全角斜杠）。
+    if len(t) >= 6 and re.search(r"[／｜]", t):
+        return True
+    # 纯拉丁（无中文）且是长句 → 外文版权行 / 出版说明，非章节标题。
+    # 用「≥5 个词」而非单纯长度：外文书名通常 ≤4 词（``TIME AND THE GODS``），
+    # 出版说明则是完整句子（``Printed and bound in the United States``）。
+    if len(t) >= 8 and not any("\u4e00" <= c <= "\u9fff" for c in t) \
+            and len(re.findall(r"[A-Za-z0-9']+", t)) >= 5:
+        return True
+    return False
 
 
 def _is_decorative_like(title: str) -> bool:
@@ -269,35 +319,6 @@ def _is_decorative_like(title: str) -> bool:
     if len(t) <= 1:
         return False
     return sum(1 for c in t if c in _DECORATIVE_DOTS) >= 2
-
-
-def _is_colophon_like(title: str) -> bool:
-    """True if a title looks like copyright/colophon back-matter.
-
-    Catches price/date/phone lines, ISBN/CIP metadata, and Latin-only
-    back-matter (English titles, ``My Daily Bread``) or Dewey-style call
-    numbers (``IV.B502.44``) — none of which are real chapter titles.
-    """
-    t = title.strip()
-    if any(k in t for k in _COLOPHON_KEYWORDS):
-        return True
-    if re.search(r"\d{2,4}\s*元", t):
-        return True
-    if re.search(r"^\d{3,4}\s*年", t):
-        return True
-    if re.search(r"20\d{2}\s*[)）]", t):
-        return True
-    if re.search(r"\d{2,3}\s*[-－]\d{2,3}[-－]\d{2,3}", t):
-        return True
-    # 杜威分类号 / 索书号（如 IV.B502.44、B502.44）。
-    if re.search(r"^[IVXLC]+\.?\s*[A-Za-z]?\d{2,}", t):
-        return True
-    if re.search(r"图书在版编目|（CIP）|CIP数据", t):
-        return True
-    # 纯拉丁（无中文）且较长 → 多为英文书名 / 版权行，非章节标题。
-    if len(t) >= 8 and not any("\u4e00" <= c <= "\u9fff" for c in t):
-        return True
-    return False
 
 
 def _is_garbage_like(title: str) -> bool:
@@ -581,6 +602,72 @@ def _numbered_match(line: str) -> Optional[Tuple[int, str]]:
     return (level, line)
 
 
+# 强章节标记前缀：行以「第X章/节/卷/篇/部/回」或中文序号「一、」开头。用于从
+# 「标题+页码+外文名/正文」挤在一行的目录条目里抽前缀——只在**目录块内部**使用
+# （整块都是目录条目，误报风险远低于对正文做同样的事）。
+_CN_CHAPTER_PREFIX_RE = re.compile(
+    r"^(第\s*[0-9%s]+\s*[章卷篇部节回])" % _CJK_NUM
+)
+_CN_ORDINAL_PREFIX_RE = re.compile(
+    r"^([一二三四五六七八九十百零〇]+\s*[、.．])"
+)
+# 标题部分以这些动词开头 → 是正文句子（如「第2章增加了……的新资料」），非标题。
+_TITLE_VERB_PREFIXES = (
+    "增加", "新增", "介绍", "讨论", "阐述", "分析", "讲述", "回顾", "梳理",
+    "列举", "说明", "解释", "探讨", "指出", "认为", "涉及", "包含", "分为",
+    "描述", "论述", "总结", "对比", "比较", "反映", "表明", "意味着",
+)
+
+
+def _merged_chapter_prefix(line: str) -> Optional[Tuple[str, int]]:
+    """从合并成一行的目录条目里抽出 ``(标题, level)``，无法安全抽取返回 None。
+
+    PDF/EPUB 常把目录条目和页码、外文书名、甚至正文挤在一行::
+
+        第二章 柏林的微生物猎手 2 DIE MIKROBENJÄGER VON BERLIN 45 世……
+        第1章 国际政治现实主义理论 之间的关系。正是……
+        一、银行成本管理内容 成本信息对于银行分部门核算的意义在于……
+
+    标题边界取「首个内部空白 / 页码 / 连续拉丁串 / 句读 / 24 字上限」中最早
+    出现者，再挡掉动词开头的正文句（``第2章增加了……``）。抽不出干净标题就返回
+    None，让调用方按普通行处理——宁可少收，不要收垃圾。
+    """
+    m = _CN_CHAPTER_PREFIX_RE.match(line) or _CN_ORDINAL_PREFIX_RE.match(line)
+    if not m:
+        return None
+    marker = m.group(1)
+    rest = line[m.end():].lstrip(" 　:：、")
+    if not rest:
+        return (marker, 1)
+    cut = len(rest)
+    # 首个内部空白：标题后紧跟的「页码 / 外文名 / 正文」都以此分隔（目录条目
+    # 被合并的典型形态），是最可靠的标题终点。
+    ws = re.search(r"\s", rest)
+    if ws:
+        cut = min(cut, ws.start())
+    pm = re.search(r"\s+\d{1,4}(?:\s|$)", rest)      # 页码
+    if pm:
+        cut = min(cut, pm.start())
+    lm = re.search(r"[A-Za-z]{4,}", rest)             # 外文名/正文起点
+    if lm:
+        cut = min(cut, lm.start())
+    sm = re.search(r"[。！？；，]", rest)              # 句读 → 正文
+    if sm:
+        cut = min(cut, sm.start())
+    cut = min(cut, 24)
+    title = rest[:cut].strip(" 　:：、,，")
+    if not title:
+        return (marker, 1)
+    # 动词开头 → 正文句子，不是标题。
+    if title.startswith(_TITLE_VERB_PREFIXES):
+        return None
+    # 「第X章」后习惯留一个空格；「一、」后不留（否则标题里多个不自然空格）。
+    sep = "" if marker[-1] in "、.．" else " "
+    full = f"{marker}{sep}{title}"
+    hit = _cn_chapter_match(full) or _cn_section_match(full)
+    return (full, hit[0] if hit else 1)
+
+
 def _extract_from_toc_block(lines: List[str]) -> List[Chapter]:
     """Extract titles from a "目录/Contents" block (one title per line).
 
@@ -598,13 +685,37 @@ def _extract_from_toc_block(lines: List[str]) -> List[Chapter]:
     chapters: List[Chapter] = []
     seen = set()
     for ln in lines[i + 1:]:
+        # 目录条目常被合并成「第X章 标题 + 页码 + 外文名/正文」的一行（真实 PDF
+        # 里往往还不足 80 字，能通过 _looks_like_title，于是页码/外文名被留在
+        # 标题里）。以强章节锚点开头且行内含页码/外文串/较长时，抽「第X章 标题」
+        # 前缀；抽不出干净标题（动词开头的正文句）就退回普通路径。
+        merged = None
+        mm = _CN_CHAPTER_PREFIX_RE.match(ln) or _CN_ORDINAL_PREFIX_RE.match(ln)
+        if mm:
+            # 「标记 + 标题 + 空白 + 更多内容」= 目录条目被合并了（页码/外文名/
+            # 正文挤在同一行）；或整行超长（无空格的超长标题）。两者都抽前缀，
+            # 且**不因此中断目录块**（否则后面真正的条目会全部丢失）。
+            tail = ln[mm.end():]
+            if re.search(r"\S\s+\S", tail) or len(ln) > 60:
+                merged = _merged_chapter_prefix(ln)
+        if merged is not None:
+            title, level = merged
+            if title not in seen:
+                seen.add(title)
+                chapters.append(Chapter(level, title, ""))
+            continue
+        if not _looks_like_title(ln):
+            # 终止条件：正文段落通常以句末标点结尾（目录标题一般不会）。
+            # 硬换行的 PDF 正文每行都短，无法靠行长度区分目录与正文，
+            # 但正文句以「。，；！？」结尾，目录标题则不会。
+            if len(ln) > 80 or (ln and ln[-1] in "。，；！？．,;!?"):
+                break
+            continue
         # 终止条件：正文段落通常以句末标点结尾（目录标题一般不会）。
         # 硬换行的 PDF 正文每行都短，无法靠行长度区分目录与正文，
         # 但正文句以「。，；！？」结尾，目录标题则不会。
         if len(ln) > 80 or (ln and ln[-1] in "。，；！？．,;!?"):
             break
-        if not _looks_like_title(ln):
-            continue
         title = _normalize_title(ln)
         hit = _cn_section_match(title) or _cn_chapter_match(title) or _numbered_match(title)
         if hit is not None:
