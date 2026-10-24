@@ -1423,6 +1423,7 @@ class MainWindow(QMainWindow):
 
         self._add_local_model_block(
             local_lay, "主模型",
+            prefix="llm",
             combo_attr="llm_backend_combo",
             path_attr="llm_model_path_edit",
             btn_attr="llm_model_path_btn",
@@ -1489,6 +1490,7 @@ class MainWindow(QMainWindow):
 
         self._add_local_model_block(
             agent_lay, "辅助模型",
+            prefix="aux_llm",
             combo_attr="aux_llm_backend_combo",
             path_attr="aux_llm_model_path_edit",
             btn_attr="aux_llm_model_path_btn",
@@ -1661,10 +1663,15 @@ class MainWindow(QMainWindow):
 
     def _add_local_model_block(
         self, lay: QVBoxLayout, title: str, *,
-        combo_attr: str, path_attr: str, btn_attr: str,
+        prefix: str, combo_attr: str, path_attr: str, btn_attr: str,
         picker, placeholder: str, path_value: str,
     ) -> None:
-        """一行「模型类型 + 本地路径 + 选择」，上方带一个小标题。"""
+        """一行「模型类型 + 本地路径 + 选择」，上方带一个小标题。
+
+        另加一行**次级路径**（按后端显隐，见 _update_secondary_path_controls）：
+        GGUF → mmproj 路径（多模态投影，可选）；ONNX → tokenizer 路径（可选）。
+        MLX / OpenAI 不显示——它们要么不需要、要么走别的字段。
+        """
         label = QLabel(title)
         label.setStyleSheet("font-weight:600;")
         lay.addWidget(label)
@@ -1690,6 +1697,34 @@ class MainWindow(QMainWindow):
         row.addWidget(edit, 3)
         row.addWidget(btn)
         lay.addLayout(row)
+
+        # 次级路径行：mmproj（GGUF）/ tokenizer（ONNX），按后端互斥显隐。
+        mm_label = QLabel("mmproj 路径")
+        mm_edit = QLineEdit(placeholderText="GGUF 多模态投影文件（mmproj，可选）")
+        mm_btn = QPushButton("选择")
+        mm_btn.clicked.connect(
+            lambda: self._on_pick_secondary_path(mm_edit, "mmproj"))
+        tok_label = QLabel("tokenizer 路径")
+        tok_edit = QLineEdit(placeholderText="ONNX tokenizer 目录（含 tokenizer.json，可选）")
+        tok_btn = QPushButton("选择")
+        tok_btn.clicked.connect(
+            lambda: self._on_pick_secondary_path(tok_edit, "tokenizer"))
+        setattr(self, f"{prefix}_mmproj_path_label", mm_label)
+        setattr(self, f"{prefix}_mmproj_path_edit", mm_edit)
+        setattr(self, f"{prefix}_mmproj_path_btn", mm_btn)
+        setattr(self, f"{prefix}_onnx_tokenizer_path_label", tok_label)
+        setattr(self, f"{prefix}_onnx_tokenizer_path_edit", tok_edit)
+        setattr(self, f"{prefix}_onnx_tokenizer_path_btn", tok_btn)
+
+        sec_row = QHBoxLayout()
+        sec_row.setSpacing(8)
+        sec_row.addWidget(mm_label)
+        sec_row.addWidget(mm_edit, 3)
+        sec_row.addWidget(mm_btn)
+        sec_row.addWidget(tok_label)
+        sec_row.addWidget(tok_edit, 3)
+        sec_row.addWidget(tok_btn)
+        lay.addLayout(sec_row)
 
     def _add_sampling_row(self, lay: QVBoxLayout, prefix: str,
                           defaults: Dict[str, Any], buttons=()) -> None:
@@ -1833,6 +1868,15 @@ class MainWindow(QMainWindow):
         self.aux_llm_model_path_edit.setText(
             getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH
         )
+        # 次级路径：GGUF→mmproj（复用 llm_vision_projection_path），ONNX→tokenizer。
+        self.llm_mmproj_path_edit.setText(
+            getattr(self.config, "llm_vision_projection_path", "") or "")
+        self.llm_onnx_tokenizer_path_edit.setText(
+            getattr(self.config, "llm_onnx_tokenizer_path", "") or "")
+        self.aux_llm_mmproj_path_edit.setText(
+            getattr(self.config, "aux_llm_vision_projection_path", "") or "")
+        self.aux_llm_onnx_tokenizer_path_edit.setText(
+            getattr(self.config, "aux_llm_onnx_tokenizer_path", "") or "")
         _select_combo_backend(
             self.embedding_backend_combo, self.config.rag_embedding_backend
         )
@@ -1911,6 +1955,23 @@ class MainWindow(QMainWindow):
         self.config.aux_llm_backend = _combo_backend_value(self.aux_llm_backend_combo)
         self.config.aux_llm_model_path = (
             self.aux_llm_model_path_edit.text().strip() or DEFAULT_AUX_MODEL_PATH
+        )
+        # 次级路径：GGUF→mmproj（写回 llm_vision_projection_path），ONNX→tokenizer。
+        self.config.llm_vision_projection_path = (
+            self.llm_mmproj_path_edit.text().strip()
+            or self.config.llm_vision_projection_path
+        )
+        self.config.llm_onnx_tokenizer_path = (
+            self.llm_onnx_tokenizer_path_edit.text().strip()
+            or self.config.llm_onnx_tokenizer_path
+        )
+        self.config.aux_llm_vision_projection_path = (
+            self.aux_llm_mmproj_path_edit.text().strip()
+            or self.config.aux_llm_vision_projection_path
+        )
+        self.config.aux_llm_onnx_tokenizer_path = (
+            self.aux_llm_onnx_tokenizer_path_edit.text().strip()
+            or self.config.aux_llm_onnx_tokenizer_path
         )
         self.config.rag_embedding_backend = (
             _combo_backend_value(self.embedding_backend_combo) or "fastembed"
@@ -2207,8 +2268,30 @@ class MainWindow(QMainWindow):
         # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
         if not multimodal and self._pending_image_path:
             self._set_attached_image("")
+        self._update_secondary_path_controls("llm")
+        self._update_secondary_path_controls("aux_llm")
         self._update_rag_model_controls()
         self._refresh_model_buttons()
+
+    def _update_secondary_path_controls(self, prefix: str) -> None:
+        """按后端显隐主/辅助模型的次级路径框：GGUF→mmproj，ONNX→tokenizer。
+
+        MLX / OpenAI 不显示——它们要么不需要（MLX 多模态走 GGUF 体系外的另一套
+        投影字段），要么没有这一项。两个次级框互斥：同一时刻只有一个可见。
+        """
+        combo = getattr(self, f"{prefix}_backend_combo")
+        backend = _combo_backend_value(combo)
+        is_gguf = backend == "llama_cpp"
+        is_onnx = backend == "onnx"
+        for lbl_attr, edit_attr, btn_attr, show in (
+            (f"{prefix}_mmproj_path_label", f"{prefix}_mmproj_path_edit",
+             f"{prefix}_mmproj_path_btn", is_gguf),
+            (f"{prefix}_onnx_tokenizer_path_label", f"{prefix}_onnx_tokenizer_path_edit",
+             f"{prefix}_onnx_tokenizer_path_btn", is_onnx),
+        ):
+            getattr(self, lbl_attr).setVisible(show)
+            getattr(self, edit_attr).setVisible(show)
+            getattr(self, btn_attr).setVisible(show)
 
     def _update_rag_model_controls(self, *_args) -> None:
         """按后端显隐 Embedding/Reranker 的「模型名」与「本地路径」字段。
@@ -2423,6 +2506,17 @@ class MainWindow(QMainWindow):
             )
         if path:
             self.reranker_model_path_edit.setText(path)
+
+    def _on_pick_secondary_path(self, edit: "QLineEdit", kind: str) -> None:
+        """次级路径选择器：mmproj 选文件，tokenizer 选目录。"""
+        start = self._dialog_start(edit.text())
+        if kind == "mmproj":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 mmproj 投影文件", start, "mmproj (*.mmproj);;所有文件 (*)")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "选择 ONNX tokenizer 目录", start)
+        if path:
+            edit.setText(path)
 
     # ------------------------------------------------------------------
     # secondary windows

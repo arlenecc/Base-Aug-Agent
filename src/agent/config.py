@@ -28,6 +28,7 @@ class AgentConfig:
     llm_backend: str = "mlx_lm"  # openai | mlx_lm | mlx_vlm | onnx | llama_cpp
     llm_model_path: str = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
     llm_vision_projection_path: str = ""  # GGUF VLM 的 mmproj/clip 文件
+    llm_onnx_tokenizer_path: str = ""  # ONNX 后端：独立 tokenizer 目录（含 tokenizer.json）
     llm_chat_format: str = ""
     llm_vlm_handler: str = "mtmd"
     # 思考模式（本地模式主模型）。走 chat template 的 enable_thinking：
@@ -40,6 +41,7 @@ class AgentConfig:
     aux_llm_backend: str = "mlx_lm"  # mlx_lm | mlx_vlm | onnx | llama_cpp
     aux_llm_model_path: str = "models/Qwen3.5-2B-MLX-4bit"
     aux_llm_vision_projection_path: str = ""
+    aux_llm_onnx_tokenizer_path: str = ""  # ONNX 后端：独立 tokenizer 目录
     aux_llm_chat_format: str = ""
     aux_llm_vlm_handler: str = "mtmd"
     # 辅助模型的思考模式。**默认关闭**：辅助模型只跑摘要/归纳这类轻量子任务，
@@ -235,10 +237,10 @@ class AgentConfig:
         "base_url", "api_key", "model", "workspace", "knowledge_base",
         "llm_mode",
         "llm_backend", "llm_model_path", "llm_vision_projection_path",
-        "llm_chat_format", "llm_vlm_handler",
+        "llm_onnx_tokenizer_path", "llm_chat_format", "llm_vlm_handler",
         "aux_llm_backend", "aux_llm_model_path",
-        "aux_llm_vision_projection_path", "aux_llm_chat_format",
-        "aux_llm_vlm_handler",
+        "aux_llm_vision_projection_path", "aux_llm_onnx_tokenizer_path",
+        "aux_llm_chat_format", "aux_llm_vlm_handler",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path",

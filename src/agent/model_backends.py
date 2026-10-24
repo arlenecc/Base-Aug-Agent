@@ -1272,6 +1272,10 @@ class ONNXLanguageBackend(_LazyLocalBackend):
                 if not candidates:
                     raise LLMError(f"目录中未找到 ONNX 文件: {path}")
                 model_file = candidates[0]
+            # tokenizer 目录：优先用独立配置的 tokenizer 路径（ONNX 模型目录外
+            # 单独的 tokenizer 导出），缺失时回退到模型目录（多数 ONNX 导出会把
+            # tokenizer 一起放进模型目录）。
+            tok_path = getattr(self.config, "llm_onnx_tokenizer_path", "") or str(model_dir)
             options = ort.SessionOptions()
             options.intra_op_num_threads = max(1, int(getattr(self.config, "onnx_threads", 4)))
             options.inter_op_num_threads = 1
@@ -1284,12 +1288,12 @@ class ONNXLanguageBackend(_LazyLocalBackend):
             self._model_file = str(model_file)
             try:
                 self._processor = AutoProcessor.from_pretrained(
-                    str(model_dir), local_files_only=True, trust_remote_code=False
+                    tok_path, local_files_only=True, trust_remote_code=False
                 )
             except Exception:
                 self._processor = None
             self._tokenizer = AutoTokenizer.from_pretrained(
-                str(model_dir), local_files_only=True, trust_remote_code=False
+                tok_path, local_files_only=True, trust_remote_code=False
             )
             logger.info("ONNX 本地模型加载完成(CPU): %s", model_file)
 
@@ -1777,6 +1781,7 @@ class _AuxConfigView:
         "llm_enable_thinking": "aux_llm_enable_thinking",
         # GGUF VLM 的 mmproj / chat format / handler（见 LlamaCppBackend）。
         "llm_vision_projection_path": "aux_llm_vision_projection_path",
+        "llm_onnx_tokenizer_path": "aux_llm_onnx_tokenizer_path",
         "llm_chat_format": "aux_llm_chat_format",
         "llm_vlm_handler": "aux_llm_vlm_handler",
     }
