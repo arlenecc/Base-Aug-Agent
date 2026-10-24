@@ -238,6 +238,28 @@ class MLXEmbeddingFunction:
         rope_base = float(config.get("rotary_emb_base", 1000.0))
         head_dim = hidden_size // num_heads
 
+        # 量化权重（MLX 约定：weight(uint32) + scales + biases 兄弟键 + config.quantization）
+        # 必须用 QuantizedLinear / QuantizedEmbedding 承载——普通 nn.Linear 只认单个
+        # fp16 的 weight，load_weights(strict=True) 会因为多出 62 组 scales/biases 而报
+        # "Received 124 parameters not in model"。无 quantization 字段时保持原 fp16 图。
+        _quant = config.get("quantization") or {}
+        _bits = int(_quant.get("bits", 0)) or None
+        _group = int(_quant.get("group_size", 64)) or 64
+        _mode = str(_quant.get("mode", "affine"))
+        quantized = bool(_bits)
+
+        def _linear(in_dims, out_dims):
+            if quantized:
+                return nn.QuantizedLinear(in_dims, out_dims, bias=False,
+                                          group_size=_group, bits=_bits, mode=_mode)
+            return nn.Linear(in_dims, out_dims, bias=False)
+
+        def _embedding(num, dims):
+            if quantized:
+                return nn.QuantizedEmbedding(num, dims, group_size=_group,
+                                             bits=_bits, mode=_mode)
+            return nn.Embedding(num, dims)
+
         def rotate_half(x):
             half = x.shape[-1] // 2
             return mx.concatenate((-x[..., half:], x[..., :half]), axis=-1)
@@ -256,8 +278,8 @@ class MLXEmbeddingFunction:
         class Embeddings(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
-                self.token_type_embeddings = nn.Embedding(type_vocab_size, hidden_size)
+                self.word_embeddings = _embedding(vocab_size, hidden_size)
+                self.token_type_embeddings = _embedding(type_vocab_size, hidden_size)
                 self.norm = nn.LayerNorm(hidden_size, eps=eps)
 
             def __call__(self, input_ids, token_type_ids=None):
@@ -271,8 +293,8 @@ class MLXEmbeddingFunction:
         class Attention(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.Wqkv = nn.Linear(hidden_size, hidden_size * 3, bias=False)
-                self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                self.Wqkv = _linear(hidden_size, hidden_size * 3)
+                self.out_proj = _linear(hidden_size, hidden_size)
 
             def __call__(self, x, attention_mask):
                 batch, seq_len, _ = x.shape
@@ -290,9 +312,9 @@ class MLXEmbeddingFunction:
         class MLP(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.fc11 = nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.fc12 = nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+                self.fc11 = _linear(hidden_size, intermediate_size)
+                self.fc12 = _linear(hidden_size, intermediate_size)
+                self.fc2 = _linear(intermediate_size, hidden_size)
 
             def __call__(self, x):
                 return self.fc2(self.fc11(x) * nn.silu(self.fc12(x)))
