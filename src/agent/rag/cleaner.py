@@ -256,9 +256,17 @@ _MD_DECOR_SEP_RE = re.compile(r'^[\s·•…—–─━═。.]{3,}$')
 # 目录点线引导 + 页码：行尾 / 表格单元格尾。引导字符可为单个 `…`/`·`/`•`
 # （这些永不是小数点），但 ASCII `.` 需 ≥2 个连续，避免误伤小数点/版本号
 # （`3.14` 只有单个 `.`，不匹配）。
-_LEADER_HEAD = r'(?:[…·•]|[.…·•]{2,})'
-_MD_TRAILING_LEADER_RE = re.compile(r'%s[.…·•\s]*\d{1,4}\s*$' % _LEADER_HEAD)
-_MD_TRAILING_LEADER_CELL_RE = re.compile(r'%s[.…·•\s]*\d{1,4}\s*(?=\|)' % _LEADER_HEAD)
+# 目录点线引导 + 页码：行尾 / 表格单元格尾。**必须防灾难性回溯**：早期版本用
+# `[.…·•]{2,}[.…·•\s]*\d{1,4}`——前缀 `{2,}` 与后续 `*` 字符类重叠、又要求末尾
+# 至少一个数字，遇到「一长串点/间隔号且无页码」的行（目录点线、装饰分隔、OCR 垃圾）
+# 会指数/立方级回溯（实测 ·×1000 ≈ 2.2s、·×4000 直接卡死），而 strip_markdown_noise_lines
+# 对每行都跑一遍 .sub，整次同步就被一行拖垮（内存飙+卡住）。
+# 修法：引导前缀改成**定长**（单个 …/·/• 或恰好两个点 `.`），页码改 `\d{0,4}`
+# （允许 0 个）——贪婪匹配一次成型、无需回溯，任意长度输入都是线性。语义不变：
+# 单个 `.`（小数点 3.14）不匹配；≥2 个点或任一 …·• 才触发。
+_LEADER_HEAD = r'(?:[…·•]|\.\.)'
+_MD_TRAILING_LEADER_RE = re.compile(r'%s[.…·•\s]*\d{0,4}\s*$' % _LEADER_HEAD)
+_MD_TRAILING_LEADER_CELL_RE = re.compile(r'%s[.…·•\s]*\d{0,4}\s*(?=\|)' % _LEADER_HEAD)
 # 被 _mask_table_blocks 掩码的 HTML <table> 块占位符（私用区字符），须原样保留。
 _TABLE_PLACEHOLDER_RE = re.compile(r'^\uE000\d+\uE000$')
 

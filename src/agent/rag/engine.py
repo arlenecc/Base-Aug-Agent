@@ -979,6 +979,13 @@ class RAGEngine:
                         len(files_to_process), self._parallel_workers)
             q: "queue.Queue[Any]" = queue.Queue(maxsize=self._parallel_workers * _QUEUE_CAPACITY_FACTOR)
 
+            # 每文件各阶段耗时：解析/清洗/切片 由 worker 记录（Step 3），向量化+
+            # 入库 由消费者在该文件完整提交时补算（Step 4）。用于每文件处理结束
+            # 时输出一段「哪一阶段是慢/卡点」的汇总日志。dict 单键赋值在 GIL 下
+            # 原子，多 worker 写不同 filepath 键无需加锁。
+            file_stage_times: Dict[str, Dict[str, float]] = {}
+            file_consume_start: Dict[str, float] = {}
+
             # 全局文件序号计数器（用于日志显示 "文件 3/10"）
             _file_counter = [0]  # 用 list 包装以在闭包中修改
             _file_counter_lock = threading.Lock()
@@ -1082,6 +1089,7 @@ class RAGEngine:
                         # clean → chunk → put 包在 try 中，避免 clean_text/
                         # normalize_markdown/chunk_documents 异常导致 worker
                         # 静默退出（异常会丢失，不记录到 stats["errors"]）。
+                        clean_dur = 0.0  # 清洗阶段耗时（三条子路径各自计时）
                         try:
                             rel_path = os.path.relpath(filepath, self._knowledge_base)
                             md_name = _safe_filename(rel_path) + ".md"
@@ -1104,7 +1112,9 @@ class RAGEngine:
                                     # 图片语法 / 内部锚点链接，读出时跑一遍完整清理并
                                     # 落盘，让脏缓存被永久修好（clean_markdown_document
                                     # 幂等，无变化的文件不会触发重写）。
+                                    _tc = time.monotonic()
                                     cleaned = clean_markdown_document(raw)
+                                    clean_dur = time.monotonic() - _tc
                                     if cleaned != raw:
                                         try:
                                             with open(md_path, "w", encoding="utf-8") as f:
@@ -1126,7 +1136,9 @@ class RAGEngine:
                                     # HTML 标签与 Markdown 图片/内部锚点链接……统一用
                                     # clean_markdown_document 无损清理（剥噪音、留正文，
                                     # 保护代码块），否则大量进入切片/嵌入。
+                                    _tc = time.monotonic()
                                     cleaned = clean_markdown_document(text)
+                                    clean_dur = time.monotonic() - _tc
                                     _log("    ├─ docling Markdown 就绪: %s (%d 字符)", fname, len(cleaned))
                                 else:
                                     # ---- 2. 清洗文本 ----
@@ -1146,6 +1158,7 @@ class RAGEngine:
                                     _log("    ├─ 转换 Markdown: %s", fname)
                                     _flush_logs(f"Markdown: {fname}")
                                     cleaned, _ = convert_plain_text_to_markdown(cleaned)
+                                    clean_dur = time.monotonic() - t_clean
                                     _log("    ├─ Markdown 完成: %s (%d 字符)", fname, len(cleaned))
                                     _flush_logs(f"Markdown完成: {fname}")
                                 try:
@@ -1257,6 +1270,12 @@ class RAGEngine:
                             )
                             _flush_logs(f"切片完成: {fname} ({len(doc_chunks)}片)")
                             _mem_mark(f"切片完成 {fname} chunks={len(doc_chunks)}")
+                            # 记录本文件前三阶段耗时，供消费者在完整入库时汇总输出。
+                            file_stage_times[filepath] = {
+                                "parse": t_extract,
+                                "clean": clean_dur,
+                                "chunk": t_chunk_end - t_chunk,
+                            }
                             del cleaned
                         except Exception as e:
                             # clean/chunk 阶段异常：记录并跳过该文件，不中断整个同步。
@@ -1271,9 +1290,9 @@ class RAGEngine:
                             stats["files_extracted"] += 1
                             stats["total_chars"] += cleaned_len
 
-                        # 文件处理完成总耗时
+                        # 解析/清洗/切片三阶段小计（向量化+入库在 Step 4，未含在内）。
                         _log(
-                            "    └─ ✅ 文件处理完成: %s (%d 切片, 总耗时 %.2fs)",
+                            "    └─ ✅ 解析/清洗/切片完成: %s (%d 切片, 耗时 %.2fs，等待向量化)",
                             fname, len(doc_chunks), time.monotonic() - t0,
                         )
                         _flush_logs(f"✅ {fname} ({len(doc_chunks)}切片)")
@@ -1362,6 +1381,29 @@ class RAGEngine:
                         done[fp] = pending_manifest[fp]
                 return done
 
+            def _log_file_stage_times(fp: str) -> None:
+                """每文件**完整入库**时输出各阶段耗时，便于定位慢/卡点在哪一步。
+
+                解析/清洗/切片 来自 worker 记录的 file_stage_times；向量化+入库
+                = 完整提交时刻 − 该文件开始进入向量化的时刻（file_consume_start）。
+                """
+                st = file_stage_times.get(fp) or {}
+                cs = file_consume_start.get(fp)
+                vec_store = (time.monotonic() - cs) if cs is not None else None
+                segs = []
+                if "parse" in st:
+                    segs.append(f"解析 {st['parse']:.2f}s")
+                if "clean" in st:
+                    segs.append(f"清洗 {st['clean']:.2f}s")
+                if "chunk" in st:
+                    segs.append(f"切片 {st['chunk']:.2f}s")
+                if vec_store is not None:
+                    segs.append(f"向量化+入库 {vec_store:.2f}s")
+                total = sum(st.values()) + (vec_store or 0.0)
+                _log("  └─ ⏱ 各阶段耗时: %s [%s] 合计 %.2fs",
+                     os.path.basename(fp), " | ".join(segs), total)
+                _flush_logs(f"⏱ {os.path.basename(fp)} 各阶段合计 {total:.1f}s")
+
             def _chunk_iter() -> Iterator[Dict[str, Any]]:
                 nonlocal cum_chunks
                 sentinels_seen = 0
@@ -1398,6 +1440,8 @@ class RAGEngine:
                     filepath, doc_chunks, c_hash, n_chunks = item
                     consumer_file_no += 1
                     fname = os.path.basename(filepath)
+                    # 记录本文件开始进入向量化的时刻：完整入库时减去即得「向量化+入库」耗时。
+                    file_consume_start[filepath] = time.monotonic()
                     _log(
                         "  [消费 %d] 向量化排队: %s (%d 个切片等待嵌入)",
                         consumer_file_no, fname, n_chunks,
@@ -1443,6 +1487,9 @@ class RAGEngine:
                         _entry = pending_manifest.get(_fp)
                         if _entry is not None:
                             new_manifest[_fp] = _entry
+                            # 该文件已完整入库：输出各阶段耗时汇总（解析/清洗/切片/
+                            # 向量化+入库），定位慢/卡点。只此一次（_fp 已进 new_manifest）。
+                            _log_file_stage_times(_fp)
                             try:
                                 _save_manifest(self._rag_dir, {_fp: _entry})
                                 _log("  ├─ 已完整入库，增量保存同步记录: %s",

@@ -155,3 +155,35 @@ def test_clean_text_removes_running_header_and_footnote():
     assert "第三章 正文" in out
     assert "第二章 → 23" not in out
     assert "[12]" not in out
+
+
+def test_strip_markdown_noise_lines_no_redos_on_long_leader_runs():
+    """长串点线/间隔号（目录点线、装饰分隔、OCR 垃圾）不得触发灾难性回溯。
+
+    早期 _MD_TRAILING_LEADER_RE 用 ``[.…·•]{2,}...\\d{1,4}``，遇「一长串引导符
+    且无页码」会立方/指数级回溯（·×4000 直接卡死）；而 strip_markdown_noise_lines
+    对每行都跑 .sub，一次同步就被一行拖垮（内存飙+卡住）。用超时守卫锁定线性行为。
+    """
+    import time
+
+    from agent.rag.cleaner import strip_markdown_noise_lines
+
+    # 50 行 × 4000 个引导符、无页码：最坏回溯输入。
+    doc = "\n".join("项目 " + "·" * 4000 for _ in range(50))
+    t = time.monotonic()
+    out = strip_markdown_noise_lines(doc)
+    dt = time.monotonic() - t
+    assert dt < 2.0, f"疑似灾难性回溯（ReDoS）：耗时 {dt:.2f}s"
+    # 功能性：引导符被清掉、标题文字保留
+    assert "项目" in out and "·" not in out
+
+
+def test_strip_markdown_noise_lines_preserves_decimals():
+    """点线清洗不得误伤小数点/版本号（3.14、1.2.3 只有单个点，不触发）。"""
+    from agent.rag.cleaner import strip_markdown_noise_lines
+
+    md = "圆周率是 3.14，版本 1.2.3 发布\n\n引论 ………… 2\n"
+    out = strip_markdown_noise_lines(md)
+    assert "3.14" in out
+    assert "1.2.3" in out
+    assert "………" not in out  # 目录点线被清

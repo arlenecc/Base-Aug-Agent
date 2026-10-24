@@ -187,6 +187,26 @@ def test_first_ingest_processes_all_files(tmp_path):
     assert "mtime" in entry and "size" in entry and "content_hash" in entry
 
 
+def test_ingest_logs_per_file_stage_timings(tmp_path):
+    """每文件完整入库后，日志应含「解析/清洗/切片/向量化+入库」四阶段耗时汇总，
+    便于定位慢/卡点在哪一步。"""
+    store = _FakeStore()
+    engine, kb = _make_engine(tmp_path, store)
+    (kb / "b.md").write_text("# 标题\n\n" + ("第二篇内容，用于切片与计时。" * 60))
+
+    logs: list = []
+    engine.ingest(force=False, log_callback=logs.append)
+
+    timing = [ln for ln in logs if "各阶段耗时" in ln]
+    # a.txt + b.md 各一行
+    assert len(timing) == 2, timing
+    for ln in timing:
+        for stage in ("解析", "清洗", "切片", "向量化+入库", "合计"):
+            assert stage in ln, f"缺少阶段 {stage}: {ln}"
+    # worker 侧的前三阶段小计行也应出现（向量化前）
+    assert any("解析/清洗/切片完成" in ln for ln in logs)
+
+
 def test_second_ingest_skips_unchanged_files(tmp_path):
     """Second ingest with force=False must skip all unchanged files — no
     re-parse, no re-chunk, no re-embed, no upsert."""
