@@ -128,23 +128,16 @@ def _ov_cfg_from_config(config: AgentConfig) -> Dict[str, str]:
     }
 
 
-_OVIS_DEFAULT_CFG = {
-    "backend": "mlx", "model": "OvisOCR3-MLX-4bit-mixed46",
-    "path": "models/OvisOCR3-MLX-4bit-mixed46",
-    "gguf_path": "", "mmproj_path": "", "vlm_handler": "mtmd", "chat_format": "",
-}
-
-
 def _ocr_image(arr: np.ndarray, model: str, config: AgentConfig) -> str:
     """对单张归一化灰度图按模型识别。"""
     if model == "apple":
         return _ocr_image_apple(arr)
     if model == "ovis":
-        return _ocr_image_ovis(arr, _OVIS_DEFAULT_CFG)
+        return _ocr_image_ovis(arr, _ov_cfg_from_config(config))
     if model == "custom":
         return _ocr_image_ovis(arr, _ov_cfg_from_config(config))
     # hybrid 对图片：退化为 Ovis（图片主要比拼表格/版面，Ovis 更擅长）
-    return _ocr_image_ovis(arr, _OVIS_DEFAULT_CFG)
+    return _ocr_image_ovis(arr, _ov_cfg_from_config(config))
 
 
 def _run_image(filepath: str, model: str, config: AgentConfig) -> List[Dict[str, Any]]:
@@ -177,13 +170,10 @@ def _run_pdf(filepath: str, model: str, config: AgentConfig) -> List[Dict[str, A
                 if model == "apple":
                     text = _ocr_image_apple(gray)
                 elif model == "ovis" or model == "custom":
-                    text = _ocr_image_ovis(
-                        gray,
-                        _OVIS_DEFAULT_CFG if model == "ovis" else _ov_cfg_from_config(config),
-                    )
+                    text = _ocr_image_ovis(gray, _ov_cfg_from_config(config))
                 else:  # hybrid：Vision 与 Ovis 各跑一份，保留更完整者
                     a = _ocr_image_apple(gray)
-                    o = _ocr_image_ovis(gray, _OVIS_DEFAULT_CFG)
+                    o = _ocr_image_ovis(gray, _ov_cfg_from_config(config))
                     text = o if len(o) >= len(a) else a
             else:
                 # 空白页
