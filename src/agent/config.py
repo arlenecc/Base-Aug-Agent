@@ -164,14 +164,14 @@ class AgentConfig:
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
     #   - "docling"：默认，版面理解 + ocrmac(Apple Vision) OCR
     #   - "marker"：marker-pdf 2.x（surya OCR，服务端进程架构）
-    #   - "ovis"：PyMuPDF + OvisOCR2 VLM（第三方案，同时是 PDF/图像的
+    #   - "ovis"：PyMuPDF + OvisOCR3 VLM（第三方案，同时是 PDF/图像的
     #     轻量兜底，2026-10 起取代 PyMuPDF+RapidOCR 组合）
     # 主引擎不可用（未安装/导入失败）时自动回退到另一引擎；单文件转换
     # 失败仍走轻量兜底，行为与 #133 之前一致。
     rag_pdf_engine: str = "docling"
-    # OvisOCR2 模型配置（ovis 引擎 / PDF 兜底共用）：
+    # OvisOCR3 模型配置（ovis 引擎 / PDF 兜底共用）：
     #   - rag_ocr_backend：mlx | onnx | gguf
-    #       · mlx  → MLX-VLM 权重（默认 OvisOCR2-0.8B-MLX-4bit）
+    #       · mlx  → MLX-VLM 权重（默认 OvisOCR3-MLX-4bit-mixed46）
     #       · onnx → ONNX 多模态导出（含视觉+文本联合图），用 rag_ocr_model_path
     #       · gguf → llama.cpp GGUF 多模态模型（需 mmproj 投影文件才能看图）
     #   - rag_ocr_model / rag_ocr_model_path：MLX / ONNX 共用（目录或 .onnx 文件）
@@ -182,8 +182,8 @@ class AgentConfig:
     #   - rag_ocr_chat_format：llama.cpp chat_format（如 qwen2-vl，模型需要的
     #     话填；多数 mtmd handler 可留空）
     rag_ocr_backend: str = "mlx"
-    rag_ocr_model: str = "OvisOCR2-0.8B-MLX-4bit"
-    rag_ocr_model_path: str = "models/OvisOCR2-0.8B-MLX-4bit"
+    rag_ocr_model: str = "OvisOCR3-MLX-4bit-mixed46"
+    rag_ocr_model_path: str = "models/OvisOCR3-MLX-4bit-mixed46"
     rag_ocr_gguf_path: str = ""
     rag_ocr_mmproj_path: str = ""
     rag_ocr_vlm_handler: str = "mtmd"

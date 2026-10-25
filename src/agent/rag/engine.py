@@ -375,9 +375,9 @@ def _escape_like(s: str) -> str:
 
 
 def _lightweight_fallback(filepath: str) -> tuple:
-    """PDF / 图像文件的轻量兜底：OvisOCR2 管线（2026-10 起取代 PyMuPDF+RapidOCR）。
+    """PDF / 图像文件的轻量兜底：OvisOCR3 管线（2026-10 起取代 PyMuPDF+RapidOCR）。
 
-    PDF 与图像文件先走 OvisOCR2（PyMuPDF 取图 + VLM 转 markdown，表格
+    PDF 与图像文件先走 OvisOCR3（PyMuPDF 取图 + VLM 转 markdown，表格
     区域裁剪识别后填回原位）；引擎不可用或解析失败时退回
     ``parsers.extract_text`` 作最终安全网（文本页直取 + 图页跳过告警）。
     非 PDF/图像格式 ovis 直接返回 None，开销可忽略。
@@ -388,7 +388,7 @@ def _lightweight_fallback(filepath: str) -> tuple:
         if md and md.strip():
             return md, True
     except Exception as e:
-        logger.warning("OvisOCR2 兜底失败，退回轻量解析: %s", e)
+        logger.warning("OvisOCR3 兜底失败，退回轻量解析: %s", e)
     return extract_text(filepath), False
 
 
@@ -402,13 +402,13 @@ def _extract_with_pdf_engine(filepath: str, pdf_engine: str = "docling") -> tupl
       1. 配置的主引擎「不可用」（未安装/导入失败）→ 尝试另一个 Markdown
          引擎。配置指向一个没有安装的引擎时，不该直接掉到轻量解析器而
          浪费另一个重型引擎。
-      2. 主引擎「可用但单文件转换失败」→ 走轻量兜底（OvisOCR2 管线 →
+      2. 主引擎「可用但单文件转换失败」→ 走轻量兜底（OvisOCR3 管线 →
          parsers.extract_text）。故意不跨引擎兜底：mid-ingest 冷启动另一个
          重型引擎（可能触发模型下载）会把个别坏文件放大成整库同步的
          长时间停顿。
     """
     if pdf_engine == "ovis":
-        # 第三方案：PyMuPDF + OvisOCR2 VLM。不可用/失败 → 轻量兜底
+        # 第三方案：PyMuPDF + OvisOCR3 VLM。不可用/失败 → 轻量兜底
         # （其中会再试一次 ovis，失败标志已缓存，开销可忽略），不冷启动
         # docling/marker 重型引擎。
         try:
@@ -576,10 +576,10 @@ class RAGEngine:
         self._rerank_enabled = bool(rerank_enabled)
         self._parallel_workers = max(1, int(parallel_workers))
         # PDF 主引擎（docling|marker|ovis）。未知值一律回退 docling，避免配置
-        # 笔误把整库同步打到意外的路径上。ovis = PyMuPDF + OvisOCR2 VLM，
+        # 笔误把整库同步打到意外的路径上。ovis = PyMuPDF + OvisOCR3 VLM，
         # 同时是 PDF/图像的轻量兜底（2026-10 起取代 PyMuPDF+RapidOCR）。
         self._pdf_engine = pdf_engine if pdf_engine in ("docling", "marker", "ovis") else "docling"
-        # OvisOCR2 配置：ovis 主路与 PDF 兜底共用，惰性加载，同步结束释放。
+        # OvisOCR3 配置：ovis 主路与 PDF 兜底共用，惰性加载，同步结束释放。
         try:
             from .ovis_ocr import configure as _ovis_configure
             _ovis_configure(
@@ -2449,7 +2449,7 @@ class RAGEngine:
             release_converter()
         except Exception as e:
             logger.debug("RAG: release marker converter error: %s", e)
-        # OvisOCR2 VLM 单例（~0.9GB 统一内存）：ovis 主路 / PDF 兜底共用。
+        # OvisOCR3 VLM 单例（~0.9GB 统一内存）：ovis 主路 / PDF 兜底共用。
         try:
             from .ovis_ocr import release_engine
             release_engine()

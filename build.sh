@@ -40,6 +40,14 @@ if ! "$PYTHON_BIN" -c "import PyInstaller" 2>/dev/null; then
     "$PIP_BIN" install pyinstaller
 fi
 
+# 提示：若希望 .app 内置默认模型，请先把模型放到仓库 models/ 目录再打包
+# （base-agent.spec 会自动将 models/ 内嵌进 .app/Contents/MacOS/models）。
+if [[ -d "models" ]]; then
+    echo "📦 检测到 models/，将随 .app 内嵌默认模型"
+else
+    echo "ℹ️  未检测到 models/，.app 将不含内置模型（运行时需手动指定模型路径）"
+fi
+
 echo "🔨 Building BaseAgent.app..."
 PYTHONPATH=src "$PYTHON_BIN" -m PyInstaller base-agent.spec --noconfirm
 

@@ -1,20 +1,20 @@
-"""OvisOCR2 多模态 OCR 引擎——docling / marker 之外的第三方案。
+"""OvisOCR3 多模态 OCR 引擎——docling / marker 之外的第三方案。
 
 定位（2026-10 需求）：
   * PDF / 图像类文件的**兜底解析方案**，取代原先 parsers.py 的
     PyMuPDF + ocrmac/rapidocr 组合；
   * 同时作为 ``rag_pdf_engine="ovis"`` 时可显式选中的主引擎。
 
-管线（PyMuPDF 取图 + OvisOCR2 VLM 转 markdown）：
+管线（PyMuPDF 取图 + OvisOCR3 VLM 转 markdown）：
   * 文本 PDF：PyMuPDF 直取每页文本；页面检测到表格时，把表格区域裁剪
     渲染成图 → 归一化 → 送 VLM 转 markdown → 填回原表格所在位置；
   * 图片 PDF（无文本层）：逐页渲染整页 → 归一化 → 送 VLM 转 markdown；
   * 图像文件（png/jpg/...）：整图归一化后送 VLM。
 
-模型默认 ``models/OvisOCR2-0.8B-MLX-4bit``（Qwen3.5-VL 架构的 853M OCR
+模型默认 ``models/OvisOCR3-MLX-4bit-mixed46``（Qwen3.5-VL 架构的 853M OCR
 微调模型，4bit MLX 量化，实测比 docling OCR 路径快 2-3 倍、内存 0.86GB）。
 后端下拉提供 MLX-VLM / ONNX / GGUF 三选：
-  * mlx   → MLX-VLM 权重（默认 OvisOCR2-0.8B-MLX-4bit）
+  * mlx   → MLX-VLM 权重（默认 OvisOCR3-MLX-4bit-mixed46）
   * onnx  → ONNX 多模态导出（含视觉+文本联合图），用 rag_ocr_model_path
   * gguf  → llama.cpp GGUF 多模态模型，必须配 mmproj 投影文件才能读图
 三者共用同一套 PDF/图像 → markdown 管线；缺权重时加载阶段给出明确错误。
@@ -45,8 +45,8 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 # 默认模型（配置窗口的默认值也用它，改这里即可全链路生效）
 DEFAULT_OCR_BACKEND = "mlx"
-DEFAULT_OCR_MODEL = "OvisOCR2-0.8B-MLX-4bit"
-DEFAULT_OCR_MODEL_PATH = "models/OvisOCR2-0.8B-MLX-4bit"
+DEFAULT_OCR_MODEL = "OvisOCR3-MLX-4bit-mixed46"
+DEFAULT_OCR_MODEL_PATH = "models/OvisOCR3-MLX-4bit-mixed46"
 
 # VLM 提示词：实测该模型被 OCR 微调「焊死」了输出格式（要求 markdown
 # 管道表格仍输出 HTML、要求省略页眉页码照旧转写），格式归一化全部在代码
@@ -283,12 +283,12 @@ def _load_mlx():
         from mlx_vlm.utils import load_config
     except Exception as e:
         raise OvisUnavailable(
-            f"mlx-vlm 未安装，OvisOCR2 不可用: {e}（pip install mlx-vlm）"
+            f"mlx-vlm 未安装，OvisOCR3 不可用: {e}（pip install mlx-vlm）"
         ) from e
     model_path = _resolve_model_path()
     if not Path(model_path).is_dir():
         raise OvisUnavailable(
-            f"OvisOCR2 模型目录不存在: {model_path}"
+            f"OvisOCR3 模型目录不存在: {model_path}"
             f"（配置的 rag_ocr_model_path）"
         )
     model, processor = load(model_path)
@@ -298,7 +298,7 @@ def _load_mlx():
     # MLX 内存上限：与嵌入/重排两个 MLX 入口一致，防止同步期 phys_footprint 暴涨。
     from .model_backends import _cap_mlx_memory_limits
     _cap_mlx_memory_limits()
-    logger.info("OvisOCR2 引擎加载完成: %s（MLX-VLM）", model_path)
+    logger.info("OvisOCR3 引擎加载完成: %s（MLX-VLM）", model_path)
     return _MLXOCREngine(model, processor, prompt)
 
 
@@ -847,7 +847,7 @@ def extract_markdown(filepath: str) -> Optional[str]:
     except OvisUnavailable:
         raise  # 引擎缺失是配置问题，让路由层决定回退
     except Exception as e:
-        logger.warning("OvisOCR2 解析失败 %s: %s", path.name, e)
+        logger.warning("OvisOCR3 解析失败 %s: %s", path.name, e)
         return None
     return None
 

@@ -114,6 +114,26 @@ for _pkg in ('docling', 'chonkie'):
         pass
 
 # -----------------------------------------------------------------------
+# 可选：将默认模型内嵌进 .app（#用户需求：打包内置模型）
+# -----------------------------------------------------------------------
+# 配置里默认相对路径 "models/<name>" 由 resolve_model_path 解析，打包后按
+# 以下位置查找（详见 src/agent/model_backends.py::resolve_model_path）：
+#   - 默认位："models"        → .app/Contents/MacOS/models          （候选④，推荐）
+#   - 标准位："Contents/Resources/models" → .app/Contents/Resources/models（候选⑤）
+# 模型可达数 GB：onefile 模式每次启动都会解压、体积与启动成本高，建议用本
+# spec 的 .app 目录(onedir)模式。models/ 不存在时跳过，不影响打包/运行
+# （运行时仍可在 UI 里手动指定模型路径）。
+MODELS_SRC = "models"
+if os.path.isdir(MODELS_SRC):
+    # 默认：落入 Contents/MacOS/models（与可执行文件同级，resolve 候选④命中）
+    datas += add_data_dir(MODELS_SRC, "models")
+    # 可选 macOS 标准位（resolve 候选⑤）：改用下一行代替上一行
+    # datas += add_data_dir(MODELS_SRC, "Contents/Resources/models")
+    print(f"[spec] 已将 {MODELS_SRC}/ 内嵌进 .app -> Contents/MacOS/models")
+else:
+    print(f"[spec] 未找到 {MODELS_SRC}/，跳过模型内嵌（运行时可在 UI 指定模型路径）")
+
+# -----------------------------------------------------------------------
 # Analysis
 # -----------------------------------------------------------------------
 

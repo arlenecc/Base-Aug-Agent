@@ -59,28 +59,28 @@ RAG_BACKENDS = (
 # 默认模型路径（#140 用户定参）：本地模式未指定时启动即加载这两个。
 DEFAULT_MAIN_MODEL_PATH = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
 DEFAULT_AUX_MODEL_PATH = "models/Qwen3.5-2B-MLX-4bit"
-# PDF 解析引擎三选一（docling / marker / OvisOCR2 第三方案）。
+# PDF 解析引擎三选一（docling / marker / OvisOCR3 第三方案）。
 PDF_ENGINES = (
     ("docling", "docling"),
     ("marker", "marker"),
-    ("OvisOCR2", "ovis"),
+    ("OvisOCR3", "ovis"),
 )
 # 各引擎单选钮的悬停说明（横排常显，tooltip 补充细节）。
 _PDF_ENGINE_TIPS = {
     "docling": "docling：版面理解 + ocrmac OCR（默认）",
     "marker": "marker：marker-pdf 2.x（surya OCR，服务端进程架构）",
-    "ovis": "OvisOCR2：PyMuPDF + OvisOCR2 VLM，表格区域裁剪识别后填回原位，"
+    "ovis": "OvisOCR3：PyMuPDF + OvisOCR3 VLM，表格区域裁剪识别后填回原位，"
             "同时是 PDF/图像的兜底方案",
 }
-# OvisOCR2 后端下拉（当前仅 MLX-VLM 有可用权重，ONNX/GGUF 预留）。
+# OvisOCR3 后端下拉（当前仅 MLX-VLM 有可用权重，ONNX/GGUF 预留）。
 OCR_BACKENDS = (
     ("MLX-VLM", "mlx"),
     ("ONNX", "onnx"),
     ("GGUF", "gguf"),
 )
-# OvisOCR2 默认模型（配置窗口默认值；改 rag/ovis_ocr.py 的 DEFAULT_* 同步生效）。
-DEFAULT_OCR_MODEL = "OvisOCR2-0.8B-MLX-4bit"
-DEFAULT_OCR_MODEL_PATH = "models/OvisOCR2-0.8B-MLX-4bit"
+# OvisOCR3 默认模型（配置窗口默认值；改 rag/ovis_ocr.py 的 DEFAULT_* 同步生效）。
+DEFAULT_OCR_MODEL = "OvisOCR3-MLX-4bit-mixed46"
+DEFAULT_OCR_MODEL_PATH = "models/OvisOCR3-MLX-4bit-mixed46"
 # 启动时自动把默认模型加载备用。测试里置 1 跳过：加载数 GB 权重会让套件变成
 # 分钟级，且 CI 上多半没有对应运行时（见 tests/conftest.py）。
 AUTOLOAD_SKIP_ENV = "BASE_AGENT_SKIP_MODEL_AUTOLOAD"
@@ -612,7 +612,7 @@ class SyncKnowledgeWorker(QThread):
                 _engine_kwargs["rerank_model"] = self._rerank_model
             # PDF 主引擎（docling|marker|ovis，#134），配置可切换。
             _engine_kwargs["pdf_engine"] = self._pdf_engine
-            # OvisOCR2 模型（ovis 引擎 / PDF 兜底共用），配置可覆盖。
+            # OvisOCR3 模型（ovis 引擎 / PDF 兜底共用），配置可覆盖。
             _engine_kwargs["ocr_backend"] = self._ocr_backend
             if self._ocr_model:
                 _engine_kwargs["ocr_model"] = self._ocr_model
@@ -1347,7 +1347,7 @@ class MainWindow(QMainWindow):
         self.embedding_model_path_btn = QPushButton("选择")
         # --- PDF 解析引擎（三选一横排单选）+ 自定义 OCR 模型 ---
         # 单选钮而不是下拉：三个引擎是互斥三选一，横排常显比收起的下拉
-        # 更易发现（尤其 OvisOCR2 是新方案）。QButtonGroup 显式保证互斥
+        # 更易发现（尤其 OvisOCR3 是新方案）。QButtonGroup 显式保证互斥
         # （不依赖父控件相同的隐式自动互斥）。
         self.pdf_engine_group = QButtonGroup(self)
         self.pdf_engine_radios = {}
@@ -1360,11 +1360,10 @@ class MainWindow(QMainWindow):
         self.ocr_backend_combo = QComboBox()
         _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
         self.ocr_backend_combo.setToolTip(
-            "OvisOCR2 推理后端。mlx=MLX-VLM 权重（默认）；onnx=ONNX 多模态导出"
+            "OvisOCR3 推理后端。mlx=MLX-VLM 权重（默认）；onnx=ONNX 多模态导出"
             "（需 rag_ocr_model_path 指向 .onnx 或目录）；gguf=llama.cpp GGUF 多模态"
             "（必须填 mmproj 投影文件才能读图）。缺权重时加载阶段给出明确错误。"
         )
-        self.ocr_model_edit = QLineEdit()
         self.ocr_model_path_edit = QLineEdit(placeholderText="MLX/ONNX 模型目录或 .onnx 文件")
         self.ocr_model_path_btn = QPushButton("选择")
         self.ocr_model_path_btn.clicked.connect(self._on_select_ocr_model_path)
@@ -1546,16 +1545,32 @@ class MainWindow(QMainWindow):
         kb_lay.addLayout(engine_row)
 
         # Row 1.6: 自定义 OCR 模型后端 | 模型/目录名 | 本地路径
-        # OvisOCR2 第三解析方案的模型配置（2026-10）。
+        # OvisOCR3 第三解析方案的模型配置（2026-10）。
         ocr_row = QHBoxLayout()
         ocr_row.setSpacing(8)
         ocr_row.addWidget(QLabel("自定义 OCR 模型"))
         ocr_row.addWidget(self.ocr_backend_combo)
-        ocr_row.addWidget(QLabel("模型/目录名"))
-        ocr_row.addWidget(self.ocr_model_edit, 2)
         ocr_row.addWidget(QLabel("本地路径"))
         ocr_row.addWidget(self.ocr_model_path_edit, 3)
         ocr_row.addWidget(self.ocr_model_path_btn)
+        ocr_row.addSpacing(12)
+        # 自定义 OCR 模型行的两个操作按钮（#用户需求）：
+        #  - 保存设置：把本行 OCR 配置写入并落盘 config，供知识库同步使用；
+        #  - 识别测试：弹出独立窗口，用各 OCR 模型对任意图片/PDF 做目测对比。
+        self.ocr_save_btn = QPushButton("保存设置")
+        self.ocr_save_btn.setToolTip(
+            "保存并应用「自定义 OCR 模型」这一行的配置\n"
+            "下次知识库同步会使用此处设置的 Ovis OCR 模型"
+        )
+        self.ocr_save_btn.clicked.connect(self._on_ocr_save_settings)
+        ocr_row.addWidget(self.ocr_save_btn)
+        self.ocr_test_btn = QPushButton("识别测试")
+        self.ocr_test_btn.setToolTip(
+            "弹出 OCR 识别测试窗口\n"
+            "可选 Apple OCR / OvisOCR3 / 混合 / 自定义 OCR，对指定图片或 PDF 做识别并左右对照"
+        )
+        self.ocr_test_btn.clicked.connect(self._on_ocr_test)
+        ocr_row.addWidget(self.ocr_test_btn)
         kb_lay.addLayout(ocr_row)
 
         # Row 1.7: GGUF 专用（仅后端选 GGUF 时需要）：模型文件 | mmproj | handler | format
@@ -1885,9 +1900,6 @@ class MainWindow(QMainWindow):
         _select_pdf_engine_radio(self, getattr(self.config, "rag_pdf_engine", "docling"))
         _select_combo_backend(self.ocr_backend_combo,
                               getattr(self.config, "rag_ocr_backend", "mlx"))
-        self.ocr_model_edit.setText(
-            getattr(self.config, "rag_ocr_model", "") or DEFAULT_OCR_MODEL
-        )
         self.ocr_model_path_edit.setText(
             getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
         )
@@ -1983,23 +1995,7 @@ class MainWindow(QMainWindow):
             self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
         )
         self.config.rag_pdf_engine = _checked_pdf_engine(self) or "docling"
-        self.config.rag_ocr_backend = (
-            _combo_backend_value(self.ocr_backend_combo) or "mlx"
-        )
-        self.config.rag_ocr_model = (
-            self.ocr_model_edit.text().strip()
-            or getattr(self.config, "rag_ocr_model", "") or DEFAULT_OCR_MODEL
-        )
-        self.config.rag_ocr_model_path = (
-            self.ocr_model_path_edit.text().strip()
-            or getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
-        )
-        self.config.rag_ocr_gguf_path = self.ocr_gguf_path_edit.text().strip()
-        self.config.rag_ocr_mmproj_path = self.ocr_mmproj_path_edit.text().strip()
-        self.config.rag_ocr_vlm_handler = (
-            self.ocr_vlm_handler_edit.text().strip() or "mtmd"
-        )
-        self.config.rag_ocr_chat_format = self.ocr_chat_format_edit.text().strip()
+        self._gather_ocr_config_from_widgets()
         self.config.rag_rerank_backend = (
             _combo_backend_value(self.reranker_backend_combo) or "fastembed"
         )
@@ -2029,6 +2025,29 @@ class MainWindow(QMainWindow):
             # the box even when the user hasn't explicitly set a path.
             kb = os.path.join(self.config.workspace, "knowledge_base")
         self.config.knowledge_base = kb
+
+    def _gather_ocr_config_from_widgets(self) -> None:
+        """从「自定义 OCR 模型」行控件收集 Ovis OCR 配置写入 config。
+
+        单独抽出，供「应用配置」「保存设置（仅 OCR）」两处复用，避免重复逻辑。
+        """
+        self.config.rag_ocr_backend = (
+            _combo_backend_value(self.ocr_backend_combo) or "mlx"
+        )
+        self.config.rag_ocr_model_path = (
+            self.ocr_model_path_edit.text().strip()
+            or getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
+        )
+        # 模型名自动由「本地路径」最后一段派生（去掉 models/ 前缀），无需用户填写。
+        self.config.rag_ocr_model = (
+            os.path.basename(self.config.rag_ocr_model_path) or DEFAULT_OCR_MODEL
+        )
+        self.config.rag_ocr_gguf_path = self.ocr_gguf_path_edit.text().strip()
+        self.config.rag_ocr_mmproj_path = self.ocr_mmproj_path_edit.text().strip()
+        self.config.rag_ocr_vlm_handler = (
+            self.ocr_vlm_handler_edit.text().strip() or "mtmd"
+        )
+        self.config.rag_ocr_chat_format = self.ocr_chat_format_edit.text().strip()
 
     def _gather_sampling_from_widgets(self, prefix: str) -> None:
         """从控件读采样参数写进 config。prefix "" = 主模型，"aux_" = 辅助。
@@ -2453,6 +2472,57 @@ class MainWindow(QMainWindow):
         if path:
             self.embedding_model_path_edit.setText(path)
 
+    def _on_ocr_save_settings(self) -> None:
+        """「保存设置」：仅把「自定义 OCR 模型」行的配置写入并落盘 config。
+
+        不重建整个 agent（OCR 配置在知识库同步时由 worker 实时读取），落盘后
+        下次同步即可生效。比起「应用配置」更轻量，也不会因其它未保存字段而改动。
+        """
+        if self._busy:
+            QMessageBox.warning(
+                self, "正在运行",
+                "Agent 正在运行，请先点击「终止对话」停止当前任务，再保存配置。",
+            )
+            return
+        if self._sync_busy or self._is_worker_running(self._sync_worker):
+            QMessageBox.warning(
+                self, "正在同步",
+                "知识库同步进行中，请先等待其完成，再保存 OCR 配置。",
+            )
+            return
+        self._gather_ocr_config_from_widgets()
+        try:
+            self.config.save(CONFIG_PATH)
+        except Exception as e:  # pragma: no cover - 防御
+            QMessageBox.critical(self, "保存失败", f"写入配置文件失败：{e}")
+            return
+        self.status_label.setText("自定义 OCR 模型设置已保存并应用")
+        QMessageBox.information(
+            self, "已保存",
+            "「自定义 OCR 模型」设置已保存。\n"
+            "下次知识库同步将使用此处配置的 Ovis OCR 模型。",
+        )
+
+    def _on_ocr_test(self) -> None:
+        """「识别测试」：弹出独立 OCR 测试窗口（依赖 RAG 解析组件）。"""
+        try:
+            from .ocr_test_window import OcrTestWindow
+        except Exception as e:  # noqa: BLE001 - 缺 RAG 依赖时优雅提示
+            logger.warning("OCR 测试窗口导入失败: %s", e)
+            QMessageBox.critical(
+                self, "不可用",
+                "OCR 测试窗口需要 RAG 解析依赖（PyMuPDF / ocrmac / OvisOCR3 等）。\n"
+                "请确认已安装对应依赖后再试。",
+            )
+            return
+        existing = getattr(self, "_ocr_test_window", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._ocr_test_window = OcrTestWindow(self.config)
+        self._ocr_test_window.show()
+
     def _on_select_ocr_model_path(self) -> None:
         """选择 MLX/ONNX 模型目录（或 ONNX 的 .onnx 文件）。"""
         backend = _combo_backend_value(self.ocr_backend_combo)
@@ -2461,7 +2531,7 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getOpenFileName(
                 self, "选择 ONNX 模型", start, "ONNX (*.onnx);;所有文件 (*)")
         else:
-            path = QFileDialog.getExistingDirectory(self, "选择 OvisOCR2 模型目录", start)
+            path = QFileDialog.getExistingDirectory(self, "选择 OvisOCR3 模型目录", start)
         if path:
             self.ocr_model_path_edit.setText(path)
 

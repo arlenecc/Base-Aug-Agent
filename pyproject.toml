@@ -34,6 +34,9 @@ rag = [
     "openpyxl>=3.0.0",
     "python-pptx>=0.6.0",
     "PyMuPDF>=1.23.0",
+    # 文本型 PDF → Markdown：保留标题/列表/表格结构的精确转换（OCR 测试窗口
+    # 对文本型页优先使用）；缺失时回退 PyMuPDF 原生 get_text，不影响其它功能。
+    "pymupdf4llm>=0.0.14",
     "ebooklib>=0.18",
     "chonkie[semantic]>=1.0.0",
     # 语义切片快路径：model2vec 静态嵌入（potion-base-32M）驱动 chonkie 的

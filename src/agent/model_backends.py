@@ -56,22 +56,44 @@ def project_root() -> Path:
 
 
 def resolve_model_path(path: str, *, expect_file: bool = False) -> str:
-    """Resolve a configured local model path without performing network access."""
+    """Resolve a configured local model path without performing network access.
+
+    相对路径按以下优先级查找（取首个真实存在的为准）：
+
+    1. ``Path.cwd() / models``        —— 便携/开发：运行时目录含 models 时优先
+    2. ``project_root() / models``    —— 开发期 ``Base-Aug-Agent/models``
+    3. ``sys._MEIPASS / models``      —— PyInstaller 单文件(onefile)解压目录
+    4. ``<exe>.parent / models``      —— 可执行文件同级（onedir / .app 的
+       ``Contents/MacOS/models``，★打包默认落点）
+    5. ``<exe>.parent.parent / Resources / models`` —— macOS .app 标准位
+       ``Contents/Resources/models``
+    6. ``<exe>.parents[2] / models``  —— ``.app`` 包根（``.app/models``）
+
+    打包时只需把 ``models/`` 作为数据资源随可执行文件发布（如
+    ``--add-data "models:models"`` 落到 ``Contents/MacOS/models``，命中 ④），
+    即可被自动定位，业务代码无需改动。回退报错路径取「项目根」以保持开发期
+    友好。
+    """
     raw = os.path.expandvars(os.path.expanduser((path or "").strip()))
     if not raw:
         raise LLMError("未配置本地模型路径")
     candidate = Path(raw)
     if not candidate.is_absolute():
         executable = Path(sys.executable).resolve()
+        meipass = getattr(sys, "_MEIPASS", None)
+        root_cand = project_root() / candidate
         candidates = [
-            Path.cwd() / candidate,
-            project_root() / candidate,
-            executable.parent / candidate,
+            Path.cwd() / candidate,                              # ① cwd
+            root_cand,                                           # ② 项目根
+            executable.parent / candidate,                      # ④ exe 同级（打包默认）
+            executable.parent.parent / "Resources" / candidate, # ⑤ macOS .app Resources
         ]
-        # macOS .app: <App>.app/Contents/MacOS/<exe>，允许 models 与 .app 同级。
-        if len(executable.parents) >= 3:
+        if meipass:                                             # ③ PyInstaller onefile
+            candidates.insert(2, Path(meipass) / candidate)
+        if len(executable.parents) >= 3:                        # ⑥ .app 包根
             candidates.append(executable.parents[2] / candidate)
-        candidate = next((item for item in candidates if item.exists()), candidates[1])
+        # 回退到项目根，给出开发期友好的报错路径。
+        candidate = next((item for item in candidates if item.exists()), root_cand)
     candidate = candidate.resolve()
     if not candidate.exists():
         raise LLMError(f"本地模型不存在: {candidate}")
