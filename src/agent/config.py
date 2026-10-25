@@ -136,7 +136,7 @@ class AgentConfig:
     # 不会出现「默认配置直接不可用」。
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"  # MLX 回退用
-    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx"
+    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx-int8"
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16

@@ -39,7 +39,7 @@ def _summary(durations: List[float], item_count: int) -> Dict[str, float]:
 
 def benchmark_embeddings(
     *,
-    mlx_path: str = "models/nomic-embed-text-v1.5-mlx",
+    mlx_path: str = "models/nomic-embed-text-v1.5-mlx-int8",
     fastembed_model: str = "nomic-ai/nomic-embed-text-v1.5-Q",
     batch_size: int = 8,
     rounds: int = 3,
@@ -99,7 +99,7 @@ def benchmark_embeddings(
 
 def benchmark_embedding_batch_sizes(
     *,
-    mlx_path: str = "models/nomic-embed-text-v1.5-mlx",
+    mlx_path: str = "models/nomic-embed-text-v1.5-mlx-int8",
     fastembed_model: str = "nomic-ai/nomic-embed-text-v1.5-Q",
     sizes=(2, 4, 6, 8, 10, 12, 16, 18, 20),
     corpus_size: int = 48,
