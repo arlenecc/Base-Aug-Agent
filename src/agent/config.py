@@ -197,6 +197,12 @@ class AgentConfig:
     # 完全一致），且目录页装饰线会被误判成表格页——故默认关闭，全篇固定
     # scale=2.0。需要表格高保真的用户在配置文件里开 true。
     rag_docling_dynamic_scale: bool = False
+    # docling VLM 模式（端到端用 Granite-Docling-258M 理解页面，取代独立的
+    # 布局 / TableFormer / OCR 级联）。需 transformers（已在 rag extra 声明）
+    # 与首次下载 ~500MB 权重；离线 / 未装 transformers 时 _build_converter 会
+    # 自动回退标准 PDF 管线。默认关：Granite-Docling 更重且需联网，版面/表格
+    # 质量未必优于标准管线——需要更统一的多语言/复杂版面理解时开 true。
+    rag_docling_vlm: bool = False
 
     # PDF 转换按文件大小限流（docling / marker 两个转换器共用一套参数）：
     #   - rag_pdf_small_concurrency：小于阈值的「小文件」最多几路并发转换（同时
@@ -261,7 +267,7 @@ class AgentConfig:
         "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
-                    "rag_docling_dynamic_scale",
+                    "rag_docling_dynamic_scale", "rag_docling_vlm",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
                     "llm_speculative", "llama_cpp_kv_cache")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。

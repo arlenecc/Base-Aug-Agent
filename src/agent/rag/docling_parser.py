@@ -241,11 +241,24 @@ _TEXT_LAYER_MIN_CHARS = 100  # 文本层字符数下限：达到即视为文本�
 # 问题是表格页升档后 OCR 像素 ×1.56 + 多建一个档位转换器）。
 _dynamic_scale_enabled = False
 
+# docling VLM 模式总开关（见 config.rag_docling_vlm）。开启后 _build_converter
+# 改用 ExtractionVlmPipeline + Granite-Docling-258M 端到端理解页面（版面+表格+
+# OCR 合一），不再跑独立的布局/TableFormer/OCR 级联。默认关：Granite-Docling
+# 更重（~500MB 权重 + transformers）且需联网下载；离线 / 未装 transformers 时
+# _build_converter 会自动回退标准 PDF 管线。
+_docling_vlm_enabled = False
+
 
 def configure_dynamic_scale(enabled: bool) -> None:
     """RAGEngine.__init__ 调用：设置动态 OCR 倍率开关（默认关）。"""
     global _dynamic_scale_enabled
     _dynamic_scale_enabled = bool(enabled)
+
+
+def configure_vlm(enabled: bool) -> None:
+    """RAGEngine.__init__ 调用：设置 docling VLM 模式开关（默认关）。"""
+    global _docling_vlm_enabled
+    _docling_vlm_enabled = bool(enabled)
 # 分类用的像素分析渲染 DPI。必须 >=150：扫描件通常按 300 DPI 栅格化，
 # 100 DPI 的 3:1 盒式降采样会把目录页的点线（leader dots）平均成连续
 # 灰带（(3×0+7×255)/10≈178 < 250 非白阈值），点线页被误判成表格；
@@ -274,7 +287,43 @@ def _build_converter(scale: float):
     ``scale`` 是该实例的 OCR 渲染倍率（72 DPI × scale），见 _OCR_SCALE_*
     常量与 _analyze_pdf_pages。构建失败抛异常，由调用方标记 unavailable。
     """
-    from docling.document_converter import DocumentConverter
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.accelerator_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+    )
+
+    if _docling_vlm_enabled:
+        # VLM 模式：Granite-Docling-258M 端到端理解页面（版面+表格+OCR 合一），
+        # 不跑独立的布局/TableFormer/OCR 级联。需 transformers（已在 pyproject
+        # rag extra 声明）与首次下载 ~500MB 权重；accelerator 仍强制 MPS + 限 4
+        # 线程，与标准管线共用同一套转换后 _flush_mps_cache 内存护栏。
+        try:
+            from docling.pipeline.vlm_pipeline import VlmPipeline
+            from docling.datamodel.pipeline_options import (
+                VlmConvertOptions,
+                VlmPipelineOptions,
+            )
+            vlm_opts = VlmPipelineOptions(
+                accelerator_options=AcceleratorOptions(
+                    num_threads=4, device=AcceleratorDevice.MPS
+                ),
+                vlm_options=VlmConvertOptions.from_preset("granite_docling"),
+            )
+            converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_cls=VlmPipeline,
+                        pipeline_options=vlm_opts,
+                    )
+                }
+            )
+            logger.info(
+                "docling VLM 模式已启用（ExtractionVlmPipeline + granite_docling-258M）")
+            return converter
+        except Exception as e:
+            logger.warning("docling VLM 管线不可用（%s），回退标准 PDF 管线", e)
 
     converter = None
     try:

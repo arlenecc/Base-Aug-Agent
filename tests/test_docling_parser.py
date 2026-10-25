@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 
 def test_extract_markdown_returns_none_when_docling_missing(monkeypatch):
     """Without docling, extract_markdown returns None (caller falls back)."""
@@ -115,3 +117,47 @@ def test_extract_markdown_conversion_error_returns_none(monkeypatch, tmp_path):
     monkeypatch.setattr(dp, "_get_converter", lambda scale=dp._OCR_SCALE_DEFAULT: _BrokenConverter())
 
     assert dp.extract_markdown(str(pdf)) is None
+
+
+def test_build_converter_uses_vlm_pipeline_when_enabled(monkeypatch):
+    """rag_docling_vlm 开启时，_build_converter 走 ExtractionVlmPipeline + granite_docling。"""
+    pytest.importorskip("docling.pipeline.vlm_pipeline")
+    from agent.rag import docling_parser as dp
+    from docling.document_converter import PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.pipeline.vlm_pipeline import VlmPipeline
+    from docling.datamodel.pipeline_options import VlmPipelineOptions
+
+    captured = {}
+    class _FakeConverter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+    monkeypatch.setattr("docling.document_converter.DocumentConverter", _FakeConverter)
+    monkeypatch.setattr(dp, "_docling_vlm_enabled", True)
+    dp._build_converter(2.0)
+    fo = captured["format_options"][InputFormat.PDF]
+    assert fo.pipeline_cls is VlmPipeline
+    assert isinstance(fo.pipeline_options, VlmPipelineOptions)
+    # 默认即 granite_docling 预设（端到端版面/表格/OCR 合一）
+    assert fo.pipeline_options.vlm_options is not None
+
+
+def test_build_converter_standard_pipeline_by_default(monkeypatch):
+    """默认（VLM 关）仍走标准 PDF 管线（StandardPdfPipeline + PdfPipelineOptions+OCR）。"""
+    from agent.rag import docling_parser as dp
+    from docling.document_converter import PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+    captured = {}
+    class _FakeConverter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+    monkeypatch.setattr("docling.document_converter.DocumentConverter", _FakeConverter)
+    monkeypatch.setattr(dp, "_docling_vlm_enabled", False)
+    dp._build_converter(2.0)
+    fo = captured["format_options"][InputFormat.PDF]
+    # 默认 pipeline_cls = StandardPdfPipeline（PdfFormatOption 类默认值）
+    assert fo.pipeline_cls.__name__ == "StandardPdfPipeline"
+    assert isinstance(fo.pipeline_options, PdfPipelineOptions)
+    assert fo.pipeline_options.ocr_options is not None

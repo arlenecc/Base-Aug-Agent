@@ -292,6 +292,7 @@ class ToolRegistry:
                 ocr_model_path=getattr(self.config, "rag_ocr_model_path", ""),
                 docling_dynamic_scale=getattr(
                     self.config, "rag_docling_dynamic_scale", False),
+                docling_vlm=getattr(self.config, "rag_docling_vlm", False),
                 # PDF 大小限流并发（小文件并发路数 / 大文件阈值 MB）。内存吃紧
                 # 时 rag_pdf_small_concurrency=1 可退回全串行。
                 pdf_small_concurrency=getattr(

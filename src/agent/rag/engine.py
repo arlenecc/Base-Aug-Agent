@@ -549,6 +549,7 @@ class RAGEngine:
         ocr_vlm_handler: str = "",
         ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
+        docling_vlm: bool = False,
         pdf_small_concurrency: int = 2,
         pdf_large_threshold_mb: float = 20.0,
         pdf_batch_threshold_mb: float = 50.0,
@@ -600,6 +601,13 @@ class RAGEngine:
             configure_dynamic_scale(docling_dynamic_scale)
         except Exception as e:
             logger.debug("RAG: docling dynamic scale configure error: %s", e)
+        # docling VLM 模式（默认关；需 transformers + 联网下载 Granite-Docling
+        # 权重，离线时自动回退标准 PDF 管线）。
+        try:
+            from .docling_parser import configure_vlm
+            configure_vlm(docling_vlm)
+        except Exception as e:
+            logger.debug("RAG: docling vlm configure error: %s", e)
         # PDF 转换按文件大小限流（小文件 N 路并发 / 大文件独占）。内存吃紧的
         # 机器把 rag_pdf_small_concurrency 设 1 即退回全串行。
         try:
