@@ -144,6 +144,9 @@ class AgentConfig:
     # n_positions=8192（本地 MLX 权重 config 即如此）；绝对位置嵌入模型（如
     # bge-small-zh，512）会在后端加载时按自己 config 夹紧。默认按 nomic 设 8192。
     rag_embedding_max_length: int = 8192
+    # 每个实例内部的 intra-op 线程数（fastembed/ONNX/llama_cpp 生效；MLX 后端
+    # 忽略此项、走自身全局线程池）。默认 6 充分利用多核；MLX 下此项无效。
+    rag_embedding_threads: int = 6
     rag_rerank_backend: str = "mlx"  # mlx | fastembed | onnx（UI 无 disabled 项）
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
     rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
@@ -196,15 +199,22 @@ class AgentConfig:
     rag_docling_dynamic_scale: bool = False
 
     # PDF 转换按文件大小限流（docling / marker 两个转换器共用一套参数）：
-    #   - rag_pdf_small_concurrency：小于阈值的「小文件」最多几路并发转换。
-    #     2 = 同时持两个转换器实例（小文件吞吐约 2x），但 MPS 上两份模型
-    #     权重常驻、并发 OCR 的峰值统一内存也约 2x。同步时若系统内存压力
-    #     大 / 疯狂 swap，把它设成 1 即退回全串行（与加此功能前一致）。
+    #   - rag_pdf_small_concurrency：小于阈值的「小文件」最多几路并发转换（同时
+    #     持有的 docling 转换器实例数，每实例 ≈1.9GB 模型权重常驻）。默认 2 =
+    #     2 路并发提速；大文件（>rag_pdf_batch_threshold_mb）已被按页分批切成
+    #     ≤rag_pdf_batch_pages 页的子 PDF，单批内存可控，允许 2 路并行而不至
+    #     瞬间撑爆内存。内存吃紧（如 16GB 统一内存机型）调回 1 即全串行。
     #   - rag_pdf_large_threshold_mb：大于等于该大小的文件视为「大文件」，
     #     独占单实例串行转换——大文件（扫描书）单册峰值内存就很高，并发
     #     两份会把统一内存撑爆。
-    rag_pdf_small_concurrency: int = 1
+    rag_pdf_small_concurrency: int = 2
     rag_pdf_large_threshold_mb: float = 20.0
+    # 大文件按页分批（2026-10 新增）：单 PDF > rag_pdf_batch_threshold_mb
+    # 且页数超过 rag_pdf_batch_pages 时，切成每批 rag_pdf_batch_pages 页的
+    # 临时子 PDF 分别转换后拼接，避免整篇一次性载入把统一内存撑爆。阈值/批
+    # 大小可在 config.json 调；(50, 50) 即「≤50MB 整篇、>50MB 每批 50 页」。
+    rag_pdf_batch_threshold_mb: float = 50.0
+    rag_pdf_batch_pages: int = 50
 
     # Browser endpoint for webexec_js (Playwright-like bridge). Optional.
     browser_endpoint: str = ""
@@ -225,12 +235,13 @@ class AgentConfig:
         "llama_cpp_kv_cache_mb",
         "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
         "rag_rerank_batch_size", "rag_rerank_max_length",
-        "rag_pdf_small_concurrency",
+        "rag_pdf_small_concurrency", "rag_pdf_batch_pages",
+        "rag_embedding_threads",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
     )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
                      "request_timeout", "context_shrink_ratio",
-                     "rag_pdf_large_threshold_mb",
+                     "rag_pdf_large_threshold_mb", "rag_pdf_batch_threshold_mb",
                      "aux_temperature", "aux_top_p", "aux_min_p",
                      "aux_repetition_penalty", "aux_request_timeout")
     _STR_FIELDS = (

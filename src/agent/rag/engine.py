@@ -109,6 +109,8 @@ def _is_stale_digest(old_digest: str) -> bool:
 # local-disk + CPU-bound parsing workloads (PDF OCR, docx parsing, etc.).
 # Embedding/vector-store writes stay serial because LanceDB's table lock is
 # not thread-safe and the embedding model instance can't be shared across threads.
+# 默认 2：docling 并发实例数由 rag_pdf_small_concurrency 单独限流（默认 2 路），
+# worker 数只要 >= 并发实例数即可让这些实例真正重叠，无需更高。
 DEFAULT_PARALLEL_WORKERS = 2
 
 # worker→主线程队列容量：限制 worker 最多超前产出多少文件的 chunks，
@@ -518,7 +520,7 @@ class RAGEngine:
         embedding_function: Any = None,
         embedding_backend: str = "fastembed",
         embedding_model_path: str = "",
-        embedding_threads: int = 4,
+        embedding_threads: int = 6,
         embedding_batch_size: int = 8,
         embedding_max_length: int = 8192,
         chunk_size: int = 800,
@@ -547,8 +549,10 @@ class RAGEngine:
         ocr_vlm_handler: str = "",
         ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
-        pdf_small_concurrency: int = 1,
+        pdf_small_concurrency: int = 2,
         pdf_large_threshold_mb: float = 20.0,
+        pdf_batch_threshold_mb: float = 50.0,
+        pdf_batch_pages: int = 50,
     ):
         self._workspace = workspace
         self._knowledge_base = knowledge_base
@@ -609,6 +613,12 @@ class RAGEngine:
             _mk_cfg(max(1, int(pdf_small_concurrency)), int(threshold_bytes))
         except Exception as e:
             logger.debug("RAG: marker concurrency configure error: %s", e)
+        # 大文件按页分批（阈值 MB / 每批页数），避免整篇载入撑爆内存。
+        try:
+            from .docling_parser import configure_batching as _db_cfg
+            _db_cfg(pdf_batch_threshold_mb, pdf_batch_pages)
+        except Exception as e:
+            logger.debug("RAG: docling batching configure error: %s", e)
         self._store: Optional[VectorStore] = None
         self._store_lock = threading.Lock()  # 保护 _store 懒初始化的线程安全
         self._cancelled = threading.Event()  # 取消标志，cancel() 设置后各阶段检查退出
@@ -1228,7 +1238,8 @@ class RAGEngine:
                                         chunk_overlap=self._chunk_overlap,
                                         min_chunk_size=self._min_chunk_size,
                                         overlap_percent=self._overlap_percent,
-                                        embedding_function=self._custom_ef,
+                                        # 切片用 model2vec，不注入 nomic EF（避免争抢）
+                                        embedding_function=None,
                                     )]
 
                                 _max_chars = max(self._chunk_size * 2, 1200)
@@ -1257,9 +1268,11 @@ class RAGEngine:
                                     chunk_overlap=self._chunk_overlap,
                                     min_chunk_size=self._min_chunk_size,
                                     overlap_percent=self._overlap_percent,
-                                    # 把引擎的 EF（可能是注入的自定义 EF）透传给
-                                    # 语义切片，避免它另起一份本地 ONNX 模型。
-                                    embedding_function=self._custom_ef,
+                                    # 语义切片强制走 model2vec 静态嵌入（不注入
+                                    # 引擎的 nomic EF）：切片只需相邻相似度相对
+                                    # 大小，不碰入库 embedding 用的 nomic 及其
+                                    # 全局锁，避免与「分片后 embedding 入库」争抢。
+                                    embedding_function=None,
                                 )
                             t_chunk_end = time.monotonic()
                             _log(
@@ -2499,7 +2512,6 @@ class RAGEngine:
                         rerank_enabled=self._rerank_enabled,
                     )
         return self._store
-
 
 def _safe_filename(path: str) -> str:
     """Convert a relative path to a safe, collision-free filename.

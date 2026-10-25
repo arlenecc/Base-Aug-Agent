@@ -7,14 +7,18 @@ quality for e-books and long documents.
 
 Embedding backends (in priority order):
   1. Explicitly injected ``embedding_function`` → wrapped via
-     ``_ChonkieEmbeddingAdapter`` (tests / external callers).
-  2. model2vec static embeddings (potion-base-32M) — fast path for chunking
-     decisions, ~100x faster than BERT inference (#118).
-  3. Shared nomic-embed-text singleton → adapter (fallback when model2vec is
-     unavailable; slow but correct).
+     ``_ChonkieEmbeddingAdapter`` (tests / external callers only — the engine
+     deliberately does NOT inject its nomic EF for ingestion).
+  2. model2vec static embeddings (potion-base-32M) — the production path for
+     chunking decisions, ~100x faster than BERT inference (#118).  Crucially it
+     does NOT touch the nomic-embed-text EF/lock used to embed stored chunks,
+     so semantic chunking never contends with the later storage-embedding stage.
 
-If none is available (or ``chonkie`` is not installed), :func:`semantic_chunk_text`
-returns ``None`` so callers fall back to the existing recursive chunker.
+The engine passes ``embedding_function=None`` for ingestion so the chunker uses
+model2vec.  model2vec is auto-installed; if it is unavailable, semantic chunking
+is skipped (returns ``None``) and callers fall back to the existing recursive
+chunker — it intentionally no longer falls back to the nomic EF, which would
+reintroduce contention with storage embedding.
 """
 from __future__ import annotations
 
@@ -95,17 +99,15 @@ def semantic_chunk_text(
             # 显式注入（测试/外部调用）：走适配器，行为与旧版一致。
             embeddings = _ChonkieEmbeddingAdapter(embedding_function)
         else:
-            # 生产路径：优先 model2vec 静态嵌入（切片决策不需要与检索向量
-            # 同空间，静态嵌入的相对相似度足够；吞吐高约两个数量级）。
-            # model2vec 缺失时回退共享 nomic 适配器（慢但正确），再不行
-            # 返回 None 交给上层递归切片兜底。
+            # 生产路径：强制 model2vec 静态嵌入（potion-base-32M，#118）。切片
+            # 决策只需相邻相似度的相对大小，无需与入库检索向量同空间，静态嵌入
+            # 足够；且它不碰入库用的 nomic EF 及其全局锁，避免与「分片后
+            # embedding 入库」争抢同一串行资源。model2vec 不可用时直接跳过语义
+            # 切片（返回 None），由上层递归切片兜底——不再回退 nomic。
             embeddings = _get_static_embeddings()
             if embeddings is None:
-                shared = _shared_embedding_function()
-                if shared is None:
-                    logger.debug("semantic chunking skipped: no embedding backend available")
-                    return None
-                embeddings = _ChonkieEmbeddingAdapter(shared)
+                logger.debug("semantic chunking skipped: model2vec unavailable")
+                return None
 
         # When chonkie is present, _BaseEmbeddings is the real base class and
         # the isinstance check in SemanticChunker.__init__ will pass.  When it
@@ -240,61 +242,6 @@ def _tail_by_tokens(text: str, max_tokens: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# embedding singleton (shared with vector store)
-# ---------------------------------------------------------------------------
-
-_shared_ef = None
-_shared_ef_resolved = False
-# 短时负缓存：模型不可用（如离线）时，同一次同步内每个 worker/每篇文档都
-# 会重复走一遍可能很慢的加载/下载失败路径。失败后 60s 内直接返回 None，
-# 网络恢复后超过间隔会自动重试（不破坏「失败后能自动升级」的原有语义）。
-_shared_ef_failed_at: Optional[float] = None
-_SHARED_EF_RETRY_INTERVAL = 60.0
-
-
-_shared_ef_lock = threading.Lock()
-
-
-def _shared_embedding_function():
-    """Return the process-wide nomic-embed-text embedding function, if available.
-
-    Imported lazily to avoid a hard dependency on fastembed/vector_store for
-    callers that never enable RAG.
-
-    失败结果不再永久缓存：旧实现先把 ``_shared_ef_resolved = True`` 置位再加载，
-    一旦首次加载失败（模型未下载、网络不通），本进程内语义切片就永久降级到递归
-    切片，即使后来网络恢复/模型下载完成也不会再试。同时加载过程加锁，避免多个
-    worker 线程并发触发多次模型加载。
-    """
-    global _shared_ef, _shared_ef_resolved, _shared_ef_failed_at
-    if _shared_ef_resolved:
-        return _shared_ef
-    # 短时负缓存：模型不可用（如离线）时，同一次同步内每个 worker/每篇文档
-    # 都会重复走一遍可能很慢的加载/下载失败路径；60s 内直接返回 None，
-    # 超过间隔自动重试（网络恢复后语义切片能自动升级，语义不丢）。
-    if (
-        _shared_ef_failed_at is not None
-        and time.monotonic() - _shared_ef_failed_at < _SHARED_EF_RETRY_INTERVAL
-    ):
-        return None
-    with _shared_ef_lock:
-        if _shared_ef_resolved:
-            return _shared_ef
-        try:
-            from .vector_store import get_or_create_embedding_function
-            _shared_ef = get_or_create_embedding_function()
-            # 只在成功时置位，失败时留给下次重试。
-            _shared_ef_resolved = _shared_ef is not None
-            if _shared_ef_resolved:
-                _shared_ef_failed_at = None
-        except Exception as e:
-            logger.debug("shared embedding function unavailable: %s", e)
-            _shared_ef = None
-            _shared_ef_failed_at = time.monotonic()
-    return _shared_ef
-
-
-# ---------------------------------------------------------------------------
 # static embeddings for chunking decisions (potion via model2vec)
 # ---------------------------------------------------------------------------
 
@@ -318,7 +265,7 @@ _POTION_MODEL = "minishlab/potion-base-32M"
 def _get_static_embeddings():
     """Return the model2vec static embeddings for chunking, or None.
 
-    失败负缓存与 ``_shared_embedding_function`` 同款：deps 在同步前自动
+    失败负缓存与下方静态嵌入加载同款：deps 在同步前自动
     安装 model2vec，安装成功后的下一次尝试（60s 负缓存过期后）自动升级
     到快路径，无需重启。首次使用会下载 potion 权重（~30MB，HF 缓存）。
     """

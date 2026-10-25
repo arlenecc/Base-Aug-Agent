@@ -37,8 +37,10 @@ _DOCLING_EXTENSIONS = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"
 # 保护，并发执行转换由 _conv_gate（按文件大小限流）控制。
 #
 # 并发策略（见 _conv_gate 与 _LARGE_FILE_THRESHOLD / _SMALL_FILE_CONCURRENCY）：
-#   * 小文件（< 20MB）：最多 2 个转换器实例并发转换，加快小文件吞吐。
-#   * 大文件（>= 20MB）：独占（1 个实例），防止大文件并发把内存撑爆。
+#   * 小文件（< 20MB）：最多 _SMALL_FILE_CONCURRENCY(2) 个转换器实例并发转换，
+#     加快小文件吞吐。大文件经按页分批后，每批（≤ rag_pdf_batch_pages 页）也
+#     走这条「读者」通道并行，故大文件批次同样能吃到 2 路并发。
+#   * 大文件（>= 20MB，且未被分批）：独占（1 个实例），防止大文件并发把内存撑爆。
 # 实例池容量上限 = _SMALL_FILE_CONCURRENCY，避免无限制新建实例。
 #
 # 锁必须在模块导入时就创建好。旧实现在 _get_converter() 里「if 锁 is None:
@@ -71,16 +73,25 @@ _CONV_FAIL_COOLDOWN_S = 60.0
 
 # 按文件大小限流的并发闸门参数。
 _LARGE_FILE_THRESHOLD = 20 * 1024 * 1024   # 20MB：以上视为大文件，独占实例
-# **默认 1 = 单实例串行**（2026-10 由 2 改回）。
+# **默认 2 路并发**（2026-10 先由 2 改回 1，后考虑大文件按页分批短暂试过 4，
+# 最终定为 2）。
 #
 # 每个 DocumentConverter 实例 = 一整套布局 + TableFormer 模型（两套并存实测
-# ~1.9GB 统一内存，见 _extract_pdf_by_scale 的注释）。2 实例对小 PDF 的吞吐
-# 收益，换不来整机内存压力：同步期还要同时常驻 RapidOCR 实例池（2×~500MB）、
-# MLX 聊天/VLM 权重与 KV 缓存。用户实测（M1/统一内存）并发两份转换器时明显
-# 吃紧，故回退到单实例串行；需要吞吐的用户把 rag_pdf_small_concurrency 调回
-# 2 即可（闸门与实例池都支持，代码未删）。
-_SMALL_FILE_CONCURRENCY = 1                # 小文件最多 1 路并发（单实例串行）
+# ~1.9GB 统一内存，见 _extract_pdf_by_scale 的注释）。此前改回 1 是因为并发
+# 两份转换器在 M1 统一内存上吃紧（还要常驻 RapidOCR 实例池 2×~500MB、MLX
+# 聊天/VLM 权重与 KV 缓存）。如今大文件（>rag_pdf_batch_threshold_mb）已被
+# 切成 ≤rag_pdf_batch_pages 页的子 PDF 分批转换——单批只载 50 页，内存可控，
+# 不再有「整本扫描书一次性载入」的尖峰，故允许 2 路并发提速。仍可按内存
+# 调小：rag_pdf_small_concurrency 设 1 即退回全串行（闸门与实例池都支持）。
+_SMALL_FILE_CONCURRENCY = 2                # 小文件最多 2 路并发
 _conv_gate = SizeAwareConversionGate(_LARGE_FILE_THRESHOLD, _SMALL_FILE_CONCURRENCY)
+
+# 大文件按页分批阈值与批大小（2026-10 新增）：单文件 > 分批阈值（默认 50MB）
+# 且页数超过单批时，切成每批 _PDF_BATCH_PAGES 页的临时子 PDF 分别转换后拼接，
+# 避免整篇一次性载入把统一内存撑爆。阈值/批大小可被 configure_batching 覆盖
+# （config 的 rag_pdf_batch_threshold_mb / rag_pdf_batch_pages 经 engine 转发）。
+_PDF_BATCH_THRESHOLD_BYTES = 50 * 1024 * 1024   # 50MB
+_PDF_BATCH_PAGES = 50                             # 每批页数
 
 # 闸门等待超过该秒数就打 INFO 日志——同步期「很久没输出」时，这条日志能直接
 # 区分「卡在等闸门（大文件独占/并发已满）」与「卡在 convert 本身」。
@@ -113,23 +124,28 @@ _convert_count = 0
 _convert_count_lock = threading.Lock()
 
 
-def _convert_with_scale(path: str, scale: float) -> Optional[str]:
+def _convert_with_scale(path: str, scale: float,
+                        force_small: bool = False) -> Optional[str]:
     """取转换器 + 转换 + 导出，全程持大小闸门（按文件大小限流并发实例数）。
 
     并发约束不再靠「全局排他锁」串行化所有转换，而是交给 _conv_gate：
       * 小文件（< 20MB）最多 _SMALL_FILE_CONCURRENCY(2) 路并发转换；
       * 大文件（>= 20MB）独占（1 路），防止大文件并发把内存撑爆。
 
-    取/还实例走 _pool_lock 保护的空闲池（最多 2 个并存实例），见
-    _get_converter / _release_pooled_converter。闸门只控制「同一时刻有几路
-    转换在跑」，实例池控制「最多建几个实例」，二者解耦。
+    取/还实例走 _pool_lock 保护的空闲池（最多 _SMALL_FILE_CONCURRENCY 个并存
+    实例），见 _get_converter / _release_pooled_converter。闸门只控制「同一时刻
+    有几路转换在跑」，实例池控制「最多建几个实例」，二者解耦。
+
+    ``force_small``：忽略真实文件大小、强制按「读者」（小文件）通道入场。
+    用于按页分批后的子 PDF——单批只有 ≤ rag_pdf_batch_pages 页、内存可控，
+    应并行而非独占，从而让大文件批次也吃到 _SMALL_FILE_CONCURRENCY 路并发。
     """
     try:
         size = Path(path).stat().st_size
     except OSError:
         size = 0
     t_wait = time.monotonic()
-    permit = _conv_gate.acquire(size)
+    permit = _conv_gate.acquire(0 if force_small else size)
     waited = time.monotonic() - t_wait
     if waited >= _GATE_WAIT_LOG_S:
         # 同步期「很久没输出」时，这条日志直接区分：卡在等闸门（大文件独占中 /
@@ -137,7 +153,8 @@ def _convert_with_scale(path: str, scale: float) -> Optional[str]:
         logger.info(
             "docling 转换闸门等待 %.1fs 后开始转换（%s）: %s",
             waited,
-            "大文件独占转换中" if size >= _conv_gate.threshold else "小文件并发已满",
+            "大文件独占转换中" if (size >= _conv_gate.threshold and not force_small)
+            else "小文件并发已满",
             getattr(path, "name", path),
         )
     converter = None
@@ -413,6 +430,21 @@ def configure_concurrency(small_capacity: Optional[int] = None,
         "docling 转换并发闸门：小文件(< %.1fMB) 最多 %d 路并发，大文件独占",
         threshold / (1024 * 1024), capacity,
     )
+
+
+def configure_batching(threshold_mb: Optional[float] = None,
+                       batch_pages: Optional[int] = None) -> None:
+    """RAGEngine.__init__ 调用：热更新大文件按页分批参数（不换分批逻辑）。
+
+    默认值来自模块常量（50MB / 50 页）；config 的 rag_pdf_batch_threshold_mb
+    / rag_pdf_batch_pages 经 engine 转发到这里。超大扫描书调大 batch_pages 可
+    减少切片/拼接开销，内存吃紧则调小。
+    """
+    global _PDF_BATCH_THRESHOLD_BYTES, _PDF_BATCH_PAGES
+    if threshold_mb is not None:
+        _PDF_BATCH_THRESHOLD_BYTES = max(1.0, float(threshold_mb)) * 1024 * 1024
+    if batch_pages is not None:
+        _PDF_BATCH_PAGES = max(1, int(batch_pages))
 
 
 def _flush_mps_cache() -> None:
@@ -768,6 +800,108 @@ def _extract_pdf_by_scale(path: Path, profiles: list) -> Optional[str]:
     return "\n\n".join(parts[k] for k in sorted(parts))
 
 
+def _convert_document(path: Path) -> Optional[str]:
+    """转换单个 PDF 文档（整篇）。
+
+    动态 OCR 倍率开启时先按档分段转换（_extract_pdf_by_scale），否则整篇默认
+    档；任一路径无输出都回退整篇默认档转换。非 PDF 不应调用本函数。
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".pdf" and _dynamic_scale_enabled:
+        profiles = _analyze_pdf_pages(path)
+        if profiles is not None:
+            md = _extract_pdf_by_scale(path, profiles)
+            if md and md.strip():
+                return md
+            logger.warning("PDF 分段转换无输出，回退整篇转换: %s", path.name)
+    return _convert_with_scale(str(path), _OCR_SCALE_DEFAULT)
+
+
+def _should_batch_by_size(path: Path) -> bool:
+    """文件超过分批阈值（默认 50MB）才走按页分批；否则整篇转换即可。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    return size > _PDF_BATCH_THRESHOLD_BYTES
+
+
+def _extract_pdf_by_batches(path: Path) -> Optional[str]:
+    """大 PDF（> 分批阈值）按固定页数切成临时子 PDF 分批转换，避免整篇载入撑爆内存。
+
+    每批 ≤ _PDF_BATCH_PAGES 页，各自用 _convert_with_scale(force_small=True)
+    并发转换（最多 _conv_gate.small_capacity 路并行），按原页序拼接。分批仅
+    改变加载方式，不影响文档内容与页序，下游 RAG 切片不受影响。页数 ≤ 单批时
+    直接返回 None，交由上层整篇转换。任一子批失败/无输出不致命：跳过该批继续，
+    全部无输出才返回 None 触发整篇回退。
+    """
+    try:
+        import os
+        import fitz
+        import tempfile
+        import shutil
+        import concurrent.futures as _cf
+
+        src = fitz.open(str(path))
+        try:
+            total = len(src)
+            if total <= _PDF_BATCH_PAGES:
+                return None
+            tmpdir = tempfile.mkdtemp(prefix="docling_batch_")
+            max_workers = max(1, int(_conv_gate.small_capacity))
+            try:
+                tmp_paths: dict = {}
+                start = 0
+                while start < total:
+                    end = min(start + _PDF_BATCH_PAGES, total)  # [start, end)
+                    sub = fitz.open()
+                    try:
+                        sub.insert_pdf(src, from_page=start, to_page=end - 1)
+                        tmp = os.path.join(tmpdir, f"batch_{start}_{end}.pdf")
+                        sub.save(tmp)
+                    finally:
+                        sub.close()
+                    tmp_paths[start] = tmp
+                    start = end
+                # 切片已全部落盘，统一并发转换：每批 force_small 走读者通道，
+                # 并行至 small_capacity 路（大文件批次不再独占、也不瞬间撑爆）。
+                parts: dict = {}
+                with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    fut_map = {
+                        ex.submit(_convert_with_scale, tp, _OCR_SCALE_DEFAULT, True): s
+                        for s, tp in tmp_paths.items()
+                    }
+                    for fut in _cf.as_completed(fut_map):
+                        s = fut_map[fut]
+                        end = min(s + _PDF_BATCH_PAGES, total)
+                        try:
+                            md = fut.result()
+                        except Exception as e:
+                            md = None
+                            logger.warning(
+                                "PDF 分批转换第 %d-%d 页异常，跳过该批: %s (%s)",
+                                s + 1, end, path.name, e)
+                        if md and md.strip():
+                            parts[s] = md
+                        else:
+                            logger.warning(
+                                "PDF 分批转换第 %d-%d 页无输出，跳过该批: %s",
+                                s + 1, end, path.name)
+                if not parts:
+                    return None
+                logger.info(
+                    "PDF 分批转换完成: %s（%d 页，%d 批，每批 %d 页，并发 %d 路）",
+                    path.name, total, len(parts), _PDF_BATCH_PAGES, max_workers)
+                return "\n\n".join(parts[k] for k in sorted(parts))
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        finally:
+            src.close()
+    except Exception as e:
+        logger.warning("PDF 分批转换失败（%s），回退整篇转换: %s", path.name, e)
+        return None
+
+
 def extract_markdown(filepath: str) -> Optional[str]:
     """Convert a document to Markdown using docling.
 
@@ -792,7 +926,17 @@ def extract_markdown(filepath: str) -> Optional[str]:
     watchdog.daemon = True
     watchdog.start()
     try:
-        # PDF 走动态 scale（**需 config.rag_docling_dynamic_scale 显式开启**，
+        # 大文件（> 分批阈值，默认 50MB）按页分批转换，避免整篇一次性载入把
+        # 内存撑爆：每批 ≤50 页各自转成临时子 PDF 转换后按原页序拼接。分批仅
+        # 改变加载方式，不影响文档内容与页序，下游 RAG 切片不受影响。
+        if suffix == ".pdf" and _should_batch_by_size(path):
+            markdown = _extract_pdf_by_batches(path)
+            if markdown and markdown.strip():
+                return markdown
+            logger.warning("PDF 分批转换无输出，回退整篇转换: %s", path.name)
+            markdown = None
+
+        # PDF 动态 OCR 倍率（**需 config.rag_docling_dynamic_scale 显式开启**，
         # 默认关闭全篇固定 2.0）：先逐页分析分类，再按档位切连续段分段
         # 转换、按序拼接。分析或分段任一失败都回退下面的「整篇 + 默认档」
         # 老路径——动态调整永远是优化，绝不让它成为新故障点。
@@ -805,12 +949,11 @@ def extract_markdown(filepath: str) -> Optional[str]:
                 logger.warning("PDF 分段转换无输出，回退整篇转换: %s", path.name)
             markdown = None
 
-        # DocumentConverter 没有声明线程安全，而 ingest 用 4 个 worker 线程
-        # 并行解析。旧实现只对「创建单例」加锁，convert() 本身完全不设防，
-        # 并发转换会互相踩踏（状态污染/崩溃）；后来改成「锁外取实例、锁内
-        # 转换」，又与周期回收藏出两代并存的竞态（见 _convert_with_scale）。
-        # 现在取实例 + 转换 + 导出在同一把锁内原子完成。
-        markdown = _convert_with_scale(str(path), _OCR_SCALE_DEFAULT)
+        # 整篇默认档转换（小文件直转；或大/分批失败回退）。
+        if suffix == ".pdf":
+            markdown = _convert_document(path)
+        else:
+            markdown = _convert_with_scale(str(path), _OCR_SCALE_DEFAULT)
         if not markdown or not markdown.strip():
             logger.warning("docling extracted empty markdown from %s", path.name)
             return None

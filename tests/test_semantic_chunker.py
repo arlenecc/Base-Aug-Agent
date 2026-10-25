@@ -183,21 +183,20 @@ def test_semantic_chunk_prefers_static_embeddings(monkeypatch):
 
 
 @pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
-def test_semantic_chunk_falls_back_to_shared_ef(monkeypatch, topic_ef):
-    """静态嵌入不可用时回退共享 nomic 适配器，仍能产出切片。"""
+def test_semantic_chunk_skips_when_static_embeddings_missing(monkeypatch):
+    """静态嵌入不可用时不再回退 nomic（避免与入库嵌入争抢），直接返回 None 由递归切片兜底。"""
     from agent.rag import semantic_chunker as sc
 
     monkeypatch.setattr(sc, "_get_static_embeddings", lambda: None)
-    monkeypatch.setattr(sc, "_shared_embedding_function", lambda: topic_ef)
+    # 即便 nomic 共享 EF 可用也绝不使用（强制 model2vec）
     out = sc.semantic_chunk_text("深度学习是机器学习的一个分支。" * 50)
-    assert out is not None and len(out) > 0
+    assert out is None
 
 
 @pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
 def test_semantic_chunk_returns_none_when_all_backends_missing(monkeypatch):
-    """静态嵌入与共享 EF 都不可用 → 返回 None（上层递归切片兜底）。"""
+    """静态嵌入不可用 → 返回 None（上层递归切片兜底）。"""
     from agent.rag import semantic_chunker as sc
 
     monkeypatch.setattr(sc, "_get_static_embeddings", lambda: None)
-    monkeypatch.setattr(sc, "_shared_embedding_function", lambda: None)
     assert sc.semantic_chunk_text("这是一段没有任何后端可用的文本。") is None

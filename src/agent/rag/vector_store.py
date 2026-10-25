@@ -243,6 +243,34 @@ def _store_op(func):
     return wrapper
 
 
+def _new_embedding_function(
+    model_name: str,
+    *,
+    backend: str,
+    model_path: str,
+    threads: int,
+    batch_size: int,
+    max_length: int,
+):
+    """Create a *new* (non-cached) embedding adapter for the selected backend.
+
+    与 ``get_or_create_embedding_function`` 的区别：永远新建、不做单例缓存。
+    供需要独立实例的调用方使用（如测试注入）。
+    """
+    backend = (backend or "fastembed").lower()
+    if backend == "fastembed":
+        return FastEmbedEmbeddingFunction(model_name=model_name, threads=threads)
+    from .model_backends import create_embedding_backend
+    return create_embedding_backend(
+        backend,
+        model_name,
+        model_path,
+        threads=threads,
+        batch_size=batch_size,
+        max_length=max_length,
+    )
+
+
 def get_or_create_embedding_function(
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     *,
@@ -252,7 +280,13 @@ def get_or_create_embedding_function(
     batch_size: int = 8,
     max_length: int = 8192,
 ):
-    """Return a shared embedding adapter for the selected local backend."""
+    """Return a shared embedding adapter for the selected local backend.
+
+    单实例适配器（与旧版一致）。Embedding 后端（MLX / fastembed / ONNX /
+    llama_cpp）内部已各自并行（MLX 走全局计算流；fastembed/ONNX 用 intra-op
+    线程），多实例并发不仅无收益（实测 MLX 仅 ~1.04x、fastembed 还因批次依赖
+    破坏嵌入一致性），反而多占模型权重内存，故不提供多实例路径。
+    """
     backend = (backend or "fastembed").lower()
     key = "|".join((
         backend,
@@ -264,20 +298,17 @@ def get_or_create_embedding_function(
     ))
     with _EF_SINGLETONS_LOCK:
         ef = _EF_SINGLETONS.get(key)
-        if ef is None:
-            if backend == "fastembed":
-                ef = FastEmbedEmbeddingFunction(model_name=model_name, threads=threads)
-            else:
-                from .model_backends import create_embedding_backend
-                ef = create_embedding_backend(
-                    backend,
-                    model_name,
-                    model_path,
-                    threads=threads,
-                    batch_size=batch_size,
-                    max_length=max_length,
-                )
-            _EF_SINGLETONS[key] = ef
+        if ef is not None:
+            return ef
+        ef = _new_embedding_function(
+            model_name,
+            backend=backend,
+            model_path=model_path,
+            threads=threads,
+            batch_size=batch_size,
+            max_length=max_length,
+        )
+        _EF_SINGLETONS[key] = ef
         return ef
 
 

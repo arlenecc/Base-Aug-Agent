@@ -270,7 +270,7 @@ class ToolRegistry:
                 embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
                 embedding_backend=getattr(self.config, "rag_embedding_backend", "fastembed"),
                 embedding_model_path=getattr(self.config, "rag_embedding_model_path", ""),
-                embedding_threads=getattr(self.config, "onnx_threads", 4),
+                embedding_threads=getattr(self.config, "rag_embedding_threads", 6),
                 embedding_batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
                 embedding_max_length=getattr(self.config, "rag_embedding_max_length", 8192),
                 chunk_size=getattr(self.config, "rag_chunk_size", 500),
@@ -295,9 +295,13 @@ class ToolRegistry:
                 # PDF 大小限流并发（小文件并发路数 / 大文件阈值 MB）。内存吃紧
                 # 时 rag_pdf_small_concurrency=1 可退回全串行。
                 pdf_small_concurrency=getattr(
-                    self.config, "rag_pdf_small_concurrency", 1),
+                    self.config, "rag_pdf_small_concurrency", 2),
                 pdf_large_threshold_mb=getattr(
                     self.config, "rag_pdf_large_threshold_mb", 20.0),
+                pdf_batch_threshold_mb=getattr(
+                    self.config, "rag_pdf_batch_threshold_mb", 50.0),
+                pdf_batch_pages=getattr(
+                    self.config, "rag_pdf_batch_pages", 50),
             )
             self._rag_engine = engine
 
