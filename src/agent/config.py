@@ -133,16 +133,15 @@ class AgentConfig:
     context_shrink_ratio: float = 0.9
 
     # RAG settings
-    # 切片按"估算 token"计（estimate_tokens：中文≈1.25 字/token，数字/符号/英文
-    # ≈2 字符/token，已按真实词表保守校准）。**入库 embedding 是真实 tokenizer**
-    # ——bge-small-zh 为 BERT 中文词表（≈1 字=1 token，位置上限 512、后端夹紧到
-    # 510）。实测比例：纯中文 ≈1.25×估算、数字密集混排 ≈1.45×；切片最坏情况打满
-    # chunk_size+overlap 预算：(300+30)×1.45+2 ≈ 480 ≤ 510 ✓，即每片 ≈375 汉字。
-    # 调大 chunk_size 会让最坏片超出 510 被静默截断（丢后半段内容）——
-    # 换 nomic（8192 上限）等长文本模型时可放宽到 500/50。
-    # 切片保证在句子结束处断开（句级兜底，仅无句读的超长单段才字符级切）。
-    rag_chunk_size: int = 300       # ≈375 汉字/片
-    rag_chunk_overlap: int = 30     # 10% of chunk_size
+    # 切片按**字符数硬限**（2026-10 用户决策，废弃 token 估算）：中文 ≈1 字=1
+    # token、数字/符号/英文更少，BERT 词表下任何字符至多 1 token（未知字 →
+    # [UNK]），因此 len(chunk)=500 ⇒ bge-small-zh 真实 token ≤ 502（位置上限
+    # 512、正文 510），**任何语料都绝不截断**。chunk_documents 末端还有硬兜底：
+    # 任何路径产出的片超 chunk_size 字符即按字符窗口强切。章节直通上限 =
+    # chunk_size（engine._max_chars）。切片保证在句子结束处断开（句级兜底，
+    # 仅无句读的超长单段才字符级切）。
+    rag_chunk_size: int = 500       # 500 字符/片（字符硬限，bge-small-zh 不截断）
+    rag_chunk_overlap: int = 50     # 10% of chunk_size
     # rag_search 结果送辅助模型归纳的阈值（字符，按检索结果原文总量计）：
     #   总量 <  rag_condense_min_chars → 跳过归纳，原样返回（保细节、不拖速）；
     #   min ≤ 总量 ≤ rag_condense_max_chars → 送辅助模型浓缩；
@@ -227,6 +226,9 @@ class AgentConfig:
     rag_ocr_model_path: str = "models/OvisOCR3-MLX-4bit-mixed46"
     rag_ocr_gguf_path: str = ""
     rag_ocr_mmproj_path: str = ""
+    # ONNX 后端：独立 tokenizer 目录（含 tokenizer.json）。不填时回退为
+    # .onnx 文件所在目录——目录里没带 tokenizer 时必须显式指定。
+    rag_ocr_tokenizer_path: str = ""
     rag_ocr_vlm_handler: str = "mtmd"
     rag_ocr_chat_format: str = ""
     # docling 动态 OCR 倍率（逐页分析：表格页升 ocr_options.scale=2.5）。
@@ -303,7 +305,7 @@ class AgentConfig:
         "rag_rerank_mlx_model_path", "rag_rerank_jina_model_path",
         "browser_endpoint", "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
-        "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
+        "rag_ocr_gguf_path", "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
         "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
@@ -322,7 +324,7 @@ class AgentConfig:
         "rag_rerank_mlx_model_path", "rag_rerank_jina_model_path",
         "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
-        "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
+        "rag_ocr_gguf_path", "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
         "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
 

@@ -591,32 +591,47 @@ def _mlx_ram_bytes() -> int:
 
 
 def apply_mlx_memory_policy() -> None:
-    """统一 MLX 内存策略（幂等，可多次调用）。聊天后端与 RAG 嵌入后端共用，
-    保证一致、互不压低。
+    """统一 MLX 内存策略（可重复调用，每次按当时系统状态重新评估）。
 
-    memory_limit：取「当前上限」与「~65% 物理 RAM」的较小值。默认 95% RAM
-        （16G 机器 ~15G）会把统一内存吃满到系统上限，物理内存耗尽后系统换页 →
-        卡死。80% 虽然不换页了，但只给系统留 ~3G（用户实测冲到 13G 后整机
-        卡顿），所以再压到 65%：16G 机器上限 ~10.4G，系统始终保有余量；
-        同时不抬高用户主动设的更严上限。
-    cache_limit：取「当前上限」与「min(40% RAM, 6GB)（至少 1GB）」的较小值。
-        默认 95% RAM 的 buffer cache 会一路涨到系统上限；但上一版压到 1GB 又会
-        在 prefill/长上下文时让 `[seq,seq]` 注意力矩阵（单层即可超 1GB）每步
-        反复释放重分配 → 生成抖动卡顿（表现为「每句话都卡、历史越长越卡」）。
-        6GB 量级既能封顶、又足够跨层复用。
+    聊天后端与 RAG 各 MLX 入口（嵌入/重排/OCR）共用。2026-10-26 用户决策：
+
+    memory_limit = **60% × 系统当前可用内存**（psutil available：总内存 −
+        已用 − 皆可回收的缓存）。以「此刻还能安全吃多少」为准而非总内存
+        固定比例——其它应用占用越多，MLX 能拿的越少。取不到 available
+        （psutil 缺失）时回退总内存 60%。下限 1GB 保底（可用内存极低时
+        至少让小模型能跑，宁可报错也不卡死系统）。
+    cache_limit = **一律 1GB**。变长批次下每个新 padding 形状都缓存一套
+        buffer，6GB 封顶实测仍会被嵌入期形状多样性吃满（#140 mem.log：
+        每子批 +0.9GB 冲到 11.12GB）；1GB 足够跨层复用，代价是长上下文
+        prefill 的 buffer 重分配开销（聊天场景可感知的抖动换取系统不卡死）。
+
+    注意：memory_limit 直接绝对设置（不做 get+min「不抬高」逻辑——重复
+    调用按当时可用内存刷新，同步卸载 LLM 后限制随之放宽，正是期望行为）。
+    cache_limit 必须无条件设置：本机 MLX 版本没有 get_cache_limit（只有
+    set），任何先 get 再 min 的写法都会抛 AttributeError。
     """
     try:
         import mlx.core as mx
 
-        ram = _mlx_ram_bytes()
-        mem_cap = max(int(ram * 0.65), 6 * 1024 ** 3)
-        cur_mem = int(mx.get_memory_limit())
-        mx.set_memory_limit(min(cur_mem, mem_cap))
+        try:
+            import psutil
 
-        cache_cap = min(int(ram * 0.40), 6 * 1024 ** 3)
-        cache_cap = max(cache_cap, 1024 ** 3)
-        cur_cache = int(mx.get_cache_limit())
-        mx.set_cache_limit(min(cur_cache, cache_cap))
+            avail = psutil.virtual_memory().available
+            mem_cap = int(avail * 0.60)
+        except Exception:
+            mem_cap = int(_mlx_ram_bytes() * 0.60)
+        mem_cap = max(mem_cap, 1024 ** 3)  # 保底 1GB
+
+        try:
+            mem = min(int(mx.get_memory_limit()), mem_cap)
+        except Exception:
+            mem = mem_cap
+        mx.set_memory_limit(mem)
+
+        # cache 1GB 硬限：必须无条件设置——本机 MLX 没有 get_cache_limit
+        # （只有 set），先 get 再 min 的写法会抛 AttributeError 且被吞掉，
+        # 等于从未生效（#140：嵌入期 cache 无界冲到 11.12GB）。
+        mx.set_cache_limit(1024 ** 3)
     except Exception as e:  # pragma: no cover - 失败不影响加载
         logger.debug("设置 MLX 内存策略失败（忽略）: %s", e)
 

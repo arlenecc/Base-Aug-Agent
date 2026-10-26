@@ -25,26 +25,22 @@ EMBEDDING_BACKENDS = ("fastembed", "mlx", "onnx", "llama_cpp")
 # 间接产生（见 VectorStore.__init__），create_reranker_backend 仍容错处理。
 RERANKER_BACKENDS = ("fastembed", "mlx", "onnx")
 
-# MLX 内存策略：复用聊天后端同款 apply_mlx_memory_policy（#fix: 同步期
-# phys_footprint 冲到 18-19GB）。MLX 默认 memory_limit = 95% RAM（16G 机器
-# ~15G），buffer cache 会一路涨到系统上限；但单纯把 cache 压到 1GB 又会
-# 在 prefill 长上下文时让 `[seq,seq]` 注意力矩阵每步反复释放重分配 → 生成
-# 抖动卡顿。统一策略：总内存封顶 ~65% RAM（防 OS 换页卡死、给系统留余量）、buffer cache
-# 封顶 ~6GB（既能封顶又足够跨层复用）。聊天后端与 RAG 共用，保证一致。
+# MLX 内存策略：复用聊天后端同款 apply_mlx_memory_policy（2026-10-26 用户
+# 决策版）：memory_limit = 60% × 系统当前**可用**内存（下限 1GB）、
+# cache_limit = 一律 1GB。函数每次调用按当时状态重新评估（同步卸载 LLM 后
+# 可用内存回升，限制随之刷新），RAG 各 MLX 模型加载时都会触发。
 _MLX_MEM_CAP_DONE = False
 
 
 def _cap_mlx_memory_limits() -> None:
-    """限制 MLX 内存，避免同步期统一内存被 cache 吃满或 prefill 抖动。
+    """限制 MLX 内存，避免同步期统一内存被 cache 吃满或解析阶段挤占系统。
 
-    直接复用聊天后端的统一策略 apply_mlx_memory_policy（见 model_backends.py），
-    保证两端内存上限一致、互不压低。
+    每次都重新应用（不做只跑一次的门闩）：策略按「当时可用内存」计算，
+    而 MLX 模型加载时机各不相同（应用启动 / 同步开始 / OCR 惰性加载），
+    只有重新评估才能让限制反映当前系统状态。apply_mlx_memory_policy 本身
+    是两次系统调用 + 一次 psutil 读取，开销可忽略。
     """
-    global _MLX_MEM_CAP_DONE
-    if _MLX_MEM_CAP_DONE:
-        return
     apply_mlx_memory_policy()
-    _MLX_MEM_CAP_DONE = True
 
 _DEFAULT_DOC_PREFIX = "search_document: "
 _DEFAULT_QUERY_PREFIX = "search_query: "

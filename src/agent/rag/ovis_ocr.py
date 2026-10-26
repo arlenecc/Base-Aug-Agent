@@ -68,6 +68,7 @@ _config = {
     "path": DEFAULT_OCR_MODEL_PATH,
     "gguf_path": "",
     "mmproj_path": "",
+    "tokenizer_path": "",
     "vlm_handler": "mtmd",
     "chat_format": "",
 }
@@ -79,6 +80,7 @@ class OvisUnavailable(RuntimeError):
 
 def configure(backend: str = "", model: str = "", path: str = "",
               gguf_path: str = "", mmproj_path: str = "",
+              tokenizer_path: str = "",
               vlm_handler: str = "", chat_format: str = "") -> None:
     """RAGEngine.__init__ 调用：记录配置。已加载的引擎不受影响。"""
     with _engine_lock:
@@ -92,6 +94,8 @@ def configure(backend: str = "", model: str = "", path: str = "",
             _config["gguf_path"] = gguf_path
         if mmproj_path:
             _config["mmproj_path"] = mmproj_path
+        if tokenizer_path:
+            _config["tokenizer_path"] = tokenizer_path
         if vlm_handler:
             _config["vlm_handler"] = vlm_handler
         if chat_format is not None:
@@ -334,8 +338,14 @@ def _load_onnx():
             str(model_dir), local_files_only=True, trust_remote_code=False)
     except Exception:
         processor = None
+    # tokenizer 目录：显式配置优先（UI「tokenizer 路径」），缺省回退模型所在
+    # 目录——.onnx 单文件分发通常不带 tokenizer，必须由用户指定目录。
+    tok_dir = _config.get("tokenizer_path") or str(model_dir)
+    if not Path(tok_dir).is_dir():
+        logger.warning("ONNX OCR 配置的 tokenizer 目录不存在，回退模型目录: %s", tok_dir)
+        tok_dir = str(model_dir)
     tokenizer = AutoTokenizer.from_pretrained(
-        str(model_dir), local_files_only=True, trust_remote_code=False)
+        tok_dir, local_files_only=True, trust_remote_code=False)
     logger.info("ONNX OCR 引擎加载完成: %s（CPU）", model_file)
     return _ONNXOCREngine(session, tokenizer, processor,
                           _build_onnx_prompt(tokenizer, processor))

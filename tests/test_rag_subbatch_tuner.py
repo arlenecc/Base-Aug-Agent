@@ -187,7 +187,7 @@ def test_monitor_floors_at_min():
         _drive_until_size(tuner, expected, max_windows=40)
         assert tuner.propose() == expected
     _drive_slow_windows(tuner, _SUBBATCH_MIN, 4)
-    assert tuner.propose() == _SUBBATCH_MIN == 2
+    assert tuner.propose() == _SUBBATCH_MIN == 6
 
 
 def test_monitor_recovers_without_stepdown():
@@ -255,7 +255,7 @@ def test_rss_wall_force_down_without_latch():
     # 一路降到下限后不再下降
     while tuner.propose() > _SUBBATCH_MIN:
         tuner.force_down()
-    assert tuner.propose() == _SUBBATCH_MIN == 2
+    assert tuner.propose() == _SUBBATCH_MIN == 6
     tuner.force_down()                   # 已在下限：不再下降
     assert tuner.propose() == _SUBBATCH_MIN
     # 无闩锁：速率恢复（≥95% 最优）→ 恢复分支把尺寸带回
@@ -301,14 +301,13 @@ def test_first_window_discarded_as_warmup():
 # ---------------------------------------------------------------------------
 
 def test_shape_cap_clamps_long_texts():
-    """激活 ∝ size × max_len²，预算 6M：1732 → 2、1414 → 3，但不再夹到 1。"""
-    assert _shape_cap_size(5, 1732) == 2
-    assert _shape_cap_size(5, 1414) == 3
-    assert _shape_cap_size(2, 2000) == 2   # 起始尺寸对最长文本也会收缩
+    """激活 ∝ size × max_len²，预算 6M：超预算时收缩但不低于 _SUBBATCH_MIN(6)。"""
+    assert _shape_cap_size(5, 1732) == 5   # 预算允许 2，但下限 6 > 请求 → 原样
+    assert _shape_cap_size(5, 1414) == 5   # 同上
+    assert _shape_cap_size(2, 2000) == 2   # 请求小于下限：按请求返回，不放大
     assert _shape_cap_size(1, 2000) == 1   # 请求只有 1 条时不放大
-    # 超长文本：预算早已不够，最低保 2 条（#139 禁止夹到 1）
-    assert _shape_cap_size(5, 2000) == 2
-    assert _shape_cap_size(16, 8192) == 2  # 默认后端 6M 预算在 8192 也保底 2
+    assert _shape_cap_size(16, 8192) == 6  # 默认后端 6M 预算 @8192 收缩到下限 6
+    assert _shape_cap_size(9, 8192) == 6   # 收缩不低于 _SUBBATCH_MIN
 
 
 def test_shape_cap_leaves_short_texts_alone():
@@ -320,12 +319,12 @@ def test_shape_cap_leaves_short_texts_alone():
 
 
 def test_shape_cap_is_backend_aware():
-    """预算按后端取：mlx=4@8192、onnx=2@8192，默认后端保底 2。"""
-    assert _shape_cap_size(16, 8192, "mlx") == 4
-    assert _shape_cap_size(16, 8192, "onnx") == 2
-    assert _shape_cap_size(16, 8192) == 2        # 未知后端：6M 预算 → 0 → 保底 2
+    """预算按后端取：mlx=4@8192、onnx=2@8192，均被下限 6 抬平。"""
+    assert _shape_cap_size(16, 8192, "mlx") == 6   # 预算允许 4，被下限 6 抬高
+    assert _shape_cap_size(16, 8192, "onnx") == 6  # 预算允许 2，被下限 6 抬高
+    assert _shape_cap_size(16, 8192) == 6          # 未知后端：6M 预算 → 0 → 下限 6
     assert _shape_cap_size(16, 2048, "onnx") == 16   # 预算允许 35，但请求只有 16
-    # 下限永远是 2，不会因为预算大而抬到请求值以上
+    # 下限永远不会把请求值放大：请求 1 条仍返回 1
     assert _shape_cap_size(1, 8192, "mlx") == 1
 
 

@@ -512,6 +512,7 @@ class SyncKnowledgeWorker(QThread):
                  ocr_backend: str = "mlx", ocr_model: str = "",
                  ocr_model_path: str = "",
                  ocr_gguf_path: str = "", ocr_mmproj_path: str = "",
+                 ocr_tokenizer_path: str = "",
                  ocr_vlm_handler: str = "mtmd", ocr_chat_format: str = "",
                  docling_dynamic_scale: bool = False,
                  docling_vlm: bool = False,
@@ -530,6 +531,7 @@ class SyncKnowledgeWorker(QThread):
         self._ocr_model_path = ocr_model_path
         self._ocr_gguf_path = ocr_gguf_path
         self._ocr_mmproj_path = ocr_mmproj_path
+        self._ocr_tokenizer_path = ocr_tokenizer_path
         self._ocr_vlm_handler = ocr_vlm_handler or "mtmd"
         self._ocr_chat_format = ocr_chat_format
         self._docling_dynamic_scale = bool(docling_dynamic_scale)
@@ -625,6 +627,18 @@ class SyncKnowledgeWorker(QThread):
                 _engine_kwargs["ocr_model"] = self._ocr_model
             if self._ocr_model_path:
                 _engine_kwargs["ocr_model_path"] = self._ocr_model_path
+            # GGUF/mmproj/handler/format 此前只存未转发（引擎永远拿默认值）——
+            # 补上；tokenizer 路径为 ONNX 后端新增。
+            if self._ocr_gguf_path:
+                _engine_kwargs["ocr_gguf_path"] = self._ocr_gguf_path
+            if self._ocr_mmproj_path:
+                _engine_kwargs["ocr_mmproj_path"] = self._ocr_mmproj_path
+            if self._ocr_tokenizer_path:
+                _engine_kwargs["ocr_tokenizer_path"] = self._ocr_tokenizer_path
+            if self._ocr_vlm_handler:
+                _engine_kwargs["ocr_vlm_handler"] = self._ocr_vlm_handler
+            if self._ocr_chat_format:
+                _engine_kwargs["ocr_chat_format"] = self._ocr_chat_format
             # docling 动态 OCR 倍率（默认关，全篇固定 2.0）。
             _engine_kwargs["docling_dynamic_scale"] = self._docling_dynamic_scale
             _engine_kwargs["docling_vlm"] = self._docling_vlm
@@ -1371,21 +1385,24 @@ class MainWindow(QMainWindow):
         _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
         self.ocr_backend_combo.setToolTip(
             "OvisOCR3 推理后端。mlx=MLX-VLM 权重（默认）；onnx=ONNX 多模态导出"
-            "（需 rag_ocr_model_path 指向 .onnx 或目录）；gguf=llama.cpp GGUF 多模态"
-            "（必须填 mmproj 投影文件才能读图）。缺权重时加载阶段给出明确错误。"
+            "（本地路径指向 .onnx 或目录，需在下方补充行选 tokenizer 目录）；"
+            "gguf=llama.cpp GGUF 多模态（本地路径指向 .gguf 文件，必须补选 mmproj "
+            "投影文件才能读图）。缺权重时加载阶段给出明确错误。"
         )
-        self.ocr_model_path_edit = QLineEdit(placeholderText="MLX/ONNX 模型目录或 .onnx 文件")
+        self.ocr_model_path_edit = QLineEdit(
+            placeholderText="MLX/ONNX/GGUF 模型目录或 .onnx/.gguf 文件")
         self.ocr_model_path_btn = QPushButton("选择")
         self.ocr_model_path_btn.clicked.connect(self._on_select_ocr_model_path)
-        # GGUF 专用（mmproj + handler + chat format）。ONNX/MLX 后端忽略这些。
-        self.ocr_gguf_path_edit = QLineEdit(placeholderText="GGUF 模型文件（.gguf）")
-        self.ocr_gguf_path_btn = QPushButton("选择")
-        self.ocr_gguf_path_btn.clicked.connect(self._on_select_ocr_gguf_path)
+        # 次级路径（按后端显隐，与主/辅助模型同一套交互）：GGUF → mmproj 投影
+        # 文件（必填才能读图）；ONNX → tokenizer 目录。MLX 不显示。
         self.ocr_mmproj_path_edit = QLineEdit(placeholderText="mmproj / clip 投影文件（必填）")
         self.ocr_mmproj_path_btn = QPushButton("选择")
         self.ocr_mmproj_path_btn.clicked.connect(self._on_select_ocr_mmproj_path)
-        self.ocr_vlm_handler_edit = QLineEdit(placeholderText="handler（默认 mtmd）")
-        self.ocr_chat_format_edit = QLineEdit(placeholderText="chat_format（可空）")
+        self.ocr_tokenizer_path_edit = QLineEdit(
+            placeholderText="ONNX tokenizer 目录（含 tokenizer.json，可选）")
+        self.ocr_tokenizer_path_btn = QPushButton("选择")
+        self.ocr_tokenizer_path_btn.clicked.connect(
+            lambda: self._on_pick_secondary_path(self.ocr_tokenizer_path_edit, "tokenizer"))
         # 精排始终启用，没有 disabled 选项；要临时关掉靠配置文件的
         # rag_rerank_enabled=false（会退化为向量距离排序）。
         self.reranker_backend_combo = QComboBox()
@@ -1554,58 +1571,55 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.kb_apply_btn)
         kb_lay.addLayout(dir_row)
 
-        # Row 1.5: PDF 解析引擎（三选一单选钮横列，独立一行）
+        # Row 1.5: PDF 解析引擎（三选一单选钮横列）+ 自定义 OCR 配置（同行）
+        # 「自定义 OCR」并入同行（2026-10 用户要求）：选中 ovis 单选时用的
+        # 就是这套配置，相邻摆放更直观；路径框省去「本地路径」标签——占位符
+        # 已说明用途，且该行变长后标签只会加剧拥挤。
         engine_row = QHBoxLayout()
         engine_row.setSpacing(8)
         engine_row.addWidget(QLabel("PDF 解析引擎"))
         for _value in ("docling", "marker", "ovis"):
             engine_row.addWidget(self.pdf_engine_radios[_value])
         engine_row.addStretch(1)
-        kb_lay.addLayout(engine_row)
-
-        # Row 1.6: 自定义 OCR 模型后端 | 模型/目录名 | 本地路径
-        # OvisOCR3 第三解析方案的模型配置（2026-10）。
-        ocr_row = QHBoxLayout()
-        ocr_row.setSpacing(8)
-        ocr_row.addWidget(QLabel("自定义 OCR 模型"))
-        ocr_row.addWidget(self.ocr_backend_combo)
-        ocr_row.addWidget(QLabel("本地路径"))
-        ocr_row.addWidget(self.ocr_model_path_edit, 3)
-        ocr_row.addWidget(self.ocr_model_path_btn)
-        ocr_row.addSpacing(12)
-        # 自定义 OCR 模型行的两个操作按钮（#用户需求）：
+        engine_row.addWidget(QLabel("自定义 OCR"))
+        engine_row.addWidget(self.ocr_backend_combo)
+        engine_row.addWidget(self.ocr_model_path_edit, 3)
+        engine_row.addWidget(self.ocr_model_path_btn)
+        # 自定义 OCR 的两个操作按钮（#用户需求）：
         #  - 保存设置：把本行 OCR 配置写入并落盘 config，供知识库同步使用；
         #  - 识别测试：弹出独立窗口，用各 OCR 模型对任意图片/PDF 做目测对比。
         self.ocr_save_btn = QPushButton("保存设置")
         self.ocr_save_btn.setToolTip(
-            "保存并应用「自定义 OCR 模型」这一行的配置\n"
+            "保存并应用「自定义 OCR」这一行的配置\n"
             "下次知识库同步会使用此处设置的 Ovis OCR 模型"
         )
         self.ocr_save_btn.clicked.connect(self._on_ocr_save_settings)
-        ocr_row.addWidget(self.ocr_save_btn)
+        engine_row.addWidget(self.ocr_save_btn)
         self.ocr_test_btn = QPushButton("识别测试")
         self.ocr_test_btn.setToolTip(
             "弹出 OCR 识别测试窗口\n"
             "可选 Apple OCR / OvisOCR3 / 混合 / 自定义 OCR，对指定图片或 PDF 做识别并左右对照"
         )
         self.ocr_test_btn.clicked.connect(self._on_ocr_test)
-        ocr_row.addWidget(self.ocr_test_btn)
-        kb_lay.addLayout(ocr_row)
+        engine_row.addWidget(self.ocr_test_btn)
+        kb_lay.addLayout(engine_row)
 
-        # Row 1.7: GGUF 专用（仅后端选 GGUF 时需要）：模型文件 | mmproj | handler | format
-        ocr_gguf_row = QHBoxLayout()
-        ocr_gguf_row.setSpacing(8)
-        ocr_gguf_row.addWidget(QLabel("GGUF 模型文件"))
-        ocr_gguf_row.addWidget(self.ocr_gguf_path_edit, 3)
-        ocr_gguf_row.addWidget(self.ocr_gguf_path_btn)
-        ocr_gguf_row.addWidget(QLabel("mmproj"))
-        ocr_gguf_row.addWidget(self.ocr_mmproj_path_edit, 3)
-        ocr_gguf_row.addWidget(self.ocr_mmproj_path_btn)
-        ocr_gguf_row.addWidget(QLabel("handler"))
-        ocr_gguf_row.addWidget(self.ocr_vlm_handler_edit, 1)
-        ocr_gguf_row.addWidget(QLabel("format"))
-        ocr_gguf_row.addWidget(self.ocr_chat_format_edit, 1)
-        kb_lay.addLayout(ocr_gguf_row)
+        # Row 1.7: 次级路径行（与主/辅助模型同一套交互）——仅 ONNX / GGUF 后端
+        # 可见（_update_ocr_secondary_controls）：GGUF → mmproj 投影文件；
+        # ONNX → tokenizer 目录。MLX 时整行隐藏。
+        ocr_sec_row = QHBoxLayout()
+        ocr_sec_row.setSpacing(8)
+        self.ocr_mmproj_path_label = QLabel("mmproj 路径")
+        ocr_sec_row.addWidget(self.ocr_mmproj_path_label)
+        ocr_sec_row.addWidget(self.ocr_mmproj_path_edit, 3)
+        ocr_sec_row.addWidget(self.ocr_mmproj_path_btn)
+        self.ocr_tokenizer_path_label = QLabel("tokenizer 路径")
+        ocr_sec_row.addWidget(self.ocr_tokenizer_path_label)
+        ocr_sec_row.addWidget(self.ocr_tokenizer_path_edit, 3)
+        ocr_sec_row.addWidget(self.ocr_tokenizer_path_btn)
+        kb_lay.addLayout(ocr_sec_row)
+        self.ocr_backend_combo.currentIndexChanged.connect(
+            self._update_ocr_secondary_controls)
 
         # Row 2: Embedding 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 同步知识
         emb_row = QHBoxLayout()
@@ -1945,18 +1959,13 @@ class MainWindow(QMainWindow):
         self.ocr_model_path_edit.setText(
             getattr(self.config, "rag_ocr_model_path", "") or DEFAULT_OCR_MODEL_PATH
         )
-        self.ocr_gguf_path_edit.setText(
-            getattr(self.config, "rag_ocr_gguf_path", "") or ""
-        )
         self.ocr_mmproj_path_edit.setText(
             getattr(self.config, "rag_ocr_mmproj_path", "") or ""
         )
-        self.ocr_vlm_handler_edit.setText(
-            getattr(self.config, "rag_ocr_vlm_handler", "") or "mtmd"
+        self.ocr_tokenizer_path_edit.setText(
+            getattr(self.config, "rag_ocr_tokenizer_path", "") or ""
         )
-        self.ocr_chat_format_edit.setText(
-            getattr(self.config, "rag_ocr_chat_format", "") or ""
-        )
+        self._update_ocr_secondary_controls()
         _select_combo_backend(self.reranker_backend_combo, self.config.rag_rerank_backend)
         self.reranker_model_edit.setText(self.config.rag_rerank_model)
         self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
@@ -2086,12 +2095,18 @@ class MainWindow(QMainWindow):
         self.config.rag_ocr_model = (
             os.path.basename(self.config.rag_ocr_model_path) or DEFAULT_OCR_MODEL
         )
-        self.config.rag_ocr_gguf_path = self.ocr_gguf_path_edit.text().strip()
-        self.config.rag_ocr_mmproj_path = self.ocr_mmproj_path_edit.text().strip()
-        self.config.rag_ocr_vlm_handler = (
-            self.ocr_vlm_handler_edit.text().strip() or "mtmd"
+        # GGUF 模型文件现在统一填在上面的「本地路径」里：选中 GGUF 后端时把
+        # 它同步到 rag_ocr_gguf_path（引擎 GGUF 加载器优先读它），其它后端清空。
+        self.config.rag_ocr_gguf_path = (
+            self.config.rag_ocr_model_path
+            if self.config.rag_ocr_backend == "gguf" else ""
         )
-        self.config.rag_ocr_chat_format = self.ocr_chat_format_edit.text().strip()
+        self.config.rag_ocr_mmproj_path = self.ocr_mmproj_path_edit.text().strip()
+        self.config.rag_ocr_tokenizer_path = (
+            self.ocr_tokenizer_path_edit.text().strip()
+        )
+        # rag_ocr_vlm_handler / rag_ocr_chat_format 的输入框已随 GGUF 专用行
+        # 移除：保留 config 既有值（默认 mtmd / 空），引擎侧继续消费。
 
     def _gather_sampling_from_widgets(self, prefix: str) -> None:
         """从控件读采样参数写进 config。prefix "" = 主模型，"aux_" = 辅助。
@@ -2356,6 +2371,26 @@ class MainWindow(QMainWindow):
             getattr(self, edit_attr).setVisible(show)
             getattr(self, btn_attr).setVisible(show)
 
+    def _update_ocr_secondary_controls(self, *_args) -> None:
+        """按 OCR 后端显隐自定义 OCR 的次级路径框（与主/辅助模型同一套交互）。
+
+        注意 OCR 的下拉值与 LLM 不同：GGUF 后端的值是 ``"gguf"``（LLM 是
+        ``"llama_cpp"``）。GGUF → mmproj（必填才能读图）；ONNX → tokenizer
+        目录；MLX 两个都不显示。同一时刻只有一个可见。
+        """
+        backend = _combo_backend_value(self.ocr_backend_combo)
+        is_gguf = backend == "gguf"
+        is_onnx = backend == "onnx"
+        for lbl, edit, btn, show in (
+            (self.ocr_mmproj_path_label, self.ocr_mmproj_path_edit,
+             self.ocr_mmproj_path_btn, is_gguf),
+            (self.ocr_tokenizer_path_label, self.ocr_tokenizer_path_edit,
+             self.ocr_tokenizer_path_btn, is_onnx),
+        ):
+            lbl.setVisible(show)
+            edit.setVisible(show)
+            btn.setVisible(show)
+
     def _update_rag_model_controls(self, *_args) -> None:
         """按后端显隐 Embedding/Reranker 的「模型名」与「本地路径」字段。
 
@@ -2568,24 +2603,19 @@ class MainWindow(QMainWindow):
         self._ocr_test_window.show()
 
     def _on_select_ocr_model_path(self) -> None:
-        """选择 MLX/ONNX 模型目录（或 ONNX 的 .onnx 文件）。"""
+        """选择 OCR 模型：ONNX 选 .onnx 文件、GGUF 选 .gguf 文件、MLX 选目录。"""
         backend = _combo_backend_value(self.ocr_backend_combo)
         start = self._dialog_start(self.ocr_model_path_edit.text())
         if backend == "onnx":
             path, _ = QFileDialog.getOpenFileName(
                 self, "选择 ONNX 模型", start, "ONNX (*.onnx);;所有文件 (*)")
+        elif backend == "gguf":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 GGUF OCR 模型", start, "GGUF (*.gguf);;所有文件 (*)")
         else:
             path = QFileDialog.getExistingDirectory(self, "选择 OvisOCR3 模型目录", start)
         if path:
             self.ocr_model_path_edit.setText(path)
-
-    def _on_select_ocr_gguf_path(self) -> None:
-        """选择 GGUF OCR 模型文件。"""
-        start = self._dialog_start(self.ocr_gguf_path_edit.text())
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择 GGUF OCR 模型", start, "GGUF (*.gguf);;所有文件 (*)")
-        if path:
-            self.ocr_gguf_path_edit.setText(path)
 
     def _on_select_ocr_mmproj_path(self) -> None:
         """选择 GGUF 多模态投影文件（mmproj/clip）。"""
@@ -3428,6 +3458,7 @@ class MainWindow(QMainWindow):
             ocr_model_path=getattr(self.config, "rag_ocr_model_path", ""),
             ocr_gguf_path=getattr(self.config, "rag_ocr_gguf_path", ""),
             ocr_mmproj_path=getattr(self.config, "rag_ocr_mmproj_path", ""),
+            ocr_tokenizer_path=getattr(self.config, "rag_ocr_tokenizer_path", ""),
             ocr_vlm_handler=getattr(self.config, "rag_ocr_vlm_handler", ""),
             ocr_chat_format=getattr(self.config, "rag_ocr_chat_format", ""),
             docling_dynamic_scale=getattr(

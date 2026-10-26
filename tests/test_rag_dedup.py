@@ -56,6 +56,10 @@ class _FakeStore:
     def count(self):
         return self._count
 
+    def reset_if_incompatible(self):
+        """engine.py 同步入口会调用（cache-DB 自愈路径）；桩恒返回 False。"""
+        return False
+
     def list_sources(self):
         return sorted({r.get("source", "") for r in self.records if r.get("source")})
 

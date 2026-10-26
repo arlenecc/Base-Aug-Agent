@@ -528,6 +528,170 @@ class TestVectorStore:
         assert "持久化测试" in results[0]["text"]
 
 
+class _FixedDimEF:
+    """Deterministic fixed-dimension embedding function for reset tests."""
+
+    def __init__(self, dim: int):
+        self.dim = dim
+
+    def __call__(self, input):
+        return [[0.1] * self.dim for _ in input]
+
+    def embed_query(self, text: str):
+        return [0.1] * self.dim
+
+
+class TestVectorStoreResetIfIncompatible:
+    """嵌入模型切换（维度变化）后，向量库应能自愈清空重建（#text_fts 修复）。"""
+
+    @pytest.fixture
+    def store_dir(self):
+        tmp = tempfile.mkdtemp(prefix="reset_test_")
+        yield tmp
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_same_dim_returns_false_and_keeps_data(self, store_dir):
+        from agent.rag.vector_store import VectorStore
+
+        ef = _FixedDimEF(128)
+        store1 = VectorStore(persist_dir=store_dir, embedding_function=ef)
+        store1.add([{"source": "a.md", "chunk_index": 0, "text": "兼容数据"}])
+        assert store1.count() == 1
+
+        # 同维度新实例：不兼容检查应返回 False，数据保留
+        store2 = VectorStore(persist_dir=store_dir, embedding_function=ef)
+        assert store2.reset_if_incompatible() is False
+        assert store2.count() == 1
+
+    def test_dim_change_resets_table(self, store_dir):
+        from agent.rag.vector_store import VectorStore
+
+        ef128 = _FixedDimEF(128)
+        store1 = VectorStore(persist_dir=store_dir, embedding_function=ef128)
+        store1.add([{"source": "a.md", "chunk_index": 0, "text": "旧模型数据"}])
+        assert store1.count() == 1
+
+        # 换成 64 维嵌入后：应检测到维度不匹配并清空重建
+        ef64 = _FixedDimEF(64)
+        store2 = VectorStore(persist_dir=store_dir, embedding_function=ef64)
+        assert store2.reset_if_incompatible() is True
+        assert store2.count() == 0
+
+        # 清空后应能正常写入与检索（新维度）
+        store2.add([{"source": "b.md", "chunk_index": 0, "text": "新模型数据"}])
+        assert store2.count() == 1
+        results = store2.search("新模型", top_k=1)
+        assert len(results) == 1
+        assert results[0]["source"] == "b.md"
+
+        # 重建后的表对同维度实例仍是兼容的（第二次检查返回 False）
+        store3 = VectorStore(persist_dir=store_dir, embedding_function=ef64)
+        assert store3.reset_if_incompatible() is False
+        assert store3.count() == 1
+
+    def test_missing_fts_column_detected(self, store_dir, monkeypatch):
+        """旧表缺 text_fts/ingested_at 列时也应判定不兼容（用户报错场景）。
+
+        正常路径下 _check_schema_migration 会在初始化时把列补齐；这里模拟
+        生产事故——迁移中途抛异常被吞（except Exception 后旧表原样保留），
+        此时 reset_if_incompatible 必须能兜底检测并清库。
+        """
+        import lancedb
+
+        from agent.rag.vector_store import _TABLE_NAME, VectorStore
+
+        # 手工造一张只含旧版列的表（无 text_fts / ingested_at）
+        db = lancedb.connect(store_dir)
+        ef = _FixedDimEF(128)
+        db.create_table(_TABLE_NAME, [
+            {"id": "x", "text": "旧表", "vector": [0.1] * 128,
+             "source": "old.md", "chunk_index": 0},
+        ])
+
+        store = VectorStore(persist_dir=store_dir, embedding_function=ef)
+        # 让初始化时的 schema 迁移失效（模拟迁移失败被吞后旧表保留）
+        monkeypatch.setattr(store, "_check_schema_migration", lambda: None)
+        store._initialized = False
+        store._ensure_initialized()
+        assert store.reset_if_incompatible() is True
+        assert store.count() == 0
+
+
+class TestSchemaMigrationSafety:
+    """#140 内存事故（22GB 卡死）回归：迁移必须维度感知 + 有界内存 + 不丢列。"""
+
+    @pytest.fixture
+    def store_dir(self):
+        tmp = tempfile.mkdtemp(prefix="mig_test_")
+        yield tmp
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def _make_old_table(self, store_dir, dim, with_fts, with_ingested):
+        """手工建一张指定列组合的旧版表，模拟历史版本的 schema。"""
+        import lancedb
+
+        from agent.rag.vector_store import _TABLE_NAME
+
+        db = lancedb.connect(store_dir)
+        row = {
+            "id": "abc_0", "text": "旧表数据",
+            "vector": [0.1] * dim,
+            "source": "old.md", "chunk_index": 0,
+        }
+        if with_fts:
+            row["text_fts"] = "旧表 数据"
+        if with_ingested:
+            row["ingested_at"] = 0.0
+        db.create_table(_TABLE_NAME, [row])
+
+    def test_migration_preserves_existing_text_fts(self, store_dir):
+        """只缺 ingested_at 的旧表迁移后必须保留已有 text_fts（生产事故根因）。"""
+        from agent.rag.vector_store import _INGESTED_AT, _FTS_COLUMN, VectorStore
+
+        # 旧表：有 text_fts，缺 ingested_at（10-22 之前的历史 schema）
+        self._make_old_table(store_dir, 128, with_fts=True, with_ingested=False)
+
+        store = VectorStore(persist_dir=store_dir, embedding_function=_FixedDimEF(128))
+        store._ensure_initialized()
+        schema = store._table.schema
+        assert _FTS_COLUMN in schema.names, "迁移丢失了已有的 text_fts 列！"
+        assert _INGESTED_AT in schema.names
+        assert store.count() == 1
+        # 已有 text_fts 内容原样保留（不重新分词）
+        rows = store._table.to_arrow().to_pylist()
+        assert rows[0]["text_fts"] == "旧表 数据"
+
+    def test_migration_skipped_on_dim_mismatch(self, store_dir):
+        """旧表维度与当前嵌入不一致时跳过迁移（不读全表），留给 reset 清库。"""
+        from agent.rag.vector_store import _FTS_COLUMN, VectorStore
+
+        # 64 维旧表，当前 EF 是 128 维，且缺 text_fts
+        self._make_old_table(store_dir, 64, with_fts=False, with_ingested=True)
+
+        store = VectorStore(persist_dir=store_dir, embedding_function=_FixedDimEF(128))
+        store._ensure_initialized()
+        # 迁移被跳过：表原样保留（仍是 64 维、缺 text_fts）
+        schema = store._table.schema
+        assert _FTS_COLUMN not in schema.names
+        assert schema.field("vector").type.list_size == 64
+        assert store.count() == 1
+        # 随后 reset_if_incompatible 兜底清库
+        assert store.reset_if_incompatible() is True
+        assert store.count() == 0
+
+    def test_add_rejects_dim_mismatch_with_clear_error(self, store_dir):
+        """旧表残留时写入必须 fail-fast 并给出可行动的错误信息。"""
+        import pytest as _pytest
+
+        from agent.rag.vector_store import VectorStore
+
+        self._make_old_table(store_dir, 64, with_fts=True, with_ingested=True)
+
+        store = VectorStore(persist_dir=store_dir, embedding_function=_FixedDimEF(128))
+        with _pytest.raises(RuntimeError, match="维度不匹配"):
+            store.add([{"source": "a.md", "chunk_index": 0, "text": "新数据"}])
+
+
 # ── Module 5: RAG Engine ────────────────────────────────────────────────────
 
 class TestRAGEngine:

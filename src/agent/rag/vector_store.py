@@ -329,7 +329,14 @@ def get_or_create_embedding_function(
 #   - 下限 2：低于 4 吞吐掉到最优的 50-69%，但保留 2 作为极端内存压力下的
 #     避让位（形状预算同样以此为止，见 _shape_cap_size，不再夹到 1）。
 # 步长 2：范围扩大到 [2,64] 后步长 1 要爬 31 档才到顶，爬山期过长。
-_SUBBATCH_MIN = 2
+# 自适应子批范围（2026-10-26 按 bge-small-zh @500 字切片实测重标定，
+# 终值 64/6/16/2 由用户拍板）：初测以为 6-8 是平台顶（~97 条/s），但三轮
+# 交错复测显示小尺寸（1-8）极差达 15-39% 且第 1 轮系统性偏快 ~15%，
+# 该"平台顶"是噪声；均值口径 6-64 全部平坦（78-85 条/s），size≥16 极差
+# <9% 才可信。故 START=16（测量最稳的平坦区起点），MAX=64（无收益上限，
+# +2.5% 在抖动范围内），MIN=6（低于 6 单条吞吐塌陷、固定成本摊不薄，
+# 见 #139），STEP=2。调参器爬坡阈值 3% 应与 ≥16 段的方差量级比较。
+_SUBBATCH_MIN = 6
 _SUBBATCH_MAX = 64
 _SUBBATCH_START = 16
 _SUBBATCH_STEP = 2
@@ -339,6 +346,9 @@ _SUBBATCH_STEP = 2
 # 也不回去」的根因之一。注意：wall 只影响运行中的进程，改这里不会让
 # 已启动的应用生效，需要完全重启。
 _SUBBATCH_RSS_LIMIT = 8.0  # GB
+
+# 逐子批内存打点文件（与 engine 的 RAG_MEM_LOG 同一开关）：footprint 口径。
+_MEM_LOG_PATH = os.environ.get("RAG_MEM_LOG") or ""
 
 # MLX 后端缓存清理间隔（每 N 个嵌入子批一次）。
 #
@@ -372,11 +382,12 @@ _SUBBATCH_RECOVER = 0.95
 def _shape_cap_size(size: int, max_len: int, backend: Optional[str] = None) -> int:
     """按形状预算收缩子批条数：超长文本下自动变小，短文本不受影响。
 
-    这是**内存硬约束**，但**不再夹到 1**：最低保 2 条，与调优器的探索下限
-    ``_SUBBATCH_MIN`` 对齐，两者不再互相打架。单条长切片会把吞吐打到最优的
-    50-69%，且模型加载 / ONNX 会话初始化的固定成本被单条摊得极薄；实测
-    int8 ONNX @8192 B=2 内存可接受，故下探到 2 为止。请求本身不足 2 条时
-    按请求返回，不会为了凑下限而放大批次。
+    这是**内存硬约束**，但收缩有下限：最低保 ``_SUBBATCH_MIN`` 条
+    （2026-10-26 终值 6），与调优器的探索下限 ``_SUBBATCH_MIN`` 对齐，两者
+    不再互相打架。单条长切片会把吞吐打到最优的 50-69%，且模型加载 / ONNX
+    会话初始化的固定成本被单条摊得极薄；本项目切片硬限 500 字符，超长文本
+    仅出现在异常输入，超预算部分由 MLX 内存策略（cache 1GB / 系统可用 60%）
+    兜底。请求本身不足下限时按请求返回，不会为了凑下限而放大批次。
 
     预算按后端取：mlx 走 flash attention（O(S)）可放到 B=4@8192；onnx(CPU)
     物化注意力（O(S²)）放到 B=2@8192；其它后端沿用 6M。
@@ -410,17 +421,17 @@ _SUBBATCH_RE_CLIMB = 1.10
 
 
 class _SubBatchTuner:
-    """在 [2, 64] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
+    """在 [6, 64] 内自动寻找吞吐最优的嵌入子批大小（爬山 + 降档）。
 
     度量：不用原始 tok/s——长度分桶后各批序列长度天然不同，直接比
     tok/s 有系统性偏差。改用算力速率 ``ops/s = n × max_len² / dt``（以
     字符数近似 token 数，单调代理即可），对批大小与批内最长长度同时
     归一，跨窗口、跨尺寸可比。
 
-    状态机（#125 用户规格，#126/#127/#128 生产验证修订，2026-10 重标定）：
-      climb   初始 16（MLX 拐点）：基线窗口（2 子批）→ 试探 +2 → 更快
-              （≥3%）则采纳并继续上调，变慢则回退到上一个数字，进入
-              monitor。起步即落在实测最优区，不必从下限一路爬上来；
+    状态机（#125 用户规格，2026-10-26 按 bge-small-zh @500 字切片实测重标定）：
+      climb   初始 6（实测平台区，size 6-8 吞吐 ~97 条/s）：基线窗口（2 子批）
+              → 试探 +2 → 更快（≥3%）则采纳并继续上调（上限 8），变慢则
+              回退到上一个数字，进入 monitor。起步即落在实测最优区；
       monitor 持续盯速率：连续 2 窗口低于历史最优 75% → 降 1 档（步长 2）
               避让（下限 2），速率恢复即停；速率回到历史最优 95% 且尺寸低于
               最优尺寸 → 尖峰已过去，回到最优尺寸重新爬升（#129，消除降档
@@ -816,6 +827,16 @@ class VectorStore:
         we rebuild the table (data survives — it is re-read from the old table
         and re-written with the new columns). 旧行没有 ingested_at，回填
         0.0（视为「最老」——历史数据天然占先，不会被重新入库的副本顶掉）。
+
+        #140 内存事故修正（2026-10-26，22GB 卡死）：
+        1. 旧表向量维度与当前嵌入模型不一致时**跳过迁移**——那些数据对当前
+           模型毫无意义（反正要清库重建），而全表迁移曾把 57 万行 × 768 维
+           向量读成 Python 对象（每 float 一个 PyHeap 对象 ≈ 20GB）直接把
+           机器卡死。清库交给 reset_if_incompatible()。
+        2. 迁移本身分批转换（每批 ≤2000 行），且**保留旧表已有列**——旧实现
+           的 records 只重建 5 个基础列，旧表只缺 ingested_at 时会把已有的
+           text_fts 整个丢掉，产出一必然写入失败的坏表（用户看到的
+           "text_fts does not exist" 正是这么来的）。
         """
         if self._table is None:
             return
@@ -828,39 +849,153 @@ class VectorStore:
         except Exception:
             return
 
+        # 维度守卫：无法确认「旧表维度 == 当前嵌入维度」就绝不做全表迁移。
+        try:
+            table_dim = schema.field("vector").type.list_size
+        except Exception:
+            table_dim = None
+        ef_dim = self._probe_ef_dim()
+        if table_dim is None or ef_dim is None or table_dim != ef_dim:
+            logger.info(
+                "  ⚙ 旧表向量维度(%s)与当前嵌入模型(%s)不一致或无法确认，"
+                "跳过 schema 迁移——旧数据将由兼容性检查清库重建",
+                table_dim, ef_dim,
+            )
+            return
+
         logger.info("  ⚙ 检测到旧版向量表（缺少 %s 列），自动迁移...", "/".join(missing))
         try:
-            # Read all existing rows via PyArrow (无 pandas 依赖)。
+            import pyarrow as pa
+
+            # 目标 schema = 现有列 + 缺失列。
+            target_names = set(schema.names) | set(missing)
+            target_fields = list(schema)
+            if _FTS_COLUMN in missing:
+                target_fields.append(pa.field(_FTS_COLUMN, pa.string()))
+            if _INGESTED_AT in missing:
+                target_fields.append(pa.field(_INGESTED_AT, pa.float64()))
+            target_schema = pa.schema(target_fields)
+
+            # 分批转换：Python 对象只在单批（≤2000 行）内瞬时存在，累计
+            # 数据用紧凑的 Arrow batch（float32 4 字节/值，全表 ~2GB 而非
+            # ~20GB）。
             arrow_table = self._table.to_arrow()
-            records = []
-            for row in arrow_table.to_pylist():
-                rec = {
-                    "id": row["id"],
-                    "text": row["text"],
-                    "vector": row["vector"],
-                    "source": row["source"],
-                    "chunk_index": row["chunk_index"],
-                }
-                if _FTS_COLUMN in missing:
-                    rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
-                if _INGESTED_AT in missing:
-                    rec[_INGESTED_AT] = 0.0
-                records.append(rec)
+            out_batches = []
+            for batch in arrow_table.to_batches(max_chunksize=2000):
+                records = []
+                for row in batch.to_pylist():
+                    # 保留旧表已有列（含 text_fts）——迁移只负责补缺，不丢数据。
+                    rec = {k: row[k] for k in target_names if k in row}
+                    if _FTS_COLUMN in missing:
+                        rec[_FTS_COLUMN] = _tokenize_for_fts(rec["text"])
+                    if _INGESTED_AT in missing:
+                        rec[_INGESTED_AT] = 0.0
+                    records.append(rec)
+                out_batches.append(
+                    pa.RecordBatch.from_pylist(records, schema=target_schema))
+            del arrow_table  # 建表前先释放源数据的 Arrow 副本
 
             # LanceDB OSS 无 rename_table，只能 drop 后重建。数据已在内存
-            # 的 records 中，drop 旧表后 create 失败可再次尝试；即使最终
+            # 的紧凑 batches 中，drop 旧表后 create 失败可再次尝试；即使最终
             # 失败，RAG 数据也可从源文件重新同步恢复（幂等）。
             self._db.drop_table(_TABLE_NAME)
             self._table = None
-            if records:
-                self._table = self._db.create_table(_TABLE_NAME, records)
+            if out_batches:
+                self._table = self._db.create_table(
+                    _TABLE_NAME,
+                    pa.Table.from_batches(out_batches, schema=target_schema))
+            else:
+                self._table = self._db.create_table(
+                    _TABLE_NAME, schema=target_schema)
+            del out_batches
             self._table_checked = True
             logger.info("  ⚙ 向量表迁移完成（新增 %s 列，%d 条记录）",
-                        "/".join(missing), len(records))
+                        "/".join(missing), self._table.count_rows())
         except Exception as e:
             logger.warning("  ⚠ 向量表迁移失败（BM25 索引将不可用）: %s", e)
             self._table = None
             self._table_checked = False
+
+    def _probe_ef_dim(self) -> Optional[int]:
+        """探测当前 embedding function 的输出维度。
+
+        返回 None 表示探测失败（EF 不可用）——调用方不应据此清库。
+        """
+        try:
+            if hasattr(self._ef, "embed_query"):
+                vec = self._ef.embed_query("维度探测")
+            else:
+                vec = self._ef(["维度探测"])[0]
+            return len(vec)
+        except Exception as e:
+            logger.warning("  ⚠ 嵌入维度探测失败: %s", e)
+            return None
+
+    def reset_if_incompatible(self) -> bool:
+        """向量库与当前嵌入模型不兼容时，自愈式清空重建。
+
+        典型场景：用户从 nomic（768 维）切换到 bge-small（512 维）后，旧表
+        里的 768 维向量与新写入的 512 维向量无法共存（LanceDB schema 固定
+        向量宽度），写入报错。此处检查表是否存在且维度匹配，不匹配则
+        drop 主表并复位内部状态，由调用方负责作废 manifest（全量重建）。
+
+        返回 True 表示执行了重置（调用方需作废同步记录）。
+        """
+        self._ensure_initialized()
+        if self._table is None:
+            return False
+        # 与 clear() 相同的并发安全姿势：先排空在途操作。
+        try:
+            self._drain_ops(timeout=10.0)
+        except Exception:
+            pass
+        try:
+            schema = self._table.schema
+            names = schema.names
+            expected_dim = self._probe_ef_dim()
+            current_dim = None
+            if "vector" in names:
+                try:
+                    current_dim = schema.field("vector").type.list_size
+                except Exception:
+                    current_dim = None
+
+            incompatible = False
+            reasons = []
+            if expected_dim is None:
+                # EF 不可用：无法判断，宁可保守不清库
+                logger.warning("  ⚠ 无法探测嵌入维度，跳过向量库兼容性检查")
+                return False
+            if "vector" not in names:
+                incompatible = True
+                reasons.append("缺少 vector 列")
+            elif current_dim != expected_dim:
+                incompatible = True
+                reasons.append(
+                    f"向量维度不匹配（库内 {current_dim} 维 vs 当前嵌入 {expected_dim} 维）")
+            for col in ("id", _FTS_COLUMN, _INGESTED_AT):
+                if col not in names:
+                    incompatible = True
+                    reasons.append(f"缺少 {col} 列")
+
+            if not incompatible:
+                return False
+
+            logger.warning(
+                "  ⚠ 向量库与当前嵌入模型不兼容（%s），执行自愈重建...", "；".join(reasons))
+            self._db.drop_table(_TABLE_NAME)
+            self._table = None
+            self._table_checked = False
+            # FTS 状态一并复位（表都没了，旧标记毫无意义）。
+            self._fts_ready = False
+            self._fts_checked = False
+            self._fts_failed = False
+            return True
+        except Exception as e:
+            logger.warning("  ⚠ 向量库兼容性检查/重置失败: %s", e)
+            return False
+        finally:
+            self._resume_ops()
 
     def _ensure_table(self) -> Optional[Any]:
         """Open existing table if it exists, return None if not yet created.
@@ -906,6 +1041,27 @@ class VectorStore:
     # CRUD
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _assert_vector_dim_compat(table: Any, records: List[Dict[str, Any]]) -> None:
+        """写入前校验表向量维度与数据一致，不一致立刻抛明确错误。
+
+        #140 防御兜底：旧表（如 nomic 768 维）未被清掉时，首批写入就拿到
+        可行动的错误提示，而不是先执行完 delete 再在 add 上报晦涩的
+        schema mismatch。
+        """
+        if table is None or not records:
+            return
+        try:
+            table_dim = table.schema.field("vector").type.list_size
+        except Exception:
+            return
+        vec = records[0].get("vector")
+        if vec is not None and len(vec) != table_dim:
+            raise RuntimeError(
+                f"向量库维度不匹配：库内向量 {table_dim} 维，当前嵌入模型输出 "
+                f"{len(vec)} 维（嵌入模型切换后旧库未清空）。"
+                f"请重新启动同步，将自动清库重建。")
+
     @_store_op
     def add(
         self,
@@ -943,6 +1099,7 @@ class VectorStore:
                 })
 
         table = self._ensure_table()
+        self._assert_vector_dim_compat(table, records)
 
         if table is None:
             # First add: create table with all records（并发安全）
@@ -1067,6 +1224,7 @@ class VectorStore:
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
         table = self._ensure_table()
+        self._assert_vector_dim_compat(table, first_records)
         # 跟踪已删除过旧数据的 source，避免后续批次重复写入时新旧数据共存。
         sources_seen = {r["source"] for r in first_records}
         created = False
@@ -1254,6 +1412,37 @@ class VectorStore:
                 _time.monotonic() - _t_embed,
             )
             tuner.report(len(idxs), max(len(texts[i]) for i in idxs), _dt)
+            # 逐子批内存打点（RAG_MEM_LOG 开启时）：footprint 口径（RSS+swap
+            # +MLX 统计）。RSS 不含 Metal 缓冲与换页——实测同一进程 RSS 2.2GB
+            # vs footprint 12.1GB，只记 RSS 会看不到嵌入期的真实增长。
+            if _MEM_LOG_PATH:
+                try:
+                    import psutil as _psutil
+
+                    _mi = _psutil.Process().memory_info()
+                    _swap = 0
+                    try:
+                        _swap = _psutil.Process().memory_swap()
+                    except Exception:
+                        pass
+                    _mx_a = _mx_c = 0
+                    try:
+                        import mlx.core as _mx
+
+                        _mx_a = _mx.get_active_memory()
+                        _mx_c = _mx.get_cache_memory()
+                    except Exception:
+                        pass
+                    with open(_MEM_LOG_PATH, "a") as _f:
+                        _f.write(
+                            f"{time.strftime('%H:%M:%S')} EMBED sub#{sub_idx} "
+                            f"size={size} max_chars={len(texts[order[sub_start - 1]]) if idxs else 0} "
+                            f"fp={(_mi.rss + _swap + _mx_a + _mx_c) / 1e9:.2f}GB rss={_mi.rss / 1e9:.2f}GB "
+                            f"swap={_swap / 1e9:.2f}GB mx_active={_mx_a / 1e9:.2f}GB "
+                            f"mx_cache={_mx_c / 1e9:.2f}GB\n"
+                        )
+                except Exception:
+                    pass
             # RSS 软墙（#129，8GB）：内存偶尔冲高是正常波动，超墙只要求降档
             # 避让——每子批检查一次，降 1 档、激活变小、RSS 自然回落，回墙
             # 下即停。无闩锁（旧 5GB 闩锁版是「卡死在 1」的根因），恢复交给

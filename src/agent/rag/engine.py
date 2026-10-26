@@ -59,16 +59,66 @@ def _mem_rss() -> int:
         return 0
 
 
+def _mem_footprint() -> tuple:
+    """返回 (rss, footprint_proxy, mx_active, mx_cache)，单位字节。
+
+    **必须用 footprint 口径**（2026-10-26 排障教训）：Activity Monitor 的
+    「内存」列是 phys_footprint（含 Metal/MLX 缓冲与换页），而 RSS 不含——
+    实测同一进程 RSS 2.2GB vs footprint 12.1GB，差 10GB。只记 RSS 会完全
+    看不到嵌入期 MLX cache 与换页的增长，误判「内存没涨」。
+    footprint 代理 = RSS + swap + USS 不可得时的近似：macOS psutil 的
+    memory_full_info 提供 uss/swap；MLX 侧直接读 mx.get_active/cache_memory。
+    """
+    global _mem_proc
+    if _mem_proc is None:
+        try:
+            import psutil
+            _mem_proc = psutil.Process(os.getpid())
+        except Exception:
+            return 0, 0, 0, 0
+    try:
+        mi = _mem_proc.memory_info()
+        rss = mi.rss
+        swap = 0
+        try:
+            swap = _mem_proc.memory_swap()
+        except Exception:
+            pass
+        # USS（私有内存）取不到时用 0
+        uss = 0
+        try:
+            uss = _mem_proc.memory_full_info().uss
+        except Exception:
+            pass
+        mx_active = mx_cache = 0
+        try:
+            import mlx.core as mx
+            mx_active = mx.get_active_memory()
+            mx_cache = mx.get_cache_memory()
+        except Exception:
+            pass
+        # MLX/Metal 缓冲不在 RSS、也不在 swap 里（实测 cache 11GB 时
+        # rss+swap 仅 0.9GB）——必须单独加进 footprint 口径。
+        fp = max(rss, uss) + swap + mx_active + mx_cache
+        return rss, fp, mx_active, mx_cache
+    except Exception:
+        return 0, 0, 0, 0
+
+
 def _mem_mark(msg: str) -> None:
     if not _MEM_LOG_PATH:
         return
     try:
-        rss = _mem_rss()
+        rss, fp, mx_active, mx_cache = _mem_footprint()
         global _mem_peak
-        _mem_peak = max(_mem_peak, rss)
+        _mem_peak = max(_mem_peak, fp)
         ts = time.strftime("%H:%M:%S")
         with open(_MEM_LOG_PATH, "a") as f:
-            f.write(f"{ts} MARK {msg} rss={rss / 1e6:.1f}MB peak={_mem_peak / 1e6:.1f}MB\n")
+            f.write(
+                f"{ts} MARK {msg} fp={fp / 1e9:.2f}GB rss={rss / 1e9:.2f}GB "
+                f"mx_active={mx_active / 1e9:.2f}GB mx_cache={mx_cache / 1e9:.2f}GB "
+                f"peak={_mem_peak / 1e9:.2f}GB\n"
+            )
     except Exception:
         pass
 
@@ -79,12 +129,13 @@ def _mem_sampler(interval: float = 1.0) -> None:
         with open(_MEM_LOG_PATH, "a") as f:
             f.write(f"{time.strftime('%H:%M:%S')} START pid={os.getpid()}\n")
             while not _mem_stop.is_set():
-                rss = _mem_rss()
-                _mem_peak = max(_mem_peak, rss)
-                f.write(f"{time.strftime('%H:%M:%S')} rss={rss / 1e6:.1f}MB "
-                        f"peak={_mem_peak / 1e6:.1f}MB\n")
+                rss, fp, mx_active, mx_cache = _mem_footprint()
+                _mem_peak = max(_mem_peak, fp)
+                f.write(f"{time.strftime('%H:%M:%S')} fp={fp / 1e9:.2f}GB "
+                        f"rss={rss / 1e9:.2f}GB mx_active={mx_active / 1e9:.2f}GB "
+                        f"mx_cache={mx_cache / 1e9:.2f}GB peak={_mem_peak / 1e9:.2f}GB\n")
                 _mem_stop.wait(interval)
-            f.write(f"{time.strftime('%H:%M:%S')} STOP peak={_mem_peak / 1e6:.1f}MB\n")
+            f.write(f"{time.strftime('%H:%M:%S')} STOP peak={_mem_peak / 1e9:.2f}GB\n")
     except Exception:
         pass
 
@@ -547,6 +598,7 @@ class RAGEngine:
         ocr_model_path: str = "",
         ocr_gguf_path: str = "",
         ocr_mmproj_path: str = "",
+        ocr_tokenizer_path: str = "",
         ocr_vlm_handler: str = "",
         ocr_chat_format: str = "",
         docling_dynamic_scale: bool = False,
@@ -592,6 +644,7 @@ class RAGEngine:
             _ovis_configure(
                 ocr_backend, ocr_model, ocr_model_path,
                 gguf_path=ocr_gguf_path, mmproj_path=ocr_mmproj_path,
+                tokenizer_path=ocr_tokenizer_path,
                 vlm_handler=ocr_vlm_handler, chat_format=ocr_chat_format,
             )
         except Exception as e:
@@ -872,7 +925,23 @@ class RAGEngine:
 
         # Step 2: load manifest and partition
         _log("━━━ Step 2/6: 增量对比（Manifest） ━━━")
+        # 向量库兼容性自愈（Step 2 前置）：嵌入模型切换（如 nomic 768 维 →
+        # bge-small 512 维）后旧表维度不匹配、或 schema 缺列，写入会在
+        # Step 4 中途失败并浪费整个同步。先检查并在必要时清库重建；库都
+        # 清空了，同步记录也必须作废（否则历史 manifest 会跳过本应重新
+        # 入库的文件，造成库空但记录齐全的假同步）。
+        store = self._get_store()
+        manifest_invalidated = False
+        if store.reset_if_incompatible():
+            manifest_invalidated = True
+            try:
+                os.remove(_manifest_path(self._rag_dir))
+            except OSError as e:
+                logger.warning("  ⚠ 同步记录删除失败（将强制忽略）: %s", e)
+            _log("  ⚠ 向量库与当前嵌入模型不兼容，已清空重建 → 同步记录作废，本次全量重建")
         manifest = _load_manifest(self._rag_dir)
+        if manifest_invalidated:
+            manifest = {}
         if manifest:
             _log("  已加载同步记录: %d 个文件有历史记录", len(manifest))
         else:
@@ -1252,7 +1321,10 @@ class RAGEngine:
                                         embedding_function=None,
                                     )]
 
-                                _max_chars = max(self._chunk_size * 2, 1200)
+                                # 章节直通上限 = 切片字符硬限（2026-10 起切片
+                                # 按字符计，500 字直通；旧值 max(2×, 1200) 曾让
+                                # 1100 字纯中文章节 ≈1100 token 被截掉一半）。
+                                _max_chars = self._chunk_size
                                 if ebook_chapters:
                                     chunk_texts: List[str] = []
                                     for chapter_text in ebook_chapters:

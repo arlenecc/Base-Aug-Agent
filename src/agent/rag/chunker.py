@@ -1,7 +1,13 @@
-"""Text chunker — splits documents into overlapping chunks for RAG.
+"""Text chunking for RAG.
 
-Chunk sizes are measured in *tokens* (estimated via character-based heuristic:
-~1.25 chars/token for Chinese, ~3 chars/token for English).
+2026-10 起**切片尺寸一律按字符数硬限**（用户决策）：token 估算（中文 1.25
+字/token 等）依赖比例假设，纯中文片实际 ≈1 字/token、数字密集文本可到 1.5+，
+最坏情况会超嵌入模型上限（bge-small-zh 位置上限 512，正文 510）。字符数是
+可靠上界：BERT 词表下任何字符至多产出 1 个 token（未知字 → [UNK]），因此
+``len(chunk) ≤ 500`` ⇒ 真实 token ≤ 502，绝不截断。
+
+``estimate_tokens`` 名字保留（hybrid/semantic/chonkie 的 get_tokenizer 及
+既有测试都引用它），语义改为「返回字符数」——整个切片栈随之变成字符制。
 """
 from __future__ import annotations
 
@@ -13,42 +19,26 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# token estimation
+# 尺寸度量：字符（1 字符 = 1 单位）
 # ---------------------------------------------------------------------------
-
-# 预编译正则 + 用 finditer 计数：estimate_tokens() 在切片热路径上被调用
-# 非常频繁，re.findall 会把所有匹配物化成一个列表（整篇文档几万个中文字符
-# = 几万个临时单字符串对象），纯属浪费。
-_CJK_RE = re.compile(r'[\u4e00-\u9fff]')
-
-
-# 中文按每 token ≈1.25 字校准（1.2~1.3 的中点）：BERT 中文词表实测 ≈1 字/token，
-# Qwen 等现代词表 ≈1.3~1.5。非中文（数字/标点/英文）按 2 字符/token 保守估：
-# BERT 对数字与标点是逐字符 1 token（"1.2.3"=5 token），英文 BPE 实际 ~4 字符/token。
-# 注意：对 bge-small-zh 这类 ≈1 字/token 的模型，中文真实 token ≈ 1.25×估算值、
-# 数字密集文本 ≈1.4~1.6×，切片预算上限校验须按最坏比例放宽（见 config 注释）。
-_TOKENS_PER_CJK_CHARS = 5   # 每 5 个中文字符估 4 个 token → 1.25 字/token
-_CJK_TOKEN_NUM = 4
-_OTHER_CHARS_PER_TOKEN = 2  # 数字/标点/英文：2 字符/token（保守）
 
 
 def _tokens_from_counts(cjk: int, other: int) -> int:
-    """由字符计数估算 token（与 estimate_tokens 同一公式，供增量计数热路径复用）。"""
-    return cjk * _CJK_TOKEN_NUM // _TOKENS_PER_CJK_CHARS + other // _OTHER_CHARS_PER_TOKEN
+    """字符计数 → 尺寸。字符制下就是总字符数（保留签名供增量计数热路径复用）。"""
+    return cjk + other
 
 
 def estimate_tokens(text: str) -> int:
-    """Roughly estimate token count.
+    """返回 ``len(text)``（字符数）。
 
-    Chinese: ~1.25 chars per token.  English: ~3 chars per token.
+    名字沿用历史（hybrid/semantic/chonkie 及测试引用），语义已从 token 估算
+    改为字符数——O(1)，同时消除了旧实现每次 finditer 全文扫描的开销。
     """
-    chinese_chars = sum(1 for _ in _CJK_RE.finditer(text))
-    other_chars = len(text) - chinese_chars
-    return _tokens_from_counts(chinese_chars, other_chars)
+    return len(text)
 
 
 def _token_count(text: str) -> int:
-    return max(estimate_tokens(text), 1) if text else 0
+    return max(len(text), 1) if text else 0
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +75,11 @@ def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> Li
     兜底切分：保证分片只在句子结束处断开，绝不从句子中间切断。唯一例外是
     单句本身超过 ``chunk_size``（无句读的超长段落/表格行）——此时无法既保句
     完整又保长度上限，退回字符级 ``_split_by_tokens``。
+
+    **零丢失保证（2026-10 用户要求）**：句 span 首尾相接、并集等于原文；
+    相邻片不做内容去重——去重会在重复文本（样板句/长重复串）上把整段区域
+    从输出里抹掉，违反「信息不能丢」。重复内容带来的检索噪声交给向量去重
+    （VectorStore 向量去重按钮）处理，不归切片器管。
     """
     if not text or not text.strip():
         return []
@@ -92,8 +87,6 @@ def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> Li
         return [text.strip()]
 
     chunks: List[str] = []
-    # O(1) 去重（存哈希），与 _split_by_tokens 同款约定。
-    seen: set = set()
     cur: List[str] = []
     cur_cjk = cur_other = 0
 
@@ -101,10 +94,7 @@ def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> Li
         nonlocal cur, cur_cjk, cur_other
         merged = "".join(cur).strip()
         if merged:
-            digest = hash(merged)
-            if digest not in seen:
-                seen.add(digest)
-                chunks.append(merged)
+            chunks.append(merged)
         cur, cur_cjk, cur_other = [], 0, 0
 
     for s, e in _iter_sentence_spans(text):
@@ -196,12 +186,15 @@ def chunk_documents(
     for doc in documents:
         source = doc.get("source", "unknown")
         text = doc.get("text", "")
-        total_tokens = estimate_tokens(text)
-        logger.debug("      文档切片: %s (%d 字符, 约 %d tokens)", source, len(text), total_tokens)
+        logger.debug("      文档切片: %s (%d 字符)", source, len(text))
         chunks = _chunk_with_hybrid_fallback(
             text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
             embedding_function,
         )
+        # 最终硬兜底：hybrid/semantic/chonkie 无论以何种单位理解 chunk_size
+        # （历史 token 估算偏差、chonkie 自带度量），从这里出去的片保证
+        # len ≤ chunk_size。巨型切片事故（33.8 万字/片）的最后防线。
+        chunks = _enforce_char_limit(chunks, chunk_size, chunk_overlap)
         for i, chunk in enumerate(chunks):
             all_chunks.append({
                 "source": source,
@@ -209,6 +202,39 @@ def chunk_documents(
                 "text": chunk,
             })
     return all_chunks
+
+
+def _enforce_char_limit(
+    chunks: List[str], chunk_size: int, chunk_overlap: int,
+) -> List[str]:
+    """最终硬兜底：超限片按**句子边界**重切到 ≤ chunk_size 字符，零信息丢失。
+
+    2026-10 用户要求：不能靠"硬切"了事——切片必须在句子自然结束处断开、
+    尽量靠近 chunk_size、且信息不能丢。这里复用 :func:`split_by_sentences`：
+
+    * 所有句 span 首尾相接、并集等于原文（除首尾空白外零丢失，切片器对
+      原文的不变量）；
+    * 整句贪心打包到接近 chunk_size，不会产生半句话的碎片；
+    * 唯一退到字符级的情况是**单句本身超过 chunk_size**（无句读的超长
+      段落/表格行）——句子完整性与长度上限不可两全，由其内部
+      ``_split_by_tokens`` 按字符窗口切（窗口平铺覆盖全文、同样无损）。
+
+    注意：这里对超限片做的是「无损重切」而非丢弃/截断。**传 0 重叠**：
+    超限片本身来自上游切分器（已带边界 overlap），若重切再叠 overlap 会把
+    同一段内容复制两份；0 重叠下句 span 平铺精确覆盖原文（除首尾空白外
+    与原文逐字相等，经随机文本性质测试验证）。
+    """
+    out: List[str] = []
+    for c in chunks:
+        if len(c) <= chunk_size:
+            if c.strip():
+                out.append(c)
+            continue
+        pieces = split_by_sentences(c, chunk_size, 0)
+        # split_by_sentences 对空输入返回空列表——超限片非空，必有产出；
+        # 防御：万一产出为空（理论上不可能），保留原片避免静默丢内容。
+        out.extend(pieces if pieces else [c])
+    return out
 
 
 def _chunk_with_hybrid_fallback(
@@ -388,11 +414,13 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     Maintains running CJK/other character counts and computes tokens via
     ``_tokens_from_counts`` — matching ``estimate_tokens`` exactly
     but without rescanning the substring on every step.
+
+    **零丢失保证（2026-10 用户要求）**：窗口平铺覆盖全文（pos 推进到 end），
+    不做内容去重——旧实现的 hash 去重会在周期性重复文本（如长重复串）上把
+    内容相同的相邻窗口整段丢弃，导致原文区域从输出里消失。重复片交给
+    向量去重处理。
     """
     chunks: List[str] = []
-    # O(1) dedup instead of O(n) `in chunks`. 存哈希而非 chunk 全文：切片
-    # 本身已经是文档全文的副本，再去重集合里各存一份会让峰值内存翻倍。
-    seen: set = set()
     pos = 0  # character position
     text_len = len(text)
 
@@ -423,10 +451,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
 
         chunk = text[pos:end].strip()
         if chunk:
-            digest = hash(chunk)
-            if digest not in seen:
-                seen.add(digest)
-                chunks.append(chunk)
+            chunks.append(chunk)
 
         if end >= text_len:
             break
@@ -472,6 +497,11 @@ def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "
     # 跟的未必是 right——只接受"首个 ≤256 的间隔"会取到错位的大间隔，把不
     # 相邻的原文拼进 chunk（且撑爆 token 预算）。这里扫描多个出现位置取
     # **最小**间隔；完美相邻（间隔 0）立即返回。扫描次数封顶防 O(n²)。
+    #
+    # _MAX_GAP 必须真正生效（#140 关联事故）：样板文字密集的书（如目录行
+    # 重复几十次的 Word/Excel 教程），256 次扫描取到的"最小间隔"仍可能是
+    # 30 万字——旧实现把它原样拼进 chunk，产出 33.8 万字的巨型切片。超限
+    # 间隔一律视为「定位错位」，退回 fallback 分隔符。
     _MAX_SCANS = 256
     best: tuple | None = None  # (gap_len, gap)
     start = 0
@@ -485,7 +515,7 @@ def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "
         gap = source[i + len(left):j]
         if not gap:
             return gap
-        if best is None or len(gap) < best[0]:
+        if len(gap) <= _MAX_GAP and (best is None or len(gap) < best[0]):
             best = (len(gap), gap)
         start = i + 1
     return best[1] if best is not None else fallback

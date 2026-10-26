@@ -119,3 +119,36 @@ def test_hybrid_empty_text(topic_ef):
 
     assert hybrid_chunk_text("", embedding_function=topic_ef) == []
     assert hybrid_chunk_text("   ", embedding_function=topic_ef) == []
+
+
+def test_chunk_documents_char_hard_limit_no_giant_chunks(topic_ef):
+    """#140 关联回归：样板文字重复的书不得产出巨型切片。
+
+    事故：目录行重复几十次的教程书，_merge_to_target_size 的 _gap_between
+    在源文本里定位错位，把 33 万字的"最小间隔"整段拼进 chunk，产出 5 个
+    33.8 万字的巨型切片（+章节直通 1200 字旁路）。修复后三道防线：
+      1. _gap_between 超过 _MAX_GAP 的间隔视为定位错位、回退分隔符；
+      2. 切片度量改为字符硬限（estimate_tokens == len）；
+      3. chunk_documents 末端 _enforce_char_limit 对任何超限片按字符窗口强切。
+    """
+    from agent.rag.chunker import chunk_documents
+
+    # 重复样板行（每行重复出现，制造 _gap_between 的多次出现定位）+ 长正文，
+    # 无 Markdown 标题层级（模拟出事的教程书结构）。
+    lines = []
+    for ch in range(30):
+        lines.append(f"第{ch}章 目录行（样板重复）")
+        lines.append(("这一章讲解具体的操作步骤与注意事项，内容较长。" * 40))
+    text = "\n\n".join(lines)
+
+    chunks = chunk_documents(
+        [{"source": "repeated.md", "text": text}],
+        chunk_size=500, chunk_overlap=50, min_chunk_size=100,
+        overlap_percent=0.10, embedding_function=topic_ef,
+    )
+    assert chunks, "should produce chunks"
+    oversized = [c for c in chunks if len(c["text"]) > 500]
+    assert not oversized, (
+        f"巨型切片仍存在: max={max(len(c['text']) for c in chunks)} 字, "
+        f"超限 {len(oversized)} 片"
+    )

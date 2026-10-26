@@ -66,10 +66,10 @@ def test_semantic_chunk_splits_by_topic(topic_ef):
     chunks = semantic_chunk_text(text, chunk_size=800, embedding_function=topic_ef)
 
     assert chunks, "semantic chunking should produce chunks when chonkie is available"
-    # Chunks should respect the token ceiling (with overlap each is still
-    # bounded by chunk_size, since overlap is borrowed from the previous chunk).
+    # 尺寸上限（2026-10 起字符制）：chunk ≤ chunk_size(800) + overlap 尾巴
+    # (80) + 源间隙（几字符）≈ 885。旧 850 是 token 估算口径，字符制下放宽。
     for c in chunks:
-        assert estimate_tokens(c) <= 850, f"chunk exceeds ceiling: {estimate_tokens(c)}"
+        assert estimate_tokens(c) <= 900, f"chunk exceeds ceiling: {estimate_tokens(c)}"
 
 
 @pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")
