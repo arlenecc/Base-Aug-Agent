@@ -1,7 +1,7 @@
 """Text chunker — splits documents into overlapping chunks for RAG.
 
 Chunk sizes are measured in *tokens* (estimated via character-based heuristic:
-~2 chars/token for Chinese, ~3 chars/token for English).
+~1.25 chars/token for Chinese, ~3 chars/token for English).
 """
 from __future__ import annotations
 
@@ -22,14 +22,29 @@ logger = logging.getLogger(__name__)
 _CJK_RE = re.compile(r'[\u4e00-\u9fff]')
 
 
+# 中文按每 token ≈1.25 字校准（1.2~1.3 的中点）：BERT 中文词表实测 ≈1 字/token，
+# Qwen 等现代词表 ≈1.3~1.5。非中文（数字/标点/英文）按 2 字符/token 保守估：
+# BERT 对数字与标点是逐字符 1 token（"1.2.3"=5 token），英文 BPE 实际 ~4 字符/token。
+# 注意：对 bge-small-zh 这类 ≈1 字/token 的模型，中文真实 token ≈ 1.25×估算值、
+# 数字密集文本 ≈1.4~1.6×，切片预算上限校验须按最坏比例放宽（见 config 注释）。
+_TOKENS_PER_CJK_CHARS = 5   # 每 5 个中文字符估 4 个 token → 1.25 字/token
+_CJK_TOKEN_NUM = 4
+_OTHER_CHARS_PER_TOKEN = 2  # 数字/标点/英文：2 字符/token（保守）
+
+
+def _tokens_from_counts(cjk: int, other: int) -> int:
+    """由字符计数估算 token（与 estimate_tokens 同一公式，供增量计数热路径复用）。"""
+    return cjk * _CJK_TOKEN_NUM // _TOKENS_PER_CJK_CHARS + other // _OTHER_CHARS_PER_TOKEN
+
+
 def estimate_tokens(text: str) -> int:
     """Roughly estimate token count.
 
-    Chinese: ~2 chars per token.  English: ~3 chars per token.
+    Chinese: ~1.25 chars per token.  English: ~3 chars per token.
     """
     chinese_chars = sum(1 for _ in _CJK_RE.finditer(text))
     other_chars = len(text) - chinese_chars
-    return chinese_chars // 2 + other_chars // 3
+    return _tokens_from_counts(chinese_chars, other_chars)
 
 
 def _token_count(text: str) -> int:
@@ -95,7 +110,7 @@ def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> Li
     for s, e in _iter_sentence_spans(text):
         piece = text[s:e]
         pc, po = _char_counts(piece)
-        if pc // 2 + po // 3 > chunk_size:
+        if _tokens_from_counts(pc, po) > chunk_size:
             # 先把已攒的句子成块落盘，再对超长单句做字符级切分。
             if cur:
                 _flush()
@@ -103,7 +118,7 @@ def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> Li
             continue
         # 预算判断必须累计"字符数"后整体取 floor（与 _split_recursive 同款）：
         # 若按逐片 token 求和，floor 的分段损失会累积，合并结果可能超出上限。
-        if cur and (cur_cjk + pc) // 2 + (cur_other + po) // 3 > chunk_size:
+        if cur and _tokens_from_counts(cur_cjk + pc, cur_other + po) > chunk_size:
             _flush()
         cur.append(piece)
         cur_cjk += pc
@@ -298,7 +313,7 @@ def _split_recursive(
                 part_cjk, part_other = _char_counts(part)
                 new_cjk = cur_cjk + sep_cjk + part_cjk
                 new_other = cur_other + sep_other + part_other
-                new_tokens = new_cjk // 2 + new_other // 3
+                new_tokens = _tokens_from_counts(new_cjk, new_other)
                 if new_tokens <= chunk_size:
                     cur_cjk = new_cjk
                     cur_other = new_other
@@ -323,7 +338,7 @@ def _split_recursive(
             else:
                 # First part
                 part_cjk, part_other = _char_counts(part)
-                if part_cjk // 2 + part_other // 3 <= chunk_size:
+                if _tokens_from_counts(part_cjk, part_other) <= chunk_size:
                     current = part
                     cur_cjk = part_cjk
                     cur_other = part_other
@@ -370,8 +385,8 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
     """Split text by character positions, respecting token budget.
 
     Uses incremental token counting: O(n) overall instead of O(n²).
-    Maintains running CJK/other character counts and computes tokens
-    as ``cjk // 2 + other // 3`` — matching ``estimate_tokens`` exactly
+    Maintains running CJK/other character counts and computes tokens via
+    ``_tokens_from_counts`` — matching ``estimate_tokens`` exactly
     but without rescanning the substring on every step.
     """
     chunks: List[str] = []
@@ -393,7 +408,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
                 cjk += 1
             else:
                 other += 1
-            if cjk // 2 + other // 3 > chunk_size:
+            if _tokens_from_counts(cjk, other) > chunk_size:
                 break
             end += 1
 
@@ -432,7 +447,7 @@ def _split_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str
             else:
                 ov_other += 1
             overlap_start -= 1
-            if ov_cjk // 2 + ov_other // 3 >= chunk_overlap:
+            if _tokens_from_counts(ov_cjk, ov_other) >= chunk_overlap:
                 break
         pos = max(overlap_start, pos + 1)  # ensure forward progress
 
@@ -507,7 +522,7 @@ def _merge_overlap(chunks: List[str], overlap: int, sep: str, source: Optional[s
                 else:
                     m_other += 1
                 boundary -= 1
-                if m_cjk // 2 + m_other // 3 >= overlap:
+                if _tokens_from_counts(m_cjk, m_other) >= overlap:
                     break
             prev_end = prev[boundary:]
 

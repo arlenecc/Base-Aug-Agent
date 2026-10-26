@@ -133,11 +133,16 @@ class AgentConfig:
     context_shrink_ratio: float = 0.9
 
     # RAG settings
-    # 切片上限按估算 token 计（中文约 2 字/token，500 token ≈ 1000 汉字）；
-    # overlap 10%（50）保证跨片上下文。切片保证在句子结束处断开（句级兜底，
-    # 仅无句读的超长单段才字符级切）。
-    rag_chunk_size: int = 500       # tokens per chunk
-    rag_chunk_overlap: int = 50     # 10% of chunk_size
+    # 切片按"估算 token"计（estimate_tokens：中文≈1.25 字/token，数字/符号/英文
+    # ≈2 字符/token，已按真实词表保守校准）。**入库 embedding 是真实 tokenizer**
+    # ——bge-small-zh 为 BERT 中文词表（≈1 字=1 token，位置上限 512、后端夹紧到
+    # 510）。实测比例：纯中文 ≈1.25×估算、数字密集混排 ≈1.45×；切片最坏情况打满
+    # chunk_size+overlap 预算：(300+30)×1.45+2 ≈ 480 ≤ 510 ✓，即每片 ≈375 汉字。
+    # 调大 chunk_size 会让最坏片超出 510 被静默截断（丢后半段内容）——
+    # 换 nomic（8192 上限）等长文本模型时可放宽到 500/50。
+    # 切片保证在句子结束处断开（句级兜底，仅无句读的超长单段才字符级切）。
+    rag_chunk_size: int = 300       # ≈375 汉字/片
+    rag_chunk_overlap: int = 30     # 10% of chunk_size
     # rag_search 结果送辅助模型归纳的阈值（字符，按检索结果原文总量计）：
     #   总量 <  rag_condense_min_chars → 跳过归纳，原样返回（保细节、不拖速）；
     #   min ≤ 总量 ≤ rag_condense_max_chars → 送辅助模型浓缩；
