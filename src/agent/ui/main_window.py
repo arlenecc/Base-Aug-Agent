@@ -1506,6 +1506,15 @@ class MainWindow(QMainWindow):
             picker=self._on_pick_aux_llm_model,
             placeholder="本地辅助模型目录或 .onnx/.gguf 文件",
             path_value=getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH,
+            # 「启用」选择框紧跟标题（默认不勾选）：控制启动自动加载与知识
+            # 同步前后的自动加载；手动「加载模型」按钮不受限（显式操作）。
+            enable_attr="aux_llm_enable_check",
+            enable_checked=getattr(self.config, "aux_llm_enabled", False),
+            enable_tooltip=(
+                "启用辅助模型（上下文摘要 / RAG 检索归纳的小模型）。\n"
+                "不勾选：启动不加载、知识同步后也不自动重载，相关功能自动"
+                "退化（摘要用主模型、检索返回原始分片）。"
+            ),
         )
         self._add_sampling_row(
             agent_lay, "aux_", self._aux_sampling_defaults(),
@@ -1690,8 +1699,13 @@ class MainWindow(QMainWindow):
         self, lay: QVBoxLayout, title: str, *,
         prefix: str, combo_attr: str, path_attr: str, btn_attr: str,
         picker, placeholder: str, path_value: str,
+        enable_attr: str = "", enable_checked: bool = False,
+        enable_tooltip: str = "",
     ) -> None:
         """一行「模型类型 + 本地路径 + 选择」，上方带一个小标题。
+
+        ``enable_attr`` 非空时在标题右侧放一个「启用」选择框（如辅助模型的
+        启用开关，默认不勾选）；主模型不传该参数，行为不变。
 
         另加一行**次级路径**（按后端显隐，见 _update_secondary_path_controls）：
         GGUF → mmproj 路径（多模态投影，可选）；ONNX → tokenizer 路径（可选）。
@@ -1699,7 +1713,21 @@ class MainWindow(QMainWindow):
         """
         label = QLabel(title)
         label.setStyleSheet("font-weight:600;")
-        lay.addWidget(label)
+        if enable_attr:
+            # 标题与「启用」选择框同一行：选择框紧跟标签之后（需求）。
+            title_row = QHBoxLayout()
+            title_row.setSpacing(8)
+            title_row.addWidget(label)
+            enable_check = QCheckBox("启用")
+            if enable_tooltip:
+                enable_check.setToolTip(enable_tooltip)
+            enable_check.setChecked(bool(enable_checked))
+            setattr(self, enable_attr, enable_check)
+            title_row.addWidget(enable_check)
+            title_row.addStretch(1)
+            lay.addLayout(title_row)
+        else:
+            lay.addWidget(label)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -1893,6 +1921,10 @@ class MainWindow(QMainWindow):
         self.aux_llm_model_path_edit.setText(
             getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH
         )
+        # 辅助模型启用开关（默认不勾选）：控制启动自动加载与同步后自动重载。
+        self.aux_llm_enable_check.setChecked(
+            bool(getattr(self.config, "aux_llm_enabled", False))
+        )
         # 次级路径：GGUF→mmproj（复用 llm_vision_projection_path），ONNX→tokenizer。
         self.llm_mmproj_path_edit.setText(
             getattr(self.config, "llm_vision_projection_path", "") or "")
@@ -1978,6 +2010,8 @@ class MainWindow(QMainWindow):
         self.config.aux_llm_model_path = (
             self.aux_llm_model_path_edit.text().strip() or DEFAULT_AUX_MODEL_PATH
         )
+        # 辅助模型启用开关 → 配置（默认 False：不启用就不自动加载）。
+        self.config.aux_llm_enabled = self.aux_llm_enable_check.isChecked()
         # 次级路径：GGUF→mmproj（写回 llm_vision_projection_path），ONNX→tokenizer。
         self.config.llm_vision_projection_path = (
             self.llm_mmproj_path_edit.text().strip()
@@ -3002,7 +3036,12 @@ class MainWindow(QMainWindow):
         try:
             if not self._is_model_loaded("main"):
                 self._on_load_model("main")
-            if not self._is_model_loaded("aux"):
+            # 辅助模型默认不启用（aux_llm_enabled=False）：启动**不加载**，
+            # 省下 ~1GB 统一内存与启动时间。勾选「启用」后才会在这里加载。
+            if (
+                getattr(self.config, "aux_llm_enabled", False)
+                and not self._is_model_loaded("aux")
+            ):
                 self._on_load_model("aux")
         finally:
             # 同步启动的 worker 会在事件循环里跑完，这里先复位标志会让失败
@@ -3307,9 +3346,14 @@ class MainWindow(QMainWindow):
         # 卸载后 agent 换回惰性后端，下次对话时自动重载，无需在此恢复。
         _unloaded = []
         _unloaded_roles = []
+        _aux_enabled = bool(getattr(self.config, "aux_llm_enabled", False))
         for _role in ("main", "aux"):
             if self._unload_role(_role):
                 _unloaded.append("主" if _role == "main" else "辅助")
+                # 辅助模型未启用时照常卸载释放内存，但**不记入重载名单**：
+                # 同步结束后不得把它重新拉起（需求：同步链路检查启用开关）。
+                if _role == "aux" and not _aux_enabled:
+                    continue
                 _unloaded_roles.append(_role)
         # 记录「同步前确实已加载」的角色：同步结束后只重载这些，避免把用户事先
         # 手动卸载的模型在同步后擅自重新加载回来（见 _reload_models_after_sync）。
@@ -3441,15 +3485,23 @@ class MainWindow(QMainWindow):
 
         只重载「同步前确实已加载」的角色（self._sync_preloaded_roles）：若用户事先
         手动卸载了某角色，不应在同步后擅自把它重新加载回来。
+        辅助模型未启用（aux_llm_enabled=False）时一律跳过——即使因竞态出现在
+        名单里也不得拉起（双保险，名单在 _on_sync_knowledge 已过滤）。
         主模型加载完成后由 _on_model_loaded 自动预热 system+tools 前缀，使同步后
         第一次对话直接命中 KV 缓存、无需再付数十秒加载 + prefill。
 
         走后台线程（LoadModelWorker），不阻塞 UI；已在加载 / 已加载的角色跳过。
+        （停止同步走的也是本函数：_on_stop_sync 只置取消标志，收尾统一在
+        _on_sync_finished/_on_sync_failed → _reload_models_after_sync。）
         """
         roles = getattr(self, "_sync_preloaded_roles", set())
         if not roles:
             return
         for role in roles:
+            if role == "aux" and not bool(
+                getattr(self.config, "aux_llm_enabled", False)
+            ):
+                continue  # 未启用的辅助模型不自动重载
             if self._model_busy.get(role, False):
                 continue  # 用户正在手动加载/卸载该角色，别抢
             # 同步起点卸载后该角色应是惰性后端；若已加载（异常）则不重复加载。

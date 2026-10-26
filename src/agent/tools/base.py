@@ -279,6 +279,7 @@ class ToolRegistry:
                 rerank_backend=getattr(self.config, "rag_rerank_backend", "fastembed"),
                 rerank_model_path=getattr(self.config, "rag_rerank_model_path", ""),
                 rerank_mlx_model_path=getattr(self.config, "rag_rerank_mlx_model_path", ""),
+                rerank_jina_model_path=getattr(self.config, "rag_rerank_jina_model_path", ""),
                 rerank_threads=getattr(self.config, "onnx_threads", 4),
                 rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
                 rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),

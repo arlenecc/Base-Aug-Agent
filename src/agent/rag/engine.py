@@ -535,6 +535,7 @@ class RAGEngine:
         rerank_backend: str = "fastembed",
         rerank_model_path: str = "",
         rerank_mlx_model_path: str = "",
+        rerank_jina_model_path: str = "",
         rerank_threads: int = 4,
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
@@ -575,6 +576,7 @@ class RAGEngine:
         self._rerank_backend = rerank_backend
         self._rerank_model_path = rerank_model_path
         self._rerank_mlx_model_path = rerank_mlx_model_path
+        self._rerank_jina_model_path = rerank_jina_model_path
         self._rerank_threads = max(1, int(rerank_threads))
         self._rerank_batch_size = max(1, int(rerank_batch_size))
         self._rerank_max_length = max(8, int(rerank_max_length))
@@ -2514,6 +2516,7 @@ class RAGEngine:
                         rerank_backend=self._rerank_backend,
                         rerank_model_path=self._rerank_model_path,
                         rerank_mlx_model_path=self._rerank_mlx_model_path,
+                        rerank_jina_model_path=self._rerank_jina_model_path,
                         rerank_threads=self._rerank_threads,
                         rerank_batch_size=self._rerank_batch_size,
                         rerank_max_length=self._rerank_max_length,

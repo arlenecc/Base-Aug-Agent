@@ -38,6 +38,10 @@ class AgentConfig:
     llm_enable_thinking: bool = True
     # 辅助模型（#140）：只支持本地直载，供上下文摘要等轻量子任务使用，
     # 避免为一次摘要把主模型的推理队列占住。默认 Qwen3.5-2B-MLX-4bit。
+    # 默认**不启用**（aux_llm_enabled=False）：启动不自动加载、知识同步后也不
+    # 自动重载；RAG 检索归纳/上下文摘要等调用方拿不到实例时都有退化路径
+    # （原始分片 / 主模型兜底），关闭不影响核心功能。设置窗口勾选后才启用。
+    aux_llm_enabled: bool = False
     aux_llm_backend: str = "mlx_lm"  # mlx_lm | mlx_vlm | onnx | llama_cpp
     aux_llm_model_path: str = "models/Qwen3.5-2B-MLX-4bit"
     aux_llm_vision_projection_path: str = ""
@@ -129,18 +133,32 @@ class AgentConfig:
     context_shrink_ratio: float = 0.9
 
     # RAG settings
+    # 切片上限按估算 token 计（中文约 2 字/token，500 token ≈ 1000 汉字）；
+    # overlap 10%（50）保证跨片上下文。切片保证在句子结束处断开（句级兜底，
+    # 仅无句读的超长单段才字符级切）。
     rag_chunk_size: int = 500       # tokens per chunk
     rag_chunk_overlap: int = 50     # 10% of chunk_size
+    # rag_search 结果送辅助模型归纳的阈值（字符，按检索结果原文总量计）：
+    #   总量 <  rag_condense_min_chars → 跳过归纳，原样返回（保细节、不拖速）；
+    #   min ≤ 总量 ≤ rag_condense_max_chars → 送辅助模型浓缩；
+    #   总量 > rag_condense_max_chars → 先截断到该上限再送（辅助模型上下文有限）。
+    # 归纳输出本身再截到 rag_condense_output_max_chars。min 设 0 = 总是归纳。
+    rag_condense_min_chars: int = 4000
+    rag_condense_max_chars: int = 12000
+    rag_condense_output_max_chars: int = 2000
     # 默认走本地 MLX 直载（实测 Embedding 3.7x、Reranker 2.5x 于 fastembed CPU）。
     # MLX 不可用时（非 Apple Silicon / 未安装 / 路径缺失）自动回退 fastembed，
     # 不会出现「默认配置直接不可用」。
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
-    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"  # MLX 回退用
-    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx-int8"
-    # 想换中文轻量 embedding 可指向 bge：rag_embedding_model_path 改成
-    # "models/bge-small-zh-v1.5-mlx" 即可（后端识别为 bert 类，自动走 mlx.nn
-    # Bert 实现 + bge 检索前缀，文档不加前缀、查询加「为这个句子生成表示以用于检索：」）。
-    # 速度约快 6×、模型更小，但检索质量在中文基准上略逊 nomic（见对比测试）。
+    # 内置默认 embedding：bge-small-zh-v1.5（中文轻量，24MB 4层/512维，
+    # 位置上限 512 由后端按 config 自动夹紧；文档不加前缀、查询自动加
+    # 「为这个句子生成表示以用于检索：」）。注意：切换 embedding 后向量空间
+    # 变了，必须 rag_ingest(force=True) 重建索引，否则新旧向量混检会错乱。
+    # 要换回 nomic（检索质量更优但更大更慢）：path 改回
+    # "models/nomic-embed-text-v1.5-mlx-int8"、model 改回
+    # "nomic-ai/nomic-embed-text-v1.5-Q" 即可。
+    rag_embedding_model: str = "BAAI/bge-small-zh-v1.5"  # MLX 不可用时的 fastembed 回退款
+    rag_embedding_model_path: str = "models/bge-small-zh-v1.5-mlx"
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16
@@ -151,12 +169,23 @@ class AgentConfig:
     # 每个实例内部的 intra-op 线程数（fastembed/ONNX/llama_cpp 生效；MLX 后端
     # 忽略此项、走自身全局线程池）。默认 6 充分利用多核；MLX 下此项无效。
     rag_embedding_threads: int = 6
-    rag_rerank_backend: str = "mlx"  # mlx | fastembed | onnx（UI 无 disabled 项）
+    # 默认 reranker 用 jina-reranker-v2-base-multilingual（ONNX/CPU，多语言、约
+    # 279MB、比 v2-m3 MLX 快约 2.6×、中文 Top-1 与 v2-m3 持平）。要更强质量或长
+    # 切片（>1024 token）时切回 "mlx"（v2-m3）；要更轻量短文本可用 "onnx"（bge-base）。
+    rag_rerank_backend: str = "jina"  # mlx | fastembed | onnx | jina（UI 无 disabled 项）
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
     rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
     # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，
     # 这样在 UI 里切换后端不必重新粘贴路径。
     rag_rerank_mlx_model_path: str = "models/bge-reranker-v2-m3-mlx-mxfp8"
+    # jina 重排序模型（可选方案）：jinaai/jina-reranker-v2-base-multilingual 的
+    # INT8 ONNX 导出，强制 CPU 推理（与上面的 bge ONNX 同一条 ONNX 路径）。
+    # 特点：多语言、位置上限 1024（夹到 1024，介于 bge-base 的 512 与 v2-m3 的
+    # 8192 之间）、12 层 768 维、约 279MB。实测比 v2-m3(MLX) 快约 2.6×、Top-1
+    # 准确率与 v2-m3 持平，但难负例区分度（margin）明显弱于 v2-m3；中文为主的
+    # 场景建议优先 v2-m3，多语言或追求更高吞吐时选 jina。切换：rag_rerank_backend
+    # 设为 "jina" 即走此路径（无需改其它配置）。
+    rag_rerank_jina_model_path: str = "models/jina-reranker-v2-base-multilingual-onnx"
     rag_rerank_batch_size: int = 16
     # bge-reranker-v2-m3 的位置嵌入上限是 8192（本地 MLX/ONNX 权重 config 均为
     # 8194，fastembed tokenizer 本身截断在 8192）。旧版 bge-reranker-base 只有
@@ -240,6 +269,8 @@ class AgentConfig:
     _INT_FIELDS = (
         "max_tokens", "top_k", "max_iterations", "max_history",
         "max_context_tokens", "rag_chunk_size", "rag_chunk_overlap",
+        "rag_condense_min_chars", "rag_condense_max_chars",
+        "rag_condense_output_max_chars",
         "local_model_threads", "local_model_batch_size", "local_gpu_layers",
         "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
         "llama_cpp_kv_cache_mb",
@@ -264,7 +295,7 @@ class AgentConfig:
         "aux_llm_chat_format", "aux_llm_vlm_handler",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
-        "rag_rerank_mlx_model_path",
+        "rag_rerank_mlx_model_path", "rag_rerank_jina_model_path",
         "browser_endpoint", "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
         "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
@@ -273,6 +304,7 @@ class AgentConfig:
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale", "rag_docling_vlm",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
+                    "aux_llm_enabled",
                     "llm_speculative", "llama_cpp_kv_cache")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
@@ -282,7 +314,7 @@ class AgentConfig:
         "aux_llm_backend", "aux_llm_model_path",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
-        "rag_rerank_mlx_model_path",
+        "rag_rerank_mlx_model_path", "rag_rerank_jina_model_path",
         "rag_pdf_engine",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
         "rag_ocr_gguf_path", "rag_ocr_mmproj_path",
@@ -466,7 +498,7 @@ class AgentConfig:
             self.aux_llm_backend = "mlx_lm"
         if self.rag_embedding_backend not in ("fastembed", "mlx", "onnx", "llama_cpp"):
             self.rag_embedding_backend = "fastembed"
-        if self.rag_rerank_backend not in ("fastembed", "mlx", "onnx", "disabled"):
+        if self.rag_rerank_backend not in ("fastembed", "mlx", "onnx", "jina", "disabled"):
             self.rag_rerank_backend = "fastembed"
         self.local_model_threads = max(1, self.local_model_threads)
         self.local_model_batch_size = max(1, self.local_model_batch_size)

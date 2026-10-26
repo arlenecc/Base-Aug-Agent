@@ -641,6 +641,7 @@ class VectorStore:
         rerank_backend: str = "fastembed",
         rerank_model_path: str = "",
         rerank_mlx_model_path: str = "",
+        rerank_jina_model_path: str = "",
         rerank_threads: int = 4,
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
@@ -657,6 +658,7 @@ class VectorStore:
         self._rerank_backend = rerank_backend if rerank_enabled else "disabled"
         self._rerank_model_path = rerank_model_path
         self._rerank_mlx_model_path = rerank_mlx_model_path
+        self._rerank_jina_model_path = rerank_jina_model_path
         self._rerank_threads = max(1, int(rerank_threads))
         self._rerank_batch_size = max(1, int(rerank_batch_size))
         self._rerank_max_length = max(8, int(rerank_max_length))
@@ -1579,6 +1581,7 @@ class VectorStore:
                         max_length=self._rerank_max_length,
                         batch_size=self._rerank_batch_size,
                         mlx_model_path=self._rerank_mlx_model_path,
+                        jina_model_path=self._rerank_jina_model_path,
                     )
                     if reranker is None:
                         self._reranker = None
@@ -1638,7 +1641,7 @@ class VectorStore:
 
         candidates 的 score 已由 search() 转换为相似度 [0,1]（越高越好）。
         回退模式下分数是余弦距离的近似（非 BGE sigmoid 语义分），因此不做
-        0.7 阈值过滤——阈值仅对 reranker 的语义分数有意义。
+        0.5 阈值过滤——阈值仅对 reranker 的语义分数有意义。
         """
         logger.info("  ├─ 重排序: BGE Reranker 不可用, 使用向量距离排序 (回退模式)")
         for c in candidates:
@@ -1662,7 +1665,7 @@ class VectorStore:
         query: str,
         candidates: List[Dict[str, Any]],
         top_k: int = 3,
-        min_similarity: float = 0.7,
+        min_similarity: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using BGE reranker for precise scoring.
 
@@ -1767,7 +1770,7 @@ class VectorStore:
         top_k: int = 3,
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
-        min_similarity: float = 0.7,
+        min_similarity: float = 0.5,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
@@ -1776,7 +1779,7 @@ class VectorStore:
           2. BM25 keyword search: top_k * candidate_multiplier candidates.
           3. Merge & dedupe by (source, chunk_index).
           4. BGE rerank the merged candidate set.
-          5. Drop any result whose rerank score < min_similarity (0.7).
+          5. Drop any result whose rerank score < min_similarity (0.5).
           6. Return up to top_k results.
 
         Args:
@@ -2419,7 +2422,7 @@ def _logit_to_score(logit: float) -> float:
 
     fastembed 的 TextCrossEncoder.rerank() 返回模型原始 logit（单调，但无界）。
     与旧 FlagReranker.compute_score(normalize=True) 一致地过 sigmoid，下游
-    min_similarity 阈值（0.7）才能维持原有语义。分段计算避免 exp 溢出。
+    min_similarity 阈值（0.5）才能维持原有语义。分段计算避免 exp 溢出。
     """
     try:
         logit = float(logit)

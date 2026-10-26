@@ -13,7 +13,7 @@ from agent.config import AgentConfig
 def test_load_returns_defaults_when_missing(tmp_path):
     p = tmp_path / "missing.json"
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    assert cfg.rag_embedding_model == "BAAI/bge-small-zh-v1.5"
     assert cfg.base_url == "https://api.openai.com/v1"
 
 
@@ -303,11 +303,11 @@ def test_local_model_defaults_are_parallel_not_forced():
     assert cfg.aux_llm_model_path.endswith("Qwen3.5-2B-MLX-4bit")
     # 主模型默认本地化，RAG 两个模型默认也走本地 MLX。
     assert cfg.rag_embedding_backend == "mlx"
-    assert cfg.rag_embedding_model_path.endswith("nomic-embed-text-v1.5-mlx")
-    assert cfg.rag_rerank_backend == "mlx"
+    assert cfg.rag_embedding_model_path.endswith("bge-small-zh-v1.5-mlx")
+    assert cfg.rag_rerank_backend == "jina"
     assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
     # 回退用的 fastembed 目录名必须保留，否则 MLX 不可用时无路可退。
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    assert cfg.rag_embedding_model == "BAAI/bge-small-zh-v1.5"
     assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
     assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
 

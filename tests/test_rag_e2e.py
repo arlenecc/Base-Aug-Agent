@@ -751,9 +751,10 @@ class TestRAGTools:
 
         class _FakeEngine:
             def search(self, query, top_k=3, source=None):
+                # 总量需 ≥ rag_condense_min_chars（默认 4000 字）才触发归纳。
                 return [
-                    {"source": "doc_a.txt", "score": 0.9, "text": "A" * 500},
-                    {"source": "doc_b.txt", "score": 0.8, "text": "B" * 500},
+                    {"source": "doc_a.txt", "score": 0.9, "text": "A" * 2500},
+                    {"source": "doc_b.txt", "score": 0.8, "text": "B" * 2500},
                 ]
 
             def format_results(self, results, *a, **k):
@@ -774,6 +775,41 @@ class TestRAGTools:
         # 主模型拿到的是辅助模型归纳后的文本，而非原始分片格式。
         assert res.output == condensed
         assert "RAW:" not in res.output
+
+    def test_rag_search_skips_condense_below_min_chars(self):
+        """结果总量 < rag_condense_min_chars（默认 4000 字）时跳过归纳、原样返回。"""
+        from src.agent.tools.rag_tool import RagSearchTool
+
+        class _Ev:
+            def __init__(self, t, c=""):
+                self.type = t
+                self.content = c
+
+        class _FakeEngine:
+            def search(self, query, top_k=3, source=None):
+                return [
+                    {"source": "doc_a.txt", "score": 0.9, "text": "A" * 500},
+                    {"source": "doc_b.txt", "score": 0.8, "text": "B" * 500},
+                ]
+
+            def format_results(self, results, *a, **k):
+                return "RAW:" + str(len(results))
+
+        class _SpyAux:
+            def __init__(self):
+                self.called = 0
+
+            def chat_stream(self, messages, tools=None, temperature=0.2):
+                self.called += 1
+                yield _Ev("content", "不该被调用")
+                yield _Ev("done")
+
+        aux = _SpyAux()
+        tool = RagSearchTool(_FakeEngine(), aux_llm_getter=lambda: aux)
+        res = tool.run(query="测试问题")
+        assert res.success is True
+        assert aux.called == 0  # 辅助模型不应被调用
+        assert res.output == "RAW:2"  # 原始分片格式直接返回
 
     def test_rag_search_falls_back_when_no_aux(self):
         """辅助模型不可用（getter 返回 None）时退化为原始分片格式。"""
@@ -822,7 +858,8 @@ class TestRAGTools:
 
         class _FakeEngine:
             def search(self, query, top_k=3, source=None):
-                return [{"source": "doc.txt", "score": 0.9, "text": "y"}]
+                # 总量需 ≥ rag_condense_min_chars（默认 4000 字）才触发归纳。
+                return [{"source": "doc.txt", "score": 0.9, "text": "y" * 4500}]
 
             def format_results(self, results, *a, **k):
                 return "RAW"

@@ -1233,12 +1233,17 @@ def create_reranker_backend(
     max_length: int = _RERANK_DEFAULT_MAX_LENGTH,
     batch_size: int = 16,
     mlx_model_path: str = "",
+    jina_model_path: str = "",
 ):
     backend = (backend or "fastembed").lower()
     if backend == "disabled":
         return None
     if backend == "onnx":
         return ONNXReranker(model_path, threads=threads, max_length=max_length)
+    if backend == "jina":
+        # jina-reranker-v2-base-multilingual 的 INT8 ONNX 导出，强制 CPU，与
+        # bge ONNX 共用 ONNXReranker（按目录自动找 model_quantized.onnx + tokenizer）。
+        return ONNXReranker(jina_model_path or model_path, threads=threads, max_length=max_length)
     if backend == "mlx":
         blocker = mlx_runtime_blocker()
         if not blocker:

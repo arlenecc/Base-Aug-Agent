@@ -37,6 +37,83 @@ def _token_count(text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# sentence-boundary fallback splitting
+# ---------------------------------------------------------------------------
+
+# 句末边界：中文句读（。！？；…）连同其后的行尾空白一起消费；英文句号只在
+# 后跟空白或文本末尾时才算边界（避免切开 "3.5"、"e.g." 这类小数/缩写）；
+# 换行也视为边界——无句读的标题/列表行能独立成块，不会被胶进下一句。
+_SENTENCE_BOUNDARY_RE = re.compile(r"[。！？；…]+[ \t]*\n?|\.(?=\s)|\.(?=\Z)|\n")
+
+
+def _iter_sentence_spans(text: str) -> List[tuple]:
+    """Return (start, end) spans of sentence pieces whose union is all of ``text``.
+
+    相邻 span 首尾相接（边界标点归前一句），按序拼接仍是原文的连续子串——
+    与 semantic_chunker/_tail_by_tokens 的「切片必须是原文子串」约束一致。
+    """
+    spans: List[tuple] = []
+    start = 0
+    for m in _SENTENCE_BOUNDARY_RE.finditer(text):
+        end = m.end()
+        if end > start:
+            spans.append((start, end))
+            start = end
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
+
+
+def split_by_sentences(text: str, chunk_size: int, chunk_overlap: int = 0) -> List[str]:
+    """Pack whole sentences into chunks of at most ``chunk_size`` tokens.
+
+    兜底切分：保证分片只在句子结束处断开，绝不从句子中间切断。唯一例外是
+    单句本身超过 ``chunk_size``（无句读的超长段落/表格行）——此时无法既保句
+    完整又保长度上限，退回字符级 ``_split_by_tokens``。
+    """
+    if not text or not text.strip():
+        return []
+    if _token_count(text) <= chunk_size:
+        return [text.strip()]
+
+    chunks: List[str] = []
+    # O(1) 去重（存哈希），与 _split_by_tokens 同款约定。
+    seen: set = set()
+    cur: List[str] = []
+    cur_cjk = cur_other = 0
+
+    def _flush() -> None:
+        nonlocal cur, cur_cjk, cur_other
+        merged = "".join(cur).strip()
+        if merged:
+            digest = hash(merged)
+            if digest not in seen:
+                seen.add(digest)
+                chunks.append(merged)
+        cur, cur_cjk, cur_other = [], 0, 0
+
+    for s, e in _iter_sentence_spans(text):
+        piece = text[s:e]
+        pc, po = _char_counts(piece)
+        if pc // 2 + po // 3 > chunk_size:
+            # 先把已攒的句子成块落盘，再对超长单句做字符级切分。
+            if cur:
+                _flush()
+            chunks.extend(_split_by_tokens(piece, chunk_size, chunk_overlap))
+            continue
+        # 预算判断必须累计"字符数"后整体取 floor（与 _split_recursive 同款）：
+        # 若按逐片 token 求和，floor 的分段损失会累积，合并结果可能超出上限。
+        if cur and (cur_cjk + pc) // 2 + (cur_other + po) // 3 > chunk_size:
+            _flush()
+        cur.append(piece)
+        cur_cjk += pc
+        cur_other += po
+    if cur:
+        _flush()
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
 
@@ -182,16 +259,28 @@ def _split_recursive(
     separators: List[str],
     chunk_size: int,
     chunk_overlap: int,
+    apply_overlap: bool = True,
 ) -> List[str]:
-    """Recursively split text at the most appropriate separator level."""
+    """Recursively split text at the most appropriate separator level.
+
+    ``apply_overlap=False`` 供递归子调用使用：只打包不补 overlap，由最外层
+    统一做一次 `_merge_overlap`。旧实现每层递归各自 merge，子层已带 overlap
+    的块在父层再被叠加（双重 overlap，实测可到 chunk_size 的 1.6 倍），且
+    混入 overlap 文本的块在原文里相位错位，`_gap_between` 对不齐、间隔取错，
+    把不相邻的原文拼进 chunk。
+    """
     if _token_count(text) <= chunk_size:
         return [text] if text.strip() else []
 
     # Try each separator in priority order
     for sep_idx, sep in enumerate(separators):
         if sep == "":
-            # Character-level split
-            return _split_by_tokens(text, chunk_size, chunk_overlap)
+            # 句子级兜底：分片只在句子结束处断开（单句超限才字符级切）。
+            chunks = split_by_sentences(text, chunk_size, chunk_overlap)
+            return (
+                _merge_overlap(chunks, chunk_overlap, sep, source=text)
+                if apply_overlap else chunks
+            )
 
         if sep not in text:
             continue
@@ -222,6 +311,7 @@ def _split_recursive(
                         sub_chunks = _split_recursive(
                             part, separators[sep_idx + 1:],
                             chunk_size, chunk_overlap,
+                            apply_overlap=False,
                         )
                         chunks.extend(sub_chunks)
                         current = ""
@@ -242,6 +332,7 @@ def _split_recursive(
                     sub_chunks = _split_recursive(
                         part, separators[sep_idx + 1:],
                         chunk_size, chunk_overlap,
+                        apply_overlap=False,
                     )
                     chunks.extend(sub_chunks)
                     # Don't reset current — next part starts fresh
@@ -250,10 +341,17 @@ def _split_recursive(
             chunks.append(current)
 
         if chunks:
-            return _merge_overlap(chunks, chunk_overlap, sep, source=text)
+            return (
+                _merge_overlap(chunks, chunk_overlap, sep, source=text)
+                if apply_overlap else chunks
+            )
 
-    # Fallback: character-level split (was previously returning an oversized chunk)
-    return _split_by_tokens(text, chunk_size, chunk_overlap)
+    # Final fallback: sentence-level split — chunks only break at sentence ends.
+    chunks = split_by_sentences(text, chunk_size, chunk_overlap)
+    return (
+        _merge_overlap(chunks, chunk_overlap, "", source=text)
+        if apply_overlap else chunks
+    )
 
 
 def _char_counts(text: str) -> tuple:
@@ -355,17 +453,27 @@ def _gap_between(source: Optional[str], left: str, right: str, fallback: str = "
     if not source or not left or not right:
         return fallback
     _MAX_GAP = 256
+    # 周期性重复文本（重复段落/样板句）里 left 会出现多次，第一次出现后面
+    # 跟的未必是 right——只接受"首个 ≤256 的间隔"会取到错位的大间隔，把不
+    # 相邻的原文拼进 chunk（且撑爆 token 预算）。这里扫描多个出现位置取
+    # **最小**间隔；完美相邻（间隔 0）立即返回。扫描次数封顶防 O(n²)。
+    _MAX_SCANS = 256
+    best: tuple | None = None  # (gap_len, gap)
     start = 0
-    while True:
+    for _ in range(_MAX_SCANS):
         i = source.find(left, start)
         if i < 0:
-            return fallback
+            break
         j = source.find(right, i + len(left))
         if j < 0:
-            return fallback
-        if j - (i + len(left)) <= _MAX_GAP:
-            return source[i + len(left):j]
+            break
+        gap = source[i + len(left):j]
+        if not gap:
+            return gap
+        if best is None or len(gap) < best[0]:
+            best = (len(gap), gap)
         start = i + 1
+    return best[1] if best is not None else fallback
 
 
 def _merge_overlap(chunks: List[str], overlap: int, sep: str, source: Optional[str] = None) -> List[str]:

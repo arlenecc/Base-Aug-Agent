@@ -12,11 +12,15 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..rag.engine import RAGEngine
 
-# RAG 检索结果送辅助模型归纳时，给辅助模型的输入上限（字符）。辅助模型上下文
-# 有限，原始分片过长时先截断再交给它，避免撑爆辅助模型。
+# 归纳阈值已做成可配置项（AgentConfig：rag_condense_min_chars /
+# rag_condense_max_chars / rag_condense_output_max_chars，见 config.py）。
+# 以下常量仅作为配置缺失时的 getattr 兜底默认值。
+# 给辅助模型的输入上限（字符）：辅助模型上下文有限，原始分片过长先截断。
 _AUX_INPUT_MAX_CHARS = 12000
-# 辅助模型归纳后交给主模型的浓缩文本上限（字符）——用户要求 2000 字以内。
+# 归纳后交给主模型的浓缩文本上限（字符）。
 _CONDENSED_MAX_CHARS = 2000
+# 触发归纳的最低结果总量（字符）：低于此值原样返回，不做归纳。
+_CONDENSE_MIN_CHARS = 4000
 
 
 class RagSearchTool(Tool):
@@ -33,7 +37,7 @@ class RagSearchTool(Tool):
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数，默认 3，上限 3。",
+                "description": "返回结果数，默认 3，上限 5。",
             },
             "source": {
                 "type": "string",
@@ -52,7 +56,9 @@ class RagSearchTool(Tool):
         self._aux_llm_getter = aux_llm_getter
 
     def bind(self, config: Any, registry: ToolRegistry) -> None:
-        pass
+        # 归纳阈值等从 AgentConfig 读取（注册时 bind 必被调用）；未 bind 时
+        # _condense_with_aux 里 getattr(self, "_config", None) 落到常量兜底。
+        self._config = config
 
     def run(self, query: str = "", top_k: int = 3, source: str = "") -> ToolResult:
         # 模型可能传 null（JSON null → None），None.strip() 会抛异常并被
@@ -62,14 +68,15 @@ class RagSearchTool(Tool):
         if not query:
             return ToolResult(success=False, error="请提供搜索查询词")
 
-        # 限制 top_k 上限：候选数 = top_k × 4 × 2 路，全量送 BGE 重排（逐对
-        # 串行 ~0.55s/对，实测 568M INT8 在本机 CPU 的地板，批并行/线程/截断
-        # 均无收益）。LLM 传 5 时 40 条 ≈ 23s（#132 实测），封顶 3 → 24 条。
+        # 限制 top_k 上限：候选数 = top_k × 4 × 2 路，全量送 reranker 精排。
+        # 默认 jina(ONNX/CPU) 实测 ~49 对/s：top_k=5 → 40 对 ≈ 0.8s，可接受；
+        # 旧默认逐对串行的 bge INT8 ~0.55s/对（#132）时 40 对要 23s，当时因此
+        # 封顶 3——换 jina 后放宽到 5。
         try:
             top_k = int(top_k)
         except (TypeError, ValueError):
             top_k = 3
-        top_k = max(1, min(top_k, 3))
+        top_k = max(1, min(top_k, 5))
 
         source = (source or "").strip()
         logger.info(
@@ -85,9 +92,9 @@ class RagSearchTool(Tool):
         if not results:
             return ToolResult(success=True, output="（知识库中未找到相关内容）")
 
-        # 新流程（用户需求）：reranker 排序后的全部文本分片先送辅助模型归纳整理，
-        # 浓缩到 2000 字以内再交给主模型，减轻主模型上下文压力。辅助模型不可用
-        # 时退化为原始截断格式（保底不丢检索结果）。
+        # 结果总量 ≥ rag_condense_min_chars（默认 4000 字）才送辅助模型归纳
+        # 浓缩（输出 ≤ rag_condense_output_max_chars）；低于阈值直接原样返回，
+        # 避免丢细节、白等一次归纳。辅助模型不可用时同样退化为原始格式。
         condensed = self._condense_with_aux(query, results)
         if condensed is not None:
             return ToolResult(success=True, output=condensed)
@@ -105,6 +112,14 @@ class RagSearchTool(Tool):
         if aux is None:
             return None
 
+        # 阈值从 AgentConfig 读取（bind 注入）；未注入时落到模块常量兜底。
+        cfg = getattr(self, "_config", None)
+        min_chars = int(getattr(cfg, "rag_condense_min_chars", _CONDENSE_MIN_CHARS) or 0)
+        max_chars = int(getattr(cfg, "rag_condense_max_chars", _AUX_INPUT_MAX_CHARS)
+                        or _AUX_INPUT_MAX_CHARS)
+        out_cap = int(getattr(cfg, "rag_condense_output_max_chars", _CONDENSED_MAX_CHARS)
+                      or _CONDENSED_MAX_CHARS)
+
         chunks = []
         for r in results:
             src = os.path.basename(r.get("source", "") or "")
@@ -114,13 +129,21 @@ class RagSearchTool(Tool):
         raw = "\n\n".join(chunks)
         if not raw.strip():
             return None
-        if len(raw) > _AUX_INPUT_MAX_CHARS:
-            raw = raw[:_AUX_INPUT_MAX_CHARS] + "\n…（原文过长，已截断）"
+        if len(raw) < min_chars:
+            # 低于最低阈值：内容本就不多，归纳反而丢细节、白等一次辅助模型
+            # 生成——直接原样返回（阈值可配 rag_condense_min_chars，0 = 总是归纳）。
+            logger.info(
+                "  ├─ 检索结果 %d 字 < 阈值 %d 字，跳过辅助模型归纳（原样返回）",
+                len(raw), min_chars,
+            )
+            return None
+        if len(raw) > max_chars:
+            raw = raw[:max_chars] + "\n…（原文过长，已截断）"
 
         prompt = (
             "以下是针对用户问题从知识库检索到的若干文本分片（已按相关度重排序）。"
             "请对全部内容进行归纳整理，保留核心观点、关键事实与重要信息，剔除冗余"
-            "和无关细节，并将全部内容浓缩精简到 2000 字以内。请保留每条要点的来源"
+            f"和无关细节，并将全部内容浓缩精简到 {out_cap} 字以内。请保留每条要点的来源"
             "标注。直接输出整理后的内容，不要加前言、不要解释过程。\n\n"
             f"用户问题：{query}\n\n检索到的文本分片：\n{raw}"
         )
@@ -142,8 +165,8 @@ class RagSearchTool(Tool):
         if not text:
             return None
         # 保险：辅助模型未遵守字数限制时强制截断（按字符）。
-        if len(text) > _CONDENSED_MAX_CHARS:
-            text = text[:_CONDENSED_MAX_CHARS]
+        if len(text) > out_cap:
+            text = text[:out_cap]
         return text
 
 

@@ -161,6 +161,16 @@ def _split_by_paragraph(text: str, max_tokens: Optional[int]) -> List[str]:
     current_tokens = 0
     for p in paragraphs:
         p_tokens = estimate_tokens(p)
+        if p_tokens > max_tokens:
+            # 单段超限（语义切片不可用时的兜底路径）：按句子边界再切，
+            # 保证分片从句子结束处断开，而不是让一个超长段落整体溜过去。
+            if current:
+                groups.append(current)
+                current = ""
+                current_tokens = 0
+            from .chunker import split_by_sentences
+            groups.extend(split_by_sentences(p, max_tokens, 0))
+            continue
         if not current:
             current = p
             current_tokens = p_tokens
