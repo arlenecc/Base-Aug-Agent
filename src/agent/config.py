@@ -137,6 +137,10 @@ class AgentConfig:
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
     rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"  # MLX 回退用
     rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx-int8"
+    # 想换中文轻量 embedding 可指向 bge：rag_embedding_model_path 改成
+    # "models/bge-small-zh-v1.5-mlx" 即可（后端识别为 bert 类，自动走 mlx.nn
+    # Bert 实现 + bge 检索前缀，文档不加前缀、查询加「为这个句子生成表示以用于检索：」）。
+    # 速度约快 6×、模型更小，但检索质量在中文基准上略逊 nomic（见对比测试）。
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16

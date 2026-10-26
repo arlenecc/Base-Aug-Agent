@@ -176,6 +176,7 @@ class MLXEmbeddingFunction:
         self._processor = None
         self._generate = None
         self._model_type = ""
+        self._is_bert = False
         self._load_lock = threading.RLock()
         self._inference_lock = threading.RLock()
 
@@ -210,11 +211,21 @@ class MLXEmbeddingFunction:
                     ) from e
                 try:
                     self._model, self._processor = load(self._model_path, lazy=False)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"mlx-embeddings 不支持或无法加载模型类型 '{self._model_type}': {e}"
-                    ) from e
-                self._generate = generate
+                except Exception:
+                    # mlx-embeddings 不支持的 bert 类导出（如 bge 中文模型：权重键
+                    # 命名与库预期不符会报 "parameters not in model"）→ 退回项目自带
+                    # 的 mlx.nn Bert 实现（标准 HF bert 权重键，掩码均值池化）。
+                    logger.info(
+                        "mlx-embeddings 无法加载 %s，退回 mlx.nn Bert 实现", self._model_path
+                    )
+                    self._model, self._processor = self._load_bert(config)
+                    self._generate = None
+                    self._is_bert = True
+                    # bge 检索约定：文档不加前缀，查询加检索指令前缀。
+                    self._document_prefix = ""
+                    self._query_prefix = "为这个句子生成表示以用于检索："
+                else:
+                    self._generate = generate
             logger.info("MLX Embedding 加载完成: %s", self._model_path)
 
     def _load_nomic(self, config: Dict[str, Any]):
@@ -363,6 +374,106 @@ class MLXEmbeddingFunction:
         )
         return model, tokenizer
 
+    def _load_bert(self, config: Dict[str, Any]):
+        """Build a standard BERT encoder with mlx.nn (for bert-style exports
+        like bge that mlx-embeddings cannot load due to weight-key naming).
+
+        Mirrors the repository's MLX weights: standard HF bert key names
+        (``embeddings.word_embeddings`` / ``encoder.layers.N.attention.query_proj``
+        …), masked mean pooling over real tokens, L2 normalize. ``pooler.*``
+        keys are ignored (``strict=False``).
+        """
+        import mlx.core as mx
+        import mlx.nn as nn
+        from transformers import AutoTokenizer
+
+        hidden_size = int(config.get("hidden_size", 768))
+        intermediate_size = int(config.get("intermediate_size", 3072))
+        num_heads = int(config.get("num_attention_heads", 12))
+        num_layers = int(config.get("num_hidden_layers", 12))
+        vocab_size = int(config.get("vocab_size", 30522))
+        type_vocab_size = int(config.get("type_vocab_size", 2))
+        eps = float(config.get("layer_norm_eps", config.get("layer_norm_epsilon", 1e-12)))
+        max_pos = int(config.get("max_position_embeddings", 512))
+
+        class _BertEmbeddings(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.word_embeddings = nn.Embedding(vocab_size, hidden_size)
+                self.position_embeddings = nn.Embedding(max_pos, hidden_size)
+                self.token_type_embeddings = nn.Embedding(type_vocab_size, hidden_size)
+                self.norm = nn.LayerNorm(hidden_size, eps=eps)
+
+            def __call__(self, ids, tok, pos):
+                return self.norm(
+                    self.word_embeddings(ids)
+                    + self.position_embeddings(pos)
+                    + self.token_type_embeddings(tok)
+                )
+
+        class _BertAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = num_heads
+                self.scale = 1.0 / (hidden_size // num_heads) ** 0.5
+                self.query_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                self.key_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                self.value_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+            def __call__(self, x, mask):
+                batch, seq_len, _ = x.shape
+                nh, hd = self.num_heads, x.shape[-1] // self.num_heads
+                split = lambda a: a.reshape(batch, seq_len, nh, hd).transpose(0, 2, 1, 3)
+                q = split(self.query_proj(x))
+                k = split(self.key_proj(x))
+                v = split(self.value_proj(x))
+                scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale + mask
+                weights = mx.softmax(scores, axis=-1)
+                ctx = (weights @ v).transpose(0, 2, 1, 3).reshape(batch, seq_len, nh * hd)
+                return self.out_proj(ctx)
+
+        class _BertLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ln1 = nn.LayerNorm(hidden_size, eps=eps)
+                self.attention = _BertAttention()
+                self.ln2 = nn.LayerNorm(hidden_size, eps=eps)
+                self.linear1 = nn.Linear(hidden_size, intermediate_size, bias=False)
+                self.linear2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+            def __call__(self, x, mask):
+                a = self.attention(self.ln1(x), mask)
+                x = x + a
+                f = self.linear2(nn.gelu(self.linear1(self.ln2(x))))
+                return x + f
+
+        class _BertEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [_BertLayer() for _ in range(num_layers)]
+
+        class _BertModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embeddings = _BertEmbeddings()
+                self.encoder = _BertEncoder()
+
+            def __call__(self, ids, tok, pos, mask):
+                h = self.embeddings(ids, tok, pos)
+                for layer in self.encoder.layers:
+                    h = layer(h, mask)
+                return h  # 全序列隐藏，交由 _embed 做掩码均值池化
+
+        model = _BertModel()
+        weights = mx.load(str(Path(self._model_path) / "model.safetensors"))
+        model.load_weights(weights, strict=False)
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(
+            self._model_path, local_files_only=True, trust_remote_code=False
+        )
+        return model, tokenizer
+
     def _embed(self, texts: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         if not texts:
             return []
@@ -404,6 +515,35 @@ class MLXEmbeddingFunction:
                         )
                         mx.eval(values)
                         outputs.extend(np.asarray(values, dtype=np.float32).tolist())
+                elif self._is_bert:
+                    import mlx.core as mx
+
+                    # bert 回退路径（bge）：标准 HF tokenizer + 掩码均值池化。
+                    encoded = self._processor(
+                        batch,
+                        padding=True,
+                        truncation=True,
+                        max_length=self._max_length,
+                        return_tensors="np",
+                    )
+                    ids = np.asarray(encoded["input_ids"])
+                    am = np.asarray(encoded["attention_mask"])
+                    pos = mx.arange(ids.shape[1])[None, :]
+                    mask = (1 - mx.array(am)[:, None, None, :]) * -1e9
+                    inner = _embedding_batch_for(len(batch), ids.shape[1], "mlx")
+                    for offset in range(0, len(batch), inner):
+                        ids_b = mx.array(ids[offset:offset + inner])
+                        amb = mx.array(am[offset:offset + inner])
+                        m = mask[offset:offset + inner]
+                        h = self._model(ids_b, mx.zeros_like(ids_b), pos, m)
+                        pooled = (h * amb[:, :, None]).sum(1) / mx.maximum(
+                            amb.sum(1, keepdims=True), 1
+                        )
+                        pooled = pooled / mx.maximum(
+                            mx.linalg.norm(pooled, axis=1, keepdims=True), 1e-12
+                        )
+                        mx.eval(pooled)
+                        outputs.extend(np.asarray(pooled, dtype=np.float32).tolist())
                 else:
                     import mlx.core as mx
 
