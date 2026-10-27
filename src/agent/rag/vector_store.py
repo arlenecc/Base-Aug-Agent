@@ -15,6 +15,9 @@ import time
 import warnings
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+import pyarrow as pa
+
 logger = logging.getLogger(__name__)
 
 # Default embedding model — quantized nomic-embed-text-v1.5 via FastEmbed (ONNX Runtime).
@@ -44,6 +47,16 @@ _FTS_COLUMN = "text_fts"
 # 这一列，schema 迁移时回填 0.0（视为最老——历史数据天然占先，不会被后来
 # 重新入库的副本顶掉）。
 _INGESTED_AT = "ingested_at"
+
+# ---------------------------------------------------------------------------
+# f16 向量存储（2026-10-27）：向量列存 fixed_size_list<float16>，检索走
+# lancedb 原生 .search()（f16 列实测可查：f32/f16 查询均 OK，可建 ANN 索引）。
+# Matryoshka 截断维度由 config.rag_matryoshka_dim 控制（默认 512）。
+# ---------------------------------------------------------------------------
+# Matryoshka 截断维度的兜底默认值（实际以构造参数 / config 为准）：
+# nomic-embed-text-v1.5 官方支持 MRL，截前 N 维后重归一化。
+_MATRYOSHKA_DIM = 512
+_MATRYOSHKA_MARKER = "nomic-embed-text-v1.5"
 
 # jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
 _jieba = None
@@ -657,6 +670,7 @@ class VectorStore:
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
+        matryoshka_dim: int = _MATRYOSHKA_DIM,
     ):
         self._persist_dir = persist_dir
         self._embedding_model = embedding_model
@@ -706,6 +720,12 @@ class VectorStore:
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
         self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
+        # ---- f16 向量存储（2026-10-27）----
+        # Matryoshka 分流：模型名/路径含 nomic-embed-text-v1.5 → 截前
+        # matryoshka_dim 维（0 = 不截断）。检索走 lancedb 原生 .search()。
+        self._matryoshka = _MATRYOSHKA_MARKER in (
+            f"{embedding_model or ''} {embedding_model_path or ''}".lower())
+        self._matryoshka_dim = max(0, int(matryoshka_dim))
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -931,6 +951,41 @@ class VectorStore:
             logger.warning("  ⚠ 嵌入维度探测失败: %s", e)
             return None
 
+    # ------------------------------------------------------------------
+    # f16 向量存储（Matryoshka 截断 + 重归一化，入库/查询对称执行）
+    # ------------------------------------------------------------------
+
+    def _expected_vec_dim(self, probe_dim: Optional[int]) -> Optional[int]:
+        """入库向量的目标维度：Matryoshka 模型截 matryoshka_dim 维，其它保持原维度。"""
+        if probe_dim is None:
+            return None
+        if self._matryoshka and self._matryoshka_dim > 0:
+            return min(probe_dim, self._matryoshka_dim)
+        return probe_dim
+
+    def _prepare_vec(self, vec) -> np.ndarray:
+        """单条向量 → 入库 f16：截断（Matryoshka）→ L2 重归一化 → f16。
+
+        重归一化是**硬性步骤**：截断会破坏单位长度（前 N 维的范数 < 1），
+        不重新归一化的话截断向量的方向虽不变，但与查询侧的处理必须一致，
+        且后续任何基于范数的计算都会失真。
+        """
+        return self._prepare_query(vec, dtype=np.float16)
+
+    def _prepare_query(self, vec, dtype=np.float32) -> np.ndarray:
+        """查询/入库向量的对称处理：截断 → 重归一化 → 指定 dtype。
+
+        入库侧 dtype=float16（列类型钉死 halffloat）；查询侧 float32
+        （lancedb 原生 .search() 对 f16 列接受 f32 查询——已实测）。
+        """
+        v = np.asarray(vec, dtype=np.float32)
+        if self._matryoshka and self._matryoshka_dim > 0:
+            v = v[:self._matryoshka_dim]
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n  # 截断后重归一化（入库与查询侧对称执行）
+        return v.astype(dtype)
+
     def reset_if_incompatible(self) -> bool:
         """向量库与当前嵌入模型不兼容时，自愈式清空重建。
 
@@ -952,11 +1007,15 @@ class VectorStore:
         try:
             schema = self._table.schema
             names = schema.names
-            expected_dim = self._probe_ef_dim()
+            expected_dim = self._expected_vec_dim(self._probe_ef_dim())
             current_dim = None
+            current_is_f16 = False
             if "vector" in names:
                 try:
-                    current_dim = schema.field("vector").type.list_size
+                    vec_type = schema.field("vector").type
+                    current_dim = vec_type.list_size
+                    current_is_f16 = (
+                        pa.types.is_float16(getattr(vec_type, "value_type", None)))
                 except Exception:
                     current_dim = None
 
@@ -973,6 +1032,9 @@ class VectorStore:
                 incompatible = True
                 reasons.append(
                     f"向量维度不匹配（库内 {current_dim} 维 vs 当前嵌入 {expected_dim} 维）")
+            elif "vector" in names and not current_is_f16:
+                incompatible = True
+                reasons.append("向量列不是 f16（旧表，f16 存储升级）")
             for col in ("id", _FTS_COLUMN, _INGESTED_AT):
                 if col not in names:
                     incompatible = True
@@ -1033,7 +1095,21 @@ class VectorStore:
             table = self._ensure_table()
             if table is not None:
                 return table, False
-            self._table = self._db.create_table(_TABLE_NAME, records)
+            # 显式 schema：向量列为 fixed_size_list<float16>（f16 存储体积 2×↓，
+            # lancedb 原生可查）。依赖数据推断会把向量推成 f32 列——类型必须钉死。
+            _first_vec = records[0].get("vector")
+            dim = len(_first_vec) if _first_vec is not None else 0
+            schema = pa.schema([
+                ("id", pa.string()),
+                ("text", pa.string()),
+                ("vector", pa.list_(pa.float16(), dim) if dim > 0
+                 else pa.list_(pa.float16())),
+                ("source", pa.string()),
+                ("chunk_index", pa.int64()),
+                (_FTS_COLUMN, pa.string()),
+                (_INGESTED_AT, pa.float64()),
+            ])
+            self._table = self._db.create_table(_TABLE_NAME, records, schema=schema)
             self._table_checked = True
             return self._table, True
 
@@ -1052,15 +1128,21 @@ class VectorStore:
         if table is None or not records:
             return
         try:
-            table_dim = table.schema.field("vector").type.list_size
+            vec_type = table.schema.field("vector").type
+            table_dim = vec_type.list_size
+            table_is_f16 = pa.types.is_float16(getattr(vec_type, "value_type", None))
         except Exception:
             return
         vec = records[0].get("vector")
         if vec is not None and len(vec) != table_dim:
             raise RuntimeError(
                 f"向量库维度不匹配：库内向量 {table_dim} 维，当前嵌入模型输出 "
-                f"{len(vec)} 维（嵌入模型切换后旧库未清空）。"
+                f"{len(vec)} 维（嵌入模型或截断维度切换后旧库未清空）。"
                 f"请重新启动同步，将自动清库重建。")
+        if vec is not None and not table_is_f16:
+            raise RuntimeError(
+                "向量库向量列不是 f16（旧表，f16 存储升级）。"
+                "请重新启动同步，将自动清库重建。")
 
     @_store_op
     def add(
@@ -1091,7 +1173,7 @@ class VectorStore:
                 records.append({
                     "id": chunk_id,
                     "text": chunk["text"],
-                    "vector": _normalize(vectors[j]),
+                    "vector": self._prepare_vec(vectors[j]),
                     "source": source,
                     "chunk_index": chunk_idx,
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
@@ -1493,7 +1575,7 @@ class VectorStore:
             records.append({
                 "id": chunk_id,
                 "text": chunk["text"],
-                "vector": _normalize(vectors[j]),
+                "vector": self._prepare_vec(vectors[j]),
                 "source": source,
                 "chunk_index": chunk_idx,
                 _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
@@ -1661,15 +1743,16 @@ class VectorStore:
             logger.info("  向量检索: 向量表为空 (查询=%r)", query[:60])
             return []
 
-        # Embed query (use embed_query for proper prefix handling)
+        # Embed query（与入库侧对称：截断 → 重归一化 → f32，lancedb 原生可查）
         logger.info("  ├─ 查询向量化: 将查询文本转为向量...")
         if hasattr(self._ef, 'embed_query'):
-            query_vec = _normalize(self._ef.embed_query(query))
+            query_vec = self._prepare_query(self._ef.embed_query(query))
         else:
-            query_vec = _normalize(self._ef([query])[0])
+            query_vec = self._prepare_query(self._ef([query])[0])
 
-        # Vector search
-        logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d...", row_count, top_k)
+        # Vector search：lancedb 原生检索（f16 列实测可查，f32 查询向量 OK）。
+        logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d (f16 原生)...",
+                    row_count, top_k)
         search = table.search(query_vec).limit(top_k)
         if where:
             # prefilter=True：先按条件过滤再做 ANN。默认的后置过滤是「先取
@@ -1686,23 +1769,23 @@ class VectorStore:
         output: List[Dict[str, Any]] = []
         for r in results:
             # LanceDB 返回 _distance（L2 距离，越小越相似）。
-            # 转换为相似度分数 [0,1]（越高越相似），统一下游接口语义。
+            # 入库/查询两侧均为重归一化后的单位向量，L2 距离 d ∈ [0,2]，
+            # 余弦相似度 cos = 1 - d²/2，转换为 [0,1] 相似度统一下游接口。
             if "_distance" in r:
                 distance = float(r["_distance"])
-                # 对归一化向量，L2 距离 d ∈ [0,2]，余弦相似度 cos = 1 - d²/2
                 similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
             else:
                 # _distance 字段缺失（罕见：表 schema 不兼容或旧表迁移）。
-                # 使用中等分数避免将无效结果排到最前或最后。
-                logger.debug("VectorStore.search: _distance field missing for result, using default score 0.5")
+                logger.debug(
+                    "VectorStore.search: _distance field missing, using default score 0.5")
                 similarity = 0.5
             output.append({
                 "text": r.get("text", ""),
                 "source": r.get("source", ""),
                 "chunk_index": r.get("chunk_index", 0),
                 "score": similarity,
+                "id": r.get("id", ""),
             })
-
         return output
 
     # ------------------------------------------------------------------

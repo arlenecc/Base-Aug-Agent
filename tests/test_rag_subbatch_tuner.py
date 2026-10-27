@@ -24,6 +24,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -346,10 +347,12 @@ def test_embed_chunks_uses_tuner_and_preserves_order():
     records = store._embed_chunks(chunks, start_idx=0)
 
     assert len(records) == len(chunks)
-    # 向量必须按原顺序回填（分桶只影响计算顺序，不影响结果顺序）
+    # 向量必须按原顺序回填（分桶只影响计算顺序，不影响结果顺序）。
+    # 2026-10-27 起写入侧走 f16 管线：内部自带截断/重归一化（对输入尺度
+    # 不变），期望值直接用同一管线对 EF 原始输出计算。
     for chunk, rec in zip(chunks, records):
-        expected = _normalize(ef([chunk["text"]])[0])
-        assert rec["vector"] == pytest.approx(expected, abs=1e-6)
+        expected = store._prepare_vec(ef([chunk["text"]])[0])
+        assert np.array_equal(np.asarray(rec["vector"]), expected)
         assert rec["text"] == chunk["text"]
     # tuner 收到了每个子批的上报，且尺寸始终在 [下限, 上限] 内
     assert store._subbatch_tuner._win_n <= 2

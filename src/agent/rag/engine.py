@@ -592,6 +592,7 @@ class RAGEngine:
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
+        matryoshka_dim: int = 512,
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         pdf_engine: str = "docling",
         ocr_backend: str = "mlx",
@@ -620,6 +621,7 @@ class RAGEngine:
         self._embedding_threads = max(1, int(embedding_threads))
         self._embedding_batch_size = max(1, int(embedding_batch_size))
         self._embedding_max_length = max(8, int(embedding_max_length))
+        self._matryoshka_dim = max(0, int(matryoshka_dim))
         self._custom_ef = embedding_function  # for testing injection
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
@@ -2597,6 +2599,7 @@ class RAGEngine:
                         rerank_threads=self._rerank_threads,
                         rerank_batch_size=self._rerank_batch_size,
                         rerank_max_length=self._rerank_max_length,
+                        matryoshka_dim=self._matryoshka_dim,
                         rerank_enabled=self._rerank_enabled,
                     )
         return self._store

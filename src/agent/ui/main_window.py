@@ -3667,6 +3667,8 @@ class MainWindow(QMainWindow):
                 "rerank_batch_size": self.config.rag_rerank_batch_size,
                 "rerank_max_length": self.config.rag_rerank_max_length,
                 "rerank_enabled": self.config.rag_rerank_enabled,
+                # Matryoshka 截断维度（f16 存储，0 = 不截断）。
+                "matryoshka_dim": getattr(self.config, "rag_matryoshka_dim", 512),
             },
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)

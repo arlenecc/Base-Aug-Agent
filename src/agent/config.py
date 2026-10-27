@@ -145,13 +145,14 @@ class AgentConfig:
     # RAG settings
     # 切片按**字符数硬限**（2026-10 用户决策，废弃 token 估算）：中文 ≈1 字=1
     # token、数字/符号/英文更少，BERT 词表下任何字符至多 1 token（未知字 →
-    # [UNK]），因此 len(chunk)=500 ⇒ bge-small-zh 真实 token ≤ 502（位置上限
-    # 512、正文 510），**任何语料都绝不截断**。chunk_documents 末端还有硬兜底：
-    # 任何路径产出的片超 chunk_size 字符即按字符窗口强切。章节直通上限 =
-    # chunk_size（engine._max_chars）。切片保证在句子结束处断开（句级兜底，
-    # 仅无句读的超长单段才字符级切）。
-    rag_chunk_size: int = 500       # 500 字符/片（字符硬限，bge-small-zh 不截断）
-    rag_chunk_overlap: int = 50     # 10% of chunk_size
+    # [UNK]），因此 len(chunk)=800 ⇒ 真实 token ≤ ~802。默认 embedding 已切回
+    # nomic（位置上限 8192），800 字符/片远在安全区内；chunk_documents 末端
+    # 还有硬兜底：任何路径产出的片超 chunk_size 字符即按字符窗口强切。章节
+    # 直通上限 = chunk_size（engine._max_chars）。切片保证在句子结束处断开
+    # （句级兜底，仅无句读的超长单段才字符级切）。注意：换回 bge-small-zh
+    # （位置上限 512）时需把切片调回 ≤500，否则会在模型层截断。
+    rag_chunk_size: int = 800       # 800 字符/片（2026-10-27 放大，配 nomic 长上下文）
+    rag_chunk_overlap: int = 80     # 10% of chunk_size
     # 语义切片开关（2026-10-27 用户需求，默认开）：开 = 结构 + 语义混合切片
     # （Markdown 标题分段 + chonkie 相似度找语义边界 + 向 chunk_size 填充）；
     # 关 = 跳过语义切片，直接按句边界贪心打包到 chunk_size 的字符递归切片
@@ -169,15 +170,20 @@ class AgentConfig:
     # MLX 不可用时（非 Apple Silicon / 未安装 / 路径缺失）自动回退 fastembed，
     # 不会出现「默认配置直接不可用」。
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
-    # 内置默认 embedding：bge-small-zh-v1.5（中文轻量，24MB 4层/512维，
-    # 位置上限 512 由后端按 config 自动夹紧；文档不加前缀、查询自动加
-    # 「为这个句子生成表示以用于检索：」）。注意：切换 embedding 后向量空间
-    # 变了，必须 rag_ingest(force=True) 重建索引，否则新旧向量混检会错乱。
-    # 要换回 nomic（检索质量更优但更大更慢）：path 改回
-    # "models/nomic-embed-text-v1.5-mlx-int8"、model 改回
-    # "nomic-ai/nomic-embed-text-v1.5-Q" 即可。
-    rag_embedding_model: str = "BAAI/bge-small-zh-v1.5"  # MLX 不可用时的 fastembed 回退款
-    rag_embedding_model_path: str = "models/bge-small-zh-v1.5-mlx"
+    # 内置默认 embedding（2026-10-27 切回）：nomic-embed-text-v1.5 的本地 MLX
+    # INT8 量化版。nomic 支持 Matryoshka（MRL）：入库/查询向量截前
+    # rag_matryoshka_dim 维后**重新归一化**再存 f16（vector_store 统一处理），
+    # 向量库体积 3×↓（768×f32 → 512×f16）且检索走 lancedb 原生 .search()。
+    # 文档加「search_document: 」、查询加「search_query: 」前缀。注意：切换
+    # embedding 或截断维度后向量空间变了，必须重新同步（force）重建索引，
+    # 否则新旧向量混检会错乱。bge-small-zh-v1.5 作为 MLX 不可用时的 fastembed
+    # 回退：
+    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
+    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx-int8"
+    # Matryoshka 截断维度（2026-10-27 可配置）：仅对支持 MRL 的 nomic 系模型
+    # 生效。默认 512（256 维中文检索质量实测偏弱，512 为官方推荐质量档）；
+    # 设 0 = 不截断（保留全部 768 维）。修改后必须 force 重新同步。
+    rag_matryoshka_dim: int = 512
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16
@@ -304,9 +310,9 @@ class AgentConfig:
         "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
         "llama_cpp_kv_cache_mb",
         "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
+        "rag_embedding_threads", "rag_matryoshka_dim",
         "rag_rerank_batch_size", "rag_rerank_max_length", "rag_rerank_top_n",
         "rag_pdf_small_concurrency", "rag_pdf_batch_pages",
-        "rag_embedding_threads",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
     )
     _FLOAT_FIELDS = ("temperature", "top_p", "min_p", "repetition_penalty",
@@ -491,6 +497,17 @@ class AgentConfig:
         # 配置的其他模型名不动。沿用 max_tokens=4096 的迁移先例。
         if self.rag_rerank_model == "BAAI/bge-reranker-base":
             self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
+        # 2026-10-27 切换：默认 embedding 切回 nomic MLX INT8 + 切片放大到
+        # 800。只重写**旧默认值**——用户显式配置过的其它模型路径/切片大小不动
+        # （沿用 max_tokens 迁移先例）。
+        if self.rag_embedding_model_path == "models/bge-small-zh-v1.5-mlx" and \
+                self.rag_embedding_backend == "mlx":
+            self.rag_embedding_model_path = "models/nomic-embed-text-v1.5-mlx-int8"
+            self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+        if self.rag_chunk_size == 500:
+            self.rag_chunk_size = 800
+        if self.rag_chunk_overlap == 50:
+            self.rag_chunk_overlap = 80
         # reranker 后端 "jina" 并入 "onnx"（2026-10-27）：jina 分支本质就是
         # ONNXReranker 换个路径参数，UI 下拉也只有 fastembed/mlx/onnx——
         # 配置里存 "jina" 会让 _select_combo_backend 找不到匹配而回落

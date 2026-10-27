@@ -285,6 +285,7 @@ class ToolRegistry:
                 rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
                 rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),
                 rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
+                matryoshka_dim=getattr(self.config, "rag_matryoshka_dim", 512),
                 pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
                 # OvisOCR3 + docling 动态倍率（2026-10 审查修复：此前漏转发，
                 # agent 侧 ingest 用模块默认值，配置窗口里的自定义模型路径与
