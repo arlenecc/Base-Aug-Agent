@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
     QStatusBar, QFileDialog, QCheckBox, QScrollArea, QGroupBox,
-    QRadioButton, QFrame, QButtonGroup, QSpinBox,
+    QRadioButton, QFrame, QSpinBox,
 )
 
 from ..agent import Agent, AgentCallbacks
@@ -61,8 +61,8 @@ DEFAULT_MAIN_MODEL_PATH = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
 DEFAULT_AUX_MODEL_PATH = "models/Qwen3.5-2B-MLX-4bit"
 # PDF 解析引擎三选一（docling / marker / OvisOCR3 第三方案）。
 PDF_ENGINES = (
-    ("docling", "docling"),
-    ("marker", "marker"),
+    ("Docling", "docling"),
+    ("Marker", "marker"),
     ("OvisOCR3", "ovis"),
 )
 # 各引擎单选钮的悬停说明（横排常显，tooltip 补充细节）。
@@ -87,21 +87,22 @@ AUTOLOAD_SKIP_ENV = "BASE_AGENT_SKIP_MODEL_AUTOLOAD"
 
 
 def _select_pdf_engine_radio(window, value: str) -> None:
-    """按引擎配置值勾选横排单选钮；未知值回落 docling（默认）。"""
-    radios = getattr(window, "pdf_engine_radios", None) or {}
-    target = value if value in radios else "docling"
-    for v, rb in radios.items():
-        rb.setChecked(v == target)
+    """按引擎配置值选中 PDF 引擎下拉项；未知值回落 docling（默认）。
+
+    2026-10-27 由横排单选钮改为下拉（节约该行宽度）；函数名保留。
+    """
+    combo = getattr(window, "pdf_engine_combo", None)
+    if combo is None:
+        return
+    _select_combo_backend(combo, value if value else "docling")
 
 
 def _checked_pdf_engine(window) -> str:
-    """读横排单选钮当前勾选的引擎配置值；全未勾选回落 docling。"""
-    radios = getattr(window, "pdf_engine_radios", None) or {}
-    for v in ("docling", "marker", "ovis"):
-        rb = radios.get(v)
-        if rb is not None and rb.isChecked():
-            return v
-    return "docling"
+    """读 PDF 引擎下拉当前选中项的配置值；空值回落 docling。"""
+    combo = getattr(window, "pdf_engine_combo", None)
+    if combo is None:
+        return "docling"
+    return _combo_backend_value(combo) or "docling"
 
 
 # 切片参数合法范围（与 UI QSpinBox 的 range 一致；QSpinBox 只防误触，
@@ -1395,18 +1396,18 @@ class MainWindow(QMainWindow):
             placeholderText="HuggingFace 模型名（如 nomic-ai/nomic-embed-text-v1.5-Q）")
         self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
         self.embedding_model_path_btn = QPushButton("选择")
-        # --- PDF 解析引擎（三选一横排单选）+ 自定义 OCR 模型 ---
-        # 单选钮而不是下拉：三个引擎是互斥三选一，横排常显比收起的下拉
-        # 更易发现（尤其 OvisOCR3 是新方案）。QButtonGroup 显式保证互斥
-        # （不依赖父控件相同的隐式自动互斥）。
-        self.pdf_engine_group = QButtonGroup(self)
-        self.pdf_engine_radios = {}
-        for _label, _value in PDF_ENGINES:
-            _rb = QRadioButton(_label)
-            _rb.setProperty("engine_value", _value)
-            _rb.setToolTip(_PDF_ENGINE_TIPS.get(_value, ""))
-            self.pdf_engine_group.addButton(_rb)
-            self.pdf_engine_radios[_value] = _rb
+        # --- PDF 解析引擎（下拉，2026-10-27 由横排单选改）+ 自定义 OCR 模型 ---
+        # 改下拉的原因：该行还挤着「自定义 OCR」整段（后端/路径/保存/测试），
+        # 三个单选钮 + 标签占掉 ~350px，下拉省出大半。引擎差异说明放进
+        # 下拉项 tooltip（_PDF_ENGINE_TIPS 逐项 setItemData 处理）。
+        self.pdf_engine_combo = QComboBox()
+        _fill_backend_combo(self.pdf_engine_combo, PDF_ENGINES)
+        for _value in PDF_ENGINES:
+            _idx = self.pdf_engine_combo.findData(_value[1])
+            if _idx >= 0:
+                self.pdf_engine_combo.setItemData(
+                    _idx, _PDF_ENGINE_TIPS.get(_value[1], ""),
+                    Qt.ItemDataRole.ToolTipRole)
         self.ocr_backend_combo = QComboBox()
         _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
         self.ocr_backend_combo.setToolTip(
@@ -1644,8 +1645,7 @@ class MainWindow(QMainWindow):
         engine_row = QHBoxLayout()
         engine_row.setSpacing(8)
         engine_row.addWidget(QLabel("PDF 解析引擎"))
-        for _value in ("docling", "marker", "ovis"):
-            engine_row.addWidget(self.pdf_engine_radios[_value])
+        engine_row.addWidget(self.pdf_engine_combo)
         engine_row.addStretch(1)
         engine_row.addWidget(QLabel("自定义 OCR"))
         engine_row.addWidget(self.ocr_backend_combo)

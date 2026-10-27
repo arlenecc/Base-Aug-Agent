@@ -17,6 +17,10 @@ sys.path.insert(0, str(SRC))
 # 变成分钟级，而且 CI 上多半没有对应的 MLX/llama.cpp 运行时。
 # MainWindow._autoload_default_models 读这个变量决定是否跳过。
 os.environ.setdefault("BASE_AGENT_SKIP_MODEL_AUTOLOAD", "1")
+# web_scan 的本机 Playwright 渲染在测试里禁用：小 HTML 夹具会触发渲染路径，
+# 真去启动 chromium 访问 fixture URL（example.com 等）既慢又不可复现。
+# 渲染行为由 test_web_scan_render_* 单测显式 monkeypatch 验证。
+os.environ.setdefault("BASE_AGENT_SKIP_WEB_RENDER", "1")
 
 
 # ---------------------------------------------------------------------------

@@ -889,3 +889,163 @@ def test_code_run_leaked_thread_does_not_hijack_stdout(config):
         reg.execute("code_run", {"code": "_cancelled()", "timeout": 5})
         _time.sleep(0.05)
     reg.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# web_scan 本机 Playwright 渲染回退 + 动态页判定（2026-10-27）
+# ---------------------------------------------------------------------------
+
+def test_web_scan_local_playwright_fallback(config, monkeypatch):
+    """无 bridge + 本机 playwright：小空壳页应走本地渲染拿正文。"""
+    from agent.tools.web import WebScanTool
+
+    shell = '<html><head><title>SPA</title></head><body><div id="root"></div></body></html>'
+    _install_ws_routes(monkeypatch, {"local.example.com": (shell, "text/html")})
+    called = {}
+
+    def _fake_local(self, url):
+        called["url"] = url
+        return {"title": "SPA", "text": "本地渲染出的正文" + "y" * 300, "iframes": []}
+
+    monkeypatch.setattr(WebScanTool, "_render_local", _fake_local)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://local.example.com"})
+    assert called.get("url") == "https://local.example.com"
+    assert "本地渲染出的正文" in res.output
+
+
+def test_web_scan_dynamic_hint_triggers_render(config, monkeypatch):
+    """静态文本不少但命中 AJAX/CMS 过滤特征 → 也应渲染（applytoeducation 场景）。
+
+    旧逻辑只看总长度（<200 才渲染）：搜索页静态 HTML 有几千字符导航/营销
+    文本，正文列表靠 JS 拉取——被误判为「静态已够」后一个职位都拿不到。
+    """
+    from agent.tools.web import WebScanTool
+
+    body = "<p>导航菜单项</p>" * 50          # ~450 字符，旧阈值 200 之上
+    shell = ('<html><head><title>搜索页</title></head><body>'
+             '<script>$.ajax({url: "/api/list"});</script>' + body + "</body></html>")
+    _install_ws_routes(monkeypatch, {"app.example.com": (shell, "text/html")})
+    called = {}
+
+    def _fake_local(self, url):
+        called["url"] = url
+        return {"title": "", "text": "真正的职位列表数据" * 100, "iframes": []}
+
+    monkeypatch.setattr(WebScanTool, "_render_local", _fake_local)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://app.example.com"})
+    assert called.get("url") == "https://app.example.com"
+    assert "真正的职位列表数据" in res.output
+
+
+def test_web_scan_render_skip_env(monkeypatch):
+    """BASE_AGENT_SKIP_WEB_RENDER=1（测试/CI）：_render_local 绝不启动浏览器。"""
+    from agent.config import AgentConfig
+    from agent.tools.web import WebScanTool
+
+    monkeypatch.setenv("BASE_AGENT_SKIP_WEB_RENDER", "1")
+    tool = WebScanTool()
+    tool.bind(AgentConfig(), None)
+    assert tool._render_local("https://anything.example.com") is None
+
+
+def test_web_scan_browser_user_agent(config):
+    """默认 UA 是浏览器 UA：base-agent/0.1 会被一部分 WAF 直接 403。"""
+    from agent.tools.web import WebScanTool, _BROWSER_UA
+
+    tool = WebScanTool()
+    tool.bind(config, None)
+    # 直接断言 bind 后客户端的头
+    assert tool._http.headers.get("User-Agent") == _BROWSER_UA
+
+
+def test_find_system_browser_env_override(monkeypatch, tmp_path):
+    """BASE_AGENT_BROWSER_BIN 显式指定的浏览器优先（且结果进程内缓存）。"""
+    from agent.tools import web as web_mod
+
+    fake = tmp_path / "fake-browser"
+    fake.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(web_mod, "_BROWSER_DISCOVERY", None)   # 清缓存
+    monkeypatch.setenv("BASE_AGENT_BROWSER_BIN", str(fake))
+    assert web_mod._find_system_browser() == str(fake)
+    # 缓存生效：把文件删了再查仍返回缓存值
+    fake.unlink()
+    assert web_mod._find_system_browser() == str(fake)
+    monkeypatch.setattr(web_mod, "_BROWSER_DISCOVERY", None)
+
+
+def test_find_system_browser_returns_none_when_absent(monkeypatch):
+    """什么浏览器都没有 → None（web_scan 退回静态策略，不报错）。"""
+    from agent.tools import web as web_mod
+
+    monkeypatch.setattr(web_mod, "_BROWSER_DISCOVERY", None)
+    monkeypatch.delenv("BASE_AGENT_BROWSER_BIN", raising=False)
+    monkeypatch.setattr(web_mod.shutil, "which", lambda _: None)
+    monkeypatch.setattr(web_mod.os.path, "isfile", lambda _: False)
+    assert web_mod._find_system_browser() is None
+
+
+# ---------------------------------------------------------------------------
+# web_scan AJAX 端点发现与直取（零依赖动态数据，2026-10-27）
+# ---------------------------------------------------------------------------
+
+def test_web_scan_ajax_endpoint_discovery(config, monkeypatch):
+    """空壳页 + 同源 JS 里的 /api/ 端点：应二次扫描并直取 JSON 数据。"""
+    shell = ('<html><head><title>app</title>'
+             '<script src="/js/app.min.js"></script>'
+             '<script src="https://cdn.example.com/lib.js"></script>'
+             '</head><body><div id="root"></div></body></html>')
+    app_js = ('(function(){var u="/api/v1/jobs";$.ajax({url:u});'
+              'var t="/api/v1/build/{id}";})()')   # 模板串必须被跳过
+    routes = {
+        # 具体键在前：_match 按插入顺序匹配，宽键 app.example.com 会挡住 JS/JSON
+        "app.example.com/js/app.min.js": (app_js, "application/javascript"),
+        "app.example.com/api/v1/jobs": ('{"items":[{"title":"教师岗"}],"total":42}',
+                                        "application/json"),
+        "app.example.com": (shell, "text/html"),
+    }
+    _install_ws_routes(monkeypatch, routes)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://app.example.com/list"})
+    assert res.success
+    assert "AJAX 数据" in res.output
+    assert "教师岗" in res.output
+    assert '"total": 42' in res.output
+
+
+def test_web_scan_ajax_skips_empty_and_cross_origin(config, monkeypatch):
+    """空结构（全 null 壳）不算命中；跨域端点不直取。"""
+    shell = ('<html><body><div id="root"></div>'
+             '<script src="/js/app.js"></script></body></html>')
+    app_js = ('var a="/api/empty";var b="https://other.example.com/api/steal";'
+              'var c="/api/err";')
+    routes = {
+        "app.example.com/js/app.js": (app_js, "application/javascript"),
+        "app.example.com/api/empty": ('{"Results":null,"Count":null}', "application/json"),
+        "app.example.com/api/err": ('{"ErrorId":"x"}', "application/json"),
+        "app.example.com": (shell, "text/html"),
+    }
+    _install_ws_routes(monkeypatch, routes)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://app.example.com/"})
+    assert res.success
+    assert "AJAX 数据" not in res.output  # 无实质命中则不输出该段
+
+
+def test_web_scan_diagnostics_report_environment(config, monkeypatch):
+    """渲染不可用时的诊断要报告本机浏览器与 playwright 检测结果（agent 降级依据）。"""
+    from agent.tools.web import WebScanTool
+
+    shell = '<html><head><title>壳</title></head><body><div id="root"></div></body></html>'
+    _install_ws_routes(monkeypatch, {"env.example.com": (shell, "text/html")})
+
+    def _none(self, url):
+        return None
+
+    monkeypatch.setattr(WebScanTool, "_render_local", _none)
+    reg = _reg(config)
+    res = reg.execute("web_scan", {"url": "https://env.example.com"})
+    out = res.output or ""
+    assert "本机浏览器" in out or "Chromium" in out   # 浏览器探测结果
+    assert "playwright" in out                        # playwright 探测结果
