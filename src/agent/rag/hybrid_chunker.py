@@ -201,6 +201,10 @@ def _semantic_split(section: str, chunk_size: int, embedding_function) -> Option
             min_chunk_size=1,  # no merging here; done globally after
             overlap_percent=0.0,
             embedding_function=embedding_function,
+            # 子片阶段保持语义边界、不向 chunk_size 填充——填充统一在
+            # hybrid_chunk_text 第 3 步的全局 _merge_to_target_size 做，
+            # 否则两阶段设计（先语义断句、后按用户设置合拢）失效。
+            fill_to_chunk_size=False,
         )
     except Exception as e:
         logger.warning("semantic split failed, falling back to paragraphs: %s", e)

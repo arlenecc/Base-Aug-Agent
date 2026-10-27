@@ -1135,6 +1135,113 @@ class ONNXReranker:
             self._tokenizer = None
 
 
+def _rerank_llama_cls():
+    """构造 ``llama_cpp.Llama`` 子类，强制 tokenize 默认 special=True。
+
+    基类 ``embed()`` 内部用 ``self.tokenize(text)`` 分词，基类默认
+    ``special=False``——文本里的 "</s>" 会被切成字面字符而不是真实 SEP
+    token，rerank 分数就废了。**必须子类化**（而不是组合 + __getattr__
+    委托）：embed 是基类方法，里面的 ``self.tokenize`` 只会解析到实例
+    真实类型的方法链，委托包装器拦不到它。
+    """
+    import llama_cpp
+
+    class _RerankLlama(llama_cpp.Llama):
+        def tokenize(self, text, add_bos=True, special=True):
+            return super().tokenize(text, add_bos=add_bos, special=special)
+
+    return _RerankLlama
+
+
+class GGUFReranker:
+    """GGUF 交叉编码器 reranker（llama.cpp RANK 池化，经 llama-cpp-python）。
+
+    输入格式遵循 llama.cpp server rerank 端点约定：``query + sep + doc``。
+    分隔符优先读 GGUF 元数据 ``tokenizer.ggml.separation_token(_id)``
+    （bge-reranker 系 GGUF 为 </s>），缺失时回退 </s>（XLMRoberta 系）。
+    ``embed()`` 在 RANK 池化下每条序列输出分类头分数——**原始 logit**，
+    与 ONNX/MLX 路径语义一致，由 vector_store 的 _logit_to_score 做
+    sigmoid 归一化到 [0,1]。
+    """
+
+    def __init__(self, model_path: str, *, threads: int = 4,
+                 max_length: int = _RERANK_DEFAULT_MAX_LENGTH,
+                 batch_size: int = 16):
+        try:
+            import llama_cpp
+        except ImportError as e:
+            raise RuntimeError(
+                "GGUF Reranker 需要 llama-cpp-python：pip install llama-cpp-python"
+            ) from e
+        if not hasattr(llama_cpp, "LLAMA_POOLING_TYPE_RANK"):
+            raise RuntimeError(
+                "llama-cpp-python 版本过旧（无 LLAMA_POOLING_TYPE_RANK），"
+                "请升级后重试"
+            )
+        self._max_length = max(8, int(max_length))
+        self._batch_size = max(1, int(batch_size))
+        self._lock = threading.RLock()
+        # rerank 输入 = query + sep + doc（单片 ≤ 千余字符），上下文开到
+        # min(max_length, 4096) 足够；n_batch 必须同步给足，否则 embed()
+        # 的 truncate 会把输入截到 512 token（n_batch 默认值）。
+        n_ctx = min(self._max_length, 4096)
+        self._llm = _rerank_llama_cls()(
+            model_path=model_path,
+            embedding=True,
+            pooling_type=llama_cpp.LLAMA_POOLING_TYPE_RANK,
+            n_ctx=n_ctx,
+            n_batch=n_ctx,
+            n_threads=max(1, int(threads)),
+            verbose=False,
+        )
+        self._sep = self._sep_from_metadata()
+        logger.info(
+            "GGUF Reranker 加载完成: %s (sep=%r, n_ctx=%d)", model_path, self._sep, n_ctx
+        )
+
+    def _sep_from_metadata(self) -> str:
+        """从 GGUF 元数据解析分隔符；bge 系 GGUF 带 </s>（XLMRoberta SEP）。"""
+        meta = getattr(self._llm, "metadata", None) or {}
+        text = meta.get("tokenizer.ggml.separation_token")
+        if text:
+            return str(text)
+        sep_id = meta.get("tokenizer.ggml.separation_token_id")
+        if sep_id is not None and str(sep_id).strip().lstrip("-").isdigit():
+            try:
+                piece = self._llm.detokenize([int(sep_id)])
+                if piece:
+                    return piece.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        return "</s>"
+
+    def rerank(self, query: str, documents: Iterable[str],
+               batch_size: int = 16, **kwargs) -> List[float]:
+        docs = list(documents)
+        size = max(1, int(batch_size or self._batch_size))
+        scores: List[float] = []
+        with self._lock:
+            for start in range(0, len(docs), size):
+                batch = [
+                    f"{query}{self._sep}{doc}" for doc in docs[start:start + size]
+                ]
+                embeddings = self._llm.embed(batch)
+                for emb in embeddings:
+                    # RANK 池化：每条序列输出 [score]（单元素向量）
+                    scores.append(float(emb[0] if isinstance(emb, list) else emb))
+        return scores
+
+    def close(self) -> None:
+        with self._lock:
+            llm = getattr(self, "_llm", None)
+            if llm is not None:
+                try:
+                    llm.close()
+                except Exception:
+                    pass
+            self._llm = None
+
+
 class FastEmbedReranker:
     def __init__(self, model_name: str, *, threads: int = 4):
         try:
@@ -1236,6 +1343,11 @@ def create_reranker_backend(
         return None
     if backend == "onnx":
         return ONNXReranker(model_path, threads=threads, max_length=max_length)
+    if backend == "gguf":
+        # GGUF 交叉编码器（llama.cpp RANK 池化）：模型文件是单 .gguf，与
+        # ONNX 共用 rag_rerank_model_path 字段（UI 路径框同一个）。
+        return GGUFReranker(model_path, threads=threads, max_length=max_length,
+                            batch_size=batch_size)
     if backend == "jina":
         # jina-reranker-v2-base-multilingual 的 INT8 ONNX 导出，强制 CPU，与
         # bge ONNX 共用 ONNXReranker（按目录自动找 model_quantized.onnx + tokenizer）。

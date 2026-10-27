@@ -275,6 +275,7 @@ class ToolRegistry:
                 embedding_max_length=getattr(self.config, "rag_embedding_max_length", 8192),
                 chunk_size=getattr(self.config, "rag_chunk_size", 500),
                 chunk_overlap=getattr(self.config, "rag_chunk_overlap", 50),
+                semantic_chunking=getattr(self.config, "rag_semantic_chunking", True),
                 rerank_model=getattr(self.config, "rag_rerank_model", "BAAI/bge-reranker-v2-m3-int8"),
                 rerank_backend=getattr(self.config, "rag_rerank_backend", "fastembed"),
                 rerank_model_path=getattr(self.config, "rag_rerank_model_path", ""),

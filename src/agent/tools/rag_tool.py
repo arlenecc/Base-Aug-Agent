@@ -37,7 +37,7 @@ class RagSearchTool(Tool):
             },
             "top_k": {
                 "type": "integer",
-                "description": "返回结果数，默认 3，上限 5。",
+                "description": "返回结果数；不传则用设置面板配置的 TopN，上限同为 TopN。",
             },
             "source": {
                 "type": "string",
@@ -60,7 +60,8 @@ class RagSearchTool(Tool):
         # _condense_with_aux 里 getattr(self, "_config", None) 落到常量兜底。
         self._config = config
 
-    def run(self, query: str = "", top_k: int = 3, source: str = "") -> ToolResult:
+    def run(self, query: str = "", top_k: Optional[int] = None,
+            source: str = "") -> ToolResult:
         # 模型可能传 null（JSON null → None），None.strip() 会抛异常并被
         # registry 兜底误报成 "Invalid arguments"，模型会原样重试。这里统一
         # 归一化成空串再判断。
@@ -68,15 +69,23 @@ class RagSearchTool(Tool):
         if not query:
             return ToolResult(success=False, error="请提供搜索查询词")
 
-        # 限制 top_k 上限：候选数 = top_k × 4 × 2 路，全量送 reranker 精排。
-        # 默认 jina(ONNX/CPU) 实测 ~49 对/s：top_k=5 → 40 对 ≈ 0.8s，可接受；
-        # 旧默认逐对串行的 bge INT8 ~0.55s/对（#132）时 40 对要 23s，当时因此
-        # 封顶 3——换 jina 后放宽到 5。
+        # TopN（设置面板 Reranker 行）：精排后选取的结果数。模型不传 top_k
+        # 时用它做默认值，传了则夹紧到 [1, TopN]——TopN 是用户显式配置的
+        # 「reranker 之后选取的结果数量」上限。候选数 = top_k × 4 × 2 路，
+        # 全量送 reranker 精排（jina ~49 对/s：TopN=3 ≈ 0.5s，TopN=8 ≈ 1.3s）。
+        # 旧实现硬限 [1,5]：TopN 是配置项后不能再写死。
+        try:
+            top_n = max(1, int(getattr(
+                getattr(self, "_config", None), "rag_rerank_top_n", 3)))
+        except (TypeError, ValueError):
+            top_n = 3
+        if top_k is None:
+            top_k = top_n
         try:
             top_k = int(top_k)
         except (TypeError, ValueError):
-            top_k = 3
-        top_k = max(1, min(top_k, 5))
+            top_k = top_n
+        top_k = max(1, min(top_k, top_n))
 
         source = (source or "").strip()
         logger.info(

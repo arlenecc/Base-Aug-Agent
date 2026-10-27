@@ -691,6 +691,11 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 self.model_path,
                 lazy=False,
                 trust_remote_code=False,
+                # qwen3.5 系列 tokenizer 自带 Mistral 式预切分正则缺陷
+                # （transformers 5.x 加载时告警 "incorrect regex pattern"
+                # 并建议传 fix_mistral_regex=True）。该标志只在检测到该
+                # 正则时生效，其它模型不受影响——始终传，避免分词偏差。
+                tokenizer_config={"fix_mistral_regex": True},
             )
             logger.info("MLX-LM 加载完成: %s", self.model_path)
 
@@ -982,9 +987,12 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 # （quantized_kv_start=0）——agent 上下文常 <5000 token，用默认
                 # 起点(5000)会完全不量化而达不到省内存目的。仅对支持量化的缓存层
                 # 生效，不支持的架构由 mlx_lm 自动跳过，不会报错。
-                gen_kwargs["kv_bits"] = 8
-                gen_kwargs["kv_group_size"] = 64
-                gen_kwargs["quantized_kv_start"] = 0
+                # config.llama_cpp_kv_q8（辅助模型 aux_llama_cpp_kv_q8 经
+                # _AuxConfigView 映射）可关（设置面板「KV量化」点选框）。
+                if bool(getattr(self.config, "llama_cpp_kv_q8", True)):
+                    gen_kwargs["kv_bits"] = 8
+                    gen_kwargs["kv_group_size"] = 64
+                    gen_kwargs["quantized_kv_start"] = 0
                 # 投机解码：草稿模型 = 已加载的辅助模型（同词表，无需额外加载）。
                 # 注意：mlx_lm 要求 prompt cache 可裁剪才允许投机解码，而 qwen3.5
                 # 的 ArraysCache 不可裁剪 → 传 prompt_cache 时必须关掉，否则
@@ -1567,6 +1575,9 @@ class LlamaCppBackend(_LazyLocalBackend):
             16 * 1024 * 1024,
             int(getattr(config, "llama_cpp_kv_cache_mb", 512)) * 1024 * 1024,
         )
+        # KV cache 量化到 int8（config.llama_cpp_kv_q8，设置面板「KV量化」）：
+        # 旧版硬编码 Q8_0，现改为可配置；关闭时保持 llama.cpp 默认 f16。
+        self._kv_q8 = bool(getattr(config, "llama_cpp_kv_q8", True))
         self._kv_cache = None  # 当前挂到 Llama 上的 LlamaCache（失效时换新的）
 
     @property
@@ -1625,8 +1636,11 @@ class LlamaCppBackend(_LazyLocalBackend):
                 chat_handler=self._chat_handler(),
                 verbose=False,
                 # KV cache int8 量化（省显存）：默认 f16 → q8_0，KV 显存减半。
-                type_k=llama_cpp.GGML_TYPE_Q8_0,
-                type_v=llama_cpp.GGML_TYPE_Q8_0,
+                # config.llama_cpp_kv_q8 可关（设置面板「KV量化」点选框）。
+                type_k=(llama_cpp.GGML_TYPE_Q8_0 if self._kv_q8
+                        else llama_cpp.GGML_TYPE_F16),
+                type_v=(llama_cpp.GGML_TYPE_Q8_0 if self._kv_q8
+                        else llama_cpp.GGML_TYPE_F16),
             )
             if self._kv_cache_enabled:
                 self._attach_kv_cache()
@@ -1816,6 +1830,11 @@ class _AuxConfigView:
         # 思考模式：不登记的话辅助模型会经 __getattr__ 回落到主模型的
         # llm_enable_thinking，UI 上辅助模型的开关就成了摆设。
         "llm_enable_thinking": "aux_llm_enable_thinking",
+        # KV cache 开关（2026-10-27）：不登记的话辅助 GGUF 的复用/量化开关
+        # 会回落到主模型字段，辅助 MLX 读 llama_cpp_kv_q8 同理——UI 上辅助
+        # 模型自己的「KV复用」「KV量化」就成了摆设。
+        "llama_cpp_kv_cache": "aux_llama_cpp_kv_cache",
+        "llama_cpp_kv_q8": "aux_llama_cpp_kv_q8",
         # GGUF VLM 的 mmproj / chat format / handler（见 LlamaCppBackend）。
         "llm_vision_projection_path": "aux_llm_vision_projection_path",
         "llm_onnx_tokenizer_path": "aux_llm_onnx_tokenizer_path",

@@ -129,7 +129,8 @@ def test_chunk_documents_falls_back_when_chonkie_missing(monkeypatch, topic_ef):
     # Force both hybrid and semantic chunking to be unavailable -> recursive.
     monkeypatch.setattr(
         ch, "_chunk_with_hybrid_fallback",
-        lambda text, cs, co, mn, op, embedding_function=None: ch.chunk_text(text, cs, co),
+        lambda text, cs, co, mn, op, embedding_function=None, use_semantic=True:
+            ch.chunk_text(text, cs, co),
     )
     docs = [{"source": "doc.md", "text": "这是测试内容。" * 200}]
     chunks = chunk_documents(docs, chunk_size=800, chunk_overlap=50)
@@ -179,7 +180,12 @@ def test_semantic_chunk_prefers_static_embeddings(monkeypatch):
     monkeypatch.setattr(sc, "_get_static_embeddings", lambda: sentinel)
     out = sc.semantic_chunk_text("这是一个测试句子。这也是另一个测试句子，主题相近。")
     assert out is not None
-    assert seen["embedding_model"] is sentinel
+    # SemanticChunker 收到的是「字符制 tokenizer 包装器」，其内层才是静态嵌入——
+    # 包装器把 chonkie 的 chunk_size 计量统一到 estimate_tokens（字符制），
+    # 否则 potion 词表 token 数与字符数脱钩，用户设置的切片大小被静默缩水。
+    wrapped = seen["embedding_model"]
+    assert isinstance(wrapped, sc._CharTokenEmbeddings)
+    assert wrapped._inner is sentinel
 
 
 @pytest.mark.skipif(not _is_chonkie_installed(), reason="chonkie not installed")

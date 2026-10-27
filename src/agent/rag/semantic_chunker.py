@@ -59,10 +59,11 @@ def _is_chonkie_available() -> bool:
 def semantic_chunk_text(
     text: str,
     chunk_size: int = 800,
-    chunk_overlap: int = 80,
+    chunk_overlap: Optional[int] = None,
     min_chunk_size: int = 100,
     overlap_percent: float = 0.10,
     embedding_function=None,
+    fill_to_chunk_size: bool = True,
 ) -> Optional[List[str]]:
     """Split ``text`` into semantic chunks using chonkie's SemanticChunker.
 
@@ -70,8 +71,8 @@ def semantic_chunk_text(
         text: The text to split.
         chunk_size: Target maximum chunk size in **tokens** (800).
         chunk_overlap: Overlap between consecutive chunks in **tokens**.
-            Defaults to 10% of ``chunk_size`` (80).  When ``overlap_percent``
-            is set, ``int(chunk_size * overlap_percent)`` overrides this.
+            显式提供时**优先**生效（含 0 = 不重叠）；未提供/为 0 时回退
+            ``int(chunk_size * overlap_percent)``。
         min_chunk_size: Target minimum chunk size in **tokens** (100). Chunks
             smaller than this are greedily merged into their neighbours.
         overlap_percent: Fraction of ``chunk_size`` used as overlap (0.10 =>
@@ -113,8 +114,10 @@ def semantic_chunk_text(
         # the isinstance check in SemanticChunker.__init__ will pass.  When it
         # fell back to ``object``, chonkie can't be imported anyway (handled
         # above by _is_chonkie_available), so this branch is defensive only.
+        # 统一 token 计量（见 _CharTokenEmbeddings）：无论嵌入后端是谁，
+        # chonkie 的 chunk_size 必须按 estimate_tokens（字符制）理解。
         chunker = SemanticChunker(
-            embedding_model=embeddings,
+            embedding_model=_CharTokenEmbeddings(embeddings),
             threshold=0.7,          # lower => larger, more coherent groups
             chunk_size=chunk_size,  # hard ceiling in tokens
             min_sentences_per_chunk=2,
@@ -125,7 +128,8 @@ def semantic_chunk_text(
         result = [c.text.strip() for c in chunks if c.text.strip()]
         # 传入原文 text，合并/重叠时用「源码里真实的间隔」拼接，保证产出的
         # chunk 一定是原文的连续子串（见 _gap_between）。
-        merged = _merge_to_target_size(result, chunk_size, min_chunk_size, source=text)
+        merged = _merge_to_target_size(result, chunk_size, min_chunk_size, source=text,
+                                       fill_to_chunk_size=fill_to_chunk_size)
         return _apply_overlap(
             merged, chunk_size, chunk_overlap, overlap_percent, source=text,
         )
@@ -142,15 +146,26 @@ def _merge_to_target_size(
     chunk_size: int,
     min_chunk_size: int,
     source: Optional[str] = None,
+    fill_to_chunk_size: bool = True,
 ) -> List[str]:
     """Greedily merge adjacent chunks toward the [min, max] token target.
 
     SemanticChunker splits on *semantic* boundaries, so chunks can be smaller
     than the target when a document has many short, topically-distinct
     sentences.  We merge adjacent chunks (which are already topically
-    contiguous, since semantic splitting only cuts at low-similarity points)
-    until each reaches ``min_chunk_size`` tokens, without exceeding
-    ``chunk_size``.
+    contiguous, since semantic splitting only cuts at low-similarity points).
+
+    合并策略（2026-10-27 修订）：
+
+    * ``fill_to_chunk_size=True``（全局合并阶段）：只要并入下一片不超
+      ``chunk_size`` 就持续合并——切片大小是用户在设置面板显式配置的，
+      语义边界只决定「从哪里断」，不决定「切多碎」。旧实现只把 < 
+      ``min_chunk_size`` 的碎片并到 100 字就停，样板重复文本（相似度曲线
+      常数化，chonkie 逐边界产生局部极小值）会产出大量 ~150 字碎片，
+      用户设 1200 也照样切短。
+    * ``fill_to_chunk_size=False``（hybrid 的 ``_semantic_split`` 内部阶段）：
+      保持旧行为，只并 ``< min_chunk_size`` 的碎片（那里 min_chunk_size=1，
+      等于不合并）——语义切分的子片要先保持边界，全局阶段再统一填充。
     """
     from .chunker import estimate_tokens
 
@@ -161,8 +176,10 @@ def _merge_to_target_size(
     current = chunks[0]
 
     for nxt in chunks[1:]:
-        if estimate_tokens(current) < min_chunk_size and \
-                estimate_tokens(current) + estimate_tokens(nxt) <= chunk_size:
+        cur_tokens = estimate_tokens(current)
+        if cur_tokens < min_chunk_size or (
+                fill_to_chunk_size
+                and cur_tokens + estimate_tokens(nxt) <= chunk_size):
             current = current + _gap_between(source, current, nxt) + nxt
         else:
             merged.append(current)
@@ -186,15 +203,23 @@ def _apply_overlap(
     never split a sentence mid-way — so that retrieval across a boundary still
     sees the surrounding sentences.
 
-    The overlap size is ``int(chunk_size * overlap_percent)`` when
-    ``overlap_percent`` is set, otherwise the explicit ``chunk_overlap``.
+    The overlap size is the explicit ``chunk_overlap`` when it is set;
+    otherwise it falls back to ``int(chunk_size * overlap_percent)``.
+
+    优先级（2026-10-27 修订）：显式 ``chunk_overlap`` **优先**于
+    ``overlap_percent``（含 0 = 明确不要重叠）。旧实现 percent 优先——
+    用户在设置面板把 overlap 设 0（明确不要重叠）时，仍被强加
+    10% × chunk_size 的重叠，切片总量膨胀近 2×（实测 2900 字文本拼接出
+    5684 字）。engine 每次都会把 config.rag_chunk_overlap 显式传下来，
+    percent 只在 ``chunk_overlap is None`` 时兜底。
     """
     from .chunker import estimate_tokens
 
     if len(chunks) <= 1:
         return chunks
 
-    overlap = int(chunk_size * overlap_percent) if overlap_percent else chunk_overlap
+    overlap = (chunk_overlap if chunk_overlap is not None
+               else int(chunk_size * overlap_percent))
     if overlap <= 0:
         return chunks
 
@@ -297,6 +322,43 @@ def _get_static_embeddings():
 # ---------------------------------------------------------------------------
 # chonkie embedding adapter
 # ---------------------------------------------------------------------------
+
+class _CharTokenEmbeddings(_BaseEmbeddings):
+    """包装任意嵌入后端，仅把 chonkie 的 token 计量统一到 ``estimate_tokens``。
+
+    **为什么必须**：chonkie 的 ``chunk_size`` 上限按「嵌入后端
+    ``get_tokenizer()`` 返回的 tokenizer」数 token。显式注入的 EF 走
+    ``_ChonkieEmbeddingAdapter``（get_tokenizer 已返回 estimate_tokens，
+    字符制）没问题；但生产路径的 model2vec 静态嵌入自带 potion 词表
+    tokenizer——中文在它词表里严重碎片化，实测 2900 字文本被它数成远超
+    2900 的 token，用户在设置面板配置的 chunk_size=1200 被静默缩水成
+    ~230 字的碎片（「某些环节把长分片切短」的实锤来源）。
+
+    这里只重写 ``get_tokenizer``，embed/similarity 全部委托内部后端，
+    切片决策的嵌入空间不受影响。
+    """
+
+    def __init__(self, inner):
+        super().__init__()
+        self._inner = inner
+
+    # -- token 计量：统一字符制 ---------------------------------------------
+    def get_tokenizer(self) -> Any:
+        return estimate_tokens
+
+    # -- 其余全部委托内部后端 -------------------------------------------------
+    def embed(self, text: str):
+        return self._inner.embed(text)
+
+    def embed_batch(self, texts: List[str]):
+        return self._inner.embed_batch(texts)
+
+    def similarity(self, u, v) -> float:
+        return self._inner.similarity(u, v)
+
+    @property
+    def dimension(self) -> int:
+        return self._inner.dimension
 
 class _ChonkieEmbeddingAdapter(_BaseEmbeddings):
     """Adapt a FastEmbed embedding function to chonkie's BaseEmbeddings interface.

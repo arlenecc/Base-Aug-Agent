@@ -578,6 +578,7 @@ class RAGEngine:
         chunk_overlap: int = 80,
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
+        semantic_chunking: bool = True,
         # 默认用 INT8 量化版 bge-reranker-v2-m3（~570MB，多语种/中文精排）。
         # 旧默认 "BAAI/bge-reranker-base" 是 fp32 ~1.04GB 且非量化——两个真实
         # 调用点（tools/base.py、ui/main_window.py）都不传 rerank_model，
@@ -624,6 +625,8 @@ class RAGEngine:
         self._chunk_overlap = chunk_overlap
         self._min_chunk_size = min_chunk_size
         self._overlap_percent = overlap_percent
+        # 语义切片开关（config.rag_semantic_chunking）：关 = 直接字符递归切片
+        self._semantic_chunking = bool(semantic_chunking)
         self._rerank_model = rerank_model
         self._rerank_backend = rerank_backend
         self._rerank_model_path = rerank_model_path
@@ -1317,6 +1320,7 @@ class RAGEngine:
                                         chunk_overlap=self._chunk_overlap,
                                         min_chunk_size=self._min_chunk_size,
                                         overlap_percent=self._overlap_percent,
+                                        use_semantic=self._semantic_chunking,
                                         # 切片用 model2vec，不注入 nomic EF（避免争抢）
                                         embedding_function=None,
                                     )]
@@ -1350,6 +1354,7 @@ class RAGEngine:
                                     chunk_overlap=self._chunk_overlap,
                                     min_chunk_size=self._min_chunk_size,
                                     overlap_percent=self._overlap_percent,
+                                    use_semantic=self._semantic_chunking,
                                     # 语义切片强制走 model2vec 静态嵌入（不注入
                                     # 引擎的 nomic EF）：切片只需相邻相似度相对
                                     # 大小，不碰入库 embedding 用的 nomic 及其

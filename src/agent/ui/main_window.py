@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
     QMessageBox, QInputDialog, QPlainTextEdit, QProgressBar,
     QStatusBar, QFileDialog, QCheckBox, QScrollArea, QGroupBox,
-    QRadioButton, QFrame, QButtonGroup,
+    QRadioButton, QFrame, QButtonGroup, QSpinBox,
 )
 
 from ..agent import Agent, AgentCallbacks
@@ -102,6 +102,25 @@ def _checked_pdf_engine(window) -> str:
         if rb is not None and rb.isChecked():
             return v
     return "docling"
+
+
+# 切片参数合法范围（与 UI QSpinBox 的 range 一致；QSpinBox 只防误触，
+# 这里是 config/直改数值路径的最终防线）。
+_CHUNK_SIZE_MIN = 100
+_CHUNK_SIZE_MAX = 8192
+
+
+def _normalize_chunk_params(size: int, overlap: int) -> tuple:
+    """夹紧切片参数到合法组合，返回 (chunk_size, chunk_overlap)。
+
+    - size ∈ [100, 8192]：下限防止切片退化成碎片；上限防止单片超长把
+      嵌入/精排阶段的内存与注意力开销顶爆。
+    - 0 ≤ overlap ≤ size − 1：重叠 ≥ 切片大小会让滑窗切分不前进
+      （每个窗口回到同一位置），必须硬性排除。
+    """
+    size = max(_CHUNK_SIZE_MIN, min(int(size or 0), _CHUNK_SIZE_MAX))
+    overlap = max(0, min(int(overlap or 0), size - 1))
+    return size, overlap
 
 
 def _fill_backend_combo(combo: QComboBox, items) -> None:
@@ -1328,6 +1347,9 @@ class MainWindow(QMainWindow):
 
     # 采样参数行的规格：(标签, 基础属性名, 宽度, 兜底值)。前缀 "" = 主模型，
     # "aux_" = 辅助模型——两套控件同名不同前缀，处理逻辑可完全复用。
+    # 「超时(秒)」已从 UI 移除（2026-10-27 用户要求）：config 的
+    # request_timeout / aux_request_timeout 字段保留（后端运行时仍读取，
+    # 已保存的配置值不受影响），只是不再从面板编辑。
     _SAMPLING_SPECS = (
         ("context", "max_tokens_edit", 80, "32768"),
         ("Temp", "temp_edit", 60, "0.7"),
@@ -1335,12 +1357,16 @@ class MainWindow(QMainWindow):
         ("min_p", "min_p_edit", 60, "0.05"),
         ("top_k", "top_k_edit", 60, "20"),
         ("repeat-penalty", "repeat_penalty_edit", 60, "1.0"),
-        ("超时(秒)", "timeout_edit", 60, "120"),
     )
     # 思考模式开关的属性基础名（实际属性 = prefix + 本名，主模型 "" / 辅助
     # "aux_"）。它插在采样行「超时(秒)」之前，不是 _SAMPLING_SPECS 的成员
     # ——后者全是 QLineEdit，开关是 QCheckBox，由 _add_sampling_row 单独插入。
     _THINKING_CHECK_BASE = "enable_thinking_check"
+    # KV cache 开关的属性基础名（prefix + 本名）：复用 = 跨轮前缀复用
+    # （llama.cpp LlamaCache / MLX prompt cache），量化 = KV cache 量化到
+    # int8（llama.cpp type_k/type_v=Q8_0；MLX kv_bits=8）。
+    _KV_REUSE_CHECK_BASE = "kv_cache_check"
+    _KV_Q8_CHECK_BASE = "kv_q8_check"
 
     def _build_config_widgets(self, lay: QVBoxLayout) -> None:
         """构建配置区控件（现在住在独立配置窗口里）。
@@ -1406,11 +1432,58 @@ class MainWindow(QMainWindow):
         # 精排始终启用，没有 disabled 选项；要临时关掉靠配置文件的
         # rag_rerank_enabled=false（会退化为向量距离排序）。
         self.reranker_backend_combo = QComboBox()
-        _fill_backend_combo(self.reranker_backend_combo, RAG_BACKENDS[:3])
+        # fastembed/mlx/onnx 三个 UI 选项 + GGUF（llama.cpp RANK 池化，
+        # 2026-10-27 新增）。"jina" 是内部后端值（本质就是 ONNXReranker），
+        # 已由 config._migrate 并入 "onnx"，UI 不提供。
+        _fill_backend_combo(
+            self.reranker_backend_combo,
+            RAG_BACKENDS[:3] + (("GGUF", "gguf"),),
+        )
         self.reranker_model_edit = QLineEdit(
             placeholderText="HuggingFace 模型名（如 BAAI/bge-reranker-v2-m3-int8）")
         self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
         self.reranker_model_path_btn = QPushButton("选择")
+        # --- TopN：reranker 精排后选取的结果数（rag_search 的 top_k 上限/默认）---
+        self.rerank_topn_spin = QSpinBox()
+        self.rerank_topn_spin.setRange(1, 20)
+        self.rerank_topn_spin.setValue(int(getattr(self.config, "rag_rerank_top_n", 3)))
+        self.rerank_topn_spin.setToolTip(
+            "TopN：reranker 精排之后选取的结果数量\n"
+            "rag_search 的 top_k 以此为上限，模型不传时也用它做默认值。\n"
+            "候选池 = TopN × 4 × 2 路全量送精排，调大会线性增加检索耗时\n"
+            "（jina 精排 ~49 对/s：TopN=3 ≈ 0.5s，TopN=8 ≈ 1.3s）。"
+        )
+        # --- 切片参数（Row 4「参数设置」）：config.rag_chunk_size/_overlap ---
+        # 全链路唯一来源：config → SyncKnowledgeWorker/tools.base → RAGEngine →
+        # chunker（含 epub 章节直通上限 engine._max_chars）。字段已在
+        # config._INT_FIELDS（字符串/浮点 json 值自动纠正），save() 全量落盘。
+        self.chunk_size_spin = QSpinBox()
+        self.chunk_size_spin.setRange(100, 8192)
+        self.chunk_size_spin.setSingleStep(50)
+        self.chunk_size_spin.setSuffix(" 字符")
+        self.chunk_size_spin.setToolTip(
+            "每个文本切片的最大字符数（硬上限，所有切片环节统一使用：普通文档、\n"
+            "epub 章节直通判定、超长章节重切均以此为准，不存在某个环节另切更短）。\n"
+            "注意：切片超过当前 Embedding 模型的位置上限时会在模型层被截断\n"
+            "（如 bge-small-zh-v1.5 = 512 字符），建议不超过该值，或换长上下文模型。"
+        )
+        self.chunk_overlap_spin = QSpinBox()
+        self.chunk_overlap_spin.setRange(0, 4096)
+        self.chunk_overlap_spin.setSingleStep(10)
+        self.chunk_overlap_spin.setSuffix(" 字符")
+        self.chunk_overlap_spin.setToolTip(
+            "相邻切片的重叠字符数（默认取切片大小的 10%）。\n"
+            "会被自动夹紧到 < 切片大小（重叠 ≥ 切片会导致切分不前进）。"
+        )
+        # 语义切片开关（默认开）：关 = 跳过语义切片，直接句边界字符递归切片。
+        self.semantic_chunk_check = QCheckBox("语义切片")
+        self.semantic_chunk_check.setChecked(
+            bool(getattr(self.config, "rag_semantic_chunking", True)))
+        self.semantic_chunk_check.setToolTip(
+            "开：结构 + 语义混合切片（标题分段 + 相似度找语义边界）\n"
+            "关：不做语义切片，直接按句边界贪心打包到切片大小的字符递归切片\n"
+            "（不加载 model2vec 嵌入，更省内存，切片更满但边界不按语义）"
+        )
         # --- 目录 / 动作 ---
         self.workspace_edit = QLineEdit()
         self.workspace_btn = QPushButton("选择")
@@ -1457,16 +1530,9 @@ class MainWindow(QMainWindow):
             placeholder="本地主模型目录或 .onnx/.gguf 文件",
             path_value=self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH,
         )
-        # GGUF 专用：跨轮 KV / 前缀复用开关（对齐 MLX 后端行为）。仅主后端选
-        # GGUF 时可见，显隐由 _update_model_controls 控制。
-        self.llama_kv_cache_check = QCheckBox(
-            "GGUF 跨轮 KV 复用（复用不变的 system prompt 前缀，加快响应）")
-        self.llama_kv_cache_check.setToolTip(
-            "用 llama.cpp 的 KV 前缀缓存，在不随时间变化的 system prompt + 对话前缀上"
-            "复用 KV，每轮只 prefill 增量 token，省掉重复计算不变部分（长 system prompt"
-            "收益明显）。内存吃紧可关闭，或在配置里调小容量 llama_cpp_kv_cache_mb。"
-        )
-        local_lay.addWidget(self.llama_kv_cache_check)
+        # （旧「GGUF 跨轮 KV 复用」点选框已移除：由参数配置行里通用的
+        # 「KV复用」「KV量化」点选框取代——新开关同时覆盖 GGUF 与 MLX，
+        # 且主/辅助模型各有一份，不再限本地 GGUF 模式。）
         self._add_sampling_row(
             local_lay, "", self._main_sampling_defaults(),
             buttons=(
@@ -1602,6 +1668,13 @@ class MainWindow(QMainWindow):
         )
         self.ocr_test_btn.clicked.connect(self._on_ocr_test)
         engine_row.addWidget(self.ocr_test_btn)
+        self.convert_tool_btn = QPushButton("转换工具")
+        self.convert_tool_btn.setToolTip(
+            "弹出文件转 Markdown 工具窗口\n"
+            "选文件或目录批量转换成 .md 写入指定目录（不入知识库），"
+            "采用本面板的解析引擎与 OCR 设置")
+        self.convert_tool_btn.clicked.connect(self._on_convert_tool)
+        engine_row.addWidget(self.convert_tool_btn)
         kb_lay.addLayout(engine_row)
 
         # Row 1.7: 次级路径行（与主/辅助模型同一套交互）——仅 ONNX / GGUF 后端
@@ -1633,6 +1706,14 @@ class MainWindow(QMainWindow):
         emb_row.addWidget(self.embedding_path_label)
         emb_row.addWidget(self.embedding_model_path_edit, 3)
         emb_row.addWidget(self.embedding_model_path_btn)
+        # 切片参数（2026-10-27 用户要求并入 Embedding 行）：语义切片开关 +
+        # 切片大小/重叠——切片产物的嵌入就在本行配置的模型上，参数放一起
+        # 便于一起调。收集/回填/同步入口 gather 与「参数设置」独立行时一致。
+        emb_row.addWidget(self.semantic_chunk_check)
+        emb_row.addWidget(QLabel("切片大小"))
+        emb_row.addWidget(self.chunk_size_spin)
+        emb_row.addWidget(QLabel("重叠"))
+        emb_row.addWidget(self.chunk_overlap_spin)
         # 向量去重按钮：放在「同步知识」前面——它是同步前的库维护操作，
         # 扫描向量库按文本内容清理重复向量（保留入库最早的一份），降低
         # 检索噪声。点击后需确认（删除不可逆）。
@@ -1668,6 +1749,8 @@ class MainWindow(QMainWindow):
         rerank_row.addWidget(self.reranker_path_label)
         rerank_row.addWidget(self.reranker_model_path_edit, 3)
         rerank_row.addWidget(self.reranker_model_path_btn)
+        rerank_row.addWidget(QLabel("TopN"))
+        rerank_row.addWidget(self.rerank_topn_spin)
         # Stop-sync button: enabled only while a sync is running. Cancels
         # the ingest after the current file completes (cooperative cancel).
         self.stop_sync_btn = QPushButton("停止同步")
@@ -1689,9 +1772,11 @@ class MainWindow(QMainWindow):
             "min_p_edit": self.config.min_p,
             "top_k_edit": self.config.top_k,
             "repeat_penalty_edit": self.config.repetition_penalty,
-            "timeout_edit": self.config.request_timeout,
             # 思考模式：主模型默认开启（思考过程可见，利于复杂任务）。
             "enable_thinking_check": getattr(self.config, "llm_enable_thinking", True),
+            # KV cache 开关：主模型字段（GGUF/MLX 共读）。
+            "kv_cache_check": getattr(self.config, "llama_cpp_kv_cache", True),
+            "kv_q8_check": getattr(self.config, "llama_cpp_kv_q8", True),
         }
 
     def _aux_sampling_defaults(self) -> Dict[str, Any]:
@@ -1703,10 +1788,12 @@ class MainWindow(QMainWindow):
             "min_p_edit": getattr(cfg, "aux_min_p", 0.05),
             "top_k_edit": getattr(cfg, "aux_top_k", 20),
             "repeat_penalty_edit": getattr(cfg, "aux_repetition_penalty", 1.0),
-            "timeout_edit": getattr(cfg, "aux_request_timeout", 120.0),
             # 思考模式：辅助模型默认**关闭**——它只跑摘要/归纳等轻量子任务，
             # 要的是快与稳，开思考只会多出一大段 reasoning 拖慢速度。
             "enable_thinking_check": getattr(cfg, "aux_llm_enable_thinking", False),
+            # KV cache 开关：辅助模型独立字段（经 _AuxConfigView 映射给后端）。
+            "kv_cache_check": getattr(cfg, "aux_llama_cpp_kv_cache", True),
+            "kv_q8_check": getattr(cfg, "aux_llama_cpp_kv_q8", True),
         }
 
     def _add_local_model_block(
@@ -1807,9 +1894,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(8)
         for label, base, width, fallback in self._SAMPLING_SPECS:
-            # 思考模式开关插在「超时(秒)」之前（需求：位于超时控制参数之前）。
-            if base == "timeout_edit":
+            # 思考模式 + KV 开关插在采样参数之后（原「超时(秒)」位置）。
+            if base == "repeat_penalty_edit":
                 self._add_thinking_check(row, prefix, defaults)
+                self._add_kv_checks(row, prefix, defaults)
             edit = QLineEdit(str(defaults.get(base, fallback)))
             edit.setFixedWidth(width)
             setattr(self, prefix + base, edit)
@@ -1848,6 +1936,38 @@ class MainWindow(QMainWindow):
         check.setChecked(bool(defaults.get(self._THINKING_CHECK_BASE, True)))
         setattr(self, prefix + self._THINKING_CHECK_BASE, check)
         row.addWidget(check)
+
+    def _add_kv_checks(self, row: QHBoxLayout, prefix: str,
+                       defaults: Dict[str, Any]) -> None:
+        """在采样行「思考模式」后插入「KV复用」「KV量化」两个勾选框。
+
+        属性名 = ``prefix + 基础名``，主/辅助模型共用同一套读写代码。
+
+        * KV复用（``kv_cache_check``）：跨轮 KV/前缀复用——llama.cpp 挂
+          ``LlamaCache``，MLX 用 prompt cache 匹配公共前缀。多轮对话同前缀
+          时省掉重复 prefill。
+        * KV量化（``kv_q8_check``）：KV cache 量化到 int8——llama.cpp
+          ``type_k/type_v = GGML_TYPE_Q8_0``，MLX ``kv_bits=8``。KV 显存减半，
+          质量损失可忽略；不支持的架构自动忽略。
+        """
+        reuse = QCheckBox("KV复用")
+        reuse.setToolTip(
+            "开启：跨轮 KV/前缀复用——多轮对话的公共前缀不重复 prefill，\n"
+            "后续轮次明显变快（llama.cpp LlamaCache / MLX prompt cache）。\n"
+            "关闭：每轮完整重新计算，无跨轮状态。"
+        )
+        reuse.setChecked(bool(defaults.get(self._KV_REUSE_CHECK_BASE, True)))
+        setattr(self, prefix + self._KV_REUSE_CHECK_BASE, reuse)
+        row.addWidget(reuse)
+        q8 = QCheckBox("KV量化")
+        q8.setToolTip(
+            "开启：KV cache 量化到 int8（llama.cpp type_k/type_v=Q8_0；\n"
+            "MLX kv_bits=8），KV 显存减半，质量损失可忽略。\n"
+            "关闭：KV 保持 f16。不支持的架构自动忽略该参数。"
+        )
+        q8.setChecked(bool(defaults.get(self._KV_Q8_CHECK_BASE, True)))
+        setattr(self, prefix + self._KV_Q8_CHECK_BASE, q8)
+        row.addWidget(q8)
 
     # ------------------------------------------------------------------
     # wiring
@@ -1930,8 +2050,6 @@ class MainWindow(QMainWindow):
         self.llm_model_path_edit.setText(
             self.config.llm_model_path or DEFAULT_MAIN_MODEL_PATH
         )
-        self.llama_kv_cache_check.setChecked(
-            bool(getattr(self.config, "llama_cpp_kv_cache", True)))
         self.aux_llm_model_path_edit.setText(
             getattr(self.config, "aux_llm_model_path", "") or DEFAULT_AUX_MODEL_PATH
         )
@@ -1969,6 +2087,12 @@ class MainWindow(QMainWindow):
         _select_combo_backend(self.reranker_backend_combo, self.config.rag_rerank_backend)
         self.reranker_model_edit.setText(self.config.rag_rerank_model)
         self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
+        self.chunk_size_spin.setValue(getattr(self.config, "rag_chunk_size", 500))
+        self.chunk_overlap_spin.setValue(getattr(self.config, "rag_chunk_overlap", 50))
+        self.semantic_chunk_check.setChecked(
+            bool(getattr(self.config, "rag_semantic_chunking", True)))
+        self.rerank_topn_spin.setValue(
+            int(getattr(self.config, "rag_rerank_top_n", 3)))
         if self.config.model:
             self.model_combo.setEditText(self.config.model)
         self._apply_sampling_to_widgets("")
@@ -1987,18 +2111,26 @@ class MainWindow(QMainWindow):
             "min_p_edit": getattr(cfg, prefix + "min_p"),
             "top_k_edit": getattr(cfg, prefix + "top_k"),
             "repeat_penalty_edit": getattr(cfg, prefix + "repetition_penalty"),
-            "timeout_edit": getattr(cfg, prefix + "request_timeout"),
+            # 超时已从 UI 移除（2026-10-27）：config 字段保留，仅不再回填编辑。
         }
         for base, value in values.items():
             getattr(self, prefix + base).setText(str(value))
-        # 思考模式是 QCheckBox 而非 QLineEdit：单独写回勾选状态。
-        # 缺省值与 dataclass 保持一致（主模型 True、辅助模型 False）。
+        # 三个 QCheckBox 单独写回勾选状态（缺省与 dataclass 保持一致：
+        # 思考模式主模型 True / 辅助 False；KV 两项主辅助都默认 True）。
         _think_check = getattr(self, prefix + self._THINKING_CHECK_BASE, None)
         if _think_check is not None:
             _think_check.setChecked(
                 bool(getattr(cfg, prefix + "llm_enable_thinking",
                              False if prefix else True))
             )
+        _kv_reuse = getattr(self, prefix + self._KV_REUSE_CHECK_BASE, None)
+        if _kv_reuse is not None:
+            _kv_reuse.setChecked(
+                bool(getattr(cfg, prefix + "llama_cpp_kv_cache", True)))
+        _kv_q8 = getattr(self, prefix + self._KV_Q8_CHECK_BASE, None)
+        if _kv_q8 is not None:
+            _kv_q8.setChecked(
+                bool(getattr(cfg, prefix + "llama_cpp_kv_q8", True)))
 
     def _gather_config_from_widgets(self) -> None:
         self.config.base_url = self.base_url_edit.text().strip()
@@ -2014,7 +2146,6 @@ class MainWindow(QMainWindow):
         self.config.llm_model_path = (
             self.llm_model_path_edit.text().strip() or DEFAULT_MAIN_MODEL_PATH
         )
-        self.config.llama_cpp_kv_cache = self.llama_kv_cache_check.isChecked()
         self.config.aux_llm_backend = _combo_backend_value(self.aux_llm_backend_combo)
         self.config.aux_llm_model_path = (
             self.aux_llm_model_path_edit.text().strip() or DEFAULT_AUX_MODEL_PATH
@@ -2055,6 +2186,13 @@ class MainWindow(QMainWindow):
         self.config.rag_rerank_model = (
             self.reranker_model_edit.text().strip() or self.config.rag_rerank_model
         )
+        # 切片参数：夹紧非法组合（重叠 ≥ 切片会导致切分不前进）后落 config。
+        self.config.rag_chunk_size, self.config.rag_chunk_overlap = (
+            _normalize_chunk_params(
+                self.chunk_size_spin.value(), self.chunk_overlap_spin.value())
+        )
+        self.config.rag_semantic_chunking = self.semantic_chunk_check.isChecked()
+        self.config.rag_rerank_top_n = self.rerank_topn_spin.value()
         # MLX 交叉编码器是目录，ONNX 是文件，两者各存一份：切换后端时不必
         # 重新粘贴路径（见 _reranker_path_for_backend）。
         path_value = self.reranker_model_path_edit.text().strip()
@@ -2147,12 +2285,8 @@ class MainWindow(QMainWindow):
             repeat = max(1.0, min(2.0, float(_edit("repeat_penalty_edit") or "1.0")))
         except ValueError:
             repeat = 1.0
-        try:
-            # 下限 1 秒：0/负数会让 httpx 在发请求前就超时，表现为所有对话
-            # 立刻失败且看不出原因。
-            timeout = max(1.0, float(_edit("timeout_edit") or "120"))
-        except ValueError:
-            timeout = 120.0
+        # 超时已从 UI 移除（2026-10-27）：config.request_timeout / aux_request_timeout
+        # 字段保留原值（后端运行时仍读取），不再从面板收集。
 
         setattr(self.config, prefix + "temperature", temperature)
         setattr(self.config, prefix + "max_tokens", max_tokens)
@@ -2160,13 +2294,22 @@ class MainWindow(QMainWindow):
         setattr(self.config, prefix + "min_p", min_p)
         setattr(self.config, prefix + "top_k", top_k)
         setattr(self.config, prefix + "repetition_penalty", repeat)
-        setattr(self.config, prefix + "request_timeout", timeout)
         # 思考模式：勾选框 → 布尔。prefix 拼出来的属性名正好对上配置字段
         # （"" → llm_enable_thinking，"aux_" → aux_llm_enable_thinking）。
         _think_check = getattr(self, prefix + self._THINKING_CHECK_BASE, None)
         if _think_check is not None:
             setattr(self.config, prefix + "llm_enable_thinking",
                     _think_check.isChecked())
+        # KV cache 开关（"" → llama_cpp_kv_cache / llama_cpp_kv_q8，
+        # "aux_" → aux_llama_cpp_kv_cache / aux_llama_cpp_kv_q8）。
+        _kv_reuse = getattr(self, prefix + self._KV_REUSE_CHECK_BASE, None)
+        if _kv_reuse is not None:
+            setattr(self.config, prefix + "llama_cpp_kv_cache",
+                    _kv_reuse.isChecked())
+        _kv_q8 = getattr(self, prefix + self._KV_Q8_CHECK_BASE, None)
+        if _kv_q8 is not None:
+            setattr(self.config, prefix + "llama_cpp_kv_q8",
+                    _kv_q8.isChecked())
 
         if not prefix:
             # Keep max_context_tokens in sync with max_tokens: the shrink
@@ -2340,8 +2483,6 @@ class MainWindow(QMainWindow):
         # 多模态后端才能附加图片；mlx_lm 是纯文本。
         multimodal = local_mode and backend in ("mlx_vlm", "onnx", "llama_cpp")
         self.attach_image_btn.setEnabled(multimodal)
-        # GGUF 跨轮 KV 复用开关：仅本地模式 + GGUF 后端时可见。
-        self.llama_kv_cache_check.setVisible(local_mode and backend == "llama_cpp")
         # 切到不支持视觉的后端时必须丢弃待发图片：否则 [image:...] 标记会以
         # 纯文本形式喂给纯文本模型，用户看到的是模型对着路径名胡编。
         if not multimodal and self._pending_image_path:
@@ -2602,6 +2743,26 @@ class MainWindow(QMainWindow):
         self._ocr_test_window = OcrTestWindow(self.config)
         self._ocr_test_window.show()
 
+    def _on_convert_tool(self) -> None:
+        """「转换工具」：弹出独立的文件转 Markdown 工具窗口。"""
+        try:
+            from .convert_tool_window import ConvertToolWindow
+        except Exception as e:  # noqa: BLE001 - 缺 RAG 依赖时优雅提示
+            logger.warning("转换工具窗口导入失败: %s", e)
+            QMessageBox.critical(
+                self, "不可用",
+                "转换工具需要 RAG 解析依赖（PyMuPDF / docling / pandoc 等）。\n"
+                "请确认已安装对应依赖后再试。",
+            )
+            return
+        existing = getattr(self, "_convert_tool_window", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._convert_tool_window = ConvertToolWindow(self)
+        self._convert_tool_window.show()
+
     def _on_select_ocr_model_path(self) -> None:
         """选择 OCR 模型：ONNX 选 .onnx 文件、GGUF 选 .gguf 文件、MLX 选目录。"""
         backend = _combo_backend_value(self.ocr_backend_combo)
@@ -2628,22 +2789,29 @@ class MainWindow(QMainWindow):
 
     def _reranker_path_for_backend(self) -> str:
         """ONNX 是文件、MLX 是目录，两者在 config 里各存一份。"""
-        backend = self.reranker_backend_combo.currentText().strip() or "fastembed"
+        backend = _combo_backend_value(self.reranker_backend_combo) or "fastembed"
         if backend == "mlx":
             return getattr(self.config, "rag_rerank_mlx_model_path", "")
         return getattr(self.config, "rag_rerank_model_path", "")
 
     def _on_reranker_backend_changed(self, *_args) -> None:
-        mlx = self.reranker_backend_combo.currentText().strip() == "mlx"
-        self.reranker_model_path_edit.setPlaceholderText(
-            "本地 MLX Reranker 目录" if mlx else "本地 Reranker .onnx 文件"
-        )
+        backend = _combo_backend_value(self.reranker_backend_combo)
+        placeholder = {
+            "mlx": "本地 MLX Reranker 目录",
+            "gguf": "本地 GGUF Reranker 文件（含 rerank 头的交叉编码器）",
+        }.get(backend, "本地 Reranker .onnx 文件")
+        self.reranker_model_path_edit.setPlaceholderText(placeholder)
         self.reranker_model_path_edit.setText(self._reranker_path_for_backend())
 
     def _on_pick_reranker_model(self) -> None:
         start = self._dialog_start(self.reranker_model_path_edit.text())
-        if self.reranker_backend_combo.currentText().strip() == "mlx":
+        backend = _combo_backend_value(self.reranker_backend_combo)
+        if backend == "mlx":
             path = QFileDialog.getExistingDirectory(self, "选择 MLX Reranker 目录", start)
+        elif backend == "gguf":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 GGUF Reranker 模型", start, "GGUF (*.gguf);;所有文件 (*)"
+            )
         else:
             path, _ = QFileDialog.getOpenFileName(
                 self, "选择 ONNX Reranker 模型", start, "ONNX (*.onnx);;所有文件 (*)"
@@ -3260,6 +3428,11 @@ class MainWindow(QMainWindow):
         if self._is_worker_running(self._deps_worker):
             logger.warning("Deps check already running, ignoring duplicate request")
             return
+        # 先把控件值收进 config（含「参数设置」行的切片大小/重叠）：同步构造
+        # SyncKnowledgeWorker 时直接读 self.config.rag_chunk_size/_overlap，
+        # 不 gather 就会用到上次「应用配置」的旧值——用户改了切片参数却不点
+        # 应用配置直接同步，新参数会静默失效。
+        self._gather_config_from_widgets()
         kb = self.knowledge_base_edit.text().strip()
         ws = self.workspace_edit.text().strip() or os.path.expanduser("~/.base-agent/workspace")
         if not kb:
@@ -3481,6 +3654,7 @@ class MainWindow(QMainWindow):
                 "embedding_max_length": self.config.rag_embedding_max_length,
                 "chunk_size": self.config.rag_chunk_size,
                 "chunk_overlap": self.config.rag_chunk_overlap,
+                "semantic_chunking": getattr(self.config, "rag_semantic_chunking", True),
                 "rerank_backend": self.config.rag_rerank_backend,
                 "rerank_model_path": self.config.rag_rerank_model_path,
                 # MLX 交叉编码器是目录，与 ONNX 文件路径分开存；漏转发会让

@@ -1016,7 +1016,7 @@ def _count_contentful(groups: List[List[Tuple[int, str, str]]]) -> int:
 def build_chapter_chunks(
     markdown: str,
     toc_chapters: Optional[List[Chapter]],
-    max_chars: int = 1200,
+    max_chars: int,
     oversized_split: Optional[Callable[[str], List[str]]] = None,
 ) -> List[str]:
     """按章节把整书 Markdown 切成 chunk 文本列表（不经语义切片）。
@@ -1029,6 +1029,11 @@ def build_chapter_chunks(
     章节内更深的标题行会保留在 chunk 文本里（作为上下文）；单个章节超过
     ``max_chars`` 时交给 ``oversized_split``（引擎传入基于 chunk_documents
     的兜底切片，保证不超嵌入模型上下文）。
+
+    ``max_chars`` **不设默认值**（必传）：唯一调用方是 engine 的 epub 路径，
+    显式传 ``engine._chunk_size``（即 config.rag_chunk_size）。旧的
+    ``=1200`` 默认值是个陷阱——未来新增调用点一旦漏传，epub 超长章节就
+    会按 1200 切，与用户在设置面板配置的切片大小脱钩。
     """
     sections = _split_sections(markdown)
     if not sections:

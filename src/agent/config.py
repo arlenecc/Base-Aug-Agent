@@ -64,6 +64,11 @@ class AgentConfig:
     aux_top_k: int = 20
     aux_repetition_penalty: float = 1.0
     aux_request_timeout: float = 120.0
+    # 辅助模型的 KV cache 开关（设置面板辅助模型「KV复用」「KV量化」点选框）。
+    # 经 _AuxConfigView._SAMPLING_MAP 映射给辅助后端，与主模型的
+    # llama_cpp_kv_cache / llama_cpp_kv_q8 各自独立。
+    aux_llama_cpp_kv_cache: bool = True
+    aux_llama_cpp_kv_q8: bool = True
     local_model_threads: int = 4
     local_model_batch_size: int = 512
     local_gpu_layers: int = -1
@@ -88,6 +93,11 @@ class AgentConfig:
     # 按最旧优先淘汰。单条 KV 状态大小 ≈ n_ctx×层数×KV头×头维×2(K,V)×精度，长上
     # 下文可达数百 MB~GB；容量放不下一条时会反复淘汰、等于不命中，可调大。
     llama_cpp_kv_cache_mb: int = 512
+    # KV cache 量化到 int8（2026-10-27 用户需求，设置面板「KV量化」点选框）：
+    # llama.cpp type_k/type_v=GGML_TYPE_Q8_0（旧版硬编码，现改为可配置）；
+    # MLX kv_bits=8 / kv_group_size=64。KV 显存减半，质量损失可忽略；
+    # 不支持的架构自动忽略。关闭 = KV 保持 f16。
+    llama_cpp_kv_q8: bool = True
     # MLX 专用：prefill 分块大小（一次前向喂多少 token）。越大越快（少几次
     # kernel 启动与同步），峰值内存越高；太小则长 prompt 的 prefill 被切成很多
     # 块、白白多付同步开销。2861 token 的预热前缀一次喂完完全没问题。
@@ -142,6 +152,11 @@ class AgentConfig:
     # 仅无句读的超长单段才字符级切）。
     rag_chunk_size: int = 500       # 500 字符/片（字符硬限，bge-small-zh 不截断）
     rag_chunk_overlap: int = 50     # 10% of chunk_size
+    # 语义切片开关（2026-10-27 用户需求，默认开）：开 = 结构 + 语义混合切片
+    # （Markdown 标题分段 + chonkie 相似度找语义边界 + 向 chunk_size 填充）；
+    # 关 = 跳过语义切片，直接按句边界贪心打包到 chunk_size 的字符递归切片
+    # （不加载 model2vec/potion，省内存，切片更「满」但边界不按语义）。
+    rag_semantic_chunking: bool = True
     # rag_search 结果送辅助模型归纳的阈值（字符，按检索结果原文总量计）：
     #   总量 <  rag_condense_min_chars → 跳过归纳，原样返回（保细节、不拖速）；
     #   min ≤ 总量 ≤ rag_condense_max_chars → 送辅助模型浓缩；
@@ -176,7 +191,10 @@ class AgentConfig:
     # 默认 reranker 用 jina-reranker-v2-base-multilingual（ONNX/CPU，多语言、约
     # 279MB、比 v2-m3 MLX 快约 2.6×、中文 Top-1 与 v2-m3 持平）。要更强质量或长
     # 切片（>1024 token）时切回 "mlx"（v2-m3）；要更轻量短文本可用 "onnx"（bge-base）。
-    rag_rerank_backend: str = "jina"  # mlx | fastembed | onnx | jina（UI 无 disabled 项）
+    # 注意：UI 下拉只有 fastembed/mlx/onnx——"jina" 是历史内部值（本质就是
+    # ONNXReranker 换路径），_migrate 会把旧配置的 jina 并入 onnx（路径一并
+    # 迁移）。新配置仍默认走 jina 模型，但后端值统一为 "onnx"。
+    rag_rerank_backend: str = "jina"  # mlx | fastembed | onnx（"jina" 经 _migrate 并入 onnx）
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
     rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
     # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，
@@ -199,6 +217,10 @@ class AgentConfig:
     # 便于在配置文件里手动写 rag_rerank_enabled=false 临时关掉精排——
     # 此时 _rerank_backend 会被置为 disabled，检索退化为向量距离排序。
     rag_rerank_enabled: bool = True
+    # TopN（2026-10-27 用户需求）：reranker 精排之后选取的结果数量。rag_search
+    # 工具的 top_k 以此为上限（模型不传时也用它做默认值）——候选池 =
+    # top_k × 4 × 2 路全量送精排，TopN 调大线性增加精排耗时（jina ~49 对/s）。
+    rag_rerank_top_n: int = 3
 
     rag_auto_ingest: bool = True
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
@@ -282,7 +304,7 @@ class AgentConfig:
         "local_llm_n_ctx", "local_llm_prompt_batch_size", "llm_num_draft_tokens",
         "llama_cpp_kv_cache_mb",
         "onnx_threads","rag_embedding_batch_size", "rag_embedding_max_length",
-        "rag_rerank_batch_size", "rag_rerank_max_length",
+        "rag_rerank_batch_size", "rag_rerank_max_length", "rag_rerank_top_n",
         "rag_pdf_small_concurrency", "rag_pdf_batch_pages",
         "rag_embedding_threads",
         "aux_max_tokens", "aux_top_k", "aux_max_context_tokens",
@@ -310,9 +332,11 @@ class AgentConfig:
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale", "rag_docling_vlm",
+                    "rag_semantic_chunking",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
                     "aux_llm_enabled",
-                    "llm_speculative", "llama_cpp_kv_cache")
+                    "llm_speculative", "llama_cpp_kv_cache", "llama_cpp_kv_q8",
+                    "aux_llama_cpp_kv_cache", "aux_llama_cpp_kv_q8")
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (
@@ -467,6 +491,16 @@ class AgentConfig:
         # 配置的其他模型名不动。沿用 max_tokens=4096 的迁移先例。
         if self.rag_rerank_model == "BAAI/bge-reranker-base":
             self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
+        # reranker 后端 "jina" 并入 "onnx"（2026-10-27）：jina 分支本质就是
+        # ONNXReranker 换个路径参数，UI 下拉也只有 fastembed/mlx/onnx——
+        # 配置里存 "jina" 会让 _select_combo_backend 找不到匹配而回落
+        # fastembed：本地路径字段连同选择按钮被整体隐藏，且「应用配置」
+        # 会把 jina 覆写成 fastembed。迁移时把 jina 的路径并入 onnx 路径
+        # （此前生效的路径就是 jina_model_path，行为保持一致）。
+        if self.rag_rerank_backend == "jina":
+            self.rag_rerank_backend = "onnx"
+            if getattr(self, "rag_rerank_jina_model_path", ""):
+                self.rag_rerank_model_path = self.rag_rerank_jina_model_path
         # Old LLMClient builds defaulted to max_tokens=4096. Only rewrite the
         # value when it is still that legacy default — an explicitly chosen
         # small budget (e.g. 4096 for a local 4K model) must survive; silently

@@ -193,7 +193,8 @@ def test_build_chapter_chunks_oversized_split():
 
 
 def test_build_chapter_chunks_empty_input():
-    assert pp.build_chapter_chunks("", None) == []
+    # max_chars 现为必传（防未来调用点漏传时回落 1200 与用户设置脱钩）
+    assert pp.build_chapter_chunks("", None, max_chars=1200) == []
 
 
 def test_split_sections_keeps_prefix_and_subheadings():

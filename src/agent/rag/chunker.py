@@ -155,6 +155,7 @@ def chunk_documents(
     min_chunk_size: int = 100,
     overlap_percent: float = 0.10,
     embedding_function=None,
+    use_semantic: bool = True,
 ) -> List[Dict[str, Any]]:
     """Chunk multiple documents with metadata.
 
@@ -189,7 +190,7 @@ def chunk_documents(
         logger.debug("      文档切片: %s (%d 字符)", source, len(text))
         chunks = _chunk_with_hybrid_fallback(
             text, chunk_size, chunk_overlap, min_chunk_size, overlap_percent,
-            embedding_function,
+            embedding_function, use_semantic=use_semantic,
         )
         # 最终硬兜底：hybrid/semantic/chonkie 无论以何种单位理解 chunk_size
         # （历史 token 估算偏差、chonkie 自带度量），从这里出去的片保证
@@ -244,6 +245,7 @@ def _chunk_with_hybrid_fallback(
     min_chunk_size: int,
     overlap_percent: float,
     embedding_function=None,
+    use_semantic: bool = True,
 ) -> List[str]:
     """Hybrid-chunk first (structure + semantic), then semantic, then recursive.
 
@@ -252,7 +254,15 @@ def _chunk_with_hybrid_fallback(
       1. hybrid_chunk_text  — Markdown-structure-aware + semantic split
       2. semantic_chunk_text — pure semantic split (chonkie)
       3. chunk_text         — recursive character split (no model needed)
+
+    ``use_semantic=False``（设置面板「语义切片」取消勾选）：跳过 1/2 两级，
+    直接走 3 的字符递归切片（句边界贪心打包到 chunk_size，不加载
+    model2vec/potion）——用户显式关闭语义切片时，任何路径都不得再引入
+    语义模型。
     """
+    if not use_semantic:
+        return chunk_text(text, chunk_size, chunk_overlap)
+
     # 1. Hybrid (structure + semantic).
     try:
         from .hybrid_chunker import hybrid_chunk_text
@@ -347,10 +357,13 @@ def _split_recursive(
                 else:
                     if current.strip():
                         chunks.append(current)
-                    # If a single part is too large, split it further
+                    # **零丢失关键**：split(sep) 把分隔符从 parts 里剥掉了。新块
+                    # 以 part 起始时，它前面那个 sep（上一块的块尾分隔符）必须
+                    # 补回来——否则每个块边界丢一个分隔符（实测 2900 字文本
+                    # ov=0 切 6 块丢 5 个「。」）。
                     if _token_count(part) > chunk_size:
                         sub_chunks = _split_recursive(
-                            part, separators[sep_idx + 1:],
+                            sep + part, separators[sep_idx + 1:],
                             chunk_size, chunk_overlap,
                             apply_overlap=False,
                         )
@@ -359,8 +372,8 @@ def _split_recursive(
                         cur_cjk = 0
                         cur_other = 0
                     else:
-                        current = part
-                        cur_cjk, cur_other = _char_counts(part)
+                        current = sep + part
+                        cur_cjk, cur_other = _char_counts(current)
             else:
                 # First part
                 part_cjk, part_other = _char_counts(part)

@@ -109,8 +109,37 @@ def _install_fake_llama_cpp(monkeypatch):
 
     pkg.Llama = Llama
     pkg.LlamaCache = LlamaCache
+    # KV int8 量化（commit 1698078）在 Llama() 构造里引用该常量，假模块必须补齐。
+    pkg.GGML_TYPE_Q8_0 = 8
+    pkg.GGML_TYPE_F16 = 1  # 「KV量化」关闭时的回退类型
     monkeypatch.setitem(sys.modules, "llama_cpp", pkg)
     return Llama, LlamaCache
+
+
+def test_llamacpp_kv_q8_on_by_default(monkeypatch):
+    """KV量化默认开：type_k/type_v = Q8_0（int8，KV 显存减半）。"""
+    _, llama, _ = _make_llamacpp(monkeypatch)
+    assert llama.kwargs["type_k"] == 8 and llama.kwargs["type_v"] == 8
+
+
+def test_llamacpp_kv_q8_configurable_off(monkeypatch):
+    """「KV量化」点选框关闭 → KV 保持 f16（llama.cpp 默认精度）。"""
+    _, llama, _ = _make_llamacpp(monkeypatch, llama_cpp_kv_q8=False)
+    assert llama.kwargs["type_k"] == 1 and llama.kwargs["type_v"] == 1
+
+
+def test_aux_config_view_maps_kv_fields():
+    """辅助模型 KV 开关经 _AuxConfigView 映射，不回落主模型字段。"""
+    from agent.model_backends import aux_sampling_config
+
+    cfg = AgentConfig()
+    cfg.llama_cpp_kv_cache = True
+    cfg.aux_llama_cpp_kv_cache = False
+    cfg.llama_cpp_kv_q8 = True
+    cfg.aux_llama_cpp_kv_q8 = False
+    view = aux_sampling_config(cfg)
+    assert view.llama_cpp_kv_cache is False
+    assert view.llama_cpp_kv_q8 is False
 
 
 def _make_llamacpp(monkeypatch, **cfg_over):
@@ -310,21 +339,20 @@ def test_onnx_llm_rejects_non_generation_logits():
 
 
 def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
-    """#159：统一 MLX 内存策略必须把 buffer cache 从默认 95% RAM 封顶到 ~6GB
-    （避免 prefill 长上下文时大注意力矩阵每步反复释放重分配 → 生成抖动卡顿），
-    并把总内存封顶到 ~65% RAM（80% 时用户实测冲到 13G 后整机卡顿，需要给系统
-    留更多余量）。同时验证幂等。"""
+    """统一 MLX 内存策略（2026-10-26 用户终值）：cache 一律 1GB，memory_limit =
+    60% × 系统当前**可用**内存（下限 1GB）。cache_limit 必须无条件设置——
+    本机 MLX 没有 get_cache_limit，任何先 get 再 min 的写法都会抛
+    AttributeError（#140：cache 无界冲到 11.12GB 的根因）。同时验证幂等。"""
     from agent import model_backends as mb
     import sys, types
 
     class FakeMX:
+        """仿本机 MLX：有 get_memory_limit，**没有** get_cache_limit。"""
+
         def __init__(self):
             self.memory_limit = 15 * 1024 ** 3   # 默认 95% RAM（16G 机器）
-            self.cache_limit = 15 * 1024 ** 3
         def get_memory_limit(self):
             return self.memory_limit
-        def get_cache_limit(self):
-            return self.cache_limit
         def set_memory_limit(self, v):
             self.memory_limit = v
         def set_cache_limit(self, v):
@@ -334,22 +362,66 @@ def test_apply_mlx_memory_policy_caps_cache_and_memory(monkeypatch):
     mlx_pkg = types.ModuleType("mlx")
     mlx_core = types.ModuleType("mlx.core")
     mlx_core.get_memory_limit = fake.get_memory_limit
-    mlx_core.get_cache_limit = fake.get_cache_limit
     mlx_core.set_memory_limit = fake.set_memory_limit
     mlx_core.set_cache_limit = fake.set_cache_limit
     monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
     monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
     monkeypatch.setattr(mb, "_mlx_ram_bytes", lambda: 16 * 1024 ** 3)
+    # psutil available = 10GB → mem_cap = 6GB（< 默认 15GB，取 min）
+    import psutil
+    monkeypatch.setattr(
+        psutil, "virtual_memory",
+        lambda: types.SimpleNamespace(available=10 * 1024 ** 3))
 
     mb.apply_mlx_memory_policy()
-    # 总内存封顶到 65% RAM = 10.4GB（低于默认 15GB，给系统留 ~5.6G）
-    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.65)
-    # buffer cache 封顶到 6GB（远低于默认 15GB，且远大于原 1GB 抖动阈值）
-    assert fake.cache_limit == 6 * 1024 ** 3
+    # 总内存封顶到 60% × 可用 10GB = 6GB
+    assert fake.memory_limit == 6 * 1024 ** 3
+    # buffer cache 一律 1GB（无条件设置，无视 get_cache_limit 缺失）
+    assert fake.cache_limit == 1 * 1024 ** 3
     # 幂等：再调用值不变、不报错
     mb.apply_mlx_memory_policy()
-    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.65)
-    assert fake.cache_limit == 6 * 1024 ** 3
+    assert fake.memory_limit == 6 * 1024 ** 3
+    assert fake.cache_limit == 1 * 1024 ** 3
+
+
+def test_apply_mlx_memory_policy_floor_and_fallback(monkeypatch):
+    """psutil 不可用回退总内存 60%；可用内存极低时 1GB 保底。"""
+    from agent import model_backends as mb
+    import sys, types
+
+    class FakeMX:
+        def __init__(self):
+            self.memory_limit = 15 * 1024 ** 3
+        def get_memory_limit(self):
+            return self.memory_limit
+        def set_memory_limit(self, v):
+            self.memory_limit = v
+        def set_cache_limit(self, v):
+            self.cache_limit = v
+
+    fake = FakeMX()
+    mlx_pkg = types.ModuleType("mlx")
+    mlx_core = types.ModuleType("mlx.core")
+    mlx_core.get_memory_limit = fake.get_memory_limit
+    mlx_core.set_memory_limit = fake.set_memory_limit
+    mlx_core.set_cache_limit = fake.set_cache_limit
+    monkeypatch.setitem(sys.modules, "mlx", mlx_pkg)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+
+    # psutil 导入失败 → 回退 _mlx_ram_bytes（16G）× 60% = 9.6GB
+    real_psutil = __import__("psutil")  # 先取真模块，稍后恢复
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(mb, "_mlx_ram_bytes", lambda: 16 * 1024 ** 3)
+    mb.apply_mlx_memory_policy()
+    assert fake.memory_limit == int(16 * 1024 ** 3 * 0.60)
+
+    # 可用内存极低（100MB）→ cap 60MB 低于保底 → 取 1GB
+    monkeypatch.setitem(sys.modules, "psutil", real_psutil)
+    monkeypatch.setattr(
+        real_psutil, "virtual_memory",
+        lambda: types.SimpleNamespace(available=100 * 1024 ** 2))
+    mb.apply_mlx_memory_policy()
+    assert fake.memory_limit == 1 * 1024 ** 3
 
 
 def test_tagged_parser_splits_reasoning_content_and_tool_call():
