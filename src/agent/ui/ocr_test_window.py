@@ -393,12 +393,14 @@ class OcrWorker(QThread):
 # --------------------------------------------------------------------------- #
 
 class OcrTestWindow(QWidget):
-    def __init__(self, config: AgentConfig) -> None:
-        super().__init__()
+    def __init__(self, config: AgentConfig, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
         self._config = config
         self._pages: List[Dict[str, Any]] = []
         self._current = 0
         self._worker: Optional[OcrWorker] = None
+        # 显式声明为标准顶层窗口：独立标题栏、可自由拖动/缩放、不依附任何父窗口。
+        self.setWindowFlags(Qt.WindowType.Window)
         self.setWindowTitle("OCR 识别测试")
         self.resize(1100, 760)
         self._build_ui()
@@ -422,7 +424,7 @@ class OcrTestWindow(QWidget):
         self.model_combo = QComboBox()
         # 「自定义 OCR」选项标签自动带上设置面板里配置的模型名（路径最后一段），
         # 让用户在下拉里就能区分当前用的是哪个 Ovis 模型。
-        _custom_ocr_path = getattr(self.config, "rag_ocr_model_path", "") or ""
+        _custom_ocr_path = getattr(self._config, "rag_ocr_model_path", "") or ""
         _custom_ocr_name = os.path.basename(_custom_ocr_path) if _custom_ocr_path else ""
         for label, value in OCR_MODELS:
             if value == "custom" and _custom_ocr_name:

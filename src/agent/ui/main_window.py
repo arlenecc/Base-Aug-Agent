@@ -2740,8 +2740,22 @@ class MainWindow(QMainWindow):
             existing.raise_()
             existing.activateWindow()
             return
-        self._ocr_test_window = OcrTestWindow(self.config)
-        self._ocr_test_window.show()
+        try:
+            # 不传 parent：做成真正独立的顶层窗口，可自由拖动/缩放，
+            # 避免 macOS 上作为主窗口子面板贴附、无法移动且界面叠乱。
+            self._ocr_test_window = OcrTestWindow(self.config)
+            self._ocr_test_window.show()
+            # macOS 上新建窗口仅靠 show() 不一定提到最前/可能落到别的桌面，
+            # 显式 raise + activate 保证可见。
+            self._ocr_test_window.raise_()
+            self._ocr_test_window.activateWindow()
+        except Exception as e:  # noqa: BLE001 - 构造/显示失败给出可见提示而非静默吞掉
+            logger.exception("OCR 测试窗口创建失败: %s", e)
+            self._ocr_test_window = None
+            QMessageBox.critical(
+                self, "窗口创建失败",
+                f"OCR 识别测试窗口启动失败：\n{e}",
+            )
 
     def _on_convert_tool(self) -> None:
         """「转换工具」：弹出独立的文件转 Markdown 工具窗口。"""
