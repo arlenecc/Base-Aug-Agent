@@ -174,7 +174,9 @@ class AgentConfig:
     # INT8 量化版。nomic 支持 Matryoshka（MRL）：入库/查询向量截前
     # rag_matryoshka_dim 维后**重新归一化**再存 f16（vector_store 统一处理），
     # 向量库体积 3×↓（768×f32 → 512×f16）且检索走 lancedb 原生 .search()。
-    # 文档加「search_document: 」、查询加「search_query: 」前缀。注意：切换
+    # 文档加「search_document: 」、查询加「search_query: 」前缀（前缀按模型族
+    # 统一判定，见 rag/embedding_prefixes.py：nomic/bge/jina/e5 各有约定）。
+    # 注意：切换
     # embedding 或截断维度后向量空间变了，必须重新同步（force）重建索引，
     # 否则新旧向量混检会错乱。bge-small-zh-v1.5 作为 MLX 不可用时的 fastembed
     # 回退：

@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pyarrow as pa
 
+from . import embedding_prefixes as _eprefix
+
 logger = logging.getLogger(__name__)
 
 # Default embedding model — quantized nomic-embed-text-v1.5 via FastEmbed (ONNX Runtime).
@@ -34,10 +36,6 @@ _TABLE_NAME = "knowledge_base"
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
 # 用于 Meta-context + Targeted RAG（先返回全文档结构概览，再按需检索细节）。
 _DOCUMENTS_TABLE_NAME = "documents"
-
-# nomic-embed-text-v1.5 requires query/document prefixes for best results
-_DOC_PREFIX = "search_document: "
-_QUERY_PREFIX = "search_query: "
 
 # BM25 全文检索的预分词列名（jieba 分词后空格连接，供原生 FTS 的 simple
 # tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
@@ -119,6 +117,11 @@ class FastEmbedEmbeddingFunction:
     def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, threads: int = 4):
         self._model_name = model_name
         self._threads = max(1, int(threads))
+        # 任务前缀按模型族统一解析（embedding_prefixes：唯一事实源），
+        # 取代原先写死的 nomic 模块常量——bge/e5/jina 等模型经 fastembed
+        # 使用时也能拿到正确前缀。
+        self._doc_prefix = _eprefix.document_prefix(model_name)
+        self._query_prefix = _eprefix.query_prefix(model_name)
         self._model = None  # lazy-init
         # 懒加载的双检锁：InferenceSession.run() 的线程安全只覆盖推理，不覆盖
         # 这里的懒初始化——两个线程同时首次调用会各自加载一份 ~130MB 模型，
@@ -200,8 +203,8 @@ class FastEmbedEmbeddingFunction:
         if not input:
             return []
         self._ensure_model()
-        # Add document prefix for nomic-embed-text-v1.5
-        prefixed = [_DOC_PREFIX + t if not t.startswith(_DOC_PREFIX) else t for t in input]
+        # 文档任务前缀按模型族策略解析（构造期已存 self._doc_prefix）
+        prefixed = [_eprefix.apply_prefix(self._doc_prefix, t) for t in input]
         if batch_size:
             with self._embed_lock:
                 embeddings = list(self._model.embed(prefixed, batch_size=int(batch_size)))
@@ -213,7 +216,7 @@ class FastEmbedEmbeddingFunction:
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query text with the query prefix."""
         self._ensure_model()
-        prefixed = _QUERY_PREFIX + text if not text.startswith(_QUERY_PREFIX) else text
+        prefixed = _eprefix.apply_prefix(self._query_prefix, text)
         with self._embed_lock:
             embeddings = list(self._model.embed([prefixed]))
         return embeddings[0].tolist()

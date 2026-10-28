@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..model_backends import resolve_model_path, apply_mlx_memory_policy
+from . import embedding_prefixes as _eprefix
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,6 @@ def _cap_mlx_memory_limits() -> None:
     是两次系统调用 + 一次 psutil 读取，开销可忽略。
     """
     apply_mlx_memory_policy()
-
-_DEFAULT_DOC_PREFIX = "search_document: "
-_DEFAULT_QUERY_PREFIX = "search_query: "
 
 # bge-reranker-v2-m3 的位置嵌入上限是 8192（本地 MLX/ONNX 权重的 config 均为
 # max_position_embeddings=8194，fastembed 侧 tokenizer 本身就截断在 8192），
@@ -158,16 +156,19 @@ class MLXEmbeddingFunction:
         *,
         batch_size: int = 8,
         max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
-        document_prefix: str = _DEFAULT_DOC_PREFIX,
-        query_prefix: str = _DEFAULT_QUERY_PREFIX,
+        document_prefix: Optional[str] = None,
+        query_prefix: Optional[str] = None,
     ):
         self._model_path = resolve_model_path(model_path)
         self._batch_size = max(1, int(batch_size))
         # 请求值先记下，模型加载后按 config 的位置/旋转上限夹紧（见 _model_max_length）。
         self._max_length_requested = max(8, int(max_length))
         self._max_length = self._max_length_requested
-        self._document_prefix = document_prefix
-        self._query_prefix = query_prefix
+        # 任务前缀按模型族统一解析（embedding_prefixes：唯一事实源）；
+        # 显式传入的前缀仍可覆盖（测试/特殊模型用）。
+        _doc_p, _query_p = _eprefix.prefixes(self._model_path)
+        self._document_prefix = document_prefix if document_prefix is not None else _doc_p
+        self._query_prefix = query_prefix if query_prefix is not None else _query_p
         self._model = None
         self._processor = None
         self._generate = None
@@ -217,9 +218,11 @@ class MLXEmbeddingFunction:
                     self._model, self._processor = self._load_bert(config)
                     self._generate = None
                     self._is_bert = True
-                    # bge 检索约定：文档不加前缀，查询加检索指令前缀。
-                    self._document_prefix = ""
-                    self._query_prefix = "为这个句子生成表示以用于检索："
+                    # bge 检索约定（经模型族策略表统一给出）：文档不加前缀，
+                    # 查询加检索指令前缀。bert 兜底路径多为 bge 中文导出，
+                    # 即使目录名不含 "bge" 也按 bge 族取值。
+                    self._document_prefix = _eprefix.document_prefix("bge")
+                    self._query_prefix = _eprefix.query_prefix("bge")
                 else:
                     self._generate = generate
             logger.info("MLX Embedding 加载完成: %s", self._model_path)
@@ -563,7 +566,7 @@ class MLXEmbeddingFunction:
 
     def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[List[float]]:
         prefixed = [
-            text if text.startswith(self._document_prefix) else self._document_prefix + text
+            _eprefix.apply_prefix(self._document_prefix, text)
             for text in input
         ]
         return self._embed(prefixed, batch_size=batch_size)
@@ -572,7 +575,7 @@ class MLXEmbeddingFunction:
         return self(texts, batch_size=batch_size)
 
     def embed_query(self, text: str) -> List[float]:
-        value = text if text.startswith(self._query_prefix) else self._query_prefix + text
+        value = _eprefix.apply_prefix(self._query_prefix, text)
         return self._embed([value])[0]
 
     def name(self) -> str:
@@ -599,8 +602,8 @@ class ONNXEmbeddingFunction:
         threads: int = 4,
         batch_size: int = 8,
         max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
-        document_prefix: str = _DEFAULT_DOC_PREFIX,
-        query_prefix: str = _DEFAULT_QUERY_PREFIX,
+        document_prefix: Optional[str] = None,
+        query_prefix: Optional[str] = None,
     ):
         self._model_file, self._model_dir = _find_onnx(model_path)
         self._threads = max(1, int(threads))
@@ -608,8 +611,11 @@ class ONNXEmbeddingFunction:
         # 模型加载后按 config 的位置/旋转上限夹紧（见 _model_max_length）。
         self._max_length_requested = max(8, int(max_length))
         self._max_length = self._max_length_requested
-        self._document_prefix = document_prefix
-        self._query_prefix = query_prefix
+        # 任务前缀按模型族统一解析（embedding_prefixes：唯一事实源）；
+        # 按原始 model_path 识别（目录名含 bge/nomic/e5/jina 等关键字）。
+        _doc_p, _query_p = _eprefix.prefixes(model_path)
+        self._document_prefix = document_prefix if document_prefix is not None else _doc_p
+        self._query_prefix = query_prefix if query_prefix is not None else _query_p
         self._session = None
         self._tokenizer = None
         self._lock = threading.RLock()
@@ -690,7 +696,7 @@ class ONNXEmbeddingFunction:
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         return self._embed([
-            text if text.startswith(self._document_prefix) else self._document_prefix + text
+            _eprefix.apply_prefix(self._document_prefix, text)
             for text in input
         ])
 
@@ -698,7 +704,7 @@ class ONNXEmbeddingFunction:
         return self(texts)
 
     def embed_query(self, text: str) -> List[float]:
-        value = text if text.startswith(self._query_prefix) else self._query_prefix + text
+        value = _eprefix.apply_prefix(self._query_prefix, text)
         return self._embed([value])[0]
 
     def name(self) -> str:
@@ -717,6 +723,11 @@ class GGUFEmbeddingFunction:
         self._model_path = resolve_model_path(model_path, expect_file=True)
         self._threads = max(1, int(threads))
         self._batch_size = max(1, int(batch_size))
+        # 任务前缀按模型族统一解析（此前 GGUF 路径完全没加前缀——nomic GGUF
+        # 缺 document/query 前缀会明显拉低检索质量，现与其余后端对齐）。
+        _doc_p, _query_p = _eprefix.prefixes(self._model_path)
+        self._document_prefix = _doc_p
+        self._query_prefix = _query_p
         self._model = None
         self._lock = threading.RLock()
 
@@ -747,13 +758,17 @@ class GGUFEmbeddingFunction:
         return _normalize_rows([item["embedding"] for item in ordered]).tolist()
 
     def __call__(self, input: List[str]) -> List[List[float]]:
-        return self._embed(input)
+        return self._embed([
+            _eprefix.apply_prefix(self._document_prefix, text)
+            for text in input
+        ])
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self._embed(texts)
+        return self(texts)
 
     def embed_query(self, text: str) -> List[float]:
-        return self._embed([text])[0]
+        value = _eprefix.apply_prefix(self._query_prefix, text)
+        return self._embed([value])[0]
 
     def name(self) -> str:
         return f"llama_cpp:{self._model_path}"
