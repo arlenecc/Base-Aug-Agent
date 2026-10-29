@@ -2389,14 +2389,163 @@ class RAGEngine:
         )
         return digest
 
+    # ------------------------------------------------------------------
+    # 闲时章节摘要（逐章摘要 + 全书摘要 + 目录结构完善）
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 闲时章节摘要（逐章摘要 + 全书摘要 + 目录结构完善）
+    # ------------------------------------------------------------------
+    # 摘要状态（已摘要章节 / 全书摘要 / 完成标记）以 sidecar JSON 落盘，与
+    # rag/documents/*.md 缓存同目录（<md>.summary.json）。这样彻底绕开 Lance
+    # 表结构演变——本仓库 lancedb 0.40 没有 add_column，给旧表加列要么失败、
+    # 要么触发全表重写的 OOM（见迁移相关事故）。目录结构（chapters）仍留在
+    # documents 表，供 rag_outline 的普通 TOC 路径使用。
+
+    def _summary_state_path(self, md_path: str) -> str:
+        if not md_path:
+            return ""
+        base, _ = os.path.splitext(md_path)
+        return base + ".summary.json"
+
+    def load_summary_state(self, md_path: str) -> Dict[str, Any]:
+        """读取某文档的章节摘要状态 sidecar；不存在/损坏则回退到空状态。"""
+        path = self._summary_state_path(md_path)
+        if not path or not os.path.exists(path):
+            return {"entries": [], "full": "", "done": False, "skipped": False}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if isinstance(s, dict):
+                s.setdefault("entries", [])
+                s.setdefault("full", "")
+                s.setdefault("done", False)
+                s.setdefault("skipped", False)
+                return s
+        except (ValueError, TypeError, OSError):
+            pass
+        return {"entries": [], "full": "", "done": False, "skipped": False}
+
+    def save_summary_state(self, md_path: str, state: Dict[str, Any]) -> None:
+        """原子写章节摘要状态 sidecar（tmp + os.replace）。"""
+        path = self._summary_state_path(md_path)
+        if not path:
+            return
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning("[summary] 写摘要状态 sidecar 失败 %s: %s", path, e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def get_documents_for_summary(self) -> List[Dict[str, Any]]:
+        """返回所有「有章节结构、可摘要」的文档记录。
+
+        每条含 doc_name / md_path / chapters(已解析列表) / summary_state(已解析 dict)。
+        无 chapters 的文档（纯文本没能抽出目录）跳过。
+        """
+        store = self._get_store()
+        try:
+            rows = store.list_document_records()
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            chapters_json = r.get("chapters") or ""
+            if not chapters_json:
+                continue
+            try:
+                chapters = json.loads(chapters_json)
+            except (ValueError, TypeError):
+                continue
+            if not chapters:
+                continue
+            md_path = r.get("md_path", "")
+            out.append({
+                "doc_name": r.get("doc_name", ""),
+                "md_path": md_path,
+                "chapters": chapters,
+                "summary_state": self.load_summary_state(md_path),
+            })
+        return out
+
+    def save_chapter_summary_state(
+        self,
+        doc_name: str,
+        state: Dict[str, Any],
+        revised_chapters: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """保存章节摘要状态（及可选的结构修订）。
+
+        摘要状态（entries / full / done / skipped）写入 sidecar JSON，避免 Lance
+        表结构演变；若目录结构被完善（``revised_chapters`` 不为 None），则把修订后的
+        结构回写 documents 表的 ``chapters`` 列，供 rag_outline 的 TOC 使用。
+        已摘要章节的 summary 一并保留在 sidecar，实现增量不重复。
+        """
+        store = self._get_store()
+        existing = store.get_document_digest(doc_name)
+        if not existing:
+            logger.warning("[summary] 保存摘要态失败：找不到文档 %s", doc_name)
+            return
+        md_path = existing.get("md_path", "") or ""
+        # 摘要状态落 sidecar。
+        self.save_summary_state(md_path, state)
+        # 结构若有修订，回写 documents 表的 chapters 列。
+        if revised_chapters is not None:
+            digest = existing.get("digest", "") or ""
+            try:
+                store.upsert_document(
+                    doc_name=doc_name,
+                    digest=digest,
+                    chapters=json.dumps(revised_chapters, ensure_ascii=False),
+                    md_path=md_path,
+                )
+            except Exception as e:
+                logger.warning("[summary] 回写目录结构失败 %s: %s", doc_name, e)
+
+    @staticmethod
+    def read_markdown(md_path: str) -> str:
+        """读取某文档的 markdown 缓存（章节正文来源）。"""
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
     def get_document_outline(self, doc_name: str) -> Optional[Dict[str, Any]]:
         """Return a document's stored digest + chapter list by (partial) name.
 
         The full markdown is no longer persisted in the metadata table; use
         the returned ``md_path`` (or the on-disk ingest cache) to read it.
+
+        缩略版优先采用「已逐章摘要并优化」的版本：若该书已由闲时后台补全了
+        逐章摘要（sidecar 状态存在且含摘要），则把 ``digest`` 替换为
+        「目录 + 逐章摘要 + 全书摘要」的富版本；否则回退到普通 TOC。
         """
         store = self._get_store()
-        return store.get_document_digest(doc_name)
+        rec = store.get_document_digest(doc_name)
+        if not rec:
+            return None
+        chapters_json = rec.get("chapters") or ""
+        md_path = rec.get("md_path", "")
+        if chapters_json and md_path:
+            try:
+                from .book_summary import render_enriched_digest
+
+                chapters = json.loads(chapters_json)
+                state = self.load_summary_state(md_path)
+                enriched = render_enriched_digest(chapters, state)
+                if enriched:
+                    rec = dict(rec)
+                    rec["digest"] = enriched
+            except (ValueError, TypeError):
+                pass
+        return rec
 
     def list_documents(self) -> List[str]:
         """Return stored document names that have a digest."""

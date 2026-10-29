@@ -206,6 +206,21 @@ def _clone_prompt_cache(caches: Any) -> Optional[List[Any]]:
     return cloned or None
 
 
+def _common_prefix_len(a: List[int], b: List[int]) -> int:
+    """两个 token 序列的最长公共前缀长度（KV 前缀复用的命中判定）。
+
+    命中形态只有两种，都要求「新 prompt 与缓存序列逐 token 一致」：
+      a) 缓存更长：缓存 = 上轮 prompt + 上轮生成，本轮 prompt 是它的前缀；
+      b) 新 prompt 更长：恰好完全包含缓存（重试/追加场景）。
+    """
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
 def _resolve_enable_thinking(config: Any) -> bool:
     """归一「思考模式」开关：未配置（None）视为**开启**。
 
@@ -805,6 +820,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 import mlx.core as mx
                 from mlx_lm.models.cache import make_prompt_cache
 
+                logger.info("MLX 预热开始: 预填 %d token 的 system+tools 前缀", len(ids))
                 cache = make_prompt_cache(self._model_obj)
                 model = self._model_obj
                 # 分块前向填 KV；与 stream_generate 的 prefill 同款（input[None]）。
@@ -827,7 +843,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                 self._head_thread_ident = threading.get_ident()
                 logger.info("MLX 预热: 已预填 %d token 的 system+tools 前缀", len(ids))
             except Exception as e:  # pragma: no cover - 预热失败不影响正常对话
-                logger.warning("MLX 预热失败（忽略）: %s", e)
+                logger.error("MLX 预热失败（忽略）: %s", e, exc_info=True)
 
     def chat_stream(self, messages, tools=None, temperature=0.7):
         self._ensure_loaded()
@@ -1116,6 +1132,27 @@ class MLXVLMBackend(_LazyLocalBackend):
         self._model_obj = None
         self._processor = None
         self._model_config: Dict[str, Any] = {}
+        # 跨轮复用的 KV 缓存与它对应的 token 序列（见 chat_stream 的前缀复用）。
+        # 混合架构（线性层 ArraysCache）不可裁剪，只在「新 prompt 完整包含
+        # 旧序列」时复用，否则整体重建——最坏退化为无缓存，不会出错。
+        self._kv_cache = None
+        self._kv_ids: List[int] = []
+        # 静态头缓存（system + 工具 schema）的**母本**与它的 token 序列：只读，
+        # 每轮生成都用它的克隆体（见 _clone_prompt_cache）。
+        self._head_cache = None
+        self._head_ids: List[int] = []
+        # 创建该缓存的 **OS 线程**标识（threading.get_ident()）。
+        # MLX 的 prompt cache 与其 stream 是线程局部的：缓存（及 stream）
+        # 在 A 线程创建、却在 B 线程用于生成时，MLX 在 B 线程的 stream 表里
+        # 找不到建缓存那个线程的 stream（RuntimeError: No Stream in current
+        # thread），所以必须校验线程标识。AgentWorker 常驻同一 OS 线程保证了
+        # 缓存可跨轮命中；get_ident() 在线程终止后会被回收复用，故新建 worker
+        # 时 UI 会主动 invalidate_kv_cache()（见 _ensure_agent_worker）。
+        self._kv_thread_ident = None
+        self._head_thread_ident = None
+        # 上一轮的模型原始输出（含工具调用 XML）。agent 把它存进历史的
+        # raw_content，本地后端据此重建忠实的历史序列以命中前缀复用。
+        self.last_raw_output = ""
 
     def _ensure_loaded(self) -> None:
         self._check_open()
@@ -1221,6 +1258,75 @@ class MLXVLMBackend(_LazyLocalBackend):
                     parser.begin_reasoning()
                 prompt_tokens = 0
                 completion_tokens = 0
+                gen_ids: List[int] = []
+                raw_text = ""
+                # ---- KV 前缀复用（对齐 MLXLanguageBackend）----
+                # 每轮 prompt = 固定头部（system + 工具 schema）+ 历史 + 新问题。
+                # 缓存只能整用或整弃（ArraysCache 不可裁剪），命中条件「新 prompt
+                # 完整包含旧序列」→ 只 prefill 新增的尾部 token。
+                cache = None
+                reuse = 0
+                ids = None
+                encode = getattr(self._processor, "encode", None)
+                if callable(encode):
+                    try:
+                        ids = encode(prompt)
+                        if not isinstance(ids, list):
+                            ids = list(ids)
+                    except Exception:  # noqa: BLE001 - 退化为无缓存
+                        ids = None
+                try:
+                    if (self._kv_cache is not None
+                            and self._kv_thread_ident != threading.get_ident()):
+                        # 缓存不是本线程建的就整份作废，在本线程重建。
+                        self._kv_cache = None
+                        self._kv_ids = []
+                    if ids is not None and self._kv_cache is not None and self._kv_ids:
+                        common = _common_prefix_len(ids, self._kv_ids)
+                        if common == len(ids) or common == len(self._kv_ids):
+                            cache, reuse = self._kv_cache, common
+                        else:
+                            # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
+                            logger.info(
+                                "MLX-VLM KV 前缀未命中: 公共前缀 %d（缓存 %d / 本轮 %d）→ 整份重建",
+                                common, len(self._kv_ids), len(ids),
+                            )
+                            self._kv_cache = None
+                            self._kv_ids = []
+                            # 降级：改用**静态头缓存的克隆体**。
+                            head, head_ids = self._usable_head_cache()
+                            if head is not None and head_ids:
+                                head_common = _common_prefix_len(ids, head_ids)
+                                if head_common == len(head_ids):
+                                    cache, reuse = _clone_prompt_cache(head), head_common
+                                    logger.info(
+                                        "MLX-VLM KV 降级复用静态头: 跳过 %d token（本 prompt %d）",
+                                        reuse, len(ids),
+                                    )
+                except Exception:  # noqa: BLE001 - 任何异常都退化为无缓存
+                    cache, reuse = None, 0
+                if cache is None:
+                    # 没有预热过、或缓存刚被作废：试静态头缓存的克隆体。
+                    head, head_ids = self._usable_head_cache()
+                    if (head is not None and head_ids and ids is not None
+                            and _common_prefix_len(ids, head_ids) == len(head_ids)):
+                        cache, reuse = _clone_prompt_cache(head), len(head_ids)
+                        logger.info(
+                            "MLX-VLM KV 复用静态头: 跳过 %d token（本 prompt %d）",
+                            reuse, len(ids),
+                        )
+                if cache is not None and reuse >= len(ids):
+                    # 缓存已完整覆盖本轮 prompt → 没有可喂的新 token，不复用。
+                    logger.info(
+                        "MLX-VLM KV 缓存已覆盖全部 prompt（%d/%d），本轮不复用",
+                        reuse, len(ids),
+                    )
+                    cache, reuse = None, 0
+                if reuse:
+                    logger.info(
+                        "MLX-VLM KV 前缀复用: 跳过 %d token 的 prefill（本 prompt %d token）",
+                        reuse, len(ids),
+                    )
                 kwargs = {
                     "max_tokens": int(getattr(self.config, "max_tokens", 32768)),
                     "sampler": sampler,
@@ -1230,23 +1336,71 @@ class MLXVLMBackend(_LazyLocalBackend):
                     "kv_group_size": 64,
                     "quantized_kv_start": 0,
                 }
-                for response in stream_generate(
-                    self._model_obj,
-                    self._processor,
-                    prompt,
-                    image=media["image"] or None,
-                    audio=media["audio"] or None,
-                    video=media["video"] or None,
-                    **kwargs,
-                ):
-                    prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
-                    completion_tokens = int(
-                        getattr(response, "generation_tokens", completion_tokens + 1)
-                        or completion_tokens + 1
-                    )
-                    for event in parser.feed(getattr(response, "text", "")):
-                        yield event
+                if cache is not None:
+                    kwargs["prompt_cache"] = cache
+                # 分块 prefill：一次前向喂多少 token。
+                kwargs["prefill_step_size"] = max(
+                    512, int(getattr(self.config, "local_llm_prompt_batch_size", 4096))
+                )
+                try:
+                    for response in stream_generate(
+                        self._model_obj,
+                        self._processor,
+                        prompt,
+                        image=media["image"] or None,
+                        audio=media["audio"] or None,
+                        video=media["video"] or None,
+                        **kwargs,
+                    ):
+                        prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+                        completion_tokens = int(
+                            getattr(response, "generation_tokens", completion_tokens + 1)
+                            or completion_tokens + 1
+                        )
+                        tok_id = getattr(response, "token", None)
+                        if tok_id is not None:
+                            gen_ids.append(int(tok_id))
+                        raw_text += getattr(response, "text", "") or ""
+                        for event in parser.feed(getattr(response, "text", "")):
+                            yield event
+                except TypeError as e:
+                    # 该 mlx_vlm 版本不接受 prompt_cache / prefill_step_size：
+                    # 退化为无缓存全量 prefill，绝不因缓存错配炸掉生成。
+                    if "prompt_cache" in str(e) or "prefill_step_size" in str(e):
+                        logger.info(
+                            "MLX-VLM: 本版本不接受 prompt_cache，退化为无缓存 prefill"
+                        )
+                        kwargs.pop("prompt_cache", None)
+                        kwargs.pop("prefill_step_size", None)
+                        self._kv_cache = None
+                        self._kv_ids = []
+                        for response in stream_generate(
+                            self._model_obj,
+                            self._processor,
+                            prompt,
+                            image=media["image"] or None,
+                            audio=media["audio"] or None,
+                            video=media["video"] or None,
+                            **kwargs,
+                        ):
+                            prompt_tokens = int(getattr(response, "prompt_tokens", prompt_tokens) or prompt_tokens)
+                            completion_tokens = int(
+                                getattr(response, "generation_tokens", completion_tokens + 1)
+                                or completion_tokens + 1
+                            )
+                            for event in parser.feed(getattr(response, "text", "")):
+                                yield event
+                    else:
+                        raise
                 yield from parser.finish()
+                # 记录本轮完整序列，供下一轮前缀比对。被取消（生成中途 break）
+                # 时 gen_ids 不完整，序列对不上，下一轮自动重建，不会错位。
+                if cache is not None:
+                    self._kv_cache = cache
+                    self._kv_thread_ident = threading.get_ident()
+                    if ids is not None:
+                        self._kv_ids = ids + gen_ids
+                self.last_raw_output = raw_text
                 yield StreamEvent(
                     "done",
                     tool_calls=parser.tool_calls,
@@ -1275,6 +1429,102 @@ class MLXVLMBackend(_LazyLocalBackend):
                 mx.clear_cache()
             except Exception:
                 pass
+
+    def _usable_head_cache(self):
+        """返回可用的静态头缓存母本 (cache, ids)；不可用返回 (None, [])。
+
+        线程亲和性：母本与其 stream 同样是线程局部的，换线程复用会让 MLX 抛
+        ``No Stream in current thread``，所以必须校验建缓存的线程。
+        """
+        head = getattr(self, "_head_cache", None)
+        head_ids = getattr(self, "_head_ids", None)
+        if head is None or not head_ids:
+            return None, []
+        if getattr(self, "_head_thread_ident", None) != threading.get_ident():
+            return None, []
+        return head, list(head_ids)
+
+    def prime_prefix_cache(self, system_prompt: str, tools=None) -> None:
+        """只 **prefill**（不生成）「system + tools」这段公共前缀，填好 KV 缓存。
+
+        与 MLXLanguageBackend.prime_prefix_cache 同款语义：真实生成会往缓存里
+        追加输出 token，而混合架构（ArraysCache）不可裁剪，一旦缓存里多了几个
+        token，下一条 prompt 就不再是它的前缀 → 缓存整体作废 → 首条真实输入仍
+        要全量 prefill（~20s）。这里只跑前向、不采样，缓存恰好等于「system+tools」
+        前缀；首条真实 prompt 以它开头，可直接命中复用（只 prefill 新增的 user 轮
+        token）。
+        """
+        self._ensure_loaded()
+        with self._generation_lock:
+            try:
+                from mlx_lm.models.cache import make_prompt_cache
+                from mlx_vlm import apply_chat_template
+
+                template_kwargs: Dict[str, Any] = {
+                    "enable_thinking": _resolve_enable_thinking(self.config),
+                }
+                if tools:
+                    template_kwargs["tools"] = tools
+                try:
+                    prompt = apply_chat_template(
+                        self._processor,
+                        self._model_config,
+                        [{"role": "system", "content": system_prompt}],
+                        **template_kwargs,
+                    )
+                except TypeError:
+                    template_kwargs.pop("enable_thinking", None)
+                    prompt = apply_chat_template(
+                        self._processor,
+                        self._model_config,
+                        [{"role": "system", "content": system_prompt}],
+                        **template_kwargs,
+                    )
+                encode = getattr(self._processor, "encode", None)
+                if not callable(encode):
+                    return
+                ids = encode(prompt)
+                if not isinstance(ids, list):
+                    ids = list(ids)
+                if not ids:
+                    return
+                import mlx.core as mx
+
+                cache = make_prompt_cache(self._model_obj)
+                # 头部只有文本（无图/音/视频），纯文本前向即可，与真实 prompt 的
+                # 文本前缀逐 token 对齐。分块前向填 KV，避免一次性喂超长序列。
+                step = max(512, int(getattr(self.config, "local_llm_prompt_batch_size", 4096)))
+                for i in range(0, len(ids), step):
+                    chunk = ids[i:i + step]
+                    self._model_obj(mx.array([chunk]), cache=cache)
+                    mx.eval([c.state for c in cache])
+                self._kv_cache = cache
+                self._kv_ids = list(ids)
+                self._kv_thread_ident = threading.get_ident()
+                # 留一份**母本**：它永不参与生成（生成只会用克隆体），长度永远停在
+                # 「system + 工具 schema」。思考模式下历史重放对不齐时，用它把
+                # 全量 prefill 降级为「只 prefill 头之后的对话部分」。
+                self._head_cache = _clone_prompt_cache(cache)
+                self._head_ids = list(ids)
+                self._head_thread_ident = threading.get_ident()
+                logger.info(
+                    "MLX-VLM 预热: 已预填 %d token 的 system+tools 前缀", len(ids)
+                )
+            except Exception as e:  # pragma: no cover - 预热失败不影响正常对话
+                logger.warning("MLX-VLM 预热失败（忽略）: %s", e)
+
+    def invalidate_kv_cache(self) -> None:
+        """丢弃跨轮 KV 缓存（历史被改写、用户取消、切换会话等场景调用）。
+
+        混合架构的 ArraysCache 不可裁剪，缓存只能整用或整弃；对不齐时
+        chat_stream 会自动重建，这里只是让调用方在已知历史变更时提前释放。
+
+        **静态头缓存保留**：它只含 system + 工具 schema，与历史无关，历史改写
+        后依然可用（下一轮直接降级复用它，省掉头部的 prefill）。
+        """
+        self._kv_cache = None
+        self._kv_ids = []
+        self._kv_thread_ident = None
 
 
 class ONNXLanguageBackend(_LazyLocalBackend):
@@ -1684,6 +1934,37 @@ class LlamaCppBackend(_LazyLocalBackend):
                 logger.warning("GGUF KV 缓存失效失败: %s", e)
         else:
             self._kv_cache = None
+
+    def prime_prefix_cache(self, system_prompt: str, tools=None) -> None:
+        """只 prefill「system + tools」头部（不生成），让 llama.cpp 的 LlamaCache
+        把这段不变前缀缓存下来，首条真实 prompt 直接命中复用（否则首条要全量
+        prefill system + 工具 schema，约 20s）。
+
+        与 MLX 后端同款语义：必须在常驻对话线程上调用（KV 缓存线程局部），由
+        AgentWorker 的 warmup 任务保证。对关闭了 KV 缓存或模型未加载的后端是
+        no-op。llama.cpp 在每次 ``create_chat_completion`` 时自动按 token 前缀命中
+        已 attach 的 LlamaCache → 只 eval 增量，所以这里只需「把头部 eval 一遍」。
+        """
+        if not self._kv_cache_enabled or self._llama is None:
+            return
+        self._ensure_loaded()
+        with self._generation_lock:
+            try:
+                # max_tokens=0：只把 system+tools 这段 prompt 前向一遍、不采样，
+                # KV 写进已 attach 的 LlamaCache；首条真实 prompt 以它开头即可命中。
+                # cache_prompt 默认 True，配合 set_cache 的 LlamaCache 做前缀匹配。
+                self._llama.create_chat_completion(
+                    messages=[{"role": "system", "content": system_prompt}],
+                    tools=tools or None,
+                    temperature=0.0,
+                    max_tokens=0,
+                    stream=False,
+                )
+                logger.info(
+                    "GGUF 预热: 已预填 system+tools 前缀（LlamaCache 自动复用）"
+                )
+            except Exception as e:  # pragma: no cover - 预热失败不影响对话
+                logger.warning("GGUF 预热失败（忽略）: %s", e)
 
     @staticmethod
     def _multimodal_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

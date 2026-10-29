@@ -2656,13 +2656,14 @@ class VectorStore:
                 table.delete("doc_id = ''")
             except Exception:
                 pass
-            table.add([{
+            row = {
                 "doc_id": doc_id,
                 "doc_name": doc_name,
                 "digest": digest,
                 "chapters": chapters,
                 "md_path": md_path,
-            }])
+            }
+            table.add([row])
             logger.info("  ├─ 文档元数据已写入: %s (digest %d 字符)", doc_name, len(digest))
             # 写入后失效缓存，下次读取时重新加载。
             self._documents_cache = None

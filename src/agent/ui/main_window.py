@@ -1135,6 +1135,10 @@ class MainWindow(QMainWindow):
         self._plan_poll_timer.timeout.connect(self._poll_task_plan)
         self._plan_rendered = ""
         self._plan_poll_timer.start()
+        # 闲时章节摘要调度器：无论辅助引擎是否启用都运行，空闲时增量补全每本书的
+        # 章节目录摘要（详见 src/agent/rag/book_summary.py）。
+        self._summary_scheduler = None
+        self._start_book_summary_scheduler()
         # Pending skill suggestion — cached when the agent emits
         # on_skill_suggested during a run, and shown as a dialog AFTER the
         # run finishes. Showing a modal dialog during streaming would block
@@ -3078,6 +3082,43 @@ class MainWindow(QMainWindow):
             getattr(llm, attr, None) is not None
             for attr in ("_model_obj", "_llama", "_session")
         )
+
+    # ------------------------------------------------------------------
+    # 闲时章节摘要调度器（见 src/agent/rag/book_summary.py）
+    # ------------------------------------------------------------------
+    def _is_idle_for_summary(self) -> bool:
+        """调度器用的「闲时」判定：未退出、无对话在进行、无知识同步在进行。"""
+        if getattr(self, "_closing", False):
+            return False
+        if getattr(self, "_busy", False):
+            return False
+        if getattr(self, "_sync_active", False):
+            return False
+        return True
+
+    def _start_book_summary_scheduler(self) -> None:
+        """启动（或复用）闲时章节摘要后台线程。"""
+        sched = getattr(self, "_summary_scheduler", None)
+        if sched is not None and sched.is_alive():
+            return
+        try:
+            from ..rag.book_summary import BookSummaryScheduler
+
+            self._summary_scheduler = BookSummaryScheduler(
+                engine_getter=lambda: getattr(self, "_engine", None),
+                config=self.config,
+                aux_getter=lambda: getattr(self, "_aux_llm", None),
+                is_idle=self._is_idle_for_summary,
+            )
+            self._summary_scheduler.start()
+            logger.info("UI: 闲时章节摘要调度器已启动")
+        except Exception as e:  # pragma: no cover - 启动失败不致命
+            logger.warning("UI: 闲时章节摘要调度器启动失败（忽略）: %s", e)
+
+    def _stop_book_summary_scheduler(self) -> None:
+        sched = getattr(self, "_summary_scheduler", None)
+        if sched is not None and sched.is_alive():
+            sched.stop()
 
     def _on_model_action(self, action: str) -> None:
         """加载模型 / 卸载 / 应用配置 的统一入口。"""
