@@ -71,6 +71,25 @@ def _hash(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _relevance_floor(embedding_model: str) -> float:
+    """语义命中的最低余弦阈值（按嵌入模型族自适应）。
+
+    不同模型族的余弦分布差异很大：nomic 对无关文本也给出 ~0.45-0.5 的
+    虚高分数（0.5 才能滤掉噪声），而 jina-embeddings-v3 分离度极好
+    （实测相关命中 ~0.37+、无关 ~0.03）——沿用 0.5 会把正确命中全部
+    滤空（2026-10-28 切默认嵌入模型后暴露）。阈值只影响「是否出现在
+    结果列表」，不影响排序。
+    """
+    try:
+        from .rag.embedding_prefixes import detect_family
+        family = detect_family(embedding_model)
+    except Exception:
+        return 0.5
+    if family == "jina":
+        return 0.25
+    return 0.5
+
+
 # ---------------------------------------------------------------------------
 # Graph store
 # ---------------------------------------------------------------------------
@@ -304,9 +323,18 @@ class GraphMemoryStore:
                 for (name, obs), vec in zip(batch, vecs)
             ]
             with self._vec_lock:
+                # 锁内重取 + double-check（与 _index_observation 同款）：回填
+                # 线程与同步写入路径可能并发首次建表——loop 外取的 table 快照
+                # 在此已可能过期，盲目 create_table 会撞「already exists」
+                # 让回填线程整批死亡（2026-10-28 实测：jina 模型加载慢、
+                # 竞态窗口显著变大）。
+                table = self._table
                 if table is None:
-                    self._table = self._db.create_table("observations", records)
-                    table = self._table
+                    if "observations" in self._db.table_names():
+                        table = self._db.open_table("observations")
+                    else:
+                        table = self._db.create_table("observations", records)
+                    self._table = table
                 else:
                     table.add(records)
         logger.info("graph_memory: backfilled %d observations into vector index", len(missing))
@@ -719,11 +747,16 @@ class GraphMemoryStore:
             results = table.search(qvec).limit(top_k).to_list()
             out = []
             for r in results:
-                dist = float(r.get("_distance", 1.0))
-                score = max(0.0, 1.0 - (dist * dist) / 2.0)
+                dist = float(r.get("_distance", 2.0))
+                # LanceDB 的 _distance 是平方 L2（‖a-b‖²）：单位向量下
+                # d² = 2(1-cos)，故 cos = 1 - d²/2，**不可**再对 dist 自身
+                # 平方（旧实现双重平方把分数系统性压低，jina 短查询命中
+                # 被阈值误滤成空——2026-10-28 修正）。
+                score = max(0.0, 1.0 - dist / 2.0)
                 # 相似度阈值：过滤语义上不相关的结果（否则无关查询也会
-                # 返回低分命中，破坏"无匹配返回空"的语义）。
-                if score < 0.5:
+                # 返回低分命中，破坏"无匹配返回空"的语义）。阈值按嵌入
+                # 模型族自适应（见 _relevance_floor）。
+                if score < _relevance_floor(self._embedding_model_name):
                     continue
                 out.append({
                     "entity": r.get("entity", ""),

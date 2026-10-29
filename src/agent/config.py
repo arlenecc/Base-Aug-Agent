@@ -170,29 +170,56 @@ class AgentConfig:
     # MLX 不可用时（非 Apple Silicon / 未安装 / 路径缺失）自动回退 fastembed，
     # 不会出现「默认配置直接不可用」。
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
-    # 内置默认 embedding（2026-10-27 切回）：nomic-embed-text-v1.5 的本地 MLX
-    # INT8 量化版。nomic 支持 Matryoshka（MRL）：入库/查询向量截前
-    # rag_matryoshka_dim 维后**重新归一化**再存 f16（vector_store 统一处理），
-    # 向量库体积 3×↓（768×f32 → 512×f16）且检索走 lancedb 原生 .search()。
-    # 文档加「search_document: 」、查询加「search_query: 」前缀（前缀按模型族
-    # 统一判定，见 rag/embedding_prefixes.py：nomic/bge/jina/e5 各有约定）。
-    # 注意：切换
-    # embedding 或截断维度后向量空间变了，必须重新同步（force）重建索引，
-    # 否则新旧向量混检会错乱。bge-small-zh-v1.5 作为 MLX 不可用时的 fastembed
-    # 回退：
-    rag_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5-Q"
-    rag_embedding_model_path: str = "models/nomic-embed-text-v1.5-mlx-int8"
-    # Matryoshka 截断维度（2026-10-27 可配置）：仅对支持 MRL 的 nomic 系模型
-    # 生效。默认 512（256 维中文检索质量实测偏弱，512 为官方推荐质量档）；
-    # 设 0 = 不截断（保留全部 768 维）。修改后必须 force 重新同步。
-    rag_matryoshka_dim: int = 512
+    # 内置默认 embedding（2026-10-28 定版）：jina-embeddings-v3 本地 MLX INT4
+    # 量化版（mlx-lm 不支持该导出，走 rag/jina_v3_mlx.py 参考实现直载）。
+    # jina v3 支持 Matryoshka（MRL）：默认裁剪 256 维 + L2 重归一化 + int8
+    # 入库（jina@256 中文检索质量实测与全维持平：20/20 vs nomic@512 8/20），
+    # 入库体积 4×↓；代价是嵌入比 nomic 慢约 3×、检索走暴力扫描（中小库无感）。
+    # 任务类型经 LoRA 运行时切换（文档 retrieval.passage / 查询 retrieval.query），
+    # 输入前置任务提示词 + 标签前缀（"passage: "/"query: "，按模型族统一判定，
+    # 见 rag/embedding_prefixes.py）。nomic-embed-text-v1.5（MLX INT8，
+    # models/nomic-embed-text-v1.5-mlx-int8）保留为高速备选：嵌入快 3×、
+    # f16 原生 ANN，中文口语化改写查询召回偏弱。注意：切换 embedding 或裁剪
+    # 维度后向量空间变了，必须重新同步（force）重建索引，否则新旧向量混检
+    # 会错乱——实际维度/类型不匹配时同步会自动清库重建。bge-small-zh-v1.5
+    # 作为 MLX 不可用时的 fastembed 回退：
+    rag_embedding_model: str = "jinaai/jina-embeddings-v3"
+    rag_embedding_model_path: str = "models/jina-embeddings-v3-mlx-int4"
+    # Matryoshka（MRL）向量裁剪（2026-10-28 可配置）：对支持 MRL 的模型
+    # （nomic-embed-text-v1.5 / jina-embeddings-v3 等，按模型名识别）生效。
+    # rag_matryoshka_enabled=False → 不裁剪，全维 f16 入库，lancedb 原生 ANN。
+    # enabled=True → 入库/查询对称执行：截前 rag_matryoshka_dim 维 → L2 重归一
+    # 化（硬性步骤）→ 按 rag_vector_dtype 决定存储精度（见下）。裁剪维度仅提供
+    # 128/256/512 三档（其它值自动吸附到最近一档）。默认 256（jina@256 实测
+    # 质量与全维持平、体积 4×↓；nomic 用户建议手动调回 512——nomic 在 256 维
+    # 中文检索质量偏弱）。修改后必须 force 重新同步（维度/类型不匹配时同步会
+    # 自动清库重建）。
+    rag_matryoshka_enabled: bool = True
+    rag_matryoshka_dim: int = 256
+    # 启用裁剪后的向量存储精度（2026-10-29 新增，可选）：
+    # 注意：两种精度的**列类型都是 float16**（2026-10-29 定版）——int8 指
+    # 「值被量化」，整数仍以 float16 承载。这样 lancedb 原生 .search() 与
+    # ANN 索引对两种精度都可用，切换本选项也不会因列类型不兼容而重建表结构
+    # （但值语义不同：量化向量范数≈127 vs 单位向量，切换后仍会重建**数据**）。
+    #   "int8"：截维 → 重归一化 → ×127 取整（值域 [-127,127]）后以 f16 存储。
+    #     体积与 f16 相同（列宽一致），好处是值只剩整数、可进一步做整数量化
+    #     存储/传输；检索按 1 - d²/(2·127²) 还原余弦。
+    #   "f16" ：截维 → 重归一化 → 直接以 f16 存储（单位向量），检索按
+    #     1 - d²/2 还原余弦；数值精度略高于 int8（无量化取整损失）。
+    # 未启用裁剪时无论此值如何都是全维 f16（原生检索）。默认保持 int8。
+    rag_vector_dtype: str = "int8"
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16
-    # nomic-embed-text-v1.5 是旋转位置编码，训练长度 2048、靠 RoPE 外推到
-    # n_positions=8192（本地 MLX 权重 config 即如此）；绝对位置嵌入模型（如
-    # bge-small-zh，512）会在后端加载时按自己 config 夹紧。默认按 nomic 设 8192。
-    rag_embedding_max_length: int = 8192
+    # 嵌入输入长度上限（2026-10-28 由 8192 收紧到 1024）：tokenizer 统一
+    # padding=True（只补到批内最长实际序列）+ truncation=True——计算量本来
+    # 就跟实际长度走，max_length 只是截断上限、不会凭空多算。收紧的理由：
+    # 切片硬限 800 字符 ≈ ≤800 token，1024 留 ~28% 余量已覆盖全部切片；
+    # 超长异常输入（如整篇文章贴进查询框）也只算 1024 token，杜绝无谓的
+    # 长序列二次方注意力开销。若调大 rag_chunk_size（>1000 字符），需同步
+    # 调大本值，否则切片尾部会被截断丢信息。绝对位置嵌入模型（bge-small-zh
+    # 512）在后端加载时按自身 config 夹紧，不受此值影响。
+    rag_embedding_max_length: int = 1024
     # 每个实例内部的 intra-op 线程数（fastembed/ONNX/llama_cpp 生效；MLX 后端
     # 忽略此项、走自身全局线程池）。默认 6 充分利用多核；MLX 下此项无效。
     rag_embedding_threads: int = 6
@@ -275,15 +302,16 @@ class AgentConfig:
     rag_docling_vlm: bool = False
 
     # PDF 转换按文件大小限流（docling / marker 两个转换器共用一套参数）：
-    #   - rag_pdf_small_concurrency：小于阈值的「小文件」最多几路并发转换（同时
-    #     持有的 docling 转换器实例数，每实例 ≈1.9GB 模型权重常驻）。默认 2 =
-    #     2 路并发提速；大文件（>rag_pdf_batch_threshold_mb）已被按页分批切成
-    #     ≤rag_pdf_batch_pages 页的子 PDF，单批内存可控，允许 2 路并行而不至
-    #     瞬间撑爆内存。内存吃紧（如 16GB 统一内存机型）调回 1 即全串行。
+    #   - rag_pdf_small_concurrency：解析引擎并发实例数——小于阈值的「小文件」
+    #     最多几路并发转换（同时持有的 docling 转换器实例数，每实例 ≈1.9GB
+    #     模型权重常驻）。设置窗口「并发实例」下拉 1-6 可选，默认 1（2026-10-28
+    #     由 2 收紧为 1：省 ~1.9GB 常驻内存，多库/大库用户可在 UI 调回 2-6 提
+    #     吞吐）。大文件（>rag_pdf_batch_threshold_mb）已被按页分批切成
+    #     ≤rag_pdf_batch_pages 页的子 PDF，调高后单批并行路数随之增加。
     #   - rag_pdf_large_threshold_mb：大于等于该大小的文件视为「大文件」，
     #     独占单实例串行转换——大文件（扫描书）单册峰值内存就很高，并发
     #     两份会把统一内存撑爆。
-    rag_pdf_small_concurrency: int = 2
+    rag_pdf_small_concurrency: int = 1
     rag_pdf_large_threshold_mb: float = 20.0
     # 大文件按页分批（2026-10 新增）：单 PDF > rag_pdf_batch_threshold_mb
     # 且页数超过 rag_pdf_batch_pages 时，切成每批 rag_pdf_batch_pages 页的
@@ -333,14 +361,14 @@ class AgentConfig:
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
         "rag_rerank_backend", "rag_rerank_model", "rag_rerank_model_path",
         "rag_rerank_mlx_model_path", "rag_rerank_jina_model_path",
-        "browser_endpoint", "rag_pdf_engine",
+        "browser_endpoint", "rag_pdf_engine", "rag_vector_dtype",
         "rag_ocr_backend", "rag_ocr_model", "rag_ocr_model_path",
         "rag_ocr_gguf_path", "rag_ocr_mmproj_path", "rag_ocr_tokenizer_path",
         "rag_ocr_vlm_handler", "rag_ocr_chat_format",
     )
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale", "rag_docling_vlm",
-                    "rag_semantic_chunking",
+                    "rag_semantic_chunking", "rag_matryoshka_enabled",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
                     "aux_llm_enabled",
                     "llm_speculative", "llama_cpp_kv_cache", "llama_cpp_kv_q8",
@@ -348,7 +376,7 @@ class AgentConfig:
     # 业务上不允许为空的字符串字段（空串 → 视为缺失，回退到默认值）。
     # knowledge_base / API key / mmproj / chat format 可以为空。
     _NON_EMPTY_STR_FIELDS = (
-        "base_url", "model", "workspace", "llm_mode",
+        "base_url", "model", "workspace", "llm_mode", "rag_vector_dtype",
         "llm_backend", "llm_model_path",
         "aux_llm_backend", "aux_llm_model_path",
         "rag_embedding_backend", "rag_embedding_model", "rag_embedding_model_path",
@@ -489,6 +517,9 @@ class AgentConfig:
         }
         if self.rag_embedding_model in _DEPRECATED_EMBEDDING_MODELS:
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+            # 路径一并归位：默认路径已是 jina（2026-10-28），仅改模型名会出现
+            # 「nomic 名 + jina 路径」的错配组合（后端按路径选模型）。
+            self.rag_embedding_model_path = "models/nomic-embed-text-v1.5-mlx-int8"
         # Non-quantized nomic-embed-text-v1.5 (~548MB) → quantized -Q (~137MB).
         # Same 768-dim embeddings, 4x smaller download, same quality.
         elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
@@ -506,6 +537,40 @@ class AgentConfig:
                 self.rag_embedding_backend == "mlx":
             self.rag_embedding_model_path = "models/nomic-embed-text-v1.5-mlx-int8"
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
+        # 2026-10-28 二次切换：默认 embedding 定为 jina-embeddings-v3 +
+        # 裁剪 256 维（jina@256 中文检索质量实测与全维持平、入库体积 4×↓；
+        # nomic 保留为高速备选）。只重写**旧默认组合**（nomic 默认模型 +
+        # 默认路径 + mlx 后端），显式配置过的模型/路径/后端不动（沿用迁移
+        # 先例）；旧默认裁剪档 512 随迁到 256。fastembed 后端不支持 jina v3，
+        # 故仅迁移 mlx 组合。
+        if (self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+                and self.rag_embedding_model_path
+                == "models/nomic-embed-text-v1.5-mlx-int8"
+                and self.rag_embedding_backend == "mlx"):
+            self.rag_embedding_model = "jinaai/jina-embeddings-v3"
+            self.rag_embedding_model_path = "models/jina-embeddings-v3-mlx-int4"
+            if self.rag_matryoshka_dim == 512:
+                self.rag_matryoshka_dim = 256
+        # 2026-10-28：嵌入输入长度上限由旧默认 8192 收紧到 1024（切片硬限
+        # 800 字符 ≈ ≤800 token，1024 足够；超长异常输入不再全额计算）。
+        # 只重写旧默认值——用户显式改过的其它值不动。
+        if self.rag_embedding_max_length == 8192:
+            self.rag_embedding_max_length = 1024
+        # 2026-10-28：PDF 解析并发实例默认由 2 收紧为 1（省 ~1.9GB 常驻内存；
+        # 需要吞吐的用户在设置窗口「并发实例」下拉调回 2-6）。只重写旧默认值。
+        if self.rag_pdf_small_concurrency == 2:
+            self.rag_pdf_small_concurrency = 1
+        # 2026-10-28：Matryoshka 裁剪维度收敛为 128/256/512 三档，并新增独立
+        # 的 enabled 开关。旧配置归一：
+        #   - dim=0（旧「0=不截断」语义）→ enabled=False + dim=256（当前默认档）；
+        #   - dim 不在三档内（如 768）→ 吸附到最近一档。
+        _MRL_DIMS = (128, 256, 512)
+        if self.rag_matryoshka_dim == 0:
+            self.rag_matryoshka_enabled = False
+            self.rag_matryoshka_dim = 256
+        elif self.rag_matryoshka_dim not in _MRL_DIMS:
+            self.rag_matryoshka_dim = min(
+                _MRL_DIMS, key=lambda d: (abs(d - self.rag_matryoshka_dim), d))
         if self.rag_chunk_size == 500:
             self.rag_chunk_size = 800
         if self.rag_chunk_overlap == 50:
@@ -568,6 +633,13 @@ class AgentConfig:
         self.rag_embedding_max_length = max(8, self.rag_embedding_max_length)
         self.rag_rerank_batch_size = max(1, self.rag_rerank_batch_size)
         self.rag_rerank_max_length = max(8, self.rag_rerank_max_length)
+        # PDF 解析并发实例夹在 [1, 6]：UI 下拉同款范围；手改配置超出时收敛，
+        # 防止无界实例数把统一内存撑爆（每实例 ≈1.9GB 模型权重）。
+        self.rag_pdf_small_concurrency = max(1, min(6, int(self.rag_pdf_small_concurrency)))
+        # 向量存储精度只允许 int8 / f16：手改配置写错值时回落到默认 int8，
+        # 避免走到「既不量化也不对列类型」的中间态导致库类型不匹配。
+        _dtype = str(self.rag_vector_dtype or "").strip().lower()
+        self.rag_vector_dtype = _dtype if _dtype in ("int8", "f16") else "int8"
 
     def save(self, path: str) -> None:
         import json

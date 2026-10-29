@@ -586,11 +586,13 @@ def test_completed_file_checkpointed_to_manifest_per_file(tmp_path, monkeypatch)
     import agent.rag.engine as engine_mod
 
     saved_calls: list = []
+    fsync_flags: list = []
     orig_save = engine_mod._save_manifest
 
-    def _spy_save(rag_dir, files, removed=None):
+    def _spy_save(rag_dir, files, removed=None, fsync=True):
         saved_calls.append(set(files.keys()))
-        return orig_save(rag_dir, files, removed)
+        fsync_flags.append(fsync)
+        return orig_save(rag_dir, files, removed, fsync)
 
     monkeypatch.setattr(engine_mod, "_save_manifest", _spy_save)
 
@@ -606,6 +608,14 @@ def test_completed_file_checkpointed_to_manifest_per_file(tmp_path, monkeypatch)
     assert single_file_saves, "应存在逐文件增量保存 manifest 的调用"
     saved_names = {os.path.basename(n) for s in single_file_saves for n in s}
     assert saved_names == {"a.txt", "b.txt"}, saved_names
+
+    # 2026-10-29：增量 checkpoint 必须**跳过 fsync**（逐文件强制刷盘是同步期
+    # 的隐性延迟来源），而终态（Step 6）落盘仍必须 fsync=True。
+    incremental_flags = [
+        f for s, f in zip(saved_calls, fsync_flags) if len(s) == 1]
+    assert incremental_flags and not any(incremental_flags), \
+        "增量保存不应做 fsync"
+    assert fsync_flags[-1] is True, "终态（Step 6）保存必须 fsync"
 
     # 最终 manifest 仍含两个文件
     assert len(_load_manifest(engine._rag_dir)) == 2

@@ -1234,11 +1234,20 @@ def test_onnx_embedding_function_splits_long_batches_without_losing_rows():
     assert all(len(v) == 4 for v in vectors) # 形状正确
 
 
-def test_config_default_embedding_length_8192(tmp_path):
+def test_config_default_embedding_length_1024(tmp_path):
+    """2026-10-28：嵌入输入上限默认收紧到 1024（切片 ≤800 字符已全覆盖）。
+
+    - 旧默认 8192 的存量配置经迁移重写为 1024；
+    - 用户显式设置的其它值（如 2048，配合加大切片）不被迁移；
+    - 非正值被拉到下限 8，不会把 tokenizer 的 max_length 置成 0/负。
+    """
     cfg = AgentConfig()
-    assert cfg.rag_embedding_max_length == 8192
-    # 非正值被拉到下限 8，不会把 tokenizer 的 max_length 置成 0/负。
+    assert cfg.rag_embedding_max_length == 1024
     path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"rag_embedding_max_length": 8192}))
+    assert AgentConfig.load(str(path)).rag_embedding_max_length == 1024
+    path.write_text(json.dumps({"rag_embedding_max_length": 2048}))
+    assert AgentConfig.load(str(path)).rag_embedding_max_length == 2048
     path.write_text(json.dumps({"rag_embedding_max_length": 0}))
     assert AgentConfig.load(str(path)).rag_embedding_max_length == 8
 

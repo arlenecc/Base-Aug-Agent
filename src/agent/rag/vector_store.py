@@ -47,14 +47,32 @@ _FTS_COLUMN = "text_fts"
 _INGESTED_AT = "ingested_at"
 
 # ---------------------------------------------------------------------------
-# f16 向量存储（2026-10-27）：向量列存 fixed_size_list<float16>，检索走
-# lancedb 原生 .search()（f16 列实测可查：f32/f16 查询均 OK，可建 ANN 索引）。
-# Matryoshka 截断维度由 config.rag_matryoshka_dim 控制（默认 512）。
+# 向量存储（2026-10-28）：支持 Matryoshka 的模型由用户配置裁剪：
+#   启用 → int8（暴力扫描）；关闭 → f16 全维（lancedb 原生 ANN，f16/f32 查询
+#   均可、可建 ANN 索引）。
 # ---------------------------------------------------------------------------
-# Matryoshka 截断维度的兜底默认值（实际以构造参数 / config 为准）：
-# nomic-embed-text-v1.5 官方支持 MRL，截前 N 维后重归一化。
-_MATRYOSHKA_DIM = 512
-_MATRYOSHKA_MARKER = "nomic-embed-text-v1.5"
+# Matryoshka（MRL）向量裁剪（2026-10-28）：对支持 MRL 的模型（nomic /
+# jina 等，按模型名识别）统一管线，由 rag_matryoshka_enabled /
+# rag_matryoshka_dim（128/256/512）控制：
+#   启用 → 入库/查询对称：截前 N 维 → L2 重归一化（硬性）→ 按 rag_vector_dtype
+#          收尾：int8 = 值量化（×127 取整），f16 = 直接保留浮点。
+#          **列类型恒为 float16**（2026-10-29 定版）：int8 只是「值量化」的
+#          标记，整数仍以 float16 承载 —— 真·FixedSizeList(Int8) 列在
+#          lancedb 0.40 上无法检索（"no vector column"），统一 f16 列后原生
+#          .search() 与 ANN 索引对两种精度都可用（已实测）。
+#   关闭 → 全维 f16 入库，lancedb 原生检索。
+_MRL_MARKERS = ("nomic-embed-text-v1.5", "jina-embeddings-v3")
+_INT8_SCALE = 127
+
+# 建表时写入 Arrow schema metadata 的键：记录该表的向量存储精度（int8 量化 /
+# f16 浮点）。列类型恒为 float16，但**值语义不同**（量化后范数≈127 vs 单位
+# 向量），切换精度后必须重建数据——靠这个标记检测，避免新旧向量混检。
+_VECTOR_DTYPE_META = b"vector_dtype"
+
+# 精排候选收敛倍数（2026-10-29）：混合检索两路合并后的候选先按融合分截断到
+# top_k × 本倍数 再送交叉编码器。2 倍足以覆盖重排需要的头部候选，精排成本
+# 约为收敛前的 1/2~1/4（原候选最多 ~8×top_k）。
+_RERANK_CANDIDATE_MULTIPLIER = 2
 
 # jieba 分词器缓存（进程级单例，避免每次调用重复初始化词典）。
 _jieba = None
@@ -673,7 +691,9 @@ class VectorStore:
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
-        matryoshka_dim: int = _MATRYOSHKA_DIM,
+        matryoshka_enabled: bool = True,
+        matryoshka_dim: int = 512,
+        vector_dtype: str = "int8",
     ):
         self._persist_dir = persist_dir
         self._embedding_model = embedding_model
@@ -723,12 +743,24 @@ class VectorStore:
         self._fts_ready = False  # BM25 全文索引是否已就绪
         self._fts_checked = False  # 是否已尝试创建过 FTS 索引
         self._fts_failed = False  # 建索引曾失败 → 不再重试（见 _ensure_fts_index）
-        # ---- f16 向量存储（2026-10-27）----
-        # Matryoshka 分流：模型名/路径含 nomic-embed-text-v1.5 → 截前
-        # matryoshka_dim 维（0 = 不截断）。检索走 lancedb 原生 .search()。
-        self._matryoshka = _MATRYOSHKA_MARKER in (
-            f"{embedding_model or ''} {embedding_model_path or ''}".lower())
+        # ---- 向量存储分流（2026-10-29 支持选择存储精度）----
+        # 支持 Matryoshka 的模型（nomic / jina 等）且用户启用裁剪 → 先统一做
+        # 「截 N 维 → L2 重归一化」，再按 vector_dtype 决定存储精度：
+        #   int8 → 量化入库（体积最小；lancedb 原生 .search() 不认 int8 列，
+        #          检索走自管 numpy 暴力扫描 O(N)）；
+        #   f16  → 保留浮点入库（lancedb **原生检索**，可建 ANN 索引，亚线性）。
+        # 未启用裁剪 → 全维 f16 入库（原生 ANN）。
+        _ident = f"{embedding_model or ''} {embedding_model_path or ''}".lower()
+        self._mrl = any(marker in _ident for marker in _MRL_MARKERS)
+        self._matryoshka_enabled = bool(matryoshka_enabled)
         self._matryoshka_dim = max(0, int(matryoshka_dim))
+        self._vector_dtype = str(vector_dtype or "int8").strip().lower()
+        if self._vector_dtype not in ("int8", "f16"):
+            self._vector_dtype = "int8"
+        # 是否执行截维（与存储精度正交：两种精度都要先截维+重归一化）
+        self._mrl_trunc = (
+            self._mrl and self._matryoshka_enabled and self._matryoshka_dim > 0)
+        self._int8_store = self._mrl_trunc and self._vector_dtype == "int8"
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -958,16 +990,23 @@ class VectorStore:
     # f16 向量存储（Matryoshka 截断 + 重归一化，入库/查询对称执行）
     # ------------------------------------------------------------------
 
+    def _vec_trunc_dim(self) -> int:
+        """向量截断维度：MRL 模型且启用裁剪时取 matryoshka_dim，否则不截。"""
+        if self._mrl_trunc:
+            return self._matryoshka_dim
+        return 0
+
     def _expected_vec_dim(self, probe_dim: Optional[int]) -> Optional[int]:
         """入库向量的目标维度：Matryoshka 模型截 matryoshka_dim 维，其它保持原维度。"""
         if probe_dim is None:
             return None
-        if self._matryoshka and self._matryoshka_dim > 0:
-            return min(probe_dim, self._matryoshka_dim)
+        trunc = self._vec_trunc_dim()
+        if trunc > 0:
+            return min(probe_dim, trunc)
         return probe_dim
 
     def _prepare_vec(self, vec) -> np.ndarray:
-        """单条向量 → 入库 f16：截断（Matryoshka）→ L2 重归一化 → f16。
+        """单条向量 → 入库：截断（Matryoshka）→ L2 重归一化 → f16（jina 为 int8）。
 
         重归一化是**硬性步骤**：截断会破坏单位长度（前 N 维的范数 < 1），
         不重新归一化的话截断向量的方向虽不变，但与查询侧的处理必须一致，
@@ -978,15 +1017,30 @@ class VectorStore:
     def _prepare_query(self, vec, dtype=np.float32) -> np.ndarray:
         """查询/入库向量的对称处理：截断 → 重归一化 → 指定 dtype。
 
-        入库侧 dtype=float16（列类型钉死 halffloat）；查询侧 float32
-        （lancedb 原生 .search() 对 f16 列接受 f32 查询——已实测）。
+        列类型**恒为 float16**（2026-10-29 定版）：int8 指的是「值量化」
+        （截维后重归一化 → ×127 取整），量化后的整数仍以浮点 dtype 承载写进
+        float16 列。这样 lancedb 原生 .search() / ANN 索引始终可用——
+        真·FixedSizeList(Int8) 列在 lancedb 0.40 上无法检索（"no vector
+        column"），本项目刻意规避。
+
+        两种精度：
+          - int8：值量化为 [-127,127] 整数（向量范数 ≈127），检索用
+            ``1 - d²/(2·127²)`` 还原余弦；
+          - f16 ：保留单位向量（范数 1），检索用 ``1 - d²/2`` 还原余弦。
+        入库侧 dtype=float16；查询侧 float32（原生 .search() 对 f16 列接受
+        f32 查询——已实测）。重归一化必须在量化之前执行（方向信息先保住）。
         """
         v = np.asarray(vec, dtype=np.float32)
-        if self._matryoshka and self._matryoshka_dim > 0:
-            v = v[:self._matryoshka_dim]
+        trunc = self._vec_trunc_dim()
+        if trunc > 0:
+            v = v[:trunc]
         n = float(np.linalg.norm(v))
         if n > 0:
-            v = v / n  # 截断后重归一化（入库与查询侧对称执行）
+            v = v / n  # 截断后重归一化（入库与查询侧对称执行，硬性步骤）
+        if self._int8_store:
+            # 量化成整数值，但以浮点承载（列是 float16，不是真 Int8 列）。
+            return np.clip(np.round(v * _INT8_SCALE),
+                           -_INT8_SCALE, _INT8_SCALE).astype(dtype)
         return v.astype(dtype)
 
     def reset_if_incompatible(self) -> bool:
@@ -1012,15 +1066,18 @@ class VectorStore:
             names = schema.names
             expected_dim = self._expected_vec_dim(self._probe_ef_dim())
             current_dim = None
-            current_is_f16 = False
+            current_type_ok = False
             if "vector" in names:
                 try:
                     vec_type = schema.field("vector").type
                     current_dim = vec_type.list_size
-                    current_is_f16 = (
-                        pa.types.is_float16(getattr(vec_type, "value_type", None)))
+                    value_type = getattr(vec_type, "value_type", None)
+                    # 列类型恒为 float16（int8 只是值量化的标记）。
+                    current_type_ok = pa.types.is_float16(value_type)
                 except Exception:
                     current_dim = None
+            # 存储精度标记（旧表无此标记 → None，视为兼容，交给维度/类型判断）
+            current_dtype = self._stored_vector_dtype(self._table)
 
             incompatible = False
             reasons = []
@@ -1035,9 +1092,16 @@ class VectorStore:
                 incompatible = True
                 reasons.append(
                     f"向量维度不匹配（库内 {current_dim} 维 vs 当前嵌入 {expected_dim} 维）")
-            elif "vector" in names and not current_is_f16:
+            elif "vector" in names and not current_type_ok:
                 incompatible = True
-                reasons.append("向量列不是 f16（旧表，f16 存储升级）")
+                reasons.append("向量列类型不符（期望 float16）")
+            elif (current_dtype and current_dtype != self._vector_dtype):
+                # 列类型相同但值语义不同：量化向量（范数≈127）与浮点向量
+                # （范数 1）混检会把相似度排序彻底带偏 → 必须重建。
+                incompatible = True
+                reasons.append(
+                    f"向量存储精度切换（库内 {current_dtype} → 当前 "
+                    f"{self._vector_dtype}）")
             for col in ("id", _FTS_COLUMN, _INGESTED_AT):
                 if col not in names:
                     incompatible = True
@@ -1098,8 +1162,12 @@ class VectorStore:
             table = self._ensure_table()
             if table is not None:
                 return table, False
-            # 显式 schema：向量列为 fixed_size_list<float16>（f16 存储体积 2×↓，
-            # lancedb 原生可查）。依赖数据推断会把向量推成 f32 列——类型必须钉死。
+            # 显式 schema：向量列**恒为** fixed_size_list<float16>（2026-10-29
+            # 定版）。int8 只表示「值被量化成 [-127,127] 整数」，整数仍以
+            # float16 承载——真 Int8 列在 lancedb 0.40 上无法检索（"no vector
+            # column"），统一 f16 列才能让原生 .search() 与 ANN 索引一直可用，
+            # 且切换 int8/f16 不会因列类型不兼容而重建表结构。
+            # 依赖数据推断会把向量推成 f32 列——类型必须钉死。
             _first_vec = records[0].get("vector")
             dim = len(_first_vec) if _first_vec is not None else 0
             schema = pa.schema([
@@ -1111,7 +1179,7 @@ class VectorStore:
                 ("chunk_index", pa.int64()),
                 (_FTS_COLUMN, pa.string()),
                 (_INGESTED_AT, pa.float64()),
-            ])
+            ], metadata={_VECTOR_DTYPE_META: self._vector_dtype})
             self._table = self._db.create_table(_TABLE_NAME, records, schema=schema)
             self._table_checked = True
             return self._table, True
@@ -1121,7 +1189,18 @@ class VectorStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _assert_vector_dim_compat(table: Any, records: List[Dict[str, Any]]) -> None:
+    def _stored_vector_dtype(table: Any) -> Optional[str]:
+        """读建表时写入 schema metadata 的向量存储精度标记（旧表返回 None）。"""
+        try:
+            meta = table.schema.metadata or {}
+            raw = meta.get(_VECTOR_DTYPE_META)
+            if raw is None:
+                return None
+            return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        except Exception:
+            return None
+
+    def _assert_vector_dim_compat(self, table: Any, records: List[Dict[str, Any]]) -> None:
         """写入前校验表向量维度与数据一致，不一致立刻抛明确错误。
 
         #140 防御兜底：旧表（如 nomic 768 维）未被清掉时，首批写入就拿到
@@ -1133,7 +1212,9 @@ class VectorStore:
         try:
             vec_type = table.schema.field("vector").type
             table_dim = vec_type.list_size
-            table_is_f16 = pa.types.is_float16(getattr(vec_type, "value_type", None))
+            value_type = getattr(vec_type, "value_type", None)
+            # 列类型恒为 float16（int8 只是「值量化」的标记）。
+            type_ok = pa.types.is_float16(value_type)
         except Exception:
             return
         vec = records[0].get("vector")
@@ -1142,10 +1223,17 @@ class VectorStore:
                 f"向量库维度不匹配：库内向量 {table_dim} 维，当前嵌入模型输出 "
                 f"{len(vec)} 维（嵌入模型或截断维度切换后旧库未清空）。"
                 f"请重新启动同步，将自动清库重建。")
-        if vec is not None and not table_is_f16:
+        if vec is not None and not type_ok:
             raise RuntimeError(
-                "向量库向量列不是 f16（旧表，f16 存储升级）。"
+                "向量库向量列不是 float16（旧表）。"
                 "请重新启动同步，将自动清库重建。")
+        # 存储精度变化（int8 量化 ↔ f16 浮点）：列类型相同但值语义不同——
+        # 量化向量范数 ≈127、浮点为 1，混检会把排序彻底带偏。必须重建数据。
+        stored_dtype = self._stored_vector_dtype(table)
+        if stored_dtype and stored_dtype != self._vector_dtype:
+            raise RuntimeError(
+                f"向量存储精度已从 {stored_dtype} 切换为 {self._vector_dtype}，"
+                "旧向量的数值尺度不同，不能混检。请重新启动同步，将自动清库重建。")
 
     @_store_op
     def add(
@@ -1665,6 +1753,29 @@ class VectorStore:
         return True
 
     @_store_op
+    @_store_op
+    def build_fts_index(self) -> bool:
+        """同步收尾**离线**构建 BM25 全文索引（2026-10-29）。
+
+        写入路径每次 add 都会置 ``_fts_ready=False``，若不在同步收尾补建，
+        「同步后第一次检索」就会在交互路径上跑一次全库 ``replace=True``
+        重建，表现为首查明显卡顿。查询路径仍保留自动补建（``search_fts``
+        → ``_ensure_fts_index``）作为兜底，因此这里失败不影响正确性。
+
+        Returns True if the index is available for querying.
+        """
+        table = self._ensure_table()
+        if table is None:
+            return False
+        try:
+            ok = bool(self._ensure_fts_index(table))
+        except Exception as e:  # noqa: BLE001 - 离线补建失败不应中断同步收尾
+            logger.debug("VectorStore: BM25 索引离线构建失败: %s", e)
+            return False
+        if ok:
+            logger.info("VectorStore: BM25 全文索引已就绪（同步收尾离线构建）")
+        return ok
+
     def search_fts(
         self,
         query: str,
@@ -1753,7 +1864,9 @@ class VectorStore:
         else:
             query_vec = self._prepare_query(self._ef([query])[0])
 
-        # Vector search：lancedb 原生检索（f16 列实测可查，f32 查询向量 OK）。
+        # Vector search：lancedb 原生检索。向量列**恒为 float16**（int8 只是
+        # 值量化标记），所以原生检索（及 ANN 索引）对两种存储精度都可用——
+        # 不再需要自管 numpy 暴力扫描。
         logger.info("  ├─ 向量相似度搜索: 在 %d 条向量中检索 top %d (f16 原生)...",
                     row_count, top_k)
         search = table.search(query_vec).limit(top_k)
@@ -1771,12 +1884,18 @@ class VectorStore:
 
         output: List[Dict[str, Any]] = []
         for r in results:
-            # LanceDB 返回 _distance（L2 距离，越小越相似）。
-            # 入库/查询两侧均为重归一化后的单位向量，L2 距离 d ∈ [0,2]，
-            # 余弦相似度 cos = 1 - d²/2，转换为 [0,1] 相似度统一下游接口。
+            # LanceDB 返回的 _distance 是**平方 L2**（‖a-b‖²，越小越相似）。
+            # _distance 是**平方 L2**（‖a-b‖²）。两侧向量尺度一致时：
+            #   f16（单位向量）：d² = 2(1-cos)      → cos = 1 - d²/2
+            #   int8（量化值，范数≈127）：d² = 2·127²(1-cos) → cos = 1 - d²/(2·127²)
+            # 注意不能再对 _distance 自身求平方（2026-10-28 修正：旧代码把它
+            # 再平方一次，所有分数被系统性压低）。
+            # ⚠ 若后续在 float16 列上建 ANN 索引，度量必须用 **l2**（默认）：
+            # 用 cosine 会让 _distance 变成 1-cos，此处换算即失效。
             if "_distance" in r:
                 distance = float(r["_distance"])
-                similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
+                scale = float(_INT8_SCALE) if self._int8_store else 1.0
+                similarity = max(0.0, 1.0 - distance / (2.0 * scale * scale))
             else:
                 # _distance 字段缺失（罕见：表 schema 不兼容或旧表迁移）。
                 logger.debug(
@@ -2093,9 +2212,19 @@ class VectorStore:
             logger.info("VectorStore.search_with_rerank: 混合检索无候选")
             return []
 
+        # 3.5 精排候选收敛（2026-10-29）：两路各取 top_k×N，合并去重后最多
+        # 约 8×top_k 条。交叉编码成本与候选条数线性相关，但重排只需要把
+        # 头部顺序理顺——对尾部的长尾候选精排是纯浪费。按融合分排序后只保留
+        # 前 top_k×_RERANK_CANDIDATE_MULTIPLIER 条（不低于 top_k）。
+        cap = max(top_k * _RERANK_CANDIDATE_MULTIPLIER, top_k)
+        if len(merged) > cap:
+            merged.sort(key=lambda c: float(c.get("score", 0.0) or 0.0), reverse=True)
+            merged = merged[:cap]
+
         logger.info(
-            "VectorStore.search_with_rerank: 混合候选 %d 条 (向量 %d + BM25 %d, 去重后 %d)",
-            len(merged), len(vec_candidates), len(fts_candidates), len(merged),
+            "VectorStore.search_with_rerank: 混合候选 %d 条 (向量 %d + BM25 %d) → 精排 %d 条",
+            len(vec_candidates) + len(fts_candidates), len(vec_candidates),
+            len(fts_candidates), len(merged),
         )
 
         # 4. BGE rerank + 5. min_similarity filter.

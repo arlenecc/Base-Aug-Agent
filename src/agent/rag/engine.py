@@ -328,6 +328,7 @@ def _save_manifest(
     rag_dir: str,
     files: Dict[str, Dict[str, Any]],
     removed: Optional[set] = None,
+    fsync: bool = True,
 ) -> None:
     """Persist the manifest atomically (temp + os.replace), **读改写合并**。
 
@@ -338,6 +339,11 @@ def _save_manifest(
     ``removed`` 是**本次有意删除**的 source 集合：这些键即使在磁盘版本里
     存在也必须删掉（否则「别的实例刚写入的条目」和「我刚删掉的条目」无法
     区分，删除会被合并逻辑复活）。
+
+    ``fsync=False``：跳过强制刷盘（2026-10-29）。同步过程中的**增量**保存
+    用不到持久化保证——进程被杀时最多丢最后攒批的几个条目，而 add_streaming
+    先按 source 删旧再插，幂等重做即可；省下的 fsync 才是同步期的隐性延迟
+    来源。收尾（Step 6）与删除清理等**终态**写入必须保持 fsync=True。
     """
     os.makedirs(rag_dir, exist_ok=True)
     path = _manifest_path(rag_dir)
@@ -351,7 +357,8 @@ def _save_manifest(
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"files": merged}, f, ensure_ascii=False, indent=2)
                 f.flush()
-                os.fsync(f.fileno())
+                if fsync:
+                    os.fsync(f.fileno())
             os.replace(tmp, path)
         except Exception:
             try:
@@ -569,7 +576,7 @@ class RAGEngine:
         knowledge_base: str = "",
         embedding_model: str = "",
         embedding_function: Any = None,
-        embedding_backend: str = "fastembed",
+        embedding_backend: str = "mlx",
         embedding_model_path: str = "",
         embedding_threads: int = 6,
         embedding_batch_size: int = 8,
@@ -592,7 +599,9 @@ class RAGEngine:
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
+        matryoshka_enabled: bool = True,
         matryoshka_dim: int = 512,
+        vector_dtype: str = "int8",
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
         pdf_engine: str = "docling",
         ocr_backend: str = "mlx",
@@ -615,13 +624,15 @@ class RAGEngine:
         self._rag_dir = os.path.join(workspace, "rag")
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
-        self._embedding_model = embedding_model or "nomic-ai/nomic-embed-text-v1.5-Q"
+        self._embedding_model = embedding_model or "jinaai/jina-embeddings-v3"
         self._embedding_backend = embedding_backend
         self._embedding_model_path = embedding_model_path
         self._embedding_threads = max(1, int(embedding_threads))
         self._embedding_batch_size = max(1, int(embedding_batch_size))
         self._embedding_max_length = max(8, int(embedding_max_length))
+        self._matryoshka_enabled = bool(matryoshka_enabled)
         self._matryoshka_dim = max(0, int(matryoshka_dim))
+        self._vector_dtype = str(vector_dtype or "int8").strip().lower()
         self._custom_ef = embedding_function  # for testing injection
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
@@ -1576,6 +1587,23 @@ class RAGEngine:
                         except Exception as e:
                             logger.warning("RAG: progress_callback error: %s", e)
 
+            def _checkpoint_file(fp: str, entry: Dict[str, Any]) -> None:
+                """文件完整入库即落盘（保持「逐文件 checkpoint」契约）。
+
+                2026-10-29 优化：增量路径**不做 fsync**。逐文件 fsync 是本步的
+                真正成本（每个文件一次强制刷盘），而这里要的只是「进程被杀后
+                已完成文件不用重做」——数据已进 OS 页缓存，正常退出/收尾写入
+                都会持久化；异常断电最多丢最后几个文件的记录，add_streaming
+                先删后插保证幂等重做。终态写入（Step 6）仍 fsync=True。
+                """
+                try:
+                    _save_manifest(self._rag_dir, {fp: entry}, fsync=False)
+                    _log("  ├─ 已完整入库，增量保存同步记录: %s",
+                         os.path.basename(fp))
+                except OSError as e:
+                    logger.warning(
+                        "RAG: 增量保存同步记录失败（不影响本次同步）: %s", e)
+
             def _on_batch(batch_added: int, total_added: int) -> None:
                 # 记录已提交切片数：取消/失败时据此判断哪些文件已完整入库。
                 committed_chunks["n"] = total_added
@@ -1592,13 +1620,8 @@ class RAGEngine:
                             # 该文件已完整入库：输出各阶段耗时汇总（解析/清洗/切片/
                             # 向量化+入库），定位慢/卡点。只此一次（_fp 已进 new_manifest）。
                             _log_file_stage_times(_fp)
-                            try:
-                                _save_manifest(self._rag_dir, {_fp: _entry})
-                                _log("  ├─ 已完整入库，增量保存同步记录: %s",
-                                     os.path.basename(_fp))
-                            except OSError as e:
-                                logger.warning(
-                                    "RAG: 增量保存同步记录失败（不影响本次同步）: %s", e)
+                            # 逐文件 checkpoint（去掉 fsync，省掉强制刷盘开销）
+                            _checkpoint_file(_fp, _entry)
                 _mem_mark(f"向量化批次 +{batch_added} (累计 {total_added})")
                 _log("  ├─ 向量化批次写入: +%d 切片 (累计 %d)", batch_added, total_added)
                 if progress_callback is not None:
@@ -1761,6 +1784,16 @@ class RAGEngine:
                     _log("  目录结构（缩略版本）补做/重刷: %d 篇", refreshed)
             except Exception as e:
                 logger.warning("  目录结构补做/重刷失败: %s", e)
+
+            # Step 8: BM25 全文索引离线补建（2026-10-29）。
+            # 写入路径每次 add 都会置 _fts_ready=False，若同步收尾不补建，
+            # 「同步后第一次检索」就会在交互路径上跑一次全库 replace=True
+            # 重建——表现为首查明显卡顿。失败不致命：查询路径会自动补建。
+            try:
+                if self._get_store().build_fts_index():
+                    _log("  BM25 全文索引已就绪（同步收尾离线构建）")
+            except Exception as e:  # noqa: BLE001 - 离线补建失败不应中断收尾
+                logger.debug("RAG: BM25 索引离线构建失败（首次检索会自动补建）: %s", e)
         finally:
             # 后台观测线程必须**无条件**停：Step 5~7（清理删除项 / 副本去重 /
             # 保存 manifest / 补刷目录）任何一步抛异常，旧实现都只从两条正常
@@ -2599,7 +2632,9 @@ class RAGEngine:
                         rerank_threads=self._rerank_threads,
                         rerank_batch_size=self._rerank_batch_size,
                         rerank_max_length=self._rerank_max_length,
+                        matryoshka_enabled=self._matryoshka_enabled,
                         matryoshka_dim=self._matryoshka_dim,
+                        vector_dtype=self._vector_dtype,
                         rerank_enabled=self._rerank_enabled,
                     )
         return self._store

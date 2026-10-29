@@ -262,13 +262,13 @@ class ToolRegistry:
             logger.info(
                 "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
                 self.config.workspace, kb,
-                getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
+                getattr(self.config, "rag_embedding_model", "jinaai/jina-embeddings-v3"),
             )
             engine = RAGEngine(
                 workspace=self.config.workspace,
                 knowledge_base=kb,
-                embedding_model=getattr(self.config, "rag_embedding_model", "nomic-ai/nomic-embed-text-v1.5-Q"),
-                embedding_backend=getattr(self.config, "rag_embedding_backend", "fastembed"),
+                embedding_model=getattr(self.config, "rag_embedding_model", "jinaai/jina-embeddings-v3"),
+                embedding_backend=getattr(self.config, "rag_embedding_backend", "mlx"),
                 embedding_model_path=getattr(self.config, "rag_embedding_model_path", ""),
                 embedding_threads=getattr(self.config, "rag_embedding_threads", 6),
                 embedding_batch_size=getattr(self.config, "rag_embedding_batch_size", 8),
@@ -285,7 +285,9 @@ class ToolRegistry:
                 rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
                 rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),
                 rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
+                matryoshka_enabled=getattr(self.config, "rag_matryoshka_enabled", True),
                 matryoshka_dim=getattr(self.config, "rag_matryoshka_dim", 512),
+                vector_dtype=getattr(self.config, "rag_vector_dtype", "int8"),
                 pdf_engine=getattr(self.config, "rag_pdf_engine", "docling"),
                 # OvisOCR3 + docling 动态倍率（2026-10 审查修复：此前漏转发，
                 # agent 侧 ingest 用模块默认值，配置窗口里的自定义模型路径与

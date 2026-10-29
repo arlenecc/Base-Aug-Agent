@@ -1294,6 +1294,246 @@ def mlx_runtime_blocker() -> str:
     return ""
 
 
+_JINA_TASK_QUERY = "retrieval.query"
+_JINA_TASK_PASSAGE = "retrieval.passage"
+# jina-embeddings-v3 ONNX 单文件的 task → task_id（模型输入，见 example/example_onnx.py）。
+_JINA_ONNX_TASK_ID = {
+    "retrieval.query": 0,
+    "retrieval.passage": 1,
+    "separation": 2,
+    "classification": 3,
+    "text-matching": 4,
+}
+# task_prompt_map 缺失时的兜底（与模型 config.json / example 一致）。
+_JINA_DEFAULT_TASK_PROMPTS = {
+    "retrieval.query": "Represent the query for retrieving evidence documents: ",
+    "retrieval.passage": "Represent the document for retrieval: ",
+    "separation": "Represent the sentence for retrieving duplicate sentences: ",
+    "classification": "Represent the document for classifying: ",
+    "text-matching": "Represent the sentence for retrieving the most similar sentence: ",
+}
+
+
+def _jina_compose(texts: List[str], task: str, task_prompt: str,
+                  label_prefix: str) -> List[str]:
+    """jina-embeddings-v3 输入组装：任务提示词 + 标签前缀 + 原文。
+
+    任务提示词（task_prompt_map，模型训练时的约定）在最前，标签前缀
+    （"passage: "/"query: "，embedding_prefixes 按模型族给出）紧贴原文。
+    """
+    return [task_prompt + _eprefix.apply_prefix(label_prefix, t) for t in texts]
+
+
+class JinaMLXEmbeddingFunction:
+    """jina-embeddings-v3 本地 MLX 直载后端。
+
+    mlx-lm / mlx-embeddings 均不支持该单文件统一导出（model_type=jina-v3-mlx），
+    模型结构与加载走参考实现 rag/jina_v3_mlx.py（vendor 自模型目录 example）。
+    任务类型经 encode(task=...) 在运行时选择 LoRA 适配器：文档分片用
+    retrieval.passage、检索查询用 retrieval.query。输出 1024 维、已 L2 归一化；
+    Matryoshka 截 256 维 / 重归一化 / int8 量化由 VectorStore 统一处理。
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        batch_size: int = 8,
+        max_length: int = 512,
+        document_prefix: Optional[str] = None,
+        query_prefix: Optional[str] = None,
+    ):
+        self._model_path = resolve_model_path(model_path)
+        self._batch_size = max(1, int(batch_size))
+        self._max_length = max(64, int(max_length))
+        _doc_p, _query_p = _eprefix.prefixes(self._model_path)
+        self._document_prefix = (
+            document_prefix if document_prefix is not None else _doc_p)
+        self._query_prefix = (
+            query_prefix if query_prefix is not None else _query_p)
+        self._model = None
+        self._tokenizer = None
+        self._task_prompts: Dict[str, str] = {}
+        self._load_lock = threading.RLock()
+        self._embed_lock = threading.RLock()
+
+    def _ensure_model(self) -> None:
+        if self._model is not None:
+            return
+        with self._load_lock:
+            if self._model is not None:
+                return
+            _cap_mlx_memory_limits()
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._model_path, local_files_only=True, trust_remote_code=False)
+            from .jina_v3_mlx import load_model
+
+            self._model, cfg = load_model(self._model_path)
+            self._task_prompts = dict(cfg.get("task_prompt_map")
+                                      or _JINA_DEFAULT_TASK_PROMPTS)
+            logger.info("Jina MLX Embedding 加载完成: %s (unified=%s)",
+                        self._model_path, cfg.get("unified"))
+
+    def _embed(self, texts: List[str], task: str) -> List[np.ndarray]:
+        if not texts:
+            return []
+        self._ensure_model()
+        import mlx.core as mx
+        import numpy as np
+
+        prompt = self._task_prompts.get(task, "")
+        label = (self._document_prefix if task == _JINA_TASK_PASSAGE
+                 else self._query_prefix)
+        out: List[np.ndarray] = []
+        with self._embed_lock:
+            for start in range(0, len(texts), self._batch_size):
+                batch = texts[start:start + self._batch_size]
+                prefixed = _jina_compose(batch, task, prompt, label)
+                enc = self._tokenizer(
+                    prefixed, padding=True, truncation=True,
+                    max_length=self._max_length, return_tensors="np",
+                )
+                emb = self._model.encode(
+                    mx.array(enc["input_ids"]),
+                    mx.array(enc["attention_mask"]),
+                    task=task,
+                )
+                out.extend(np.asarray(emb, dtype=np.float32))
+        return out
+
+    def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self._embed(input, _JINA_TASK_PASSAGE)
+
+    def embed_documents(self, texts: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self(texts, batch_size=batch_size)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self._embed([text], _JINA_TASK_QUERY)[0]
+
+    def name(self) -> str:
+        return f"jina_mlx:{self._model_path}"
+
+    def close(self) -> None:
+        with self._load_lock:
+            self._model = None
+            self._tokenizer = None
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+
+
+class JinaONNXEmbeddingFunction:
+    """jina-embeddings-v3 单文件 ONNX 后端（task_id 输入选择任务 LoRA）。
+
+    单 model.onnx 服务全部 5 个任务：输入 input_ids / attention_mask（int64）
+    外加标量 task_id（retrieval.query=0、retrieval.passage=1，见模型目录
+    example/example_onnx.py）。输出 (B, 1024) 已 mean-pool + L2 归一化。
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        threads: int = 4,
+        batch_size: int = 8,
+        max_length: int = 512,
+        document_prefix: Optional[str] = None,
+        query_prefix: Optional[str] = None,
+    ):
+        self._model_file, self._model_dir = _find_onnx(model_path)
+        self._threads = max(1, int(threads))
+        self._batch_size = max(1, int(batch_size))
+        self._max_length = max(64, int(max_length))
+        _doc_p, _query_p = _eprefix.prefixes(f"{self._model_dir} {model_path}")
+        self._document_prefix = (
+            document_prefix if document_prefix is not None else _doc_p)
+        self._query_prefix = (
+            query_prefix if query_prefix is not None else _query_p)
+        self._session = None
+        self._tokenizer = None
+        self._task_prompts: Dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    def _ensure_model(self) -> None:
+        if self._session is not None:
+            return
+        with self._lock:
+            if self._session is not None:
+                return
+            import json
+            import onnxruntime as ort
+            from transformers import AutoTokenizer
+
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = self._threads
+            options.inter_op_num_threads = 1
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self._session = ort.InferenceSession(
+                self._model_file, sess_options=options,
+                providers=["CPUExecutionProvider"])
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._model_dir, local_files_only=True, trust_remote_code=False)
+            try:
+                with open(os.path.join(self._model_dir, "config.json"),
+                          encoding="utf-8") as f:
+                    self._task_prompts = dict(
+                        json.load(f).get("task_prompt_map")
+                        or _JINA_DEFAULT_TASK_PROMPTS)
+            except Exception:
+                self._task_prompts = dict(_JINA_DEFAULT_TASK_PROMPTS)
+            logger.info("Jina ONNX Embedding 加载完成(CPU): %s", self._model_file)
+
+    def _embed(self, texts: List[str], task: str) -> List[np.ndarray]:
+        if not texts:
+            return []
+        self._ensure_model()
+        import numpy as np
+
+        prompt = self._task_prompts.get(task, "")
+        label = (self._document_prefix if task == _JINA_TASK_PASSAGE
+                 else self._query_prefix)
+        task_id = _JINA_ONNX_TASK_ID.get(task)
+        if task_id is None:
+            raise ValueError(f"jina-embeddings-v3 不支持任务类型: {task}")
+        out: List[np.ndarray] = []
+        with self._lock:
+            for start in range(0, len(texts), self._batch_size):
+                batch = texts[start:start + self._batch_size]
+                prefixed = _jina_compose(batch, task, prompt, label)
+                enc = self._tokenizer(
+                    prefixed, padding=True, truncation=True,
+                    max_length=self._max_length, return_tensors="np")
+                values = self._session.run(None, {
+                    "input_ids": enc["input_ids"].astype(np.int64),
+                    "attention_mask": enc["attention_mask"].astype(np.int64),
+                    "task_id": np.array(task_id, dtype=np.int64),
+                })[0]
+                out.extend(np.asarray(values, dtype=np.float32))
+        return out
+
+    def __call__(self, input: List[str]) -> List[np.ndarray]:
+        return self._embed(input, _JINA_TASK_PASSAGE)
+
+    def embed_documents(self, texts: List[str]) -> List[np.ndarray]:
+        return self(texts)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self._embed([text], _JINA_TASK_QUERY)[0]
+
+    def name(self) -> str:
+        return f"jina_onnx:{self._model_file}"
+
+    def close(self) -> None:
+        with self._lock:
+            self._session = None
+            self._tokenizer = None
+
+
 def _fastembed_embedding(model_name: str, threads: int):
     from .vector_store import FastEmbedEmbeddingFunction
 
@@ -1310,6 +1550,25 @@ def create_embedding_backend(
     max_length: int = _EMBEDDING_DEFAULT_MAX_LENGTH,
 ):
     backend = (backend or "fastembed").lower()
+    # jina-embeddings-v3：mlx-lm/mlx-embeddings/fastembed 均不支持该导出，
+    # 必须走专用后端；且不允许静默回退 fastembed（会错成别的模型）。
+    ident = f"{model_name or ''} {model_path or ''}".lower()
+    if "jina-embeddings-v3" in ident:
+        if backend == "mlx":
+            blocker = mlx_runtime_blocker()
+            if blocker:
+                raise RuntimeError(
+                    f"jina-embeddings-v3 需要 MLX 运行时（当前不可用: {blocker}）。"
+                    "可改用 ONNX 后端 + models/jina-embeddings-v3-onnx-int4。")
+            return JinaMLXEmbeddingFunction(
+                model_path, batch_size=batch_size, max_length=max_length)
+        if backend == "onnx":
+            return JinaONNXEmbeddingFunction(
+                model_path, threads=threads, batch_size=batch_size,
+                max_length=max_length)
+        raise ValueError(
+            "jina-embeddings-v3 仅支持 mlx / onnx 后端"
+            f"（当前后端 {backend!r} 无此模型）")
     if backend == "mlx":
         blocker = mlx_runtime_blocker()
         if blocker:

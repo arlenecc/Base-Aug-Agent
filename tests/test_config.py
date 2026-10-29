@@ -13,10 +13,10 @@ from agent.config import AgentConfig
 def test_load_returns_defaults_when_missing(tmp_path):
     p = tmp_path / "missing.json"
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
-    assert cfg.rag_embedding_model_path == "models/nomic-embed-text-v1.5-mlx-int8"
+    assert cfg.rag_embedding_model == "jinaai/jina-embeddings-v3"
+    assert cfg.rag_embedding_model_path == "models/jina-embeddings-v3-mlx-int4"
     assert cfg.rag_chunk_size == 800
-    assert cfg.rag_matryoshka_dim == 512
+    assert cfg.rag_matryoshka_dim == 256
     assert cfg.base_url == "https://api.openai.com/v1"
 
 
@@ -73,8 +73,9 @@ def test_save_round_trip(tmp_path):
 ])
 def test_migrate_deprecated_embedding_models(stale_name, tmp_path):
     """Stale embedding model names saved before the LanceDB migration must be
-    silently rewritten to the current default so old config files don't break
-    RAG sync."""
+    silently rewritten to the current default (jina) so old config files
+    don't break RAG sync. 迁移链：stale → nomic 归位 → 旧 nomic 默认组合 →
+    jina（backend 保持默认 mlx 时）。"""
     p = tmp_path / "c.json"
     p.write_text(json.dumps({
         "base_url": "http://x",
@@ -83,7 +84,118 @@ def test_migrate_deprecated_embedding_models(stale_name, tmp_path):
         "rag_embedding_model": stale_name,
     }))
     cfg = AgentConfig.load(str(p))
+    assert cfg.rag_embedding_model == "jinaai/jina-embeddings-v3"
+    assert cfg.rag_embedding_model_path == "models/jina-embeddings-v3-mlx-int4"
+
+
+def test_migrate_old_nomic_default_to_jina(tmp_path):
+    """2026-10-28 二次切换：旧 nomic 默认组合（模型+路径+mlx）迁移到 jina，
+    旧默认裁剪档 512 随迁为 256。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "base_url": "http://x",
+        "api_key": "",
+        "model": "m",
+        "rag_embedding_backend": "mlx",
+        "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
+        "rag_embedding_model_path": "models/nomic-embed-text-v1.5-mlx-int8",
+        "rag_matryoshka_dim": 512,
+    }))
+    cfg = AgentConfig.load(str(p))
+    assert cfg.rag_embedding_model == "jinaai/jina-embeddings-v3"
+    assert cfg.rag_embedding_model_path == "models/jina-embeddings-v3-mlx-int4"
+    assert cfg.rag_matryoshka_dim == 256
+
+
+def test_explicit_nomic_with_custom_path_not_migrated(tmp_path):
+    """用户显式配置的 nomic（非默认路径/组合）不被迁移。"""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({
+        "base_url": "http://x",
+        "api_key": "",
+        "model": "m",
+        "rag_embedding_backend": "mlx",
+        "rag_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
+        "rag_embedding_model_path": "models/my-own-nomic",
+    }))
+    cfg = AgentConfig.load(str(p))
     assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    assert cfg.rag_embedding_model_path == "models/my-own-nomic"
+
+
+def test_matryoshka_dim_normalized_to_three_choices(tmp_path):
+    """2026-10-28：裁剪维度收敛为 128/256/512 三档。
+
+    - 非法值（768）吸附到最近档（512）；
+    - 旧「0 = 不截断」语义迁移为 enabled=False + dim=512；
+    - 默认配置：enabled=True + 512。
+    """
+    def _load(dim, enabled=None):
+        d = {"base_url": "http://x", "api_key": "", "model": "m",
+             "rag_matryoshka_dim": dim}
+        if enabled is not None:
+            d["rag_matryoshka_enabled"] = enabled
+        p = tmp_path / f"c{dim}-{enabled}.json"
+        p.write_text(json.dumps(d))
+        return AgentConfig.load(str(p))
+
+    cfg768 = _load(768)
+    assert cfg768.rag_matryoshka_dim == 512
+    assert cfg768.rag_matryoshka_enabled is True
+
+    cfg100 = _load(100)
+    assert cfg100.rag_matryoshka_dim == 128
+
+    cfg_off = _load(0)  # 旧「0 = 不截断」语义
+    assert cfg_off.rag_matryoshka_enabled is False
+    assert cfg_off.rag_matryoshka_dim == 256
+
+    cfg_valid = _load(512, enabled=False)  # 用户显式值不动
+    assert cfg_valid.rag_matryoshka_dim == 512
+    assert cfg_valid.rag_matryoshka_enabled is False
+
+    fresh = AgentConfig()
+    assert fresh.rag_matryoshka_enabled is True
+    assert fresh.rag_matryoshka_dim == 256
+
+
+def test_pdf_concurrency_default_migrated_and_clamped(tmp_path):
+    """2026-10-28：PDF 解析并发实例默认由 2 收紧为 1，范围钳制 [1,6]。
+
+    - 旧默认 2 的存量配置迁移为 1；
+    - 用户显式设置的其它值（3-6）保留；
+    - 手改配置越界（0 / 99）收敛到边界；
+    - 默认新装 = 1。
+    """
+    def _load(value):
+        p = tmp_path / f"pc{value}.json"
+        p.write_text(json.dumps({"rag_pdf_small_concurrency": value}))
+        return AgentConfig.load(str(p))
+
+    assert _load(2).rag_pdf_small_concurrency == 1      # 旧默认 → 新默认
+    assert _load(4).rag_pdf_small_concurrency == 4      # 显式值保留
+    assert _load(0).rag_pdf_small_concurrency == 1      # 下界
+    assert _load(99).rag_pdf_small_concurrency == 6     # 上界
+    assert AgentConfig().rag_pdf_small_concurrency == 1  # 新装默认
+
+
+def test_vector_dtype_option(tmp_path):
+    """2026-10-29：向量存储精度可选 int8（默认）/ f16。
+
+    - 默认 int8（保持既有行为，不打扰存量配置）；
+    - 合法值 f16 保留；非法值 / 空串回落 int8。
+    """
+    assert AgentConfig().rag_vector_dtype == "int8"
+
+    def _load(value):
+        p = tmp_path / f"vd{value}.json"
+        p.write_text(json.dumps({"rag_vector_dtype": value}))
+        return AgentConfig.load(str(p))
+
+    assert _load("f16").rag_vector_dtype == "f16"
+    assert _load("F16").rag_vector_dtype == "f16"   # 大小写归一
+    assert _load("float16").rag_vector_dtype == "int8"  # 非法值回落
+    assert _load("").rag_vector_dtype == "int8"     # 空串 → 按缺失回退默认
 
 
 def test_migrate_preserves_valid_embedding_model(tmp_path):
@@ -127,7 +239,7 @@ def test_migrate_persisted_after_save(tmp_path):
     cfg.save(str(p))  # persist the migrated value
     # Reload — should now read the corrected value from disk directly.
     cfg2 = AgentConfig.load(str(p))
-    assert cfg2.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    assert cfg2.rag_embedding_model == "jinaai/jina-embeddings-v3"
 
 
 def test_migrate_legacy_rerank_model(tmp_path):
@@ -304,13 +416,13 @@ def test_local_model_defaults_are_parallel_not_forced():
     assert cfg.llm_model_path.endswith("qwen3.5-4b-agentic-coder-v4-4bit-mlx")
     assert cfg.aux_llm_backend == "mlx_lm"
     assert cfg.aux_llm_model_path.endswith("Qwen3.5-2B-MLX-4bit")
-    # 主模型默认本地化，RAG 两个模型默认也走本地 MLX（2026-10-27 切回 nomic）。
+    # 主模型默认本地化，RAG 两个模型默认也走本地 MLX（2026-10-28 切 jina）。
     assert cfg.rag_embedding_backend == "mlx"
-    assert cfg.rag_embedding_model_path.endswith("nomic-embed-text-v1.5-mlx-int8")
+    assert cfg.rag_embedding_model_path.endswith("jina-embeddings-v3-mlx-int4")
     assert cfg.rag_rerank_backend == "jina"
     assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
-    # 回退用的 fastembed 目录名必须保留，否则 MLX 不可用时无路可退。
-    assert cfg.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5-Q"
+    # 默认 embedding 模型名（fastembed 目录名回退语义由 _DEPRECATED 映射保留）。
+    assert cfg.rag_embedding_model == "jinaai/jina-embeddings-v3"
     assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
     assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
 
