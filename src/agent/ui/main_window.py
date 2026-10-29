@@ -1396,6 +1396,41 @@ class MainWindow(QMainWindow):
             placeholderText="HuggingFace 模型名（如 nomic-ai/nomic-embed-text-v1.5-Q）")
         self.embedding_model_path_edit = QLineEdit(placeholderText="本地 Embedding 模型目录/文件")
         self.embedding_model_path_btn = QPushButton("选择")
+        # Matryoshka（MRL）向量裁剪（2026-10-28）：对 nomic / jina 等支持 MRL
+        # 的嵌入模型生效。启用后入库/查询对称执行「截 N 维 → L2 重归一化 →
+        # int8 量化」；关闭则全维 f16 入库（原生 ANN 检索）。
+        self.matryoshka_check = QCheckBox("向量裁剪")
+        self.matryoshka_check.setToolTip(
+            "Matryoshka 向量裁剪（MRL），对 nomic / jina 等支持的模型生效\n"
+            "开：入库和查询都截前 N 维 → 重新归一化 → int8 量化（体积 4×↓）\n"
+            "关：保留模型全维向量（f16 存储，检索更快）\n"
+            "修改后需重新同步知识库（向量空间变化会自动清库重建）"
+        )
+        self.matryoshka_dim_combo = QComboBox()
+        for _d, _tip in (
+            (128, "最小体积，速度最快；召回质量最低"),
+            (256, "均衡；jina 模型此档质量与全维持平"),
+            (512, "官方推荐质量档（nomic 256 维中文实测偏弱）"),
+        ):
+            self.matryoshka_dim_combo.addItem(f"{_d} 维", _d)
+        self.matryoshka_dim_combo.setToolTip(
+            "裁剪保留的向量维度（Matryoshka 前缀维度）\n"
+            "裁剪后自动完成 L2 重归一化，再按「存储精度」收尾（入库/查询对称）" + "\n"
+            + " / ".join(f"{d}维：{t}" for d, t in ((128, "最小体积"), (256, "均衡"), (512, "质量最优")))
+        )
+        # 存储精度（2026-10-29 新增）：启用裁剪后向量以什么精度入库。
+        # int8=体积最小但只能暴力扫描；f16=多 1 倍体积换回 lancedb 原生检索
+        # （可建 ANN 索引，大库检索亚线性）。
+        self.vector_dtype_combo = QComboBox()
+        self.vector_dtype_combo.addItem("int8（省空间）", "int8")
+        self.vector_dtype_combo.addItem("f16（原生检索）", "f16")
+        self.vector_dtype_combo.setToolTip(
+            "向量存储精度（需先开启「向量裁剪」）\n"
+            "int8：256B/条（256 维），体积最小；lancedb 原生检索不认 int8 列，"
+            "走自管 numpy 暴力扫描（小中库无感）\n"
+            "f16：512B/条，可用 lancedb 原生检索并可建 ANN 索引（大库推荐）\n"
+            "关闭裁剪时始终为全维 f16（原生检索）"
+        )
         # --- PDF 解析引擎（下拉，2026-10-27 由横排单选改）+ 自定义 OCR 模型 ---
         # 改下拉的原因：该行还挤着「自定义 OCR」整段（后端/路径/保存/测试），
         # 三个单选钮 + 标签占掉 ~350px，下拉省出大半。引擎差异说明放进
@@ -1408,6 +1443,17 @@ class MainWindow(QMainWindow):
                 self.pdf_engine_combo.setItemData(
                     _idx, _PDF_ENGINE_TIPS.get(_value[1], ""),
                     Qt.ItemDataRole.ToolTipRole)
+        # 并发实例（2026-10-28 用户要求）：解析引擎同时持有的转换实例路数
+        # （docling/marker 共用 rag_pdf_small_concurrency），1-6 可选、默认 1。
+        # 大文件（>阈值）仍独占单实例；每实例 ≈1.9GB 模型权重常驻。
+        self.pdf_concurrency_combo = QComboBox()
+        for _n in range(1, 7):
+            self.pdf_concurrency_combo.addItem(str(_n), _n)
+        self.pdf_concurrency_combo.setToolTip(
+            "PDF 解析引擎并发实例数（1-6）\n"
+            "同时转换的小文件路数：调大提速，代价是每实例 ~1.9GB 常驻内存\n"
+            "大文件（>20MB）始终独占单实例串行转换；默认 1 = 最省内存"
+        )
         self.ocr_backend_combo = QComboBox()
         _fill_backend_combo(self.ocr_backend_combo, OCR_BACKENDS)
         self.ocr_backend_combo.setToolTip(
@@ -1636,6 +1682,35 @@ class MainWindow(QMainWindow):
         self.kb_apply_btn.setToolTip("应用工作目录 / 知识库 / Embedding / Reranker 设置")
         self.kb_apply_btn.clicked.connect(self._on_apply_config)
         dir_row.addWidget(self.kb_apply_btn)
+        # 知识库三个操作按钮（2026-10-28 用户要求）：依次排在「应用配置」后面，
+        # 从 Embedding / Reranker 行挪出——三个行内控件本就挤，操作入口集中在
+        # 首行更好找。顺序：开始同步 → 停止同步 → 向量去重。
+        self.sync_knowledge_btn = QPushButton("开始同步")
+        self.sync_knowledge_btn.setToolTip(
+            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
+            "左键：增量同步（只处理新增/修改的文件）\n"
+            "右键：强制全量重新处理"
+        )
+        # Right-click context menu: force full reprocess (ignores manifest).
+        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
+        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
+        dir_row.addWidget(self.sync_knowledge_btn)
+        # Stop-sync button: enabled only while a sync is running. Cancels
+        # the ingest after the current file completes (cooperative cancel).
+        self.stop_sync_btn = QPushButton("停止同步")
+        self.stop_sync_btn.setEnabled(False)
+        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
+        dir_row.addWidget(self.stop_sync_btn)
+        # 向量去重：同步前的库维护操作——扫描向量库按文本内容清理重复向量
+        # （保留入库最早的一份），降低检索噪声。点击后需确认（删除不可逆）。
+        self.vector_dedup_btn = QPushButton("向量去重")
+        self.vector_dedup_btn.setToolTip(
+            "扫描向量库，按文本内容找出完全相同的重复向量\n"
+            "保留入库最早的一份，其余删除（不可恢复）\n"
+            "用于清理同一文档多次入库造成的检索噪声"
+        )
+        dir_row.addWidget(self.vector_dedup_btn)
         kb_lay.addLayout(dir_row)
 
         # Row 1.5: PDF 解析引擎（三选一单选钮横列）+ 自定义 OCR 配置（同行）
@@ -1646,6 +1721,8 @@ class MainWindow(QMainWindow):
         engine_row.setSpacing(8)
         engine_row.addWidget(QLabel("PDF 解析引擎"))
         engine_row.addWidget(self.pdf_engine_combo)
+        engine_row.addWidget(QLabel("并发实例"))
+        engine_row.addWidget(self.pdf_concurrency_combo)
         engine_row.addStretch(1)
         engine_row.addWidget(QLabel("自定义 OCR"))
         engine_row.addWidget(self.ocr_backend_combo)
@@ -1694,7 +1771,7 @@ class MainWindow(QMainWindow):
         self.ocr_backend_combo.currentIndexChanged.connect(
             self._update_ocr_secondary_controls)
 
-        # Row 2: Embedding 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 同步知识
+        # Row 2: Embedding 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 切片/裁剪参数
         emb_row = QHBoxLayout()
         emb_row.setSpacing(8)
         emb_row.addWidget(QLabel("Embedding"))
@@ -1714,30 +1791,13 @@ class MainWindow(QMainWindow):
         emb_row.addWidget(self.chunk_size_spin)
         emb_row.addWidget(QLabel("重叠"))
         emb_row.addWidget(self.chunk_overlap_spin)
-        # 向量去重按钮：放在「同步知识」前面——它是同步前的库维护操作，
-        # 扫描向量库按文本内容清理重复向量（保留入库最早的一份），降低
-        # 检索噪声。点击后需确认（删除不可逆）。
-        self.vector_dedup_btn = QPushButton("向量去重")
-        self.vector_dedup_btn.setToolTip(
-            "扫描向量库，按文本内容找出完全相同的重复向量\n"
-            "保留入库最早的一份，其余删除（不可恢复）\n"
-            "用于清理同一文档多次入库造成的检索噪声"
-        )
-        emb_row.addWidget(self.vector_dedup_btn)
-        self.sync_knowledge_btn = QPushButton("同步知识")
-        self.sync_knowledge_btn.setToolTip(
-            "解析知识库文档、建立向量索引，支持 RAG 检索\n"
-            "左键：增量同步（只处理新增/修改的文件）\n"
-            "右键：强制全量重新处理"
-        )
-        # Right-click context menu: force full reprocess (ignores manifest).
-        self.sync_knowledge_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
-        self._force_sync_action = self.sync_knowledge_btn.addAction("强制全量重新处理")
-        self._force_sync_action.triggered.connect(lambda: self._on_sync_knowledge(force=True))
-        emb_row.addWidget(self.sync_knowledge_btn)
+        # 向量裁剪（Matryoshka）：与切片参数同属「嵌入产物怎么入库」的配置。
+        emb_row.addWidget(self.matryoshka_check)
+        emb_row.addWidget(self.matryoshka_dim_combo)
+        emb_row.addWidget(self.vector_dtype_combo)
         kb_lay.addLayout(emb_row)
 
-        # Row 3: Reranker 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | 停止同步
+        # Row 3: Reranker 后端 | 模型名(仅 fastembed) / 本地路径(本地后端) | TopN
         rerank_row = QHBoxLayout()
         rerank_row.setSpacing(8)
         rerank_row.addWidget(QLabel("Reranker"))
@@ -1751,12 +1811,6 @@ class MainWindow(QMainWindow):
         rerank_row.addWidget(self.reranker_model_path_btn)
         rerank_row.addWidget(QLabel("TopN"))
         rerank_row.addWidget(self.rerank_topn_spin)
-        # Stop-sync button: enabled only while a sync is running. Cancels
-        # the ingest after the current file completes (cooperative cancel).
-        self.stop_sync_btn = QPushButton("停止同步")
-        self.stop_sync_btn.setEnabled(False)
-        self.stop_sync_btn.setToolTip("停止知识库同步（在当前文件处理完成后生效）")
-        rerank_row.addWidget(self.stop_sync_btn)
         kb_lay.addLayout(rerank_row)
 
         lay.addWidget(kb_group)
@@ -2071,7 +2125,19 @@ class MainWindow(QMainWindow):
         )
         self.embedding_model_edit.setText(self.config.rag_embedding_model)
         self.embedding_model_path_edit.setText(self.config.rag_embedding_model_path)
+        self.matryoshka_check.setChecked(
+            bool(getattr(self.config, "rag_matryoshka_enabled", True)))
+        _mrl_dim = int(getattr(self.config, "rag_matryoshka_dim", 512))
+        _mrl_idx = self.matryoshka_dim_combo.findData(_mrl_dim)
+        self.matryoshka_dim_combo.setCurrentIndex(
+            _mrl_idx if _mrl_idx >= 0 else self.matryoshka_dim_combo.findData(512))
+        _dtype = str(getattr(self.config, "rag_vector_dtype", "int8") or "int8").lower()
+        self.vector_dtype_combo.setCurrentIndex(
+            max(0, self.vector_dtype_combo.findData(_dtype)))
         _select_pdf_engine_radio(self, getattr(self.config, "rag_pdf_engine", "docling"))
+        _pc = max(1, min(6, int(getattr(self.config, "rag_pdf_small_concurrency", 1))))
+        _pc_idx = self.pdf_concurrency_combo.findData(_pc)
+        self.pdf_concurrency_combo.setCurrentIndex(_pc_idx if _pc_idx >= 0 else 0)
         _select_combo_backend(self.ocr_backend_combo,
                               getattr(self.config, "rag_ocr_backend", "mlx"))
         self.ocr_model_path_edit.setText(
@@ -2175,10 +2241,19 @@ class MainWindow(QMainWindow):
         self.config.rag_embedding_model = (
             self.embedding_model_edit.text().strip() or self.config.rag_embedding_model
         )
+        self.config.rag_matryoshka_enabled = self.matryoshka_check.isChecked()
+        _mrl_dim = self.matryoshka_dim_combo.currentData()
+        if _mrl_dim:
+            self.config.rag_matryoshka_dim = int(_mrl_dim)
+        _vdtype = self.vector_dtype_combo.currentData()
+        if _vdtype:
+            self.config.rag_vector_dtype = str(_vdtype)
         self.config.rag_embedding_model_path = (
             self.embedding_model_path_edit.text().strip() or self.config.rag_embedding_model_path
         )
         self.config.rag_pdf_engine = _checked_pdf_engine(self) or "docling"
+        self.config.rag_pdf_small_concurrency = int(
+            self.pdf_concurrency_combo.currentData() or 1)
         self._gather_ocr_config_from_widgets()
         self.config.rag_rerank_backend = (
             _combo_backend_value(self.reranker_backend_combo) or "fastembed"
@@ -3489,7 +3564,7 @@ class MainWindow(QMainWindow):
         # 否则按钮可见可点，点下去只得到一个「正在运行」弹窗 —— 与
         # _set_controls_busy 合成的忙碌态不一致。
         self.sync_knowledge_btn.setEnabled(not self._busy)
-        self.sync_knowledge_btn.setText("同步知识")
+        self.sync_knowledge_btn.setText("开始同步")
         self.stop_sync_btn.setEnabled(False)
         # 同步结束：恢复模型「加载」按钮（同步期间被禁用，避免中途加载 LLM）。
         self._refresh_model_buttons()
@@ -3681,8 +3756,12 @@ class MainWindow(QMainWindow):
                 "rerank_batch_size": self.config.rag_rerank_batch_size,
                 "rerank_max_length": self.config.rag_rerank_max_length,
                 "rerank_enabled": self.config.rag_rerank_enabled,
-                # Matryoshka 截断维度（f16 存储，0 = 不截断）。
+                # Matryoshka 向量裁剪：enabled 开 + dim∈{128,256,512} →
+                # 截维+重归一化+int8 入库；关 → 全维 f16。
+                "matryoshka_enabled": bool(
+                    getattr(self.config, "rag_matryoshka_enabled", True)),
                 "matryoshka_dim": getattr(self.config, "rag_matryoshka_dim", 512),
+                "vector_dtype": getattr(self.config, "rag_vector_dtype", "int8"),
             },
         )
         self._sync_worker.sync_finished.connect(self._on_sync_finished)
@@ -3859,7 +3938,7 @@ class MainWindow(QMainWindow):
         """兜底检查：QThread.finished 信号在 run() 返回后自动发射。
 
         如果 sync_finished / sync_failed 信号已正常处理，此时按钮应该已经
-        恢复为"同步知识"状态。如果按钮仍处于同步相关状态，说明同步结束信号
+        恢复为"开始同步"状态。如果按钮仍处于同步相关状态，说明同步结束信号
         未被正确处理，需要强制恢复 UI 状态以避免用户界面永久卡住。
 
         注意：不检查 self._sync_worker is not None，因为 _on_sync_finished
