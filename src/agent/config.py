@@ -170,32 +170,32 @@ class AgentConfig:
     # MLX 不可用时（非 Apple Silicon / 未安装 / 路径缺失）自动回退 fastembed，
     # 不会出现「默认配置直接不可用」。
     rag_embedding_backend: str = "mlx"  # mlx | fastembed | onnx | llama_cpp
-    # 内置默认 embedding（2026-10-28 定版）：jina-embeddings-v3 本地 MLX INT4
-    # 量化版（mlx-lm 不支持该导出，走 rag/jina_v3_mlx.py 参考实现直载）。
-    # jina v3 支持 Matryoshka（MRL）：默认裁剪 256 维 + L2 重归一化 + int8
-    # 入库（jina@256 中文检索质量实测与全维持平：20/20 vs nomic@512 8/20），
-    # 入库体积 4×↓；代价是嵌入比 nomic 慢约 3×、检索走暴力扫描（中小库无感）。
-    # 任务类型经 LoRA 运行时切换（文档 retrieval.passage / 查询 retrieval.query），
-    # 输入前置任务提示词 + 标签前缀（"passage: "/"query: "，按模型族统一判定，
-    # 见 rag/embedding_prefixes.py）。nomic-embed-text-v1.5（MLX INT8，
-    # models/nomic-embed-text-v1.5-mlx-int8）保留为高速备选：嵌入快 3×、
-    # f16 原生 ANN，中文口语化改写查询召回偏弱。注意：切换 embedding 或裁剪
-    # 维度后向量空间变了，必须重新同步（force）重建索引，否则新旧向量混检
-    # 会错乱——实际维度/类型不匹配时同步会自动清库重建。bge-small-zh-v1.5
-    # 作为 MLX 不可用时的 fastembed 回退：
-    rag_embedding_model: str = "jinaai/jina-embeddings-v3"
-    rag_embedding_model_path: str = "models/jina-embeddings-v3-mlx-int4"
+    # 内置默认 embedding（2026-10-30 定版）：jina-embeddings-v5-text-nano
+    # 本地 MLX INT4 量化版（EuroBERT-210m 骨干，132MB；mlx-lm/fastembed 均不
+    # 支持，走 rag/jina_v5_nano_mlx.py 参考实现直载）。支持 Matryoshka（MRL）：
+    # 默认裁剪 128 维 + L2 重归一化 + int8 入库（模型官方推荐 128 档检索质量
+    # 基本无损、体积/速度收益大）。任务类型用内部任务类型 query/doc：检索查询
+    # 用 query、文档分片用 doc；量化版已预合并 retrieval LoRA，query/doc 仅靠
+    # 文本前缀区分——查询加 "Query: "、文档加 "Document: "（见
+    # JinaV5NanoEmbeddingFunction）。注意：切换 embedding 或裁剪维度后向量
+    # 空间变了，必须重新同步（force）重建索引，否则新旧向量混检会错乱——
+    # 实际维度/类型不匹配时同步会自动清库重建。jina-embeddings-v3（MLX INT4，
+    # models/jina-embeddings-v3-mlx-int4）保留为上一代备选；nomic-embed-text-
+    # v1.5（MLX INT8）嵌入更快、f16 原生 ANN，中文口语化改写查询召回偏弱。
+    # bge-small-zh-v1.5 作为 MLX 不可用时的 fastembed 回退：
+    rag_embedding_model: str = "jinaai/jina-embeddings-v5-text-nano"
+    rag_embedding_model_path: str = "models/jina-embeddings-v5-text-nano-mlx-int4"
     # Matryoshka（MRL）向量裁剪（2026-10-28 可配置）：对支持 MRL 的模型
-    # （nomic-embed-text-v1.5 / jina-embeddings-v3 等，按模型名识别）生效。
-    # rag_matryoshka_enabled=False → 不裁剪，全维 f16 入库，lancedb 原生 ANN。
-    # enabled=True → 入库/查询对称执行：截前 rag_matryoshka_dim 维 → L2 重归一
-    # 化（硬性步骤）→ 按 rag_vector_dtype 决定存储精度（见下）。裁剪维度仅提供
-    # 128/256/512 三档（其它值自动吸附到最近一档）。默认 256（jina@256 实测
-    # 质量与全维持平、体积 4×↓；nomic 用户建议手动调回 512——nomic 在 256 维
-    # 中文检索质量偏弱）。修改后必须 force 重新同步（维度/类型不匹配时同步会
-    # 自动清库重建）。
+    # （nomic-embed-text-v1.5 / jina-embeddings-v3 / jina-embeddings-v5 等，
+    # 按模型名识别）生效。rag_matryoshka_enabled=False → 不裁剪，全维 f16
+    # 入库，lancedb 原生 ANN。enabled=True → 入库/查询对称执行：截前
+    # rag_matryoshka_dim 维 → L2 重归一化（硬性步骤）→ 按 rag_vector_dtype
+    # 决定存储精度（见下）。裁剪维度仅提供 128/256/512 三档（其它值自动吸附
+    # 到最近一档）。默认 128（v5-nano 官方推荐档：检索质量基本无损、体积/
+    # 速度收益大）。修改后必须 force 重新同步（维度/类型不匹配时同步会自动
+    # 清库重建）。
     rag_matryoshka_enabled: bool = True
-    rag_matryoshka_dim: int = 256
+    rag_matryoshka_dim: int = 128
     # 启用裁剪后的向量存储精度（2026-10-29 新增，可选）：
     # 注意：两种精度的**列类型都是 float16**（2026-10-29 定版）——int8 指
     # 「值被量化」，整数仍以 float16 承载。这样 lancedb 原生 .search() 与
@@ -551,6 +551,20 @@ class AgentConfig:
             self.rag_embedding_model_path = "models/jina-embeddings-v3-mlx-int4"
             if self.rag_matryoshka_dim == 512:
                 self.rag_matryoshka_dim = 256
+        # 2026-10-30 三次切换：默认 embedding 定为 jina-embeddings-v5-text-nano
+        # （EuroBERT 骨干、132MB、官方推荐 128 维 MRL 档）。只重写**旧默认组合**
+        # （v3 默认模型 + 默认路径 + mlx 后端），显式配置过的模型/路径/后端不动
+        # （沿用迁移先例）；旧默认裁剪档 256 随迁到 128。维度变了向量空间随之
+        # 改变，切换后需 force 重新同步（维度不匹配时同步会自动清库重建）。
+        if (self.rag_embedding_model == "jinaai/jina-embeddings-v3"
+                and self.rag_embedding_model_path
+                == "models/jina-embeddings-v3-mlx-int4"
+                and self.rag_embedding_backend == "mlx"):
+            self.rag_embedding_model = "jinaai/jina-embeddings-v5-text-nano"
+            self.rag_embedding_model_path = \
+                "models/jina-embeddings-v5-text-nano-mlx-int4"
+            if self.rag_matryoshka_dim == 256:
+                self.rag_matryoshka_dim = 128
         # 2026-10-28：嵌入输入长度上限由旧默认 8192 收紧到 1024（切片硬限
         # 800 字符 ≈ ≤800 token，1024 足够；超长异常输入不再全额计算）。
         # 只重写旧默认值——用户显式改过的其它值不动。
@@ -562,12 +576,12 @@ class AgentConfig:
             self.rag_pdf_small_concurrency = 1
         # 2026-10-28：Matryoshka 裁剪维度收敛为 128/256/512 三档，并新增独立
         # 的 enabled 开关。旧配置归一：
-        #   - dim=0（旧「0=不截断」语义）→ enabled=False + dim=256（当前默认档）；
+        #   - dim=0（旧「0=不截断」语义）→ enabled=False + dim=128（当前默认档）；
         #   - dim 不在三档内（如 768）→ 吸附到最近一档。
         _MRL_DIMS = (128, 256, 512)
         if self.rag_matryoshka_dim == 0:
             self.rag_matryoshka_enabled = False
-            self.rag_matryoshka_dim = 256
+            self.rag_matryoshka_dim = 128
         elif self.rag_matryoshka_dim not in _MRL_DIMS:
             self.rag_matryoshka_dim = min(
                 _MRL_DIMS, key=lambda d: (abs(d - self.rag_matryoshka_dim), d))

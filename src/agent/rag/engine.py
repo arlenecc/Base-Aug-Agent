@@ -624,7 +624,7 @@ class RAGEngine:
         self._rag_dir = os.path.join(workspace, "rag")
         self._markdown_dir = os.path.join(self._rag_dir, "documents")
         self._vector_dir = os.path.join(self._rag_dir, "vectors")
-        self._embedding_model = embedding_model or "jinaai/jina-embeddings-v3"
+        self._embedding_model = embedding_model or "jinaai/jina-embeddings-v5-text-nano"
         self._embedding_backend = embedding_backend
         self._embedding_model_path = embedding_model_path
         self._embedding_threads = max(1, int(embedding_threads))

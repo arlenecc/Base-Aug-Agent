@@ -11,6 +11,7 @@ from agent.config import AgentConfig
 from agent.llm_client import LLMClient
 from agent.model_backends import (
     MLXLanguageBackend,
+    MLXAuxBackend,
     _TaggedOutputParser,
     _coerce_param,
     _prompt_opens_thinking,
@@ -18,6 +19,11 @@ from agent.model_backends import (
     create_llm_backend,
     discover_local_models,
     resolve_model_path,
+)
+from agent.rag.model_backends import (
+    JinaV5NanoEmbeddingFunction,
+    JinaV5NanoONNXEmbeddingFunction,
+    create_embedding_backend,
 )
 
 # XML / 思考标签：用字符拼接构造，源码里不出现完整标签。
@@ -738,7 +744,7 @@ def test_aux_factory_builds_local_backend_with_aux_sampling(tmp_path):
     )
     backend = create_aux_llm_backend(cfg)
     try:
-            assert isinstance(backend, MLXLanguageBackend)
+            assert isinstance(backend, MLXAuxBackend)
             view = backend.config
             assert view.temperature == 0.15
             assert view.max_tokens == 1234
@@ -1285,3 +1291,38 @@ def test_template_messages_replays_raw_content_without_extra_think_block():
         think_opened=False,
     )
     assert out3[0]["content"] == tool_raw
+
+
+# ---------------------------------------------------------------------------
+# jina-embeddings-v5-text-nano embedding 后端路由
+# ---------------------------------------------------------------------------
+
+def test_jina_v5_nano_routes_to_mlx_backend():
+    """v5-nano 标识 + mlx 后端 → JinaV5NanoEmbeddingFunction（构造不触发模型加载）。"""
+    ef = create_embedding_backend(
+        "mlx", "jinaai/jina-embeddings-v5-text-nano",
+        "models/jina-embeddings-v5-text-nano-mlx-int4",
+        batch_size=8, max_length=1024,
+    )
+    assert isinstance(ef, JinaV5NanoEmbeddingFunction)
+    assert ef.name().startswith("jina_v5_nano:")
+
+
+def test_jina_v5_nano_routes_to_onnx_backend():
+    """v5-nano 标识 + onnx 后端 → JinaV5NanoONNXEmbeddingFunction（构造不触发模型加载）。"""
+    ef = create_embedding_backend(
+        "onnx", "jinaai/jina-embeddings-v5-text-nano",
+        "models/jina-embeddings-v5-text-nano-onnx-int8",
+        threads=4, batch_size=8, max_length=1024,
+    )
+    assert isinstance(ef, JinaV5NanoONNXEmbeddingFunction)
+    assert ef.name().startswith("jina_v5_nano_onnx:")
+
+
+def test_jina_v5_nano_rejects_unsupported_backend():
+    """v5-nano 只支持 mlx / onnx，其它后端应抛出可操作错误（禁止静默回退）。"""
+    with pytest.raises(ValueError):
+        create_embedding_backend(
+            "fastembed", "jinaai/jina-embeddings-v5-text-nano",
+            "models/jina-embeddings-v5-text-nano-mlx-int4",
+        )

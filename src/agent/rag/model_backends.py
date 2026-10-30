@@ -1534,6 +1534,217 @@ class JinaONNXEmbeddingFunction:
             self._tokenizer = None
 
 
+class JinaV5NanoEmbeddingFunction:
+    """jina-embeddings-v5-text-nano 本地 MLX 直载后端（EuroBERT 骨干）。
+
+    mlx-lm / mlx-embeddings / fastembed 均不支持该模型，模型结构与加载走
+    参考实现 ``rag/jina_v5_nano_mlx.py``（vendor 自模型目录 model.py/utils.py，
+    见 models/jina-embeddings-v5-text-nano-mlx-int4）。
+
+    任务类型用**内部任务类型** ``"query"`` / ``"doc"``：检索查询用 query、
+    文档分片用 doc。该模型目录的 int4 量化版已**预合并 retrieval LoRA**
+    （packed 量化权重无法原位切适配器），query/doc 仅靠文本前缀区分：
+    query 加 ``"Query: "``、doc 加 ``"Document: "``（模型 encode 的
+    task_type 参数只决定前缀）。
+
+    输出全 768 维、已 L2 归一化 fp32；Matryoshka 截 128 维 / 重归一化 /
+    int8 量化由 VectorStore 统一管线处理（入库/查询对称，见
+    vector_store._prepare_query）。
+    """
+
+    # 内部任务类型 → 模型侧 task_type（决定 "Query: " / "Document: " 前缀）。
+    _TASK_QUERY = "query"
+    _TASK_DOC = "doc"
+    _TASK_MAP = {
+        "query": "retrieval.query",
+        "doc": "retrieval.passage",
+    }
+
+    def __init__(self, model_path: str, *, batch_size: int = 8,
+                 max_length: int = 1024):
+        self._model_path = resolve_model_path(model_path)
+        self._batch_size = max(1, int(batch_size))
+        self._max_length = max(64, int(max_length))
+        self._model = None
+        self._tokenizer = None
+        self._load_lock = threading.RLock()
+        self._embed_lock = threading.RLock()
+
+    def _ensure_model(self) -> None:
+        if self._model is not None:
+            return
+        with self._load_lock:
+            if self._model is not None:
+                return
+            _cap_mlx_memory_limits()
+            from .jina_v5_nano_mlx import load_model
+
+            self._model, self._tokenizer, cfg = load_model(self._model_path)
+            logger.info("Jina v5-nano MLX Embedding 加载完成: %s (bits=%s)",
+                        self._model_path,
+                        (cfg.get("quantization") or {}).get("bits"))
+
+    def _embed(self, texts: List[str], task: str) -> List[np.ndarray]:
+        if not texts:
+            return []
+        if task not in self._TASK_MAP:
+            raise ValueError(
+                f"未知任务类型: {task!r}（可用: query / doc）")
+        self._ensure_model()
+        import mlx.core as mx
+        import numpy as np
+
+        model_task = self._TASK_MAP[task]
+        out: List[np.ndarray] = []
+        with self._embed_lock:
+            for start in range(0, len(texts), self._batch_size):
+                batch = texts[start:start + self._batch_size]
+                emb = self._model.encode(
+                    batch, self._tokenizer,
+                    max_length=self._max_length,
+                    task_type=model_task,
+                )
+                out.extend(np.asarray(emb.astype(mx.float32),
+                                      dtype=np.float32))
+        return out
+
+    def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self._embed(input, self._TASK_DOC)
+
+    def embed_documents(self, texts: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self(texts, batch_size=batch_size)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self._embed([text], self._TASK_QUERY)[0]
+
+    def name(self) -> str:
+        return f"jina_v5_nano:{self._model_path}"
+
+    def close(self) -> None:
+        with self._load_lock:
+            self._model = None
+            self._tokenizer = None
+            try:
+                import mlx.core as mx
+
+                mx.clear_cache()
+            except Exception:
+                pass
+
+
+class JinaV5NanoONNXEmbeddingFunction:
+    """jina-embeddings-v5-text-nano 本地 ONNX 后端（EuroBERT 骨干，CPU-only）。
+
+    与 MLX 后端（JinaV5NanoEmbeddingFunction）同模型、不同运行时：用
+    onnxruntime 的 CPUExecutionProvider 直接推理，不依赖 MLX / torch，适合
+    跨平台无 GPU 环境。模型目录参考 ``models/jina-embeddings-v3-onnx-int4``
+    的结构（单 model_quantized.onnx + tokenizer.json + config.json）。
+
+    与 v3 ONNX（JinaONNXEmbeddingFunction，单文件服务全部任务、靠 task_id
+    输入切 LoRA）不同：v5 量化版已**预合并 retrieval LoRA**，ONNX 输入只有
+    ``input_ids`` / ``attention_mask``（无 task_id），query/doc 仅靠文本前缀
+    区分——查询加 ``"Query: "``、文档加 ``"Document: "``（前缀从模型目录
+    config.json 读取，见 JinaV5NanoEmbeddingFunction）。输出全 768 维、图内
+    已 L2 归一化；Matryoshka 截 128 维 / 重归一化 / int8 量化由 VectorStore
+    统一管线处理（入库/查询对称）。
+    """
+
+    # 内部任务类型 → 前缀键（config.json 的 prefixes 映射）。
+    _TASK_QUERY = "query"
+    _TASK_DOC = "doc"
+
+    def __init__(self, model_path: str, *, threads: int = 4,
+                 batch_size: int = 8, max_length: int = 1024):
+        self._model_file, self._model_dir = _find_onnx(model_path)
+        self._threads = max(1, int(threads))
+        self._batch_size = max(1, int(batch_size))
+        self._max_length = max(64, int(max_length))
+        self._session = None
+        self._tokenizer = None
+        self._query_prefix = "Query: "
+        self._doc_prefix = "Document: "
+        self._lock = threading.RLock()
+
+    def _ensure_model(self) -> None:
+        if self._session is not None:
+            return
+        with self._lock:
+            if self._session is not None:
+                return
+            import json
+
+            import onnxruntime as ort
+            from tokenizers import Tokenizer
+
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = self._threads
+            options.inter_op_num_threads = 1
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self._session = ort.InferenceSession(
+                self._model_file, sess_options=options,
+                providers=["CPUExecutionProvider"])
+            self._tokenizer = Tokenizer.from_file(
+                os.path.join(self._model_dir, "tokenizer.json"))
+            try:
+                with open(os.path.join(self._model_dir, "config.json"),
+                          encoding="utf-8") as f:
+                    cfg = json.load(f)
+                _prefixes = cfg.get("prefixes") or {}
+                self._query_prefix = _prefixes.get("query", "Query: ")
+                self._doc_prefix = _prefixes.get("doc", "Document: ")
+            except Exception:
+                pass
+            logger.info("Jina v5-nano ONNX Embedding 加载完成(CPU): %s",
+                        self._model_file)
+
+    def _embed(self, texts: List[str], task: str) -> List[np.ndarray]:
+        if not texts:
+            return []
+        if task == self._TASK_QUERY:
+            prefix = self._query_prefix
+        elif task == self._TASK_DOC:
+            prefix = self._doc_prefix
+        else:
+            raise ValueError(
+                f"未知任务类型: {task!r}（可用: query / doc）")
+        self._ensure_model()
+        import numpy as np
+
+        prefixed = [prefix + t for t in texts]
+        self._tokenizer.enable_truncation(self._max_length)
+        encs = self._tokenizer.encode_batch(prefixed)
+        max_len = max(len(e.ids) for e in encs)
+        ids = np.array(
+            [e.ids + [0] * (max_len - len(e.ids)) for e in encs],
+            dtype=np.int64)
+        attn = np.array(
+            [e.attention_mask + [0] * (max_len - len(e.ids)) for e in encs],
+            dtype=np.int64)
+        with self._lock:
+            out = self._session.run(None, {
+                "input_ids": ids,
+                "attention_mask": attn,
+            })[0]
+        return [np.asarray(v, dtype=np.float32) for v in out]
+
+    def __call__(self, input: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self._embed(input, self._TASK_DOC)
+
+    def embed_documents(self, texts: List[str], batch_size: Optional[int] = None) -> List[np.ndarray]:
+        return self(texts, batch_size=batch_size)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self._embed([text], self._TASK_QUERY)[0]
+
+    def name(self) -> str:
+        return f"jina_v5_nano_onnx:{self._model_file}"
+
+    def close(self) -> None:
+        with self._lock:
+            self._session = None
+            self._tokenizer = None
+
+
 def _fastembed_embedding(model_name: str, threads: int):
     from .vector_store import FastEmbedEmbeddingFunction
 
@@ -1553,6 +1764,25 @@ def create_embedding_backend(
     # jina-embeddings-v3：mlx-lm/mlx-embeddings/fastembed 均不支持该导出，
     # 必须走专用后端；且不允许静默回退 fastembed（会错成别的模型）。
     ident = f"{model_name or ''} {model_path or ''}".lower()
+    if "jina-embeddings-v5" in ident:
+        # v5-text-nano（EuroBERT 骨干）：支持 mlx / onnx 两种后端，但都走专用
+        # 后端（接口与 nomic/v3 不同），不允许静默回退（回退会错成别的模型、
+        # 向量空间完全不同）。
+        if backend == "mlx":
+            blocker = mlx_runtime_blocker()
+            if blocker:
+                raise RuntimeError(
+                    f"jina-embeddings-v5 需要 MLX 运行时（当前不可用: {blocker}）。"
+                    "可改用 onnx 后端 + models/jina-embeddings-v5-text-nano-onnx-int8。")
+            return JinaV5NanoEmbeddingFunction(
+                model_path, batch_size=batch_size, max_length=max_length)
+        if backend == "onnx":
+            return JinaV5NanoONNXEmbeddingFunction(
+                model_path, threads=threads, batch_size=batch_size,
+                max_length=max_length)
+        raise ValueError(
+            "jina-embeddings-v5 仅支持 mlx / onnx 后端"
+            f"（当前后端 {backend!r} 无此模型）")
     if "jina-embeddings-v3" in ident:
         if backend == "mlx":
             blocker = mlx_runtime_blocker()

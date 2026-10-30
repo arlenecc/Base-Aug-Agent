@@ -262,12 +262,14 @@ class ToolRegistry:
             logger.info(
                 "RAG: initializing engine (workspace=%s kb=%s embedding=%s)",
                 self.config.workspace, kb,
-                getattr(self.config, "rag_embedding_model", "jinaai/jina-embeddings-v3"),
+                getattr(self.config, "rag_embedding_model",
+                        "jinaai/jina-embeddings-v5-text-nano"),
             )
             engine = RAGEngine(
                 workspace=self.config.workspace,
                 knowledge_base=kb,
-                embedding_model=getattr(self.config, "rag_embedding_model", "jinaai/jina-embeddings-v3"),
+                embedding_model=getattr(self.config, "rag_embedding_model",
+                                       "jinaai/jina-embeddings-v5-text-nano"),
                 embedding_backend=getattr(self.config, "rag_embedding_backend", "mlx"),
                 embedding_model_path=getattr(self.config, "rag_embedding_model_path", ""),
                 embedding_threads=getattr(self.config, "rag_embedding_threads", 6),

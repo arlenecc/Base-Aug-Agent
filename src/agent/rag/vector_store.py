@@ -61,7 +61,8 @@ _INGESTED_AT = "ingested_at"
 #          lancedb 0.40 上无法检索（"no vector column"），统一 f16 列后原生
 #          .search() 与 ANN 索引对两种精度都可用（已实测）。
 #   关闭 → 全维 f16 入库，lancedb 原生检索。
-_MRL_MARKERS = ("nomic-embed-text-v1.5", "jina-embeddings-v3")
+_MRL_MARKERS = ("nomic-embed-text-v1.5", "jina-embeddings-v3",
+                "jina-embeddings-v5")
 _INT8_SCALE = 127
 
 # 建表时写入 Arrow schema metadata 的键：记录该表的向量存储精度（int8 量化 /

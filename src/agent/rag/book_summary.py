@@ -8,8 +8,9 @@
   节奏 **5 分钟/章**。
 - 已生成过摘要的章节不重复生成（状态以 sidecar JSON 落盘，与 ``rag/documents/*.md``
   缓存同目录，避免动 Lance 表结构 / 旧表全表重写的 OOM 风险）。
-- 逐章基于「全章全文」调辅助模型生成 **50-100 字**摘要；上下文窗口放得下整章则
-  直接整章直摘（质量最高），放不下则按段落 map-reduce（分块摘 → 逐级归并）。
+- 逐章基于「全章全文」调辅助模型生成 **50-100 字**摘要；≤4000 字的短章节优先
+  整章直摘（质量最高），超过 4000 字的长章节一律按 **每 3000 字一个 map** 走
+  map-reduce（分块摘 → 逐级归并），以保证长章摘要不被单段直摘压掉细节。
 - 全部章节完成后，结合目录结构与各章摘要，生成「真正的全书摘要」。
 - 摘要过程中若发现某章正文内含未被捕获的小节标题，就把这些小节补进目录结构
   （顺便完善章节目录）。
@@ -27,7 +28,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .document_outline import Chapter, extract_chapters
-from .model_backends import create_aux_llm_backend
+from ..model_backends import create_aux_llm_backend
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,6 @@ logger = logging.getLogger(__name__)
 _CHARS_PER_TOKEN = 1.5
 # 整章直摘时预留的指令+输出 token 预算。
 _WHOLE_OVERHEAD = 800
-# map-reduce 时每块预留的指令+输出 token 预算。
-_CHUNK_OVERHEAD = 900
 # 节奏下限（秒）。
 _INTERVAL_SHARED = 900   # 启用/可用：15 分钟/章
 _INTERVAL_TEMP = 300     # 临时加载：5 分钟/章
@@ -92,8 +91,43 @@ def release_aux(backend: Optional[Any], owned: bool) -> None:
             logger.warning("[summary] 释放临时辅助引擎失败（忽略）: %s", e)
 
 
-def _safe_chat(aux, messages: List[Dict[str, str]], temperature: float) -> str:
-    """用辅助模型跑一段非流式摘要/归纳；异常返回空串。"""
+# 摘要/归纳类调用的生成上限：章节摘要(~200 token)与全书摘要(300-500字≈700 token)
+# 都远小于此。强制封顶可防止「模型不吐 EOS」时一路生成到 config.max_tokens(默认
+# 32768) —— 那会既慢又吃显存，是闲时调度器后台跑摘要时的真实失控风险。
+_SUMMARY_MAX_TOKENS = 1024
+# 整章直摘的字数上限：超过该字数的章节一律走 map-reduce（即便全文能塞进上下文
+# 窗口），以保证长章摘要质量、不被单段直摘压掉细节；短章节才优先整章直摘。
+_WHOLE_MAX_CHARS = 4000
+# map-reduce 的切块粒度：每 ~3000 字切一个 map（按段落边界尽量不截断句子）；以及
+# map 阶段每块摘要的输出 token 上限（2-3 句中文约 60-150 token，留足余量）。
+_MAP_CHUNK_CHARS = 3000
+_MAP_CHUNK_MAX_TOKENS = 400
+# 并行批大小——多个分片一次性喂进辅助模型做批量前向，显著提升长章节摘要速度
+# （MLX 后端走真·批量 [B,T] 并行解码，其余后端顺序兜底），上限 5 以控显存。
+_MAP_CHUNK_BATCH = 5
+
+
+def _safe_chat(
+    aux, messages: List[Dict[str, str]], temperature: float, max_tokens: int = _SUMMARY_MAX_TOKENS
+) -> str:
+    """用辅助模型跑一段非流式摘要/归纳；异常返回空串。
+
+    调用期间临时调整后端配置，结束还原：
+      * 生成长度封顶到 ``max_tokens`` —— 防止个别模型不吐 EOS 时狂生成到默认上限
+        （默认 32768）既慢又吃显存；
+      * 关闭「思考模式」（``llm_enable_thinking``）—— 摘要是单轮直答任务，开启
+        思考会把 token 预算全耗在推理链上、正文还没输出就到上限，导致整章直摘
+        返回空（Qwen3.5 系实测）。关闭后直接作答、更快更稳。
+    """
+    cfg = getattr(aux, "config", None)
+    saved: Dict[str, Any] = {}
+    if cfg is not None:
+        for attr, val in (("max_tokens", max_tokens), ("llm_enable_thinking", False)):
+            try:
+                saved[attr] = getattr(cfg, attr, None)
+                setattr(cfg, attr, val)
+            except Exception:
+                saved.pop(attr, None)
     try:
         buf: List[str] = []
         for ev in aux.chat_stream(messages, tools=None, temperature=temperature):
@@ -103,6 +137,13 @@ def _safe_chat(aux, messages: List[Dict[str, str]], temperature: float) -> str:
     except Exception as e:
         logger.warning("[summary] 辅助模型调用失败: %s", e)
         return ""
+    finally:
+        if cfg is not None:
+            for attr, old in saved.items():
+                try:
+                    setattr(cfg, attr, old)
+                except Exception:
+                    pass
 
 
 def _is_error_text(text: str) -> bool:
@@ -155,7 +196,10 @@ def summarize_chapter(
     if not body:
         return ""
     ctx = _context_window(aux, config)
-    if _estimate_tokens(body) + _WHOLE_OVERHEAD <= ctx:
+    # 长章节（>4000 字）一律走 map-reduce：单段直摘会压掉细节、损害摘要质量，即便
+    # 全文能塞进上下文窗口也不整章直摘。短章节才优先整章直摘（质量最高）。
+    if len(body) <= _WHOLE_MAX_CHARS and \
+            _estimate_tokens(body) + _WHOLE_OVERHEAD <= ctx:
         s = _summarize_whole(aux, book_title, chapter_title, body)
         if s:
             return s
@@ -185,26 +229,35 @@ def _summarize_whole(aux, book_title, chapter_title, body) -> str:
     return ""
 
 
-def _chunk_size(ctx: int) -> int:
-    """单块正文字符上限：按上下文窗口与中文 token 系数反推，留足指令+输出预算。"""
-    return max(1200, int((ctx - _CHUNK_OVERHEAD) / _CHARS_PER_TOKEN))
-
-
 def _summarize_mapreduce(aux, book_title, chapter_title, body, ctx) -> str:
-    size = _chunk_size(ctx)
-    chunks = _split_by_paragraph(body, size)
+    chunks = _split_by_paragraph(body, _MAP_CHUNK_CHARS)
     if not chunks:
         return ""
-    parts: List[str] = []
-    for ch in chunks:
-        s = _map_chunk(aux, book_title, chapter_title, ch)
-        if s:
-            parts.append(s)
+    if len(chunks) == 1:
+        return _map_chunk(aux, book_title, chapter_title, chunks[0])
+    # map 阶段：分片并行（批量前向，batch=5）一次性处理，显著快于逐条。
+    parts = _map_chunks_batch(aux, book_title, chapter_title, chunks)
+    # 个别分片若批量失败（多为溢出），降级走单条 map（含对半递归兜底）。
+    for i, p in enumerate(parts):
+        if not p:
+            parts[i] = _map_chunk(aux, book_title, chapter_title, chunks[i])
+    parts = [p for p in parts if p]
     if not parts:
         return ""
-    if len(parts) == 1:
-        return _clean_summary(parts[0])
     return _reduce_summaries(aux, book_title, chapter_title, parts, ctx)
+
+
+def _map_chunk_messages(book_title: str, chapter_title: str, chunk: str) -> List[Dict[str, str]]:
+    """构造单块正文的 map 提示（与 _map_chunk 共用，便于批量拼接）。"""
+    system = (
+        "你是图书摘要助手。阅读下面这一段【章节正文片段】，用 2-3 句中文概括这部分"
+        "的关键内容、事实或论点；只输出摘要，不要前言与标题。"
+    )
+    user = f"《{book_title}》【{chapter_title}】片段：\n{chunk}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def _split_by_paragraph(text: str, size: int) -> List[str]:
@@ -235,18 +288,8 @@ def _split_by_paragraph(text: str, size: int) -> List[str]:
 
 def _map_chunk(aux, book_title, chapter_title, chunk, depth: int = 0) -> str:
     """map 阶段：对一块正文生成 2-3 句短摘要；若溢出则对半递归再合并。"""
-    system = (
-        "你是图书摘要助手。阅读下面这一段【章节正文片段】，用 2-3 句中文概括这部分"
-        "的关键内容、事实或论点；只输出摘要，不要前言与标题。"
-    )
-    user = f"《{book_title}》【{chapter_title}】片段：\n{chunk}"
     text = _safe_chat(
-        aux,
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.3,
+        aux, _map_chunk_messages(book_title, chapter_title, chunk), temperature=0.3
     )
     if text and not _is_error_text(text):
         return _clean_summary(text)
@@ -258,6 +301,46 @@ def _map_chunk(aux, book_title, chapter_title, chunk, depth: int = 0) -> str:
         if sa or sb:
             return _merge_two(aux, book_title, chapter_title, sa, sb)
     return ""
+
+
+def _map_chunks_batch(
+    aux, book_title: str, chapter_title: str, chunks: List[str]
+) -> List[str]:
+    """map 阶段批量并行：把分片按 batch=5 分组，一次性喂辅助模型批量生成。
+
+    依赖后端的 ``generate_batch``（MLX 走真·批量 [B,T] 并行前向；其余后端顺序兜底）。
+    调用期间临时关闭思考模式、封顶输出 token，避免长章节 map 被推理链拖慢/失控。
+    """
+    if not chunks:
+        return []
+    cfg = getattr(aux, "config", None)
+    saved: Dict[str, Any] = {}
+    if cfg is not None:
+        for attr, val in (("llm_enable_thinking", False), ("max_tokens", _MAP_CHUNK_MAX_TOKENS)):
+            try:
+                saved[attr] = getattr(cfg, attr, None)
+                setattr(cfg, attr, val)
+            except Exception:
+                saved.pop(attr, None)
+    try:
+        msgs_list = [_map_chunk_messages(book_title, chapter_title, ch) for ch in chunks]
+        out = aux.generate_batch(
+            msgs_list,
+            batch_size=_MAP_CHUNK_BATCH,
+            temperature=0.3,
+            max_tokens=_MAP_CHUNK_MAX_TOKENS,
+        )
+        return [_clean_summary(x) if x else "" for x in out]
+    except Exception as e:
+        logger.warning("[summary] 批量 map 失败，降级逐条: %s", e)
+        return [_map_chunk(aux, book_title, chapter_title, ch) for ch in chunks]
+    finally:
+        if cfg is not None:
+            for attr, old in saved.items():
+                try:
+                    setattr(cfg, attr, old)
+                except Exception:
+                    pass
 
 
 def _half_split(text: str) -> Tuple[str, str]:

@@ -543,6 +543,27 @@ class _LazyLocalBackend:
         # set_draft_model()。默认 None → 退化为普通解码。
         self._draft_backend: Optional[Any] = None
 
+    def generate_batch(
+        self, message_lists, batch_size=5, temperature=0.7, max_tokens=1024
+    ) -> List[str]:
+        """批量生成的通用兜底：逐条走 ``chat_stream``，保证正确但非真并行。
+
+        MLX 等支持真·批量的后端会重写本方法（一次性把多组消息 pad 成 ``[B, T]``
+        做并行前向）。摘要任务调用前会在外层临时关闭思考模式，这里不再重复处理。
+        """
+        out: List[str] = []
+        for msgs in message_lists:
+            try:
+                buf: List[str] = []
+                for ev in self.chat_stream(msgs, tools=None, temperature=temperature):
+                    if ev.type == "content":
+                        buf.append(ev.content)
+                out.append("".join(buf).strip())
+            except Exception as e:  # pragma: no cover - 单条容错
+                logger.warning("[batch] 单条生成失败: %s", e)
+                out.append("")
+        return out
+
     def list_models(self) -> List[str]:
         return [self.model]
 
@@ -649,6 +670,182 @@ def apply_mlx_memory_policy() -> None:
         mx.set_cache_limit(1024 ** 3)
     except Exception as e:  # pragma: no cover - 失败不影响加载
         logger.debug("设置 MLX 内存策略失败（忽略）: %s", e)
+
+
+def _mlx_batched_generate(
+    model_obj,
+    tokenizer,
+    config,
+    message_lists,
+    batch_size: int,
+    temperature: float,
+    max_tokens: int,
+    prompt_fn,
+) -> List[str]:
+    """mlx_lm 真·批量生成引擎（主模型 / 辅助模型共用）。
+
+    把多组消息按 ``batch_size`` 分组、pad 成 ``[B, T]`` 一次前向并行 prefill +
+    自回归解码，显著快于逐条生成。``prompt_fn(messages)`` 负责应用 chat 模板
+    （思考 / 工具等由各自后端决定），引擎本身只管并行生成与内存安全。
+
+    内存安全三道闸：① 分块 prefill（按 2048 与 logits 预算自适应步长），避免
+    长序列一次性 ``[B,T]`` 前向让全注意力层算出 ``[B,T,T]`` 级中间张量 OOM；
+    ② ``B×T`` 预算 + 组内长度比约束，长分片自动退化为小批、同组行长度相近以压低
+    右填充占比（填充 KV 会污染短行解码注意力）；③ 每块 / 每 256 步 ``clear_cache``
+    释放中间张量，防显存累积泄漏。
+    """
+    import mlx.core as mx
+    from mlx_lm.sample_utils import make_sampler, make_logits_processors
+    from mlx_lm.models.cache import make_prompt_cache
+
+    sampler = make_sampler(
+        temp=max(0.0, float(temperature)),
+        top_p=float(getattr(config, "top_p", 0.95)),
+        min_p=float(getattr(config, "min_p", 0.0)),
+        top_k=int(getattr(config, "top_k", 0)),
+    )
+    logits_processors = make_logits_processors(
+        repetition_penalty=float(getattr(config, "repetition_penalty", 1.0)),
+    )
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_id, list):
+        eos_id = eos_id[0] if eos_id else None
+    pad_id = getattr(tokenizer, "pad_token_id", None) or 0
+
+    n = len(message_lists)
+    out_tokens: List[List[int]] = [[] for _ in range(n)]
+    done = [False] * n
+    if n == 0:
+        return []
+    # 内存预算（见模块 docstring / 上方函数说明）。
+    _BATCH_TOKEN_BUDGET = 12_000
+    _PREFILL_STEP = 2048  # 与 stream_generate 的 prefill_step_size 一致
+    _LOGIT_BUDGET = 2_000_000_000
+    _vocab_size = 0
+    for _probe in (
+        getattr(getattr(model_obj, "model", None), "embed_tokens", None),
+        getattr(model_obj, "lm_head", None),
+    ):
+        _sh = getattr(getattr(_probe, "weight", _probe), "shape", None)
+        if _sh:
+            _vocab_size = int(_sh[0])
+            break
+    if _vocab_size <= 0:
+        _vocab_size = 248_320
+    import time as _t
+
+    _t0 = _t.monotonic()  # GEN_BATCH_DEBUG 计时基准
+    # 先全部模板化+编码，按长度降序排列：长序列先处理（受预算限制只能小批甚至
+    # 单条），短序列随后可满额并行，同时减少批内填充浪费。
+    prompts = [prompt_fn(m) for m in message_lists]
+    encs = [list(tokenizer.encode(p)) for p in prompts]
+    order = sorted(range(n), key=lambda i: -len(encs[i]))
+    pos_i = 0
+    while pos_i < n:
+        t_max = max(1, len(encs[order[pos_i]]))
+        b = min(batch_size, max(1, _BATCH_TOKEN_BUDGET // t_max), n - pos_i)
+        # 组内长度比约束：只与首行长度相近（≥80%）的行同组，避免短行被长行垫高后
+        # 大量右填充 KV 污染其解码注意力（实测产生回声式垃圾输出）。
+        _min_len = (t_max * 4) // 5
+        for _k in range(b):
+            if len(encs[order[pos_i + _k]]) < _min_len:
+                b = max(1, _k)
+                break
+        idxs = order[pos_i : pos_i + b]
+        pos_i += b
+        grp_encs = [encs[i] for i in idxs]
+        g = len(grp_encs)
+        max_len = max(len(e) for e in grp_encs)
+        real_lens = [len(e) for e in grp_encs]
+        ids = mx.array(
+            [
+                [(e[i] if i < len(e) else pad_id) for i in range(max_len)]
+                for e in grp_encs
+            ]
+        )
+        cache = make_prompt_cache(model_obj)
+        step_size = max(
+            128,
+            min(_PREFILL_STEP, _LOGIT_BUDGET // max(1, g * _vocab_size * 2)),
+        )
+        row_last: List[Any] = [None] * g
+        processed = 0
+        while processed < max_len:
+            s = min(step_size, max_len - processed)
+            chunk = ids[:, processed : processed + s]
+            logits = model_obj(chunk, cache=cache)
+            mx.eval(logits)
+            # 物化混合架构（qwen3_5 的 GatedDeltaNet 等）的递归缓存状态：其状态以
+            # 副作用形式写入缓存对象，仅 mx.eval(logits) 不会持久化，会导致后续解码
+            # 步复用旧状态、重复生成同一 token。
+            mx.eval([c.state for c in cache])
+            mx.clear_cache()  # 释放本块中间张量，防止显存随步累积泄漏
+            if logits.ndim == 2:  # 个别返回展平形状，规整回 [B, S, V]
+                logits = logits.reshape(g, s, -1)
+            for j in range(g):
+                rl = real_lens[j]
+                if rl == 0:
+                    row_last[j] = logits[j, 0]  # 占位，空编码行不参与解码
+                elif processed < rl <= processed + s:
+                    row_last[j] = logits[j, rl - 1 - processed]
+            processed += s
+        last_logits = mx.stack(row_last)  # [g, V]
+        if os.environ.get("GEN_BATCH_DEBUG"):
+            logger.warning(
+                "[GB] 组=%s B=%d T=%d step_size=%d prefill完成 t=%.1fs",
+                idxs, g, max_len, step_size, _t.monotonic() - _t0,
+            )
+        step = 0
+        active = [not done[gi] for gi in idxs]
+        while step < max_tokens and any(active):
+            next_tok = []
+            for j in range(g):
+                if active[j]:
+                    # 保持 [1,V] 二维：repetition 处理器内部用 logits[:, tokens]。
+                    # 注意 mlx_lm 处理器签名是 (tokens, logits)，顺序别反。
+                    lg = last_logits[j:j + 1]
+                    toks = out_tokens[idxs[j]]
+                    for proc in logits_processors:
+                        lg = proc(toks, lg)
+                    raw = sampler(lg[0])
+                    if isinstance(raw, mx.array):
+                        raw = raw.item() if raw.ndim == 0 else int(raw.reshape(-1)[0])
+                    next_tok.append(int(raw))
+                else:
+                    next_tok.append(pad_id)
+            nxt = mx.array(next_tok).reshape(g, 1)
+            logits = model_obj(nxt, cache=cache)
+            mx.eval(logits)
+            mx.eval([c.state for c in cache])
+            # 每 256 步清理一次中间张量（与 mlx_lm generate_step 一致）：每步都清
+            # 会让 Metal 分配器逐缓冲重申请，实测解码慢一个量级；完全不清则多次
+            # 调用后显存累积泄漏（实测 86s+OOM）。
+            if step % 256 == 0:
+                mx.clear_cache()
+            last_logits = logits[:, 0, :]  # [g, V]
+            step += 1
+            if os.environ.get("GEN_BATCH_DEBUG") and step % 100 == 0:
+                logger.warning(
+                    "[GB] 组=%s 解码 step=%d/%d t=%.1fs",
+                    idxs, step, max_tokens, _t.monotonic() - _t0,
+                )
+            for j in range(g):
+                gi = idxs[j]
+                if not active[j]:
+                    continue
+                nt = next_tok[j]
+                if eos_id is not None and nt == eos_id:
+                    done[gi] = True
+                    active[j] = False
+                else:
+                    out_tokens[gi].append(nt)
+    results = []
+    for toks in out_tokens:
+        try:
+            results.append(tokenizer.decode(toks).strip())
+        except Exception:
+            results.append("")
+    return results
 
 
 class MLXLanguageBackend(_LazyLocalBackend):
@@ -1090,6 +1287,69 @@ class MLXLanguageBackend(_LazyLocalBackend):
             except Exception as e:
                 raise LLMError(f"MLX-LM 推理失败: {type(e).__name__}: {e}") from e
 
+    def generate_batch(
+        self, message_lists, batch_size=5, temperature=0.7, max_tokens=1024
+    ) -> List[str]:
+        """真·批量生成：把多组消息按 ``batch_size`` 分组，每组 pad 成 ``[B, T]`` 一次
+        前向、并行 prefill + 自回归解码，显著快于逐条 ``chat_stream``。
+
+        底层引擎见模块级 ``_mlx_batched_generate``（主/辅后端共用）。本方法额外：
+          * 调用期间临时关闭思考模式（摘要是单轮直答，思考只拖慢且浪费预算）；
+          * 整组在同一把 ``_generation_lock`` 下完成，不与主对话的 ``chat_stream``
+            并发，避免 MLX 权重/缓存的线程竞争；
+          * 异常时降级 ``_generate_batch_sequential``（逐条 ``chat_stream``）。
+        """
+        self._ensure_loaded()
+        cfg = getattr(self, "config", None)
+        saved_think = getattr(cfg, "llm_enable_thinking", None) if cfg is not None else None
+        if cfg is not None:
+            try:
+                cfg.llm_enable_thinking = False
+            except Exception:
+                saved_think = None
+        try:
+            with self._generation_lock:
+                return _mlx_batched_generate(
+                    self._model_obj,
+                    self._tokenizer,
+                    self.config,
+                    message_lists,
+                    batch_size,
+                    temperature,
+                    max_tokens,
+                    self._prompt,
+                )
+        except LLMError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[MLX batch] 批量生成异常，降级逐条 chat_stream: %s", e, exc_info=True
+            )
+            return self._generate_batch_sequential(
+                message_lists, temperature=temperature
+            )
+        finally:
+            if cfg is not None and saved_think is not None:
+                try:
+                    cfg.llm_enable_thinking = saved_think
+                except Exception:
+                    pass
+
+    def _generate_batch_sequential(self, message_lists, temperature=0.7) -> List[str]:
+        """generate_batch 失败时的顺序兜底（复用 chat_stream）。"""
+        out: List[str] = []
+        for msgs in message_lists:
+            try:
+                buf: List[str] = []
+                for ev in self.chat_stream(msgs, tools=None, temperature=temperature):
+                    if ev.type == "content":
+                        buf.append(ev.content)
+                out.append("".join(buf).strip())
+            except Exception as e:  # pragma: no cover - 单条容错
+                logger.warning("[batch] 单条生成失败: %s", e)
+                out.append("")
+        return out
+
     def close(self) -> None:
         with self._load_lock:
             self._closed = True
@@ -1122,6 +1382,191 @@ class MLXLanguageBackend(_LazyLocalBackend):
         self._kv_cache = None
         self._kv_ids = []
         self._kv_thread_ident = None
+
+
+class MLXAuxBackend:
+    """轻量辅助模型后端：原生支持批量生成，专为高频长文本摘要 / 归并等任务设计。
+
+    相比主模型后端（``MLXLanguageBackend``）刻意砍掉：工具调用、思考模式
+    （辅助只做单轮直答，思考纯属浪费）、KV 前缀复用、静态头缓存、投机解码、
+    流式首包延迟等主对话专用逻辑——辅助模型要的是**快、稳、省、批量**，把大量
+    不适合主模型做的长文本处理在闲时一次性并行跑完，避免交互被卡住。
+
+    批量引擎复用模块级 ``_mlx_batched_generate``（与主模型同一套并行 prefill +
+    解码、内存安全闸），只换一个始终「关思考」的极简 chat 模板渲染。
+    """
+
+    def __init__(self, model_path: str, config: Any):
+        self.model_path = resolve_model_path(model_path)
+        self.model = os.path.basename(self.model_path.rstrip(os.sep)) or self.model_path
+        self.config = config
+        self._model_obj = None
+        self._tokenizer = None
+        self._load_lock = threading.RLock()
+        self._generation_lock = threading.RLock()  # 辅助推理串行化，与主模型锁独立
+        self._closed = False
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise LLMError("辅助模型后端已关闭")
+
+    def _ensure_loaded(self) -> None:
+        self._check_open()
+        if self._model_obj is not None:
+            return
+        with self._load_lock:
+            if self._model_obj is not None:
+                return
+            try:
+                from mlx_lm import load
+            except ImportError as e:
+                raise LLMError("MLX-LM 未安装，请安装: pip install mlx-lm") from e
+            logger.info("正在从本地加载辅助 MLX-LM: %s", self.model_path)
+            # 统一 MLX 内存策略（与主模型共用，避免两者同时占满显存）。
+            apply_mlx_memory_policy()
+            self._model_obj, self._tokenizer = load(
+                self.model_path,
+                lazy=False,
+                trust_remote_code=False,
+                tokenizer_config={"fix_mistral_regex": True},
+            )
+            logger.info("辅助 MLX-LM 加载完成: %s", self.model_path)
+
+    def _aux_prompt(self, messages: List[Dict[str, Any]]) -> Any:
+        """极简 chat 模板渲染：始终关思考、不挂工具、只加 generation prompt。
+
+        辅助模型只跑摘要 / 归纳这类单轮直答，无需工具与思考链；剥离这些只渲染
+        必要模板，既快又稳（开思考会多出一大段 reasoning 文本拖慢且对归纳无益）。
+        """
+        kwargs: Dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": False,
+        }
+        messages = _template_messages(messages, think_opened=False)
+        try:
+            return self._tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            pruned = dict(kwargs)
+            pruned.pop("enable_thinking", None)
+            return self._tokenizer.apply_chat_template(messages, **pruned)
+
+    def generate_batch(
+        self, message_lists, batch_size=5, temperature=0.7, max_tokens=1024
+    ) -> List[str]:
+        """并行批量生成（辅助模型主力路径）。
+
+        用于闲时摘要 map-reduce 的分片并行：把多个正文分片一次性 pad 成 ``[B, T]``
+        走并行前向，显著快于逐条。思考恒定关闭，整组在 ``_generation_lock`` 下完成。
+        """
+        self._ensure_loaded()
+        try:
+            with self._generation_lock:
+                return _mlx_batched_generate(
+                    self._model_obj,
+                    self._tokenizer,
+                    self.config,
+                    message_lists,
+                    batch_size,
+                    temperature,
+                    max_tokens,
+                    self._aux_prompt,
+                )
+        except LLMError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[aux batch] 辅助批量生成异常，降级逐条 chat_stream: %s", e, exc_info=True
+            )
+            return self._aux_generate_sequential(message_lists, temperature=temperature)
+
+    def _aux_generate_sequential(self, message_lists, temperature=0.7) -> List[str]:
+        """generate_batch 失败时的顺序兜底（复用 chat_stream）。"""
+        out: List[str] = []
+        for msgs in message_lists:
+            try:
+                buf: List[str] = []
+                for ev in self.chat_stream(msgs, tools=None, temperature=temperature):
+                    if ev.type == "content":
+                        buf.append(ev.content)
+                out.append("".join(buf).strip())
+            except Exception as e:  # pragma: no cover - 单条容错
+                logger.warning("[aux batch] 单条生成失败: %s", e)
+                out.append("")
+        return out
+
+    def chat_stream(
+        self, messages, tools=None, temperature: float = 0.7
+    ) -> Iterator[StreamEvent]:
+        """单条非流式直答（辅助模型无需真正流式：摘要不在意首包延迟）。
+
+        用 ``batch_size=1`` 的批量引擎一次跑完，对外仍以 ``StreamEvent`` 流式协议
+        吐出内容 + done，兼容 ``book_summary._safe_chat`` 等调用方。
+        """
+        self._ensure_loaded()
+        temp = (
+            float(temperature)
+            if temperature is not None
+            else float(getattr(self.config, "temperature", 0.7))
+        )
+        max_tokens = int(getattr(self.config, "max_tokens", 2048) or 2048)
+        try:
+            with self._generation_lock:
+                out = _mlx_batched_generate(
+                    self._model_obj,
+                    self._tokenizer,
+                    self.config,
+                    [messages],
+                    batch_size=1,
+                    temperature=temp,
+                    max_tokens=max_tokens,
+                    prompt_fn=self._aux_prompt,
+                )
+            text = out[0] if out else ""
+            if text:
+                yield StreamEvent("content", content=text)
+        except LLMError:
+            raise
+        except Exception as e:
+            logger.warning("[aux] chat_stream 生成失败: %s", e)
+        yield StreamEvent("done")
+
+    def generate(self, messages, temperature=0.7, max_tokens=1024) -> str:
+        """单条一次性生成（便捷封装，等价于 batch_size=1）。"""
+        out = self.generate_batch(
+            [messages], batch_size=1, temperature=temperature, max_tokens=max_tokens
+        )
+        return out[0] if out else ""
+
+    @property
+    def context_window(self) -> int:
+        """辅助模型有效上下文窗口（token）。优先模型 config，回落到 aux_max_context_tokens。"""
+        cfg_max = int(getattr(self.config, "max_context_tokens", 0) or 0)
+        try:
+            mcfg = getattr(self._model_obj, "config", None)
+            if isinstance(mcfg, dict):
+                m = int(mcfg.get("max_position_embeddings", 0) or 0)
+            else:
+                m = int(getattr(mcfg, "max_position_embeddings", 0) or 0)
+            if m >= 512:
+                return m
+        except Exception:
+            pass
+        return cfg_max if cfg_max >= 512 else 16384
+
+    def list_models(self) -> List[str]:
+        return [self.model]
+
+    def close(self) -> None:
+        self._closed = True
+        self._model_obj = None
+        self._tokenizer = None
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
 
 
 class MLXVLMBackend(_LazyLocalBackend):
@@ -2157,7 +2602,7 @@ def create_aux_llm_backend(config: Any) -> LLMBackend:
     path = getattr(config, "aux_llm_model_path", "")
     view = aux_sampling_config(config)
     if backend == "mlx_lm":
-        return MLXLanguageBackend(path, view)
+        return MLXAuxBackend(path, view)
     if backend == "mlx_vlm":
         return MLXVLMBackend(path, view)
     if backend == "onnx":
