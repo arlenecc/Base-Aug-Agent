@@ -224,24 +224,18 @@ class AgentConfig:
     # 忽略此项、走自身全局线程池）。默认 6 充分利用多核；MLX 下此项无效。
     rag_embedding_threads: int = 6
     # 默认 reranker 用 jina-reranker-v2-base-multilingual（ONNX/CPU，多语言、约
-    # 279MB、比 v2-m3 MLX 快约 2.6×、中文 Top-1 与 v2-m3 持平）。要更强质量或长
-    # 切片（>1024 token）时切回 "mlx"（v2-m3）；要更轻量短文本可用 "onnx"（bge-base）。
-    # 注意：UI 下拉只有 fastembed/mlx/onnx——"jina" 是历史内部值（本质就是
-    # ONNXReranker 换路径），_migrate 会把旧配置的 jina 并入 onnx（路径一并
-    # 迁移）。新配置仍默认走 jina 模型，但后端值统一为 "onnx"。
-    rag_rerank_backend: str = "jina"  # mlx | fastembed | onnx（"jina" 经 _migrate 并入 onnx）
-    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"  # MLX 回退用
-    rag_rerank_model_path: str = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
-    # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，
-    # 这样在 UI 里切换后端不必重新粘贴路径。
-    rag_rerank_mlx_model_path: str = "models/bge-reranker-v2-m3-mlx-mxfp8"
-    # jina 重排序模型（可选方案）：jinaai/jina-reranker-v2-base-multilingual 的
-    # INT8 ONNX 导出，强制 CPU 推理（与上面的 bge ONNX 同一条 ONNX 路径）。
-    # 特点：多语言、位置上限 1024（夹到 1024，介于 bge-base 的 512 与 v2-m3 的
-    # 8192 之间）、12 层 768 维、约 279MB。实测比 v2-m3(MLX) 快约 2.6×、Top-1
-    # 准确率与 v2-m3 持平，但难负例区分度（margin）明显弱于 v2-m3；中文为主的
-    # 场景建议优先 v2-m3，多语言或追求更高吞吐时选 jina。切换：rag_rerank_backend
-    # 设为 "jina" 即走此路径（无需改其它配置）。
+    # 279MB、12 层 768 维、位置上限 1024、比 v2-m3 MLX 快约 2.6×、中文 Top-1 与
+    # v2-m3 持平）。bge-reranker-v2-m3 自 1.2.4 起**不再使用**（已退役）。后端
+    # 值统一为 "onnx"（ONNXReranker 走 jina 的 ONNX 目录）。
+    rag_rerank_backend: str = "onnx"  # fastembed | mlx | onnx | gguf
+    rag_rerank_model: str = "jinaai/jina-reranker-v2-base-multilingual"
+    rag_rerank_model_path: str = "models/jina-reranker-v2-base-multilingual-onnx"
+    # MLX 交叉编码器是目录而非 .onnx 文件，与上面的 ONNX 路径分开保存，这样在
+    # UI 里切换后端不必重新粘贴路径。bge-reranker-v2-m3 已退役，此字段仅保留给
+    # 用户自带的其他 MLX 交叉编码器（默认空 = 走 jina ONNX）。
+    rag_rerank_mlx_model_path: str = ""
+    # jina 重排序模型 ONNX 目录（默认 reranker）：与上面 model_path 同源，仅保留
+    # 给旧配置 "jina" 内部值的迁移（见 _migrate）。
     rag_rerank_jina_model_path: str = "models/jina-reranker-v2-base-multilingual-onnx"
     rag_rerank_batch_size: int = 16
     # bge-reranker-v2-m3 的位置嵌入上限是 8192（本地 MLX/ONNX 权重 config 均为
@@ -524,12 +518,23 @@ class AgentConfig:
         # Same 768-dim embeddings, 4x smaller download, same quality.
         elif self.rag_embedding_model == "nomic-ai/nomic-embed-text-v1.5":
             self.rag_embedding_model = "nomic-ai/nomic-embed-text-v1.5-Q"
-        # 重排序已迁移到 fastembed ONNX 栈：旧默认 bge-reranker-base 是
-        # FlagEmbedding 时代的 fp32 全量模型（~1.1GB），默认值统一升级到
-        # 官方 INT8 版（~570MB，中文精排更强）。仅重写旧默认值——手工显式
-        # 配置的其他模型名不动。沿用 max_tokens=4096 的迁移先例。
-        if self.rag_rerank_model == "BAAI/bge-reranker-base":
-            self.rag_rerank_model = "BAAI/bge-reranker-v2-m3-int8"
+        # 2026-10-31：bge 系列 reranker 全部退役，旧默认统一迁到 jina-
+        # reranker-v2-base-multilingual（ONNX/CPU，多语言、中文 Top-1 与 v2-m3
+        # 持平、更快）。仅重写旧默认值（"BAAI/bge-reranker-base" / 各 v2-m3 写法 /
+        # 旧默认 ONNX 路径）——手工显式配置的其他模型名/路径不动。沿用
+        # max_tokens=4096 的迁移先例。
+        _BGE_RERANKER_NAMES = (
+            "BAAI/bge-reranker-base",
+            "BAAI/bge-reranker-v2-m3",
+            "BAAI/bge-reranker-v2-m3-int8",
+        )
+        _BGE_RERANKER_ONNX = "models/bge-reranker-v2-m3-ONNX/model_quantized.onnx"
+        if self.rag_rerank_model in _BGE_RERANKER_NAMES:
+            self.rag_rerank_model = "jinaai/jina-reranker-v2-base-multilingual"
+            if self.rag_rerank_model_path == _BGE_RERANKER_ONNX:
+                self.rag_rerank_model_path = self.rag_rerank_jina_model_path
+            if self.rag_rerank_backend in ("fastembed", "mlx"):
+                self.rag_rerank_backend = "onnx"
         # 2026-10-27 切换：默认 embedding 切回 nomic MLX INT8 + 切片放大到
         # 800。只重写**旧默认值**——用户显式配置过的其它模型路径/切片大小不动
         # （沿用 max_tokens 迁移先例）。

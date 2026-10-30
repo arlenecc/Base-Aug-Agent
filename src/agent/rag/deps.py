@@ -110,15 +110,15 @@ _EMBEDDING_REQUIRED_FILES = [
 # blocking the first search). Optional: search falls back to distance-based
 # ranking if unavailable.
 #
-# 重排序改走 fastembed 的 ONNX 路线（TextCrossEncoder），不再依赖
-# FlagEmbedding——后者会连带安装 PyTorch（~2GB）。这里选官方 INT8 量化版：
-# ~570MB（fp32 全量 2.3GB 的一半不到）、CPU EP 上有 int8 加速、且
-# bge-reranker-v2-m3 的多语种/中文精排能力优于 bge-reranker-base。
-RERANK_MODEL_ID = "BAAI/bge-reranker-v2-m3-int8"
+# 重排序默认走 jina-reranker-v2-base-multilingual 的 ONNX 路线（CPU EP，多语言、
+# 中文 Top-1 与 bge-reranker-v2-m3 持平、更快）；bge 系列自 1.2.4 起退役。
+# 这里保留 fastembed 回退用的模型标识（仅当用户切换 reranker 后端到 fastembed
+# 时触发下载，默认 ONNX 路线不需要）。
+RERANK_MODEL_ID = "jinaai/jina-reranker-v2-base-multilingual"
 # fastembed catalog 中该模型实际拉取的 HF 仓库与权重文件（用于缓存判定）。
-_RERANKER_HF_REPO = "onnx-community/bge-reranker-v2-m3-ONNX"
-_RERANKER_WEIGHT_FILE = "onnx/model_int8.onnx"
-RERANK_MODEL_LABEL = "重排序模型 bge-reranker-v2-m3 (INT8, ~570MB, 可选)"
+_RERANKER_HF_REPO = "jinaai/jina-reranker-v2-base-multilingual"
+_RERANKER_WEIGHT_FILE = "onnx/model.onnx"
+RERANK_MODEL_LABEL = "重排序模型 jina-reranker-v2-base-multilingual (可选)"
 
 # Version pins: packages that need specific version constraints
 VERSION_PINS: Dict[str, str] = {

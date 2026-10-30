@@ -1100,7 +1100,8 @@ class ONNXReranker:
                 f"Reranker 必须使用 CPUExecutionProvider，实际为 {self._session.get_providers()}"
             )
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self._model_dir, local_files_only=True, trust_remote_code=False
+            self._model_dir, local_files_only=True, trust_remote_code=False,
+            tokenizer_config={"fix_mistral_regex": True},
         )
         # ONNX 图是动态序列长，超长输入不会报错、只会给出无意义分数，所以必须
         # 按位置嵌入上限夹紧：bge-reranker-v2-m3 → 8192，base → 512。

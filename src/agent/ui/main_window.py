@@ -1491,7 +1491,7 @@ class MainWindow(QMainWindow):
             RAG_BACKENDS[:3] + (("GGUF", "gguf"),),
         )
         self.reranker_model_edit = QLineEdit(
-            placeholderText="HuggingFace 模型名（如 BAAI/bge-reranker-v2-m3-int8）")
+            placeholderText="HuggingFace 模型名（如 jinaai/jina-reranker-v2-base-multilingual）")
         self.reranker_model_path_edit = QLineEdit(placeholderText="本地 Reranker .onnx 文件")
         self.reranker_model_path_btn = QPushButton("选择")
         # --- TopN：reranker 精排后选取的结果数（rag_search 的 top_k 上限/默认）---

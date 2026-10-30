@@ -280,24 +280,33 @@ def test_migrate_persisted_after_save(tmp_path):
 
 
 def test_migrate_legacy_rerank_model(tmp_path):
-    """FlagEmbedding 时代的旧默认 bge-reranker-base（fp32 1.1GB）迁移到
-    fastembed 的 INT8 版；其他显式配置的模型名保持不动。"""
+    """bge 系列 reranker 已退役：旧默认 bge-reranker-base 与 bge-reranker-v2-m3
+    统一迁移到 jina-reranker-v2-base-multilingual；显式配置的非 bge 模型名不动。"""
     p = tmp_path / "c.json"
     p.write_text(json.dumps({
         "base_url": "http://x",
         "rag_rerank_model": "BAAI/bge-reranker-base",
     }))
     cfg = AgentConfig.load(str(p))
-    assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
+    assert cfg.rag_rerank_model == "jinaai/jina-reranker-v2-base-multilingual"
 
-    # 显式配置的其他模型名（如 fp32 官方版）不是旧默认值，不迁移
+    # 旧默认 v2-m3 写法同样迁移到 jina（bge 全系退役）
     p2 = tmp_path / "c2.json"
     p2.write_text(json.dumps({
         "base_url": "http://x",
-        "rag_rerank_model": "BAAI/bge-reranker-v2-m3",
+        "rag_rerank_model": "BAAI/bge-reranker-v2-m3-int8",
     }))
     cfg2 = AgentConfig.load(str(p2))
-    assert cfg2.rag_rerank_model == "BAAI/bge-reranker-v2-m3"
+    assert cfg2.rag_rerank_model == "jinaai/jina-reranker-v2-base-multilingual"
+
+    # 显式配置的非 bge 模型名不是旧默认值，不迁移
+    p3 = tmp_path / "c3.json"
+    p3.write_text(json.dumps({
+        "base_url": "http://x",
+        "rag_rerank_model": "BAAI/bge-reranker-v2-m3-fp32-official",
+    }))
+    cfg3 = AgentConfig.load(str(p3))
+    assert cfg3.rag_rerank_model == "BAAI/bge-reranker-v2-m3-fp32-official"
 
 
 def test_migrate_bumps_small_max_tokens(tmp_path):
@@ -457,12 +466,14 @@ def test_local_model_defaults_are_parallel_not_forced():
     assert cfg.rag_embedding_backend == "mlx"
     assert cfg.rag_embedding_model_path.endswith(
         "jina-embeddings-v5-text-nano-mlx-int4")
-    assert cfg.rag_rerank_backend == "jina"
-    assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+    # 默认 reranker 统一为 jina（ONNX/CPU）；bge-reranker-v2-m3 已退役，MLX
+    # 交叉编码器路径默认空（仅保留给自带 MLX 模型的用户显式填）。
+    assert cfg.rag_rerank_backend == "onnx"
+    assert cfg.rag_rerank_mlx_model_path == ""
     # 默认 embedding 模型名（fastembed 目录名回退语义由 _DEPRECATED 映射保留）。
     assert cfg.rag_embedding_model == "jinaai/jina-embeddings-v5-text-nano"
-    assert cfg.rag_rerank_model == "BAAI/bge-reranker-v2-m3-int8"
-    assert cfg.rag_rerank_mlx_model_path.endswith("bge-reranker-v2-m3-mlx-mxfp8")
+    assert cfg.rag_rerank_model == "jinaai/jina-reranker-v2-base-multilingual"
+    assert cfg.rag_rerank_mlx_model_path == ""
 
 
 def test_llm_mode_and_backend_stay_coherent():

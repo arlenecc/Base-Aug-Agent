@@ -586,10 +586,10 @@ class RAGEngine:
         min_chunk_size: int = 100,
         overlap_percent: float = 0.10,
         semantic_chunking: bool = True,
-        # 默认用 INT8 量化版 bge-reranker-v2-m3（~570MB，多语种/中文精排）。
-        # 旧默认 "BAAI/bge-reranker-base" 是 fp32 ~1.04GB 且非量化——两个真实
-        # 调用点（tools/base.py、ui/main_window.py）都不传 rerank_model，
-        # 这个默认值就是实际加载的模型（#131）。
+        # 默认 reranker 模型名（实际由 config.rag_rerank_model 传入，bge 系列已
+        # 退役、统一为 jina-reranker-v2-base-multilingual）。两个真实调用点
+        # （tools/base.py、ui/main_window.py）都不传 rerank_model，这个默认值
+        # 仅作兜底（#131）。
         rerank_model: str = DEFAULT_RERANK_MODEL,
         rerank_backend: str = "fastembed",
         rerank_model_path: str = "",

@@ -26,11 +26,10 @@ logger = logging.getLogger(__name__)
 # Using the -Q variant: model_quantized.onnx (~137MB) instead of model.onnx (~548MB).
 # Same 768-dim embeddings, same quality, 4x smaller download.
 DEFAULT_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5-Q"
-# 重排序走 fastembed TextCrossEncoder（ONNX，无 PyTorch 依赖）。选官方 INT8
-# 量化版：~570MB（fp32 全量 2.3GB 的一半不到），且 v2-m3 的多语种/中文精排
-# 能力优于 bge-reranker-base。旧配置里的 bge-reranker-base 仍被 fastembed
-# 支持（fp32 onnx ~1.1GB），无需迁移。
-DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
+# 默认 reranker 模型名（兜底值，实际由 config.rag_rerank_model 传入）。
+# bge-reranker-v2-m3 自 1.2.4 起退役，默认统一为 jina-reranker-v2-base-
+# multilingual（ONNX/CPU，多语言、中文 Top-1 与 v2-m3 持平、更快）。
+DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
 _TABLE_NAME = "knowledge_base"
 
 # 文档元数据表：存储每个文档的缩略版本（目录结构 + 章节标题）与完整 Markdown，
