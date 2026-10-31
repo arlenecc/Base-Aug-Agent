@@ -17,6 +17,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -1197,3 +1198,87 @@ class TestRerankSimilarityThreshold:
         kept = store._filter_by_similarity(results, 0.55)
         assert [r["source"] for r in kept] == ["a"]
         assert len(kept) == 1
+
+
+class TestBinaryCoarseRetrieval:
+    """两段式检索（二进制量化 BQ 极速粗筛）的单元/集成验证。
+
+    仅当 rag_binary_coarse_enabled=True 时启用；默认关闭，故不影响既有检索行为。
+    """
+
+    def test_default_disabled(self):
+        from agent.config import AgentConfig
+        assert AgentConfig().rag_binary_coarse_enabled is False
+
+    def test_prepare_binary_packed_length(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(
+            persist_dir=str(tmp_path), binary_coarse_enabled=True)
+        # FakeEmbeddingFunction 为 128 维，matryoshka_dim=128 → 截断后 128 维，
+        # 符号位打包后 ceil(128/8)=16 字节。
+        packed = store._prepare_binary(np.zeros(128, dtype=np.float32))
+        assert isinstance(packed, bytes)
+        assert len(packed) == 16
+
+    def test_enabled_populates_binary_table(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(
+            persist_dir=str(tmp_path), binary_coarse_enabled=True)
+        store.add([
+            {"text": "机器学习是人工智能的一个分支", "source": "a.txt", "chunk_index": 0},
+            {"text": "向量数据库用于存储嵌入向量", "source": "a.txt", "chunk_index": 1},
+            {"text": "二进制量化把向量压缩成比特串", "source": "b.txt", "chunk_index": 0},
+        ])
+        # kb_binary 表应被创建并写入 3 条。
+        assert "kb_binary" in store._db.table_names()
+        btbl = store._db.open_table("kb_binary")
+        assert btbl.count_rows() == 3
+        # 二进制列宽度 = 16 字节（128 维）。
+        arrow = btbl.to_arrow()
+        assert arrow.schema.field("binary").type.byte_width == 16
+
+    def test_disabled_store_has_no_binary_table(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(persist_dir=str(tmp_path))  # 默认关闭
+        store.add([
+            {"text": "机器学习是人工智能的一个分支", "source": "a.txt", "chunk_index": 0},
+        ])
+        assert "kb_binary" not in store._db.table_names()
+        assert store.search_binary_coarse("机器学习", refine_top_k=3) is None
+
+    def test_coarse_returns_candidates(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(
+            persist_dir=str(tmp_path), binary_coarse_enabled=True)
+        store.add([
+            {"text": "机器学习是人工智能的一个分支", "source": "a.txt", "chunk_index": 0},
+            {"text": "深度学习使用神经网络", "source": "a.txt", "chunk_index": 1},
+            {"text": "向量数据库用于存储嵌入向量", "source": "b.txt", "chunk_index": 0},
+            {"text": "二进制量化把向量压缩成比特串以加速检索",
+             "source": "b.txt", "chunk_index": 1},
+        ])
+        out = store.search_binary_coarse("机器学习", refine_top_k=3)
+        assert isinstance(out, list) and len(out) > 0
+        assert {"text", "source", "chunk_index", "score", "id"}.issubset(out[0].keys())
+        # 分数应按余弦降序。
+        scores = [c["score"] for c in out]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_search_with_rerank_uses_coarse(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(
+            persist_dir=str(tmp_path), binary_coarse_enabled=True)
+        store.add([
+            {"text": "机器学习是人工智能的一个分支", "source": "a.txt", "chunk_index": 0},
+            {"text": "深度学习使用神经网络", "source": "a.txt", "chunk_index": 1},
+            {"text": "向量数据库用于存储嵌入向量", "source": "b.txt", "chunk_index": 0},
+        ])
+        # 开启 BQ 粗筛后 search_with_rerank 仍应正常返回候选，不崩溃。
+        results = store.search_with_rerank("机器学习", top_k=2)
+        assert isinstance(results, list)
+        assert len(results) >= 1
+
+    def test_clear_drops_binary_table(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(
+            persist_dir=str(tmp_path), binary_coarse_enabled=True)
+        store.add([
+            {"text": "机器学习是人工智能的一个分支", "source": "a.txt", "chunk_index": 0},
+        ])
+        assert "kb_binary" in store._db.table_names()
+        store.clear()
+        assert "kb_binary" not in store._db.table_names()

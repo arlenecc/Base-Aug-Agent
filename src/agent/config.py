@@ -209,6 +209,13 @@ class AgentConfig:
     #     1 - d²/2 还原余弦；数值精度略高于 int8（无量化取整损失）。
     # 未启用裁剪时无论此值如何都是全维 f16（原生检索）。默认保持 int8。
     rag_vector_dtype: str = "int8"
+    # 两段式检索：二进制量化（BQ）极速粗筛（2026-10-31 新增，默认关闭）。
+    # 开启后：入库时额外为每个切片生成一份 BQ 二进制向量（符号位打包），
+    # 存入独立的 kb_binary 表；检索时先以汉明距离（XOR+popcount）从全库极速
+    # 粗筛 top200 候选，再用 INT8 向量计算余弦精筛，最终交给 reranker 深度打分。
+    # 关闭（默认）则完全退回原流程，行为与旧版一致。大库（数万~百万级切片）
+    # 下汉明粗筛比原生 ANN/暴力扫描更快；小库或 kb_binary 表缺失时自动回退。
+    rag_binary_coarse_enabled: bool = False
     # 子批扫档实测（MLX）：2→88、8→152、16→178、32→205、64→205、128→190 条/s。
     # 默认取拐点 16；下限 2 保留极端内存压力下的避让位，上限 64 之后无收益。
     rag_embedding_batch_size: int = 16
@@ -371,6 +378,7 @@ class AgentConfig:
     _BOOL_FIELDS = ("rag_rerank_enabled", "rag_auto_ingest",
                     "rag_docling_dynamic_scale", "rag_docling_vlm",
                     "rag_semantic_chunking", "rag_matryoshka_enabled",
+                    "rag_binary_coarse_enabled",
                     "llm_enable_thinking", "aux_llm_enable_thinking",
                     "aux_llm_enabled",
                     "llm_speculative", "llama_cpp_kv_cache", "llama_cpp_kv_q8",

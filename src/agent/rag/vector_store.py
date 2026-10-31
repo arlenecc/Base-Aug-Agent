@@ -36,6 +36,13 @@ _TABLE_NAME = "knowledge_base"
 # 用于 Meta-context + Targeted RAG（先返回全文档结构概览，再按需检索细节）。
 _DOCUMENTS_TABLE_NAME = "documents"
 
+# 二进制量化（BQ）索引表：与 knowledge_base 平行，存每个切片的 BQ 二进制向量
+# （符号位打包）+ 其 INT8 量化向量副本 + 来源信息，供两段式检索的极速粗筛使用。
+# 通过共享的 id（"{source_hash}_{chunk_index}"）与主表关联。
+_BINARY_TABLE_NAME = "kb_binary"
+# 粗筛候选数：汉明距离极速选出全库 top200，再在其上做 INT8 余弦精筛。
+_BINARY_COARSE_TOP_K = 200
+
 # BM25 全文检索的预分词列名（jieba 分词后空格连接，供原生 FTS 的 simple
 # tokenizer 按空格切分索引，解决中文无空格无法分词的问题）。
 _FTS_COLUMN = "text_fts"
@@ -694,6 +701,7 @@ class VectorStore:
         matryoshka_enabled: bool = True,
         matryoshka_dim: int = 512,
         vector_dtype: str = "int8",
+        binary_coarse_enabled: bool = False,
     ):
         self._persist_dir = persist_dir
         self._embedding_model = embedding_model
@@ -761,6 +769,12 @@ class VectorStore:
         self._mrl_trunc = (
             self._mrl and self._matryoshka_enabled and self._matryoshka_dim > 0)
         self._int8_store = self._mrl_trunc and self._vector_dtype == "int8"
+        self._binary_coarse_enabled = bool(binary_coarse_enabled)
+        # 二进制量化（BQ）粗筛相关状态。
+        self._binary_cache = None          # 内存缓存：全库 packed 二进制 + INT8 向量
+        self._text_by_id = {}              # 内存缓存：id → text（粗筛取原文用，免二次查询）
+        self._binary_dirty = True          # 写入/删除后失效，下次查询重建
+        self._binary_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -1005,8 +1019,23 @@ class VectorStore:
             return min(probe_dim, trunc)
         return probe_dim
 
+    def _normalized_vec(self, vec) -> np.ndarray:
+        """截断（Matryoshka）→ L2 重归一化，返回单位向量（float32）。
+
+        入库与查询侧对称执行，是 int8 量化、f16 存储、**二进制量化（BQ）**
+        的共同前置步骤——三者都基于同一份归一化向量派生，保证方向一致。
+        """
+        v = np.asarray(vec, dtype=np.float32)
+        trunc = self._vec_trunc_dim()
+        if trunc > 0:
+            v = v[:trunc]
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v = v / n  # 截断后重归一化（入库与查询侧对称执行，硬性步骤）
+        return v
+
     def _prepare_vec(self, vec) -> np.ndarray:
-        """单条向量 → 入库：截断（Matryoshka）→ L2 重归一化 → f16（jina 为 int8）。
+        """单条向量 → 入库：归一化 → f16（jina 为 int8 量化值）。
 
         重归一化是**硬性步骤**：截断会破坏单位长度（前 N 维的范数 < 1），
         不重新归一化的话截断向量的方向虽不变，但与查询侧的处理必须一致，
@@ -1015,10 +1044,10 @@ class VectorStore:
         return self._prepare_query(vec, dtype=np.float16)
 
     def _prepare_query(self, vec, dtype=np.float32) -> np.ndarray:
-        """查询/入库向量的对称处理：截断 → 重归一化 → 指定 dtype。
+        """查询/入库向量的对称处理：归一化 → 指定 dtype（int8 量化 / f16 浮点）。
 
         列类型**恒为 float16**（2026-10-29 定版）：int8 指的是「值量化」
-        （截维后重归一化 → ×127 取整），量化后的整数仍以浮点 dtype 承载写进
+        （归一化 → ×127 取整），量化后的整数仍以浮点 dtype 承载写进
         float16 列。这样 lancedb 原生 .search() / ANN 索引始终可用——
         真·FixedSizeList(Int8) 列在 lancedb 0.40 上无法检索（"no vector
         column"），本项目刻意规避。
@@ -1030,18 +1059,111 @@ class VectorStore:
         入库侧 dtype=float16；查询侧 float32（原生 .search() 对 f16 列接受
         f32 查询——已实测）。重归一化必须在量化之前执行（方向信息先保住）。
         """
-        v = np.asarray(vec, dtype=np.float32)
-        trunc = self._vec_trunc_dim()
-        if trunc > 0:
-            v = v[:trunc]
-        n = float(np.linalg.norm(v))
-        if n > 0:
-            v = v / n  # 截断后重归一化（入库与查询侧对称执行，硬性步骤）
+        v = self._normalized_vec(vec)
         if self._int8_store:
             # 量化成整数值，但以浮点承载（列是 float16，不是真 Int8 列）。
             return np.clip(np.round(v * _INT8_SCALE),
                            -_INT8_SCALE, _INT8_SCALE).astype(dtype)
         return v.astype(dtype)
+
+    def _prepare_binary(self, vec) -> bytes:
+        """二进制量化（BQ）：取归一化向量的符号位 → 位打包（packbits）。
+
+        与 int8/f16 **同源**——同一份归一化向量，符号位即余弦方向的粗粒度
+        表达。返回 ``ceil(dim/8)`` 字节的 packed bytes，供汉明距离
+        （XOR+popcount）极速粗筛使用。符号约定：分量 ≥0 → 1，否则 → 0。
+        """
+        v = self._normalized_vec(vec)
+        bits = (v >= 0).astype(np.uint8)
+        return np.packbits(bits).tobytes()
+
+    # ------------------------------------------------------------------
+    # 二进制量化（BQ）索引表：两段式检索的极速粗筛数据源
+    # ------------------------------------------------------------------
+
+    def _open_binary_table(self):
+        """打开已存在的 kb_binary 表；不存在返回 None。"""
+        if self._db is None:
+            return None
+        try:
+            if _BINARY_TABLE_NAME in self._db.table_names():
+                return self._db.open_table(_BINARY_TABLE_NAME)
+        except Exception:
+            return None
+        return None
+
+    def _ensure_binary_table(self, packed_len: int, dim: int):
+        """懒创建 kb_binary 表（id / source / chunk_index / binary / vector）。"""
+        if self._db is None:
+            self._ensure_initialized()
+        if self._open_binary_table() is not None:
+            return self._open_binary_table()
+        schema = pa.schema([
+            pa.field("id", pa.string()),
+            pa.field("source", pa.string()),
+            pa.field("chunk_index", pa.int64()),
+            pa.field("binary", pa.binary(packed_len)),
+            pa.field("vector", pa.list_(pa.float16(), dim)),
+        ])
+        # 注意：本版本 lancedb 在「仅传 schema、无 data」建表时会触发 sanitize
+        # 对齐 bug（与 vector 列冲突）。改为传入一个带 schema 的空表建表即可绕开。
+        empty = pa.Table.from_pylist([], schema=schema)
+        return self._db.create_table(_BINARY_TABLE_NAME, data=empty)
+
+    def _delete_binary_by_source(self, h: str) -> None:
+        """按 source 哈希前缀删除 kb_binary 表中的条目。"""
+        btbl = self._open_binary_table()
+        if btbl is None:
+            return
+        try:
+            btbl.delete(f"id LIKE '{h}_%'")
+            self._binary_dirty = True
+        except Exception as e:
+            logger.warning("VectorStore: kb_binary 按 source 删除失败（已跳过）: %s", e)
+
+    def _sync_binary_for_records(
+        self, records: List[Dict[str, Any]],
+        binaries: Optional[List[bytes]] = None,
+    ) -> None:
+        """将一批 records 的 BQ 二进制向量写入 kb_binary 表（与主表同生命周期）。
+
+        关闭开关时直接跳过（不建表、不占存储）；开启时按 source 删除旧条目后
+        写入——与主表 add 的 upsert-by-source 语义对齐。任何异常都被吞掉：
+        BQ 索引只是检索加速的「锦上添花」，绝不可中断主入库流程。
+
+        ``binaries`` 必须与 ``records`` 等长，且由**原始嵌入向量**派生（见
+        ``_prepare_binary``），不能从主表已量化的 vector 列反推（int8 量化会
+        破坏符号精度）。不传时退回从 records 的 vector 列重算（仅兜底，方向近似）。
+        """
+        if not self._binary_coarse_enabled or not records:
+            return
+        try:
+            if binaries is None:
+                binaries = [self._prepare_binary(r["vector"]) for r in records]
+            if len(binaries) != len(records):
+                logger.warning(
+                    "VectorStore: kb_binary binaries 与 records 长度不一致，跳过同步")
+                return
+            first = records[0]
+            packed_len = len(binaries[0]) if binaries else 0
+            vec = first.get("vector")
+            dim = len(vec) if vec is not None else 0
+            if packed_len == 0 or dim == 0:
+                return
+            btbl = self._ensure_binary_table(packed_len, dim)
+            for source in sorted({r.get("source", "unknown") for r in records}):
+                self._delete_binary_by_source(_hash_source(source))
+            bin_records = [{
+                "id": r["id"],
+                "source": r["source"],
+                "chunk_index": r.get("chunk_index", 0),
+                "binary": binaries[i],
+                "vector": r["vector"],
+            } for i, r in enumerate(records)]
+            btbl.add(bin_records)
+            self._binary_dirty = True
+        except Exception as e:
+            logger.warning("VectorStore: kb_binary 同步失败（已跳过）: %s", e)
 
     def reset_if_incompatible(self) -> bool:
         """向量库与当前嵌入模型不兼容时，自愈式清空重建。
@@ -1115,6 +1237,12 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False
+            # 二进制量化索引与主表同生命周期：一并丢弃并清缓存。
+            if _BINARY_TABLE_NAME in self._db.table_names():
+                self._db.drop_table(_BINARY_TABLE_NAME)
+            self._binary_cache = None
+            self._text_by_id = {}
+            self._binary_dirty = True
             # FTS 状态一并复位（表都没了，旧标记毫无意义）。
             self._fts_ready = False
             self._fts_checked = False
@@ -1251,7 +1379,12 @@ class VectorStore:
             return 0
 
         # Build records (embed in batches to avoid OOM on large knowledge bases)
+        # 注意：主表 records **不能**含 binary 字段——kb_binary 表才有 binary
+        # 列，主表 schema 不含它，混进去会在 create_table 的 schema 对齐阶段
+        # 报 "Field 'binary' not found in target schema"。binary 单独用
+        # binaries 列表保存，最后交给 _sync_binary_for_records。
         records: List[Dict[str, Any]] = []
+        binaries: List[bytes] = []
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [c["text"] for c in batch_chunks]
@@ -1270,6 +1403,7 @@ class VectorStore:
                     _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
                     _INGESTED_AT: time.time(),
                 })
+                binaries.append(self._prepare_binary(vectors[j]))
 
         table = self._ensure_table()
         self._assert_vector_dim_compat(table, records)
@@ -1280,6 +1414,8 @@ class VectorStore:
             if created:
                 self._fts_ready = False  # 推迟到下次 search 重建 BM25 索引
                 logger.info("LanceDB table '%s' created with %d records", _TABLE_NAME, len(records))
+                # 主表首建即写入全量，kb_binary 必须与主表同生命周期同步。
+                self._sync_binary_for_records(records, binaries)
                 return len(records)
             # 并发线程刚建了表 → 继续走下面的 upsert 路径
 
@@ -1319,6 +1455,9 @@ class VectorStore:
         # 每次都全表重建是 O(N) 的浪费。置 _fts_ready=False 把重建推迟到
         # 下一次 search_fts()（那里已有惰性建索引路径），一次同步只付一次
         # 建索引成本。
+        # 同步二进制量化索引（kb_binary 表）：与主表同生命周期（删除旧来源 + 写入）。
+        self._sync_binary_for_records(records, binaries)
+
         self._fts_ready = False
 
         logger.info("VectorStore: added %d chunks", total)
@@ -1340,6 +1479,8 @@ class VectorStore:
         # 失败文件被无条件 pop，向量永久残留且下次同步没有重试机会。
         try:
             table.delete(f"id LIKE '{h}_%'")
+            # 二进制量化索引与主表同步删除（按同一 id 前缀）。
+            self._delete_binary_by_source(h)
             # 向量删了，但 BM25 倒排索引里的 term 还在——必须失效索引，
             # 否则已删除文档的内容仍会被关键词检索召回并返回给 LLM。
             self._fts_ready = False
@@ -1393,7 +1534,7 @@ class VectorStore:
 
         # Embed 第一批
         logger.info("  ├─ 向量化: 首批 %d 个切片正在嵌入...", len(first_batch))
-        first_records = self._embed_chunks(first_batch, 0)
+        first_records, first_binaries = self._embed_chunks(first_batch, 0)
         logger.info("  ├─ 向量化完成: 首批 %d 个切片", len(first_records))
 
         table = self._ensure_table()
@@ -1431,6 +1572,7 @@ class VectorStore:
             # 写入第一批
             try:
                 table.add(first_records)
+                self._sync_binary_for_records(first_records, first_binaries)
                 total = len(first_records)
                 logger.info("  ├─ 向量库写入: 首批 %d 条记录", total)
                 if on_batch:
@@ -1470,9 +1612,10 @@ class VectorStore:
                             except Exception:
                                 pass
                         deleted_sources.update(new_sources)
-                records = self._embed_chunks(batch_buf, chunk_idx)
+                records, binaries = self._embed_chunks(batch_buf, chunk_idx)
                 try:
                     table.add(records)
+                    self._sync_binary_for_records(records, binaries)
                     total += len(records)
                     logger.info("  ├─ 向量库写入: 第 %d 批 %d 条 (累计 %d)", batch_num, len(records), total)
                     if on_batch:
@@ -1499,9 +1642,10 @@ class VectorStore:
                             table.delete(f"id LIKE '{h}_%'")
                         except Exception:
                             pass
-            records = self._embed_chunks(batch_buf, chunk_idx)
+            records, binaries = self._embed_chunks(batch_buf, chunk_idx)
             try:
                 table.add(records)
+                self._sync_binary_for_records(records, binaries)
                 total += len(records)
                 logger.info("  ├─ 向量库写入: 最后批次 %d 条 (累计 %d)", len(records), total)
                 if on_batch:
@@ -1649,6 +1793,7 @@ class VectorStore:
                 _last_yield = _time.monotonic()
         vectors = vectors_by_idx
         records: List[Dict[str, Any]] = []
+        binaries: List[bytes] = []
         # 批次级入库时间戳：向量去重按它保留最早入库的一份（见 _INGESTED_AT）。
         _now = time.time()
         # 一批 chunk 通常来源相同 → 缓存 source→hash 映射，避免每个 chunk
@@ -1672,7 +1817,10 @@ class VectorStore:
                 _FTS_COLUMN: _tokenize_for_fts(chunk["text"]),
                 _INGESTED_AT: _now,
             })
-        return records
+            # binary 不进主表 records（主表 schema 无此列），单独收集供
+            # kb_binary 同步使用；必须用原始向量派生，保证符号精度。
+            binaries.append(self._prepare_binary(vectors[j]))
+        return records, binaries
 
     # ------------------------------------------------------------------
     # BM25 full-text search (hybrid retrieval)
@@ -2170,6 +2318,184 @@ class VectorStore:
         )
         return [best]
 
+    # ------------------------------------------------------------------
+    # 两段式检索：二进制量化（BQ）极速粗筛 + INT8 余弦精筛
+    # ------------------------------------------------------------------
+
+    def _get_binary_cache(self):
+        """构建/复用 kb_binary 的全库内存缓存（packed 二进制 + INT8 向量）。
+
+        命中后汉明粗筛与余弦精筛全在内存 numpy 完成，无需任何向量库查询——
+        这是大库下比原生 ANN/暴力扫描更快的根源。写入/删除/清空后
+        ``_binary_dirty`` 置位，下次查询重建。
+        """
+        if not self._binary_coarse_enabled:
+            return None
+        with self._binary_lock:
+            if self._binary_cache is not None and not self._binary_dirty:
+                return self._binary_cache
+            btbl = self._open_binary_table()
+            if btbl is None:
+                self._binary_cache = None
+                self._text_by_id = {}
+                return None
+            arrow = btbl.to_arrow()
+            n = arrow.num_rows
+            if n == 0:
+                self._binary_cache = {"ids": []}
+                self._text_by_id = {}
+                self._binary_dirty = False
+                return self._binary_cache
+            ids = arrow.column("id").to_pylist()
+            sources = arrow.column("source").to_pylist()
+            chunk_indexes = arrow.column("chunk_index").to_pylist()
+            binaries = self._fixed_size_binary_to_uint8(arrow.column("binary"))
+            vecs = np.array(arrow.column("vector").to_pylist(),
+                            dtype=np.float32)
+            if self._int8_store:
+                vecs = vecs.astype(np.int8)  # [-127,127] 无损，省 4x 内存
+            self._binary_cache = {
+                "ids": ids,
+                "sources": sources,
+                "chunk_indexes": chunk_indexes,
+                "binaries": binaries,
+                "vectors": vecs,
+            }
+            # 顺带把主表 text 一次性载入内存：粗筛取回原文时直接用，避免每条
+            # 查询再打一次 LanceDB 查询（那会让粗筛全路径反而慢于原生检索）。
+            self._text_by_id = self._load_text_cache()
+            self._binary_dirty = False
+            return self._binary_cache
+
+    @staticmethod
+    def _fixed_size_binary_to_uint8(col) -> np.ndarray:
+        """Arrow FixedSizeBinary 列 → (N, byte_width) 的 uint8 numpy 矩阵。"""
+        arr = col.combine_chunks()
+        buf = arr.buffers()  # [validity, data]
+        data = buf[1]
+        width = arr.type.byte_width
+        return np.frombuffer(data, dtype=np.uint8).reshape(len(arr), width)
+
+    @staticmethod
+    def _source_like_match(where, source):
+        """粗略匹配 engine.search 产出的 ``source LIKE '%x%' ESCAPE '\'`` 谓词。
+
+        仅用于 kb_binary 内存缓存内的范围过滤；解析失败则回退为不过滤（安全）。
+        """
+        import re
+        if not where or not source:
+            return True
+        m = re.search(r"LIKE\s+'%(.*)%'\s+ESCAPE", where, re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1) in source
+        m = re.search(r"=\s*'([^']*)'", where)
+        if m:
+            return m.group(1) == source
+        return True
+
+    def _load_text_cache(self) -> Dict[str, str]:
+        """一次性把主表全部 id→text 载入内存，供粗筛取原文免二次查询。
+
+        仅在 kb_binary 缓存重建时调用一次（与二进制缓存同生命周期：写入/
+        删除后 _binary_dirty 置位，下次查询重建）。文本常驻内存会随知识库
+        增大而增内存占用——但 BQ 粗筛本就是「用内存换速度」的 opt-in 加速，
+        且二进制缓存本身已是全库常驻，文本只是顺带一份。
+        """
+        table = self._ensure_table()
+        if table is None:
+            return {}
+        try:
+            out: Dict[str, str] = {}
+            for row in table.to_arrow().to_pylist():
+                out[row.get("id")] = row.get("text", "")
+            return out
+        except Exception as e:
+            logger.warning("VectorStore: 载入 text 缓存失败（回退按 id 查询）: %s", e)
+            return {}
+
+    def _fetch_texts_by_ids(self, ids):
+        """从主表按 id 取 text，返回 {id: text}（内存缓存优先，缺失则回退查询）。"""
+        if not ids:
+            return {}
+        # 粗筛路径已通过 _get_binary_cache 把全表 text 载入 self._text_by_id，
+        # 直接命中即可，无需再打 LanceDB 查询。
+        if self._text_by_id:
+            return {i: self._text_by_id.get(i, "") for i in ids}
+        table = self._ensure_table()
+        if table is None:
+            return {}
+        try:
+            dim = table.schema.field("vector").type.list_size
+            in_clause = "id IN ({})".format(
+                ",".join("'{}'".format(i.replace("'", "\\'")) for i in ids))
+            q = np.zeros(dim, dtype=np.float32)
+            texts = {}
+            for row in table.search(q, vector_column_name="vector").where(
+                    in_clause, prefilter=True).limit(20_000_000).to_list():
+                texts[row["id"]] = row["text"]
+            return texts
+        except Exception as e:
+            logger.warning("VectorStore: 按 id 取 text 失败（已跳过）: %s", e)
+            return {}
+
+    def search_binary_coarse(self, query: str, refine_top_k: int,
+                             where: Optional[str] = None):
+        """两段式检索的第一段——二进制量化极速粗筛 + INT8 余弦精筛。
+
+        返回与 ``search()`` 同构的 vec_candidates 列表（含 text/source/
+        chunk_index/score/id），供 ``search_with_rerank`` 当作向量通道候选。
+        不可用（开关关闭 / kb_binary 表缺失 / 空表）时返回 None，由调用方
+        回退到原生 ``self.search``。
+        """
+        if not self._binary_coarse_enabled:
+            return None
+        cache = self._get_binary_cache()
+        if cache is None or len(cache["ids"]) == 0:
+            return None
+        # 1) 查询向量的 BQ 表达与 INT8 表达。
+        if hasattr(self._ef, "embed_query"):
+            raw = self._ef.embed_query(query)
+        else:
+            raw = self._ef([query])[0]
+        q_bin = np.frombuffer(self._prepare_binary(raw), dtype=np.uint8)
+        q_vec = self._prepare_query(raw).astype(np.float32)
+
+        # 2) 汉明距离（XOR+popcount）全库粗筛 top200。
+        db_bin = cache["binaries"]
+        diff = np.count_nonzero(db_bin ^ q_bin[None, :], axis=1)
+        order = np.argsort(diff).tolist()  # 升序：差异位越少越相似（list 便于 where 过滤）
+        if where:
+            allowed = {cache["ids"][i] for i in range(len(cache["ids"]))
+                       if self._source_like_match(where, cache["sources"][i])}
+            if allowed:
+                order = [i for i in order if cache["ids"][i] in allowed]
+        top = order[:_BINARY_COARSE_TOP_K]
+        if not top:
+            return []
+
+        # 3) 在 top200 上用 INT8 向量做余弦精筛，取 refine_top_k。
+        db_vec = cache["vectors"]
+        scale = float(_INT8_SCALE) if self._int8_store else 1.0
+        sub = db_vec[top].astype(np.float32)
+        d2 = np.sum((sub - q_vec[None, :]) ** 2, axis=1)
+        sim = np.maximum(0.0, 1.0 - d2 / (2.0 * scale * scale))
+        keep = np.argsort(-sim)[:refine_top_k]
+
+        # 4) 取回最终候选的原文（仅 refine_top_k 条，避免全量拉取）。
+        keep_ids = [cache["ids"][top[k]] for k in keep]
+        texts = self._fetch_texts_by_ids(keep_ids)
+        out = []
+        for k in keep:
+            i = top[k]
+            out.append({
+                "text": texts.get(cache["ids"][i], ""),
+                "source": cache["sources"][i],
+                "chunk_index": cache["chunk_indexes"][i],
+                "score": float(sim[k]),
+                "id": cache["ids"][i],
+            })
+        return out
+
     @_store_op
     def search_with_rerank(
         self,
@@ -2199,10 +2525,24 @@ class VectorStore:
         n_candidates = top_k * candidate_multiplier
 
         # 1. Vector similarity search.
-        vec_candidates = self.search(query, top_k=n_candidates, where=where)
-        logger.info(
-            "VectorStore.search_with_rerank: 向量检索 %d 条候选", len(vec_candidates),
-        )
+        #    两段式：若开启 BQ 极速粗筛，先用汉明距离从全库粗筛 top200、
+        #    再在其上做 INT8 余弦精筛得到向量通道候选；否则退回原生 self.search。
+        #    任一不可用（开关关闭 / kb_binary 表缺失）时自动回退，行为与原版一致。
+        vec_candidates = []
+        if self._binary_coarse_enabled:
+            coarse = self.search_binary_coarse(
+                query, refine_top_k=n_candidates, where=where)
+            if coarse:
+                vec_candidates = coarse
+                logger.info(
+                    "VectorStore.search_with_rerank: BQ 粗筛 %d 条向量候选",
+                    len(vec_candidates),
+                )
+        if not vec_candidates:
+            vec_candidates = self.search(query, top_k=n_candidates, where=where)
+            logger.info(
+                "VectorStore.search_with_rerank: 向量检索 %d 条候选", len(vec_candidates),
+            )
 
         # 2. BM25 keyword search (同样的 where 过滤，保证定向检索一致)。
         fts_candidates = self.search_fts(query, top_k=n_candidates, where=where)
@@ -2273,6 +2613,12 @@ class VectorStore:
             self._db.drop_table(_TABLE_NAME)
             self._table = None
             self._table_checked = False  # 重置标记，允许下次 add 重新创建表
+            # 二进制量化索引与主表同生命周期：一并丢弃并清缓存。
+            if _BINARY_TABLE_NAME in self._db.table_names():
+                self._db.drop_table(_BINARY_TABLE_NAME)
+            self._binary_cache = None
+            self._text_by_id = {}
+            self._binary_dirty = True
             # 必须同时重置 FTS 三标记（与 close() 同款）：漏掉的话 _fts_ready
             # 仍为 True，add() 重建新表时会跳过建索引，search_fts 也认为索引
             # 就绪 → 在未索引列上跑 FTS 抛异常被吞掉 → BM25 通道从此永久

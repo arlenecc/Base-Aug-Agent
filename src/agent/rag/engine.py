@@ -601,6 +601,7 @@ class RAGEngine:
         rerank_enabled: bool = True,
         min_similarity: float = 0.55,
         matryoshka_enabled: bool = True,
+        binary_coarse_enabled: bool = False,
         matryoshka_dim: int = 512,
         vector_dtype: str = "int8",
         parallel_workers: int = DEFAULT_PARALLEL_WORKERS,
@@ -653,6 +654,7 @@ class RAGEngine:
         # 精排相似度过滤阈值：sigmoid 归一化后的 rerank 分低于此值的结果被丢弃。
         # 夹在 [0,1]，防御配置文件里手填越界值（如 2.0 / 负数）。
         self._min_similarity = max(0.0, min(1.0, float(min_similarity)))
+        self._binary_coarse_enabled = bool(binary_coarse_enabled)
         self._parallel_workers = max(1, int(parallel_workers))
         # PDF 主引擎（docling|marker|ovis）。未知值一律回退 docling，避免配置
         # 笔误把整库同步打到意外的路径上。ovis = PyMuPDF + OvisOCR3 VLM，
@@ -2801,6 +2803,7 @@ class RAGEngine:
                         matryoshka_dim=self._matryoshka_dim,
                         vector_dtype=self._vector_dtype,
                         rerank_enabled=self._rerank_enabled,
+                        binary_coarse_enabled=self._binary_coarse_enabled,
                     )
         return self._store
 
