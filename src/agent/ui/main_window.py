@@ -1504,6 +1504,15 @@ class MainWindow(QMainWindow):
             "候选池 = TopN × 4 × 2 路全量送精排，调大会线性增加检索耗时\n"
             "（jina 精排 ~49 对/s：TopN=3 ≈ 0.5s，TopN=8 ≈ 1.3s）。"
         )
+        # --- 快速粗筛开关：两段式 BQ 粗筛（config.rag_binary_coarse_enabled）---
+        self.fast_coarse_check = QCheckBox("快速粗筛")
+        self.fast_coarse_check.setToolTip(
+            "快速粗筛：入库时按符号位生成二进制量化（BQ）向量，查询时先用\n"
+            "内存汉明扫描极速粗筛、再 INT8 余弦精筛，可大幅加快大库检索。\n"
+            "默认关闭；开启后不可用时（缺表/空表）自动回退原生检索，召回不受影响。"
+        )
+        self.fast_coarse_check.setChecked(
+            bool(getattr(self.config, "rag_binary_coarse_enabled", False)))
         # --- 切片参数（Row 4「参数设置」）：config.rag_chunk_size/_overlap ---
         # 全链路唯一来源：config → SyncKnowledgeWorker/tools.base → RAGEngine →
         # chunker（含 epub 章节直通上限 engine._max_chars）。字段已在
@@ -1815,6 +1824,7 @@ class MainWindow(QMainWindow):
         rerank_row.addWidget(self.reranker_model_path_btn)
         rerank_row.addWidget(QLabel("TopN"))
         rerank_row.addWidget(self.rerank_topn_spin)
+        rerank_row.addWidget(self.fast_coarse_check)
         kb_lay.addLayout(rerank_row)
 
         lay.addWidget(kb_group)
@@ -2163,6 +2173,8 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "rag_semantic_chunking", True)))
         self.rerank_topn_spin.setValue(
             int(getattr(self.config, "rag_rerank_top_n", 3)))
+        self.fast_coarse_check.setChecked(
+            bool(getattr(self.config, "rag_binary_coarse_enabled", False)))
         if self.config.model:
             self.model_combo.setEditText(self.config.model)
         self._apply_sampling_to_widgets("")
@@ -2272,6 +2284,7 @@ class MainWindow(QMainWindow):
         )
         self.config.rag_semantic_chunking = self.semantic_chunk_check.isChecked()
         self.config.rag_rerank_top_n = self.rerank_topn_spin.value()
+        self.config.rag_binary_coarse_enabled = self.fast_coarse_check.isChecked()
         # MLX 交叉编码器是目录，ONNX 是文件，两者各存一份：切换后端时不必
         # 重新粘贴路径（见 _reranker_path_for_backend）。
         path_value = self.reranker_model_path_edit.text().strip()
