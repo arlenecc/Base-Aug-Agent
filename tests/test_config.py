@@ -336,24 +336,26 @@ def test_default_max_tokens_is_32768():
     assert cfg.max_context_tokens == 32768
 
 
-def test_aux_defaults_are_16384_ctx_and_05_temp():
-    """辅助模型默认加载参数：上下文 16384、temp 0.5，其它参数不变。"""
+def test_aux_defaults_are_8192_ctx_and_03_temp():
+    """辅助模型默认加载参数：上下文 8192、temp 0.3、rep 1.1，其它参数不变。"""
     cfg = AgentConfig()
-    assert cfg.aux_max_context_tokens == 16384
-    assert cfg.aux_temperature == 0.5
+    assert cfg.aux_max_context_tokens == 8192
+    assert cfg.aux_temperature == 0.3
     assert cfg.aux_max_tokens == 2048
     assert cfg.aux_top_p == 0.95
     assert cfg.aux_min_p == 0.05
     assert cfg.aux_top_k == 20
-    assert cfg.aux_repetition_penalty == 1.0
+    assert cfg.aux_repetition_penalty == 1.1
+    # 思考模式默认关闭（辅助模型只跑摘要/归纳，开思考只会拖慢响应）。
+    assert cfg.aux_llm_enable_thinking is False
 
 
 def test_migrate_aux_legacy_temperature(tmp_path):
-    """旧配置里的 aux_temperature=0.2（旧默认）升级到 0.5；
+    """旧配置里的 aux_temperature=0.2（旧默认）升级到 0.3；
     用户显式调过的值必须保留。"""
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"aux_temperature": 0.2}))
-    assert AgentConfig.load(str(p)).aux_temperature == 0.5
+    assert AgentConfig.load(str(p)).aux_temperature == 0.3
 
     p2 = tmp_path / "c2.json"
     p2.write_text(json.dumps({"aux_temperature": 0.7}))
@@ -361,11 +363,11 @@ def test_migrate_aux_legacy_temperature(tmp_path):
 
 
 def test_migrate_aux_context_floor(tmp_path):
-    """aux_max_context_tokens 是后加字段：旧配置默认 16384；
-    被设成比生成长度还小的非法值时兜底回 16384。"""
+    """aux_max_context_tokens 默认 8192（2026-10-31 调小以加快响应）；
+    被设成比生成长度还小的非法值时兜底回 16384（防止 n_ctx 卡死）。"""
     p = tmp_path / "c.json"
     p.write_text(json.dumps({}))
-    assert AgentConfig.load(str(p)).aux_max_context_tokens == 16384
+    assert AgentConfig.load(str(p)).aux_max_context_tokens == 8192
 
     p2 = tmp_path / "c2.json"
     p2.write_text(json.dumps({"aux_max_context_tokens": 512}))
