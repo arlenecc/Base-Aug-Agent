@@ -287,6 +287,7 @@ class ToolRegistry:
                 rerank_batch_size=getattr(self.config, "rag_rerank_batch_size", 16),
                 rerank_max_length=getattr(self.config, "rag_rerank_max_length", 8192),
                 rerank_enabled=getattr(self.config, "rag_rerank_enabled", True),
+                min_similarity=getattr(self.config, "rag_rerank_min_similarity", 0.55),
                 matryoshka_enabled=getattr(self.config, "rag_matryoshka_enabled", True),
                 matryoshka_dim=getattr(self.config, "rag_matryoshka_dim", 512),
                 vector_dtype=getattr(self.config, "rag_vector_dtype", "int8"),

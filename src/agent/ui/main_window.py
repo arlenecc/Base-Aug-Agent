@@ -3797,6 +3797,8 @@ class MainWindow(QMainWindow):
                 "rerank_batch_size": self.config.rag_rerank_batch_size,
                 "rerank_max_length": self.config.rag_rerank_max_length,
                 "rerank_enabled": self.config.rag_rerank_enabled,
+                "min_similarity": getattr(
+                    self.config, "rag_rerank_min_similarity", 0.55),
                 # Matryoshka 向量裁剪：enabled 开 + dim∈{128,256,512} →
                 # 截维+重归一化+int8 入库；关 → 全维 f16。
                 "matryoshka_enabled": bool(

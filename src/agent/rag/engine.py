@@ -599,6 +599,7 @@ class RAGEngine:
         rerank_batch_size: int = 16,
         rerank_max_length: int = 8192,
         rerank_enabled: bool = True,
+        min_similarity: float = 0.55,
         matryoshka_enabled: bool = True,
         matryoshka_dim: int = 512,
         vector_dtype: str = "int8",
@@ -649,6 +650,9 @@ class RAGEngine:
         self._rerank_batch_size = max(1, int(rerank_batch_size))
         self._rerank_max_length = max(8, int(rerank_max_length))
         self._rerank_enabled = bool(rerank_enabled)
+        # 精排相似度过滤阈值：sigmoid 归一化后的 rerank 分低于此值的结果被丢弃。
+        # 夹在 [0,1]，防御配置文件里手填越界值（如 2.0 / 负数）。
+        self._min_similarity = max(0.0, min(1.0, float(min_similarity)))
         self._parallel_workers = max(1, int(parallel_workers))
         # PDF 主引擎（docling|marker|ovis）。未知值一律回退 docling，避免配置
         # 笔误把整库同步打到意外的路径上。ovis = PyMuPDF + OvisOCR3 VLM，
@@ -2259,8 +2263,9 @@ class RAGEngine:
 
         Retrieves top_k * 4 candidates each from vector-similarity search and
         BM25 keyword search, merges/dedupes, then uses BGE reranker to pick
-        the most relevant results.  Results below the 0.7 similarity threshold
-        are dropped before returning.
+        the most relevant results.  Results whose rerank score is below
+        ``min_similarity`` (config.rag_rerank_min_similarity, default 0.55) are
+        dropped before returning.
 
         ``source`` 为可选文档名/关键词过滤：定向检索某本书/文档内的切片
         （配合 rag_outline 实现 Targeted RAG——先掌握全局结构，再按需检索
@@ -2282,7 +2287,8 @@ class RAGEngine:
             query[:80], top_k, store_count,
         )
         logger.info("  ├─ 混合初检: 向量相似度 + BM25 关键词, 各取 top %d 候选", top_k * 4)
-        results = store.search_with_rerank(query, top_k=top_k, where=where)
+        results = store.search_with_rerank(
+            query, top_k=top_k, where=where, min_similarity=self._min_similarity)
         t_total = time.monotonic() - t0
         if results:
             logger.info("  └─ ✅ 检索完成: 返回 %d 条结果 (耗时 %.2fs)", len(results), t_total)

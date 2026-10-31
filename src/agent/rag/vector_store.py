@@ -2059,7 +2059,7 @@ class VectorStore:
         query: str,
         candidates: List[Dict[str, Any]],
         top_k: int = 3,
-        min_similarity: float = 0.5,
+        min_similarity: float = 0.55,
     ) -> List[Dict[str, Any]]:
         """Re-rank candidates using BGE reranker for precise scoring.
 
@@ -2145,17 +2145,30 @@ class VectorStore:
         A rerank score (BGE sigmoid, or cosine-similarity fallback) below the
         threshold means the chunk is not semantically close enough to the
         query to be worth sending to the LLM.
+
+        保底：当**全部**候选都低于阈值（整体打分偏低——查询词质量差、跨语种弱
+        匹配等，rerank 语义分普遍贴着 0.5）时，至少保留得分最高的 1 条，避免空
+        结果让下游 LLM 完全丢失上下文。保底只取 top-1（rerank 视角下最相关的
+        切片），不把明显噪声一并塞回去。
         """
         if not results or min_similarity <= 0:
             return results
         kept = [r for r in results if r.get("score", 0.0) >= min_similarity]
-        if len(kept) < len(results):
-            dropped = len(results) - len(kept)
-            logger.info(
-                "  ├─ 相似度过滤: 丢弃 %d 条 < %.2f 的结果, 保留 %d 条",
-                dropped, min_similarity, len(kept),
-            )
-        return kept
+        if kept:
+            if len(kept) < len(results):
+                dropped = len(results) - len(kept)
+                logger.info(
+                    "  ├─ 相似度过滤: 丢弃 %d 条 < %.2f 的结果, 保留 %d 条",
+                    dropped, min_similarity, len(kept),
+                )
+            return kept
+        # 保底：全部候选都低于阈值时，至少保留得分最高的 1 条。
+        best = max(results, key=lambda r: r.get("score", 0.0))
+        logger.info(
+            "  ├─ 相似度过滤: 全部 %d 条均 < %.2f, 保底保留最高分 (%.4f) 的 1 条结果",
+            len(results), min_similarity, best.get("score", 0.0),
+        )
+        return [best]
 
     @_store_op
     def search_with_rerank(
@@ -2164,7 +2177,7 @@ class VectorStore:
         top_k: int = 3,
         candidate_multiplier: int = 4,
         where: Optional[str] = None,
-        min_similarity: float = 0.5,
+        min_similarity: float = 0.55,
     ) -> List[Dict[str, Any]]:
         """Hybrid retrieval: vector similarity + BM25 keyword, then BGE rerank.
 
@@ -2173,7 +2186,7 @@ class VectorStore:
           2. BM25 keyword search: top_k * candidate_multiplier candidates.
           3. Merge & dedupe by (source, chunk_index).
           4. BGE rerank the merged candidate set.
-          5. Drop any result whose rerank score < min_similarity (0.5).
+          5. Drop any result whose rerank score < min_similarity (0.55).
           6. Return up to top_k results.
 
         Args:
@@ -2827,7 +2840,7 @@ def _logit_to_score(logit: float) -> float:
 
     fastembed 的 TextCrossEncoder.rerank() 返回模型原始 logit（单调，但无界）。
     与旧 FlagReranker.compute_score(normalize=True) 一致地过 sigmoid，下游
-    min_similarity 阈值（0.5）才能维持原有语义。分段计算避免 exp 溢出。
+    min_similarity 阈值（0.55）才能维持原有语义。分段计算避免 exp 溢出。
     """
     try:
         logit = float(logit)

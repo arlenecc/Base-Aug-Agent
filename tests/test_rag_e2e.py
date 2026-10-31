@@ -1143,3 +1143,57 @@ class TestEndToEndPipeline:
         assert len(results) >= 1
         combined = " ".join(r["text"] for r in results)
         assert "token" in combined.lower() or "Token" in combined
+
+
+class TestRerankSimilarityThreshold:
+    """min_similarity 过滤阈值（rag_rerank_min_similarity，默认 0.55，config 可调）。
+
+    单元验证，不加载模型：直接对「已 sigmoid 归一化到 [0,1] 的 rerank 分」施加
+    阈值，确认默认档位与「阈值过高(0.7)会误伤边界相关项」的风险预期一致。
+    """
+
+    def test_default_threshold_is_055(self):
+        from agent.config import AgentConfig
+        assert AgentConfig().rag_rerank_min_similarity == 0.55
+
+    def test_filter_drops_below_threshold(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(persist_dir=str(tmp_path))
+        # 0.88=强相关、0.57=边界相关（机器学习主题实测档位）、
+        # 0.51=无关弱匹配、0.49=噪声。
+        results = [
+            {"source": "a", "score": 0.88},
+            {"source": "b", "score": 0.57},
+            {"source": "c", "score": 0.51},
+            {"source": "d", "score": 0.49},
+        ]
+        kept = store._filter_by_similarity(results, 0.55)
+        assert [r["source"] for r in kept] == ["a", "b"]
+
+    def test_threshold_070_misfires_borderline(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(persist_dir=str(tmp_path))
+        results = [
+            {"source": "a", "score": 0.88},
+            {"source": "b", "score": 0.57},  # 正确相关项，但 < 0.7
+        ]
+        # 0.7 会误伤 0.57 的正确相关项，只剩强相关那条 → 召回率下降。
+        kept = store._filter_by_similarity(results, 0.7)
+        assert [r["source"] for r in kept] == ["a"]
+
+    def test_nonpositive_threshold_keeps_all(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(persist_dir=str(tmp_path))
+        results = [{"source": "x", "score": 0.1}, {"source": "y", "score": 0.2}]
+        assert store._filter_by_similarity(results, 0) == results
+        assert store._filter_by_similarity(results, -1) == results
+
+    def test_filter_keeps_top1_when_all_below_threshold(self, vector_store_factory, tmp_path):
+        store = vector_store_factory(persist_dir=str(tmp_path))
+        # 整体打分偏低：全部候选都低于阈值（跨语种弱匹配 / 查询词质量差）。
+        results = [
+            {"source": "a", "score": 0.51},  # 最高分
+            {"source": "b", "score": 0.49},
+            {"source": "c", "score": 0.40},
+        ]
+        # 保底：至少保留得分最高的 1 条，而非返回空 → 下游 LLM 不会丢上下文。
+        kept = store._filter_by_similarity(results, 0.55)
+        assert [r["source"] for r in kept] == ["a"]
+        assert len(kept) == 1

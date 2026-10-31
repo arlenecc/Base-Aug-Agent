@@ -250,6 +250,12 @@ class AgentConfig:
     # 工具的 top_k 以此为上限（模型不传时也用它做默认值）——候选池 =
     # top_k × 4 × 2 路全量送精排，TopN 调大线性增加精排耗时（jina ~49 对/s）。
     rag_rerank_top_n: int = 3
+    # 精排相似度过滤阈值（2026-10-31 调整）：reranker 打分（sigmoid 归一化到
+    # [0,1]）低于此值的结果在送交 LLM 前被丢弃。实测 jina 交叉编码器分数整体
+    # 偏高、区分度偏软，相关命中普遍 0.57~0.88、无关弱匹配 ~0.51；阈值取 0.55
+    # 能在不过度误伤边界相关项（如 0.57 的机器学习主题）的前提下滤掉明显噪声。
+    # 阈值过高（如 0.7）会误伤 0.57~0.69 段的正确相关结果、召回率崩塌——勿动。
+    rag_rerank_min_similarity: float = 0.55
 
     rag_auto_ingest: bool = True
     # PDF 解析引擎（2026-10 新增，与 docling 并行的 marker-pdf 路线）：
@@ -343,7 +349,8 @@ class AgentConfig:
                      "request_timeout", "context_shrink_ratio",
                      "rag_pdf_large_threshold_mb", "rag_pdf_batch_threshold_mb",
                      "aux_temperature", "aux_top_p", "aux_min_p",
-                     "aux_repetition_penalty", "aux_request_timeout")
+                     "aux_repetition_penalty", "aux_request_timeout",
+                     "rag_rerank_min_similarity")
     _STR_FIELDS = (
         "base_url", "api_key", "model", "workspace", "knowledge_base",
         "llm_mode",
