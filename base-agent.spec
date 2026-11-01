@@ -146,24 +146,47 @@ for _pkg in ('docling', 'chonkie'):
         pass
 
 # -----------------------------------------------------------------------
-# 可选：将默认模型内嵌进 .app（#用户需求：打包内置模型）
+# 可选：将默认模型内嵌进 .app（默认不内嵌，体积过大）
 # -----------------------------------------------------------------------
 # 配置里默认相对路径 "models/<name>" 由 resolve_model_path 解析，打包后按
 # 以下位置查找（详见 src/agent/model_backends.py::resolve_model_path）：
 #   - 默认位："models"        → .app/Contents/MacOS/models          （候选④，推荐）
 #   - 标准位："Contents/Resources/models" → .app/Contents/Resources/models（候选⑤）
-# 模型可达数 GB：onefile 模式每次启动都会解压、体积与启动成本高，建议用本
-# spec 的 .app 目录(onedir)模式。models/ 不存在时跳过，不影响打包/运行
-# （运行时仍可在 UI 里手动指定模型路径）。
+# 模型（主模型 Qwen3.5-* + 辅助模型 jina/OvisOCR 等）可达数 GB，默认不内嵌
+# 以控制包体。需要离线开箱即用时设置环境变量再构建：
+#     BUNDLE_MODELS=1 python -m PyInstaller base-agent.spec
+# 未内嵌时不影响打包/运行（运行时仍可在 UI 里手动指定模型路径，或把
+# models/ 放到可执行文件同级目录）。
 MODELS_SRC = "models"
-if os.path.isdir(MODELS_SRC):
-    # 默认：落入 Contents/MacOS/models（与可执行文件同级，resolve 候选④命中）
+# 辅助模型（嵌入 / 重排）：离线 RAG 必需，体积较小。
+# 注：OvisOCR3(OCR) 不打包以控制体积，需要 OCR 时运行时另行指定模型路径。
+AUX_MODEL_DIRS = [
+    "jina-embeddings-v5-text-nano-mlx-int4",
+    "jina-reranker-v2-base-multilingual-onnx",
+]
+
+
+def _bundle_model_dir(name):
+    global datas
+    src = os.path.join(MODELS_SRC, name)
+    if not os.path.isdir(src):
+        print(f"[spec] 警告: 未找到 {src}，跳过")
+        return
+    # 落入 Contents/MacOS/models/<name>（resolve 候选④命中）
+    datas += add_data_dir(src, os.path.join("models", name))
+
+
+if os.environ.get("BUNDLE_MODELS") == "1" and os.path.isdir(MODELS_SRC):
+    # 全量内嵌（主模型 Qwen3.5 + 辅助模型）
     datas += add_data_dir(MODELS_SRC, "models")
-    # 可选 macOS 标准位（resolve 候选⑤）：改用下一行代替上一行
-    # datas += add_data_dir(MODELS_SRC, "Contents/Resources/models")
-    print(f"[spec] 已将 {MODELS_SRC}/ 内嵌进 .app -> Contents/MacOS/models")
+    print(f"[spec] BUNDLE_MODELS=1：已内嵌全部 {MODELS_SRC}/（含主模型）")
+elif os.environ.get("BUNDLE_AUX_MODELS") == "1" and os.path.isdir(MODELS_SRC):
+    # 仅内嵌辅助模型（排除主模型 Qwen3.5，体积可控且离线 RAG/OCR 可用）
+    for _d in AUX_MODEL_DIRS:
+        _bundle_model_dir(_d)
+    print(f"[spec] BUNDLE_AUX_MODELS=1：已内嵌辅助模型 {AUX_MODEL_DIRS}（不含主模型）")
 else:
-    print(f"[spec] 未找到 {MODELS_SRC}/，跳过模型内嵌（运行时可在 UI 指定模型路径）")
+    print(f"[spec] 未内嵌模型（BUNDLE_MODELS/BUNDLE_AUX_MODELS 未开启）—— 运行时需在 UI 指定模型路径")
 
 # -----------------------------------------------------------------------
 # Analysis

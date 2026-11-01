@@ -40,12 +40,15 @@ if ! "$PYTHON_BIN" -c "import PyInstaller" 2>/dev/null; then
     "$PIP_BIN" install pyinstaller
 fi
 
-# 提示：若希望 .app 内置默认模型，请先把模型放到仓库 models/ 目录再打包
-# （base-agent.spec 会自动将 models/ 内嵌进 .app/Contents/MacOS/models）。
-if [[ -d "models" ]]; then
-    echo "📦 检测到 models/，将随 .app 内嵌默认模型"
+# 默认不内嵌模型（主模型 Qwen3.5 + 辅助模型约 5.6GB，体积过大）。
+#   BUNDLE_AUX_MODELS=1  → 仅内嵌辅助模型(embedding/reranker)，离线 RAG 可用
+#   BUNDLE_MODELS=1      → 全量内嵌（含主模型），离线开箱即用
+if [[ "${BUNDLE_MODELS:-}" == "1" && -d "models" ]]; then
+    echo "📦 BUNDLE_MODELS=1：将内嵌全部 models/（含主模型）"
+elif [[ "${BUNDLE_AUX_MODELS:-}" == "1" && -d "models" ]]; then
+    echo "📦 BUNDLE_AUX_MODELS=1：将内嵌辅助模型(embedding/reranker)，不含主模型与 OCR"
 else
-    echo "ℹ️  未检测到 models/，.app 将不含内置模型（运行时需手动指定模型路径）"
+    echo "ℹ️  默认不内嵌模型 —— 运行时需手动指定模型路径"
 fi
 
 echo "🔨 Building BaseAgent.app..."
