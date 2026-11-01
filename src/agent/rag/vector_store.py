@@ -830,6 +830,27 @@ class VectorStore:
             self._closing = False
             self._op_cv.notify_all()
 
+    def _ensure_embedder(self) -> None:
+        """惰性构建嵌入函数，仅 add/search 真正需要时调用。
+
+        不再于 ``_initialize_locked`` 中急切构建——向量去重等只读/删除类
+        维护操作（count / scan / delete）无需加载嵌入模型，否则在尚未配置
+        嵌入/LLM 路径时会误报「未配置本地模型路径」。
+        """
+        if self._ef is not None:
+            return
+        if self._custom_ef is not None:
+            self._ef = self._custom_ef
+        else:
+            self._ef = get_or_create_embedding_function(
+                self._embedding_model,
+                backend=self._embedding_backend,
+                model_path=self._embedding_model_path,
+                threads=self._embedding_threads,
+                batch_size=self._embedding_batch_size,
+                max_length=self._embedding_max_length,
+            )
+
     def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -861,18 +882,9 @@ class VectorStore:
         logger.info("  连接 LanceDB: %s", self._persist_dir)
         self._db = lancedb.connect(self._persist_dir)
 
-        # Use injected embedding function (for testing) or the configured shared backend.
-        if self._custom_ef is not None:
-            self._ef = self._custom_ef
-        else:
-            self._ef = get_or_create_embedding_function(
-                self._embedding_model,
-                backend=self._embedding_backend,
-                model_path=self._embedding_model_path,
-                threads=self._embedding_threads,
-                batch_size=self._embedding_batch_size,
-                max_length=self._embedding_max_length,
-            )
+        # 嵌入函数（_ef）延迟构建：仅 add/search 真正需要时由 _ensure_embedder()
+        # 初始化。count/scan/delete 等维护操作（含向量去重）无需加载模型，避免
+        # 「未配置本地模型路径」这类与去重无关的错误（#向量去重报错）。
 
         # Open existing table or defer creation until first add
         if _TABLE_NAME in self._db.table_names():
@@ -990,6 +1002,7 @@ class VectorStore:
 
         返回 None 表示探测失败（EF 不可用）——调用方不应据此清库。
         """
+        self._ensure_embedder()
         try:
             if hasattr(self._ef, "embed_query"):
                 vec = self._ef.embed_query("维度探测")
@@ -1388,6 +1401,7 @@ class VectorStore:
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
             texts = [c["text"] for c in batch_chunks]
+            self._ensure_embedder()
             vectors = self._ef(texts)
             for j, chunk in enumerate(batch_chunks):
                 idx = i + j
@@ -1716,6 +1730,7 @@ class VectorStore:
             size = _shape_cap_size(size, len(texts[order[sub_start]]), self._embedding_backend)
             idxs = order[sub_start:sub_start + size]
             _t_sub = _time.monotonic()
+            self._ensure_embedder()
             sub_vectors = self._ef([texts[i] for i in idxs])
             _dt = _time.monotonic() - _t_sub
             for i, v in zip(idxs, sub_vectors):
@@ -1999,6 +2014,7 @@ class VectorStore:
         Returns list of {text, source, chunk_index, score} dicts.
         """
         self._ensure_initialized()
+        self._ensure_embedder()
         table = self._ensure_table()
         if table is None:
             logger.info("  向量检索: 向量表不存在 (查询=%r)", query[:60])
@@ -2452,6 +2468,7 @@ class VectorStore:
         """
         if not self._binary_coarse_enabled:
             return None
+        self._ensure_embedder()
         cache = self._get_binary_cache()
         if cache is None or len(cache["ids"]) == 0:
             return None
