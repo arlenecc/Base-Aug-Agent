@@ -1,16 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for building base-agent into a macOS .app bundle.
+"""PyInstaller spec for building base-agent into a platform-native bundle.
 
 Usage:
     pyinstaller base-agent.spec
 
 Produces:
-    dist/BaseAgent.app       — macOS application bundle
-    dist/BaseAgent           — command-line executable
+    macOS : dist/BaseAgent.app  — application bundle (via BUNDLE)
+    Win   : dist/BaseAgent/     — onedir folder with BaseAgent.exe (via COLLECT)
+    Linux: dist/BaseAgent/      — onedir folder (via COLLECT)
 """
 
 import os
 import sys
+
+# Icon: macOS uses .icns; Windows/Linux need .ico (fall back to none if absent).
+if sys.platform == 'darwin':
+    _ICON = 'BaseAgent.icns'
+elif os.path.exists('BaseAgent.ico'):
+    _ICON = 'BaseAgent.ico'
+else:
+    _ICON = None
+
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_submodules,
@@ -18,6 +28,18 @@ from PyInstaller.utils.hooks import (
 )
 
 block_cipher = None
+
+
+# Helper to bundle an arbitrary directory tree as datas (PyInstaller 6.x no
+# longer injects add_data_dir into the spec namespace, so define it here).
+def add_data_dir(src, dest):
+    out = []
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, src)
+            out.append((full, os.path.join(dest, rel)))
+    return out
 
 # -----------------------------------------------------------------------
 # Collect all data files and submodules for complex dependencies
@@ -55,7 +77,10 @@ hiddenimports += collect_submodules('onnxruntime')
 datas += collect_data_files('onnxruntime')
 
 # --- FlagEmbedding (reranker) ---
-hiddenimports += collect_submodules('FlagEmbedding')
+try:
+    hiddenimports += collect_submodules('FlagEmbedding')
+except Exception:
+    pass
 
 # --- Document parsers (optional RAG deps) ---
 for mod in ['docx', 'openpyxl', 'pptx', 'fitz', 'ebooklib']:
@@ -91,6 +116,13 @@ try:
     hiddenimports += collect_submodules('numpy')
 except Exception:
     pass
+
+# --- agent internal modules (ensure fully bundled; some are lazily imported) ---
+hiddenimports += [
+    'agent', 'agent.ui', 'agent.ui.main_window',
+    'agent.rag', 'agent.rag.engine', 'agent.rag.vector_store',
+    'agent.rag.parsers', 'agent.rag.deps',
+]
 
 # --- RapidOCR (optional OCR for scanned PDFs) ---
 try:
@@ -143,7 +175,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=['hooks'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
@@ -178,26 +210,39 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,  # Keep console for log output
+    icon=_ICON,
 )
 
-# -----------------------------------------------------------------------
-# macOS .app bundle
-# -----------------------------------------------------------------------
-
-app = BUNDLE(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    name='BaseAgent.app',
-    icon='BaseAgent.icns',
-    bundle_identifier='com.baseagent.app',
-    info_plist={
-        'CFBundleDisplayName': 'BaseAgent',
-        'CFBundleShortVersionString': '0.1.0',
-        'CFBundleVersion': '1',
-        'NSHighResolutionCapable': True,
-        'NSMicrophoneUsageDescription': 'BaseAgent may need microphone access for voice input.',
-        'LSMinimumSystemVersion': '12.0',
-    },
-)
+if sys.platform == 'darwin':
+    # -------------------------------------------------------------------
+    # macOS .app bundle
+    # -------------------------------------------------------------------
+    app = BUNDLE(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name='BaseAgent.app',
+        icon=_ICON,
+        bundle_identifier='com.baseagent.app',
+        info_plist={
+            'CFBundleDisplayName': 'BaseAgent',
+            'CFBundleShortVersionString': '0.1.0',
+            'CFBundleVersion': '1',
+            'NSHighResolutionCapable': True,
+            'NSMicrophoneUsageDescription': 'BaseAgent may need microphone access for voice input.',
+            'LSMinimumSystemVersion': '12.0',
+        },
+    )
+else:
+    # -------------------------------------------------------------------
+    # Windows / Linux onedir folder (BUNDLE is macOS-only)
+    # -------------------------------------------------------------------
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name='BaseAgent',
+        icon=_ICON,
+    )

@@ -1548,6 +1548,9 @@ class VectorStore:
         if created:
             logger.info("  ├─ 向量库: 新建 LanceDB 表 '%s', 写入 %d 条记录", _TABLE_NAME, len(first_records))
             total = len(first_records)
+            # 首建表时同步 kb_binary：否则仅一批即耗尽时（小库常见）二进制表
+            # 不会被建立，开启 BQ 粗筛后无数据可扫，粗筛静默失效。
+            self._sync_binary_for_records(first_records, first_binaries)
             if on_batch:
                 on_batch(len(first_records), total)
             if exhausted:
