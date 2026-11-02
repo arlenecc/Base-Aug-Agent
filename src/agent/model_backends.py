@@ -37,6 +37,10 @@ LLM_BACKENDS = ("openai", "mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
 # 辅助模型（#140）只支持进程内直载：没有网络端点可配。
 AUX_LLM_BACKENDS = ("mlx_lm", "mlx_vlm", "onnx", "llama_cpp")
 
+# 长会话 KV 护栏：缓存序列（token 数）超过该值则整轮重建，避免单个 KV 对象无限
+# 增长（内存另有 1GB cache_limit 兜底，这里再按 token 数设一道闸）。0 = 关闭。
+_KV_MAX_TOKENS = int(os.environ.get("BASEAGENT_KV_MAX_TOKENS", "24000") or 0)
+
 
 class LLMBackend(Protocol):
     def list_models(self) -> List[str]: ...
@@ -55,7 +59,17 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def resolve_model_path(path: str, *, expect_file: bool = False) -> str:
+def get_app_data_dir() -> Path:
+    """应用数据目录（即 config.json 所在目录 ~/.base-agent）。
+
+    用户未自定义模型路径时，模型默认下载 / 查找到 ``<此目录>/models`` 下，
+    保证与配置文件同目录、随用户数据一致，也避开了打包 .app 内 models 的只读问题。
+    注意：必须与 ``ui.main_window.CONFIG_PATH``（~/.base-agent/config.json）保持一致。
+    """
+    return Path.home() / ".base-agent"
+
+
+def resolve_model_path(path: str, *, expect_file: bool = False, strict: bool = True) -> str:
     """Resolve a configured local model path without performing network access.
 
     相对路径按以下优先级查找（取首个真实存在的为准）：
@@ -68,6 +82,8 @@ def resolve_model_path(path: str, *, expect_file: bool = False) -> str:
     5. ``<exe>.parent.parent / Resources / models`` —— macOS .app 标准位
        ``Contents/Resources/models``
     6. ``<exe>.parents[2] / models``  —— ``.app`` 包根（``.app/models``）
+    7. ``~/.base-agent/models``      —— 用户数据目录（当 .app 包不可写时的回退落点，
+       与 ``get_models_base_dir`` 的回退保持一致）
 
     打包时只需把 ``models/`` 作为数据资源随可执行文件发布（如
     ``--add-data "models:models"`` 落到 ``Contents/MacOS/models``，命中 ④），
@@ -81,27 +97,83 @@ def resolve_model_path(path: str, *, expect_file: bool = False) -> str:
     if not candidate.is_absolute():
         executable = Path(sys.executable).resolve()
         meipass = getattr(sys, "_MEIPASS", None)
-        root_cand = project_root() / candidate
+        root_cand = get_app_data_dir() / candidate
+        home_cand = Path.home() / ".base-agent" / candidate
         candidates = [
-            Path.cwd() / candidate,                              # ① cwd
-            root_cand,                                           # ② 项目根
+            Path.cwd() / candidate,                              # ① cwd（开发期仓库根）
+            root_cand,                                           # ② 应用数据目录（=~/.base-agent，默认下载/查找落点）
             executable.parent / candidate,                      # ④ exe 同级（打包默认）
             executable.parent.parent / "Resources" / candidate, # ⑤ macOS .app Resources
+            home_cand,                                          # ⑦ 用户数据目录（回退，与 ② 同一路径）
         ]
         if meipass:                                             # ③ PyInstaller onefile
             candidates.insert(2, Path(meipass) / candidate)
         if len(executable.parents) >= 3:                        # ⑥ .app 包根
             candidates.append(executable.parents[2] / candidate)
-        # 回退到项目根，给出开发期友好的报错路径。
+        # 回退到应用数据目录（与 config 同目录），给出稳定可写的报错路径。
         candidate = next((item for item in candidates if item.exists()), root_cand)
     candidate = candidate.resolve()
     if not candidate.exists():
-        raise LLMError(f"本地模型不存在: {candidate}")
+        if strict:
+            raise LLMError(f"本地模型不存在: {candidate}")
+        # 非严格模式：返回「预期落点」，供下载器作为写入目录使用，
+        # 确保下载完成后能被同一函数（严格模式）在下次启动正常定位。
+        return str(candidate)
     if expect_file and not candidate.is_file():
         raise LLMError(f"需要模型文件，实际为目录: {candidate}")
     if not expect_file and not candidate.is_dir():
         raise LLMError(f"需要模型目录，实际为文件: {candidate}")
     return str(candidate)
+
+
+def get_models_base_dir() -> Path:
+    """返回用于**下载/写入**模型的基目录，与 ``resolve_model_path`` 的查找顺序一致，
+
+    保证下载完成后能被自动定位（无需改动业务代码）。
+
+    用户未自定义模型路径时，默认落点是**应用数据目录**（即 config.json 所在目录
+    ``~/.base-agent``）下的 ``models/``——与配置文件同目录、随用户数据一致，也避开
+    打包 .app 内 models 的只读问题。候选顺序：应用数据目录 → cwd → 项目根 →
+    (onefile 解压) → 可执行同级（打包默认落点 ``Contents/MacOS/models``）→
+    ``.app/Resources/models`` → ``.app`` 包根。取首个**可写**的目录；都不行时回退到
+    ``~/.base-agent/models``。
+    """
+    executable = Path(sys.executable).resolve()
+    meipass = getattr(sys, "_MEIPASS", None)
+    proj = project_root()
+    candidates = [
+        get_app_data_dir() / "models",                 # ① 应用数据目录（= config 目录，默认落点）
+        Path.cwd() / "models",                         # ② cwd（开发期仓库根）
+        proj / "models",                               # ③ 项目根
+    ]
+    if meipass:                                       # ④ PyInstaller onefile
+        candidates.append(Path(meipass) / "models")
+    candidates.append(executable.parent / "models")   # ⑤ 可执行同级（打包默认）
+    candidates.append(
+        executable.parent.parent / "Resources" / "models"  # ⑥ macOS .app Resources
+    )
+    if len(executable.parents) >= 3:                  # ⑦ .app 包根
+        candidates.append(executable.parents[2] / "models")
+    last_err: Exception | None = None
+    for c in candidates:
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            probe = c / ".hf_download_probe"
+            probe.write_text("ok")
+            probe.unlink()
+            return c
+        except Exception as e:  # 只读/权限不足 → 试下一个候选
+            last_err = e
+            continue
+    # 所有候选都不可写：回退到应用数据目录（保证可用）。
+    fallback = get_app_data_dir() / "models"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    except Exception as e:
+        raise LLMError(
+            f"无法确定可写的模型目录（候选均失败：{last_err}；回退也失败：{e}）"
+        )
 
 
 def discover_local_models(models_dir: str = "models", backend: str = "") -> List[str]:
@@ -204,6 +276,28 @@ def _clone_prompt_cache(caches: Any) -> Optional[List[Any]]:
         logger.debug("克隆 prompt cache 失败（退化为全量 prefill）: %s", e)
         return None
     return cloned or None
+
+
+def _try_trim_prompt_cache(cache: Any, total: int, keep: int) -> bool:
+    """把 prompt cache 裁到「保留前 ``keep`` 个 token」，用于前缀分叉后复用公共前缀。
+
+    ⚠️ 语义陷阱：mlx_lm 的 ``trim_prompt_cache(cache, n)`` 是**从末尾裁掉 n 个
+    token**（保留前 ``total - n`` 个），绝非「裁到保留前 n 个」。故这里传
+    ``total - keep``。
+
+    返回是否成功裁剪：可裁剪架构（如 Qwen3 的 AttentionCache）成功；不可裁剪架构
+    （如 Qwen3.5 的 ArraysCache，``can_trim_prompt_cache`` 返回 False）返回 False
+    且 cache 保持不变，由调用方降级到静态头或整轮重建——绝不会因裁错而污染输出。
+    """
+    if cache is None or keep <= 0 or total <= keep:
+        return False
+    try:
+        from mlx_lm.models.cache import trim_prompt_cache
+        removed = trim_prompt_cache(cache, total - keep)
+        return bool(removed and removed > 0)
+    except Exception:
+        return False
+
 
 
 def _common_prefix_len(a: List[int], b: List[int]) -> int:
@@ -920,6 +1014,34 @@ class MLXLanguageBackend(_LazyLocalBackend):
             n += 1
         return n
 
+    def _kv_friendly_chat_template(self):
+        """返回「历史轮也渲染思考块」的 chat template（覆盖用，不改动模型自带文件）。
+
+        根因：qwen3.5-agentic-coder 等模板对**历史 assistant 轮**直接丢弃
+        ``<think>…</think>`` 推理（仅「最后的待生成轮」才渲染，靠
+        ``loop.index0 > ns.last_query_index`` 这个栅栏），而 KV 缓存里那一轮当时是
+        「待生成轮」、**包含**推理 → 下一轮重渲染时两边从 assistant 块起永久错开，
+        form① 整份作废。这里把历史轮也按生成提示词同样的方式渲染思考块，使重渲染
+        与缓存逐 token 一致。
+
+        只在模板确实含该栅栏结构时才打补丁；其它模板（如 qwen3、不同结构的）
+        原样返回 ``None`` → 走默认模板，不影响。
+        """
+        cached = getattr(self, "_kv_tmpl_patched", None)
+        if cached is not None or hasattr(self, "_kv_tmpl_patched"):
+            return self._kv_tmpl_patched
+        tmpl = getattr(self._tokenizer, "chat_template", None)
+        # 栅栏条件：仅「最后的待生成轮」才渲染思考块，历史轮直接丢弃推理。
+        marker = "loop.index0 > ns.last_query_index"
+        if not tmpl or marker not in tmpl:
+            self._kv_tmpl_patched = None
+            return None
+        # 把栅栏换成恒真：让所有 assistant 轮都用同一套「思考块」渲染（思考开带推理、
+        # 思考关为空块），与生成提示词（模板末尾 add_generation_prompt 那段）逐 token
+        # 对齐——这是 form① 滚动复用能命中的前提。不改 body，开/闭标签原样保留。
+        self._kv_tmpl_patched = tmpl.replace(marker, "true")
+        return self._kv_tmpl_patched
+
     def _prompt(
         self,
         messages: List[Dict[str, Any]],
@@ -951,6 +1073,10 @@ class MLXLanguageBackend(_LazyLocalBackend):
         }
         if tools:
             kwargs["tools"] = tools
+        # 历史轮也渲染思考块，保证重渲染与缓存逐 token 一致（见 _kv_friendly_chat_template）。
+        tmpl = self._kv_friendly_chat_template()
+        if tmpl is not None:
+            kwargs["chat_template"] = tmpl
         # arguments 还原成 dict：模板按 mapping 渲染历史 tool_calls 的参数。
         # think_opened：生成提示是否预置了 <think>（思考模式开关），决定历史里
         # 的 raw_content 该怎么补闭合标签才能与生成序列对齐。
@@ -1108,6 +1234,23 @@ class MLXLanguageBackend(_LazyLocalBackend):
                         self._kv_thread_ident, threading.get_ident())
                     self._kv_cache = None
                     self._kv_ids = []
+                # KV 复用总开关（对应 UI「KV复用」勾选；llama_cpp_kv_cache 对 MLX
+                # 同样适用）。关闭时清空所有前缀缓存，每轮全量预填充。
+                kv_reuse_enabled = bool(getattr(self.config, "llama_cpp_kv_cache", True))
+                # 长会话护栏：缓存序列超过阈值则整轮重建，避免单个 KV 对象无限增长
+                # （内存另有 1GB cache_limit 兜底，这里再按 token 数设一道闸）。
+                if (self._kv_ids and _KV_MAX_TOKENS
+                        and len(self._kv_ids) >= _KV_MAX_TOKENS):
+                    logger.info(
+                        "MLX KV 缓存超阈值(%d>=%d)，长会话整体重建",
+                        len(self._kv_ids), _KV_MAX_TOKENS)
+                    self._kv_cache = None
+                    self._kv_ids = []
+                if not kv_reuse_enabled:
+                    # 显式关闭：不保留/不复用任何前缀缓存（含静态头）。
+                    self._head_cache = None
+                    self._kv_cache = None
+                    self._kv_ids = []
                 if ids is not None and self._kv_cache is not None and self._kv_ids:
                     # 两种命中形态，都要求「新 prompt 与缓存序列逐 token 一致」：
                     #   a) 缓存更长（常态）：缓存 = 上轮 prompt + 上轮生成，本轮
@@ -1117,42 +1260,53 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     common = self._common_prefix_len(ids, self._kv_ids)
                     if common == len(ids) or common == len(self._kv_ids):
                         cache, reuse = self._kv_cache, common
-                    else:
-                        # 前缀对不齐：缓存整体作废（不可裁剪，只能重建）。
-                        # 诊断：打印公共前缀位置，配合「本轮比上轮短多少」判断是
-                        # 历史被改写（common 远小于缓存）还是头部被改（common 很小）。
                         logger.info(
-                            "MLX KV 前缀未命中: 公共前缀 %d（缓存 %d / 本轮 %d）→ 整份重建",
-                            common, len(self._kv_ids), len(ids),
-                        )
-                        try:
-                            dec = self._tokenizer.decode
-                            lo = max(0, common - 6)
+                            "MLX KV 前缀复用: 跳过 %d token（本 prompt %d）→ 仅预填增量",
+                            reuse, len(ids))
+                    else:
+                        # 前缀分叉（历史被改写 / 上下文收缩 / WORKING MEMORY 等动态
+                        # 包装每轮变化，分叉点通常在 user 消息）。先尝试把缓存裁到
+                        # 公共前缀并复用——可裁剪架构（如 Qwen3 的 AttentionCache）
+                        # 能保住「system + 早期历史」，比退回静态头（仅 system+tools）
+                        # 多复用一大段；不可裁剪（如 Qwen3.5 的 ArraysCache）则退回
+                        # 静态头，最差整轮重建。
+                        trimmed = _try_trim_prompt_cache(
+                            self._kv_cache, len(self._kv_ids), common)
+                        if trimmed:
+                            cache, reuse = self._kv_cache, common
                             logger.info(
-                                "MLX KV 分歧点: 缓存侧=%r || 本轮侧=%r",
-                                dec(self._kv_ids[lo:common + 6]),
-                                dec(ids[lo:common + 6]),
-                            )
-                        except Exception:  # pragma: no cover - 仅诊断
-                            pass
-
-                        self._kv_cache = None
-                        self._kv_ids = []
-                        # 降级：改用**静态头缓存的克隆体**。头（system + 工具
-                        # schema）恒定且重放必然一致，所以即便历史里的思考段被
-                        # 模板剥掉，头这一段照样对得上——本轮只需 prefill 头之后
-                        # 的对话部分，而不是整个 prompt。
-                        head, head_ids = self._usable_head_cache()
-                        if head is not None and head_ids:
-                            head_common = self._common_prefix_len(ids, head_ids)
-                            if head_common == len(head_ids):
-                                cloned = _clone_prompt_cache(head)
-                                if cloned is not None:
-                                    cache, reuse = cloned, head_common
-                                    logger.info(
-                                        "MLX KV 降级复用静态头: 跳过 %d token（本 prompt %d）",
-                                        reuse, len(ids),
-                                    )
+                                "MLX KV 分叉：裁到公共前缀 %d token 复用（缓存原 %d）→ 仅预填增量",
+                                common, len(self._kv_ids))
+                        else:
+                            # 诊断：打印公共前缀位置，配合「本轮比上轮短多少」判断是
+                            # 历史被改写（common 远小于缓存）还是头部被改（common 很小）。
+                            try:
+                                dec = self._tokenizer.decode
+                                lo = max(0, common - 6)
+                                logger.info(
+                                    "MLX KV 分歧点: 缓存侧=%r || 本轮侧=%r",
+                                    dec(self._kv_ids[lo:common + 6]),
+                                    dec(ids[lo:common + 6]),
+                                )
+                            except Exception:  # pragma: no cover - 仅诊断
+                                pass
+                            self._kv_cache = None
+                            self._kv_ids = []
+                            # 降级：改用**静态头缓存的克隆体**（仅当 KV 复用开启）。
+                            # 头（system + 工具 schema）恒定且重放必然一致，所以即便
+                            # 历史里的思考段被模板剥掉，头这一段照样对得上。
+                            if kv_reuse_enabled:
+                                head, head_ids = self._usable_head_cache()
+                                if head is not None and head_ids:
+                                    head_common = self._common_prefix_len(ids, head_ids)
+                                    if head_common == len(head_ids):
+                                        cloned = _clone_prompt_cache(head)
+                                        if cloned is not None:
+                                            cache, reuse = cloned, head_common
+                                            logger.info(
+                                                "MLX KV 降级复用静态头: 跳过 %d token（本 prompt %d）",
+                                                reuse, len(ids),
+                                            )
                 if cache is not None and reuse >= len(ids):
                     # 缓存已完整覆盖本轮 prompt → 没有可喂的新 token，
                     # ids[reuse:] 为空，mlx_lm 直接报
@@ -1162,7 +1316,7 @@ class MLXLanguageBackend(_LazyLocalBackend):
                     logger.info("MLX KV 缓存已覆盖全部 prompt（%d/%d），本轮不复用",
                                 reuse, len(ids))
                     cache, reuse = None, 0
-                if cache is None:
+                if cache is None and kv_reuse_enabled:
                     # 同样先试静态头缓存的克隆体（没有预热过、或缓存刚被作废）。
                     head, head_ids = self._usable_head_cache()
                     if (head is not None and head_ids and ids is not None

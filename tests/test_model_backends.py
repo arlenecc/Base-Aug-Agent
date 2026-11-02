@@ -1052,6 +1052,51 @@ def test_mlx_kv_prefix_reuse_skips_cached_prefill(monkeypatch, tmp_path):
     assert prior_cache > 0, "上一轮缓存非空"
 
 
+def test_kv_friendly_chat_template_keeps_history_reasoning():
+    """_kv_friendly_chat_template 必须把「历史轮丢弃推理」的栅栏换成恒真。
+
+    根因：qwen3.5-agentic-coder 等模板对历史 assistant 轮直接丢弃 <think>…</think>
+    推理，而 KV 缓存里那一轮当时是「待生成轮」、包含推理 → 下一轮重渲染时两边从
+    assistant 块起永久错开，form① 整份作废。补丁把 `loop.index0 > ns.last_query_index`
+    换成 `true`，让所有 assistant 轮都按生成提示词同样渲染思考块。
+    """
+    marker = "loop.index0 > ns.last_query_index"
+    # 合成模板：含真实标记；历史 assistant 轮原本走 else（DROP=丢弃推理）。
+    synth = (
+        "{% for m in messages %}"
+        "{% if m.role == 'assistant' %}"
+        "{% if " + marker + " %}KEEP{{ m.content }}{% else %}DROP{{ m.content }}{% endif %}"
+        "{% else %}{{ m.content }}{% endif %}"
+        "{% endfor %}"
+    )
+
+    class _Tok:
+        chat_template = synth
+
+    class _Backend:
+        _tokenizer = _Tok()
+
+    patched = MLXLanguageBackend._kv_friendly_chat_template(_Backend())
+    assert patched is not None, "应打补丁"
+    assert marker not in patched, "栅栏条件必须被替换掉"
+    # 渲染：历史 assistant 轮（非最后一条）必须走 KEEP 分支（保留推理），而非 DROP。
+    from jinja2 import Template
+    out = Template(patched).render(messages=[
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "REASON"},  # 历史轮
+        {"role": "user", "content": "bye"},
+    ])
+    assert "KEEP" in out and "REASON" in out
+    assert "DROP" not in out, "历史轮不应再丢弃推理"
+
+    # 不含该栅栏的模板（如 qwen3 等其它结构）应原样返回 None → 走默认模板。
+    class _Tok2:
+        chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}"
+    class _Backend2:
+        _tokenizer = _Tok2()
+    assert MLXLanguageBackend._kv_friendly_chat_template(_Backend2()) is None
+
+
 def test_mlx_kv_cache_invalidated_on_reset(monkeypatch, tmp_path):
     """reset / 历史被改写后，缓存应被清掉，避免前缀错位。"""
     tok, stream = _install_mock_mlx(
