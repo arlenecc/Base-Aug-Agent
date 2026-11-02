@@ -12,7 +12,8 @@ import os
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QKeyEvent
@@ -31,7 +32,11 @@ from ..model_backends import (
     create_aux_llm_backend,
     create_llm_backend,
     discover_local_models,
+    get_models_base_dir,
+    resolve_model_path,
 )
+from ..model_registry import HF_MIRROR, collect_needed_models
+from .model_download_dialog import ModelDownloadDialog, ModelDownloadChoiceDialog
 from ..skills import Skill
 from ..tools import ToolRegistry
 from ..rag.engine import RAGEngine
@@ -5214,6 +5219,75 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# 角色 → 配置中对应的「模型路径」字段（即用户当前设置的目录）。
+_ROLE_PATH_FIELD = {
+    "llm": "llm_model_path",
+    "aux_llm": "aux_llm_model_path",
+    "embedding": "rag_embedding_model_path",
+    "reranker": "rag_rerank_model_path",
+    "ocr": "rag_ocr_model_path",
+}
+
+
+def ensure_default_models(config) -> bool:
+    """首次启动 / 默认模型缺失时，弹窗引导联网下载。
+
+    关键：缺失判定基于**用户当前配置并解析出的目录** ``resolve_model_path``，
+    而非写死的默认路径。这样当用户自行指定了模型目录（且目录已就绪）时，
+    不会永远被误判为「缺失」。
+
+    返回 False 表示用户取消或下载失败——调用方应退出应用（缺模型无法使用）。
+    若没有缺失或无需下载，直接返回 True（不阻断启动）。
+    """
+    try:
+        specs = collect_needed_models(config)
+    except Exception as e:  # 收集失败不应阻断启动
+        logger.warning("收集默认模型清单失败（跳过下载引导）: %s", e)
+        return True
+    if not specs:
+        return True
+
+    missing_for_choice: List[tuple] = []   # (role, local_name, repo_id) 用于展示
+    missing_for_dl: List[tuple] = []        # (role, target_dir, repo_id) 用于下载
+    for role, local_name, repo_id in specs:
+        path_field = _ROLE_PATH_FIELD.get(role)
+        raw = getattr(config, path_field, "") if path_field else ""
+        # 解析用户配置目录；strict=False 时即使目录尚不存在也返回「预期落点」，
+        # 保证自动下载后能被同一函数（严格模式）在下次启动正常定位。
+        try:
+            target_dir = resolve_model_path(raw, expect_file=False, strict=False) if raw else None
+        except Exception:
+            target_dir = None
+        ready = False
+        if target_dir and Path(target_dir).exists():
+            # 目录存在且非空 → 视为已就绪（含用户自行放置的模型，
+            # 不要求 .download_complete 标记）。空目录仍按缺失处理。
+            try:
+                ready = any(Path(target_dir).iterdir())
+            except OSError:
+                ready = False
+        if ready:
+            continue
+        tgt = target_dir or str(get_models_base_dir() / local_name)
+        missing_for_choice.append((role, local_name, repo_id))
+        missing_for_dl.append((role, tgt, repo_id))
+
+    if not missing_for_dl:
+        return True
+    # 先让用户确认：自动下载补全，还是自行下载并配置。
+    choice_dlg = ModelDownloadChoiceDialog(missing_for_choice, parent=None)
+    choice_dlg.exec()
+    if choice_dlg.choice == "exit":
+        return False
+    if choice_dlg.choice == "manual":
+        # 用户选择自行下载/配置：跳过自动下载，直接进应用。
+        return True
+    # 自动下载补全：弹出进度框（模态，未完成不能进应用）。
+    dlg = ModelDownloadDialog(missing_for_dl, HF_MIRROR, parent=None)
+    dlg.exec()
+    return dlg.succeeded
+
+
 def run() -> None:
     """应用入口。
 
@@ -5244,6 +5318,9 @@ def run() -> None:
             f"主窗口初始化失败：\n{type(e).__name__}: {e}\n\n"
             "若为依赖缺失，请安装后重试（RAG 相关：poetry install -E rag）。",
         )
+        return
+    # 首次启动 / 默认模型缺失：引导联网下载（模态，未完成则退出）。
+    if not ensure_default_models(w.config):
         return
     w.show()
     sys.exit(app.exec())
