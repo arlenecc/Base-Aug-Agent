@@ -71,9 +71,21 @@ if [[ "${1:-}" == "dist" ]]; then
     echo "   Archive: dist/BaseAgent.zip ($(du -sh dist/BaseAgent.zip | cut -f1))"
 fi
 
+# 版本号：跟随代码库 git tag（git describe --abbrev=0 取「最近的可达 tag」的纯净名，
+# 忽略「+N提交-g哈希」后缀，得到干净的 BaseAgent-<tag>.dmg）。回退：取不到 tag 时
+# 回退到 spec 的 CFBundleShortVersionString，再回退 0.0.0。
+detect_version() {
+    local v
+    v="$(git describe --tags --abbrev=0 2>/dev/null)" && [[ -n "$v" ]] && { echo "$v"; return; }
+    grep -oE "CFBundleShortVersionString': '[0-9]+\.[0-9]+\.[0-9]+'" base-agent.spec \
+        | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -1
+}
+
 create_dmg() {
     local app_path="dist/BaseAgent.app"
-    local dmg_path="dist/BaseAgent.dmg"
+    local VERSION="$(detect_version)"
+    [[ -z "$VERSION" ]] && VERSION="0.0.0"
+    local dmg_path="dist/BaseAgent-${VERSION}.dmg"
     local staging="dist/dmg_staging"
     local vol_name="BaseAgent"
 
@@ -83,7 +95,7 @@ create_dmg() {
     fi
 
     echo ""
-    echo "💿 Creating DMG installer..."
+    echo "💿 Creating DMG installer (version ${VERSION})..."
 
     # Clean up any previous artifacts
     rm -f "$dmg_path"
@@ -114,5 +126,5 @@ create_dmg() {
 if [[ "${1:-}" == "dmg" ]]; then
     create_dmg
     echo ""
-    echo "🎉 Done! Distribute dist/BaseAgent.dmg"
+    echo "🎉 Done! Distribute dist/BaseAgent-$(detect_version 2>/dev/null || echo 0.0.0).dmg"
 fi
