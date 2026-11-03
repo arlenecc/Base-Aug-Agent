@@ -79,10 +79,14 @@ SYSTEM_PROMPT = """You are base-agent, a local autonomous agent. Complete each t
 6. Semantic queries (`memory_search` / `skill_semantic_search` / `rag_search`): use the user's own natural-language wording. Never translate, transliterate to pinyin, or reduce to bare keywords — these are vector searches and mangled queries silently return nothing.
 
 # Knowledge base (RAG)
-7. When the user asks about the content of a book/document in the knowledge base, follow these steps in order — do not skip any:
-   a. `rag_outline` FIRST (with the book name) to grasp the document's overall structure. Unsure which documents exist → call `rag_outline` with no argument to list them.
-   b. From the outline, locate the chapters relevant to the user's actual question, then `rag_search` (query in the user's own words, `source` set to that book) for targeted details; search several chapters if needed.
-   c. Synthesize the outline + search results into a focused answer that cites the chapters/sources used. Never answer detail questions from the outline alone, and never fire a blind `rag_search` without checking the outline first.
+7. When the user asks about a book/document in the knowledge base, follow this flow — and keep `rag_search` minimal:
+   a. `rag_outline` FIRST (with the book name) to get the structure. Unsure which documents exist → call `rag_outline` with no argument to list them.
+   b. Read the outline: it may already contain a "## 全书摘要" (whole-book summary) and/or per-chapter "## 章节摘要" entries (lines like `- 【章节名】摘要…`). Decide the minimum `rag_search` calls needed — NEVER blindly search the whole book, and NEVER exceed 3 `rag_search` calls per question:
+      - If the outline already contains a usable summary that answers the question, answer directly from the outline and call `rag_search` ZERO times.
+      - If the question is about the document's OVERALL content (theme, main idea, general structure) and no summary covers it, `rag_search` ONLY the preface/intro (query the 前言/序/目录 region) — at most ONE search, not the whole book.
+      - If the question targets SPECIFIC chapters, `rag_search` ONLY those target chapters (set `source` to the book, phrase the query around the chapter topic). Do not search unrelated chapters or the entire book.
+   c. Synthesize a focused answer that cites the chapters/sources used. Never answer detail questions from the outline alone when no summary covers them, and never fire a blind `rag_search` without checking the outline first.
+   d. HARD BUDGET: after 3 `rag_search` calls, stop searching. Synthesize from the outline, any summaries, and the searches already done — do not fire a 4th.
 
 # Execution & safety
 8. Missing info → `ask_user`, never guess.
@@ -242,6 +246,7 @@ class Agent:
         self._cached_prompt = ""
         self._turn_idx = 0  # incremented each run() call; used for prompt cache
         self._tool_call_counter = 0  # stable id generator for missing tool_call ids
+        self._rag_search_count = 0   # 单次提问内 rag_search 调用计数（≤3 护栏）
         # tools schema 的 token 估算缓存（见 _tool_schema_tokens）。
         self._tool_schema_tokens_cache: Optional[int] = None
         self._tool_schema_version: int = -2  # -2 = 从未计算过
@@ -975,6 +980,7 @@ class Agent:
             self._log(f"[skills] record_request error: {e}")
         skill_offered = False
         tool_calls_done = 0
+        self._rag_search_count = 0  # 每轮重置 rag_search 次数护栏
         used_plan = False
 
         self._last_user_text = user_input
@@ -1459,6 +1465,20 @@ class Agent:
             self._safe_callback("on_tool_end", name, res)
             return res
 
+        # 单轮 rag_search 次数护栏：超过 3 次直接拦截，避免 outliner 后大量无效检索。
+        if name == "rag_search" and self._rag_search_count >= 3:
+            self._safe_callback("on_tool_start", name, args)
+            res = ToolResult(
+                True,
+                output=(
+                    "已达到单次提问的 rag_search 次数上限（3 次）。请基于已获取的文档"
+                    "大纲（及其中可能包含的「全书摘要 / 章节摘要」）直接作答，不要再"
+                    "调用 rag_search。"
+                ),
+            )
+            self._safe_callback("on_tool_end", name, res)
+            return res
+
         try:
             tool = self.tools.get(name)
         except Exception as e:
@@ -1493,6 +1513,8 @@ class Agent:
                 self._safe_callback("on_tool_end", name, res)
                 return res
 
+        if name == "rag_search":
+            self._rag_search_count += 1
         self._safe_callback("on_tool_start", name, args)
         try:
             res = self.tools.execute(name, args)
